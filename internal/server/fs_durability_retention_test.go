@@ -578,7 +578,7 @@ func TestSecretReceiptDirSyncFailureRetainsReceipt(t *testing.T) {
 	}
 	key := secretReceiptKey(jobID, gen, "tok")
 	s.mu.Lock()
-	retained := s.secretReceipts[key]
+	_, retained := s.secretReceipts[key]
 	s.mu.Unlock()
 	if !retained {
 		t.Fatal("published secret receipt was rolled back in memory")
@@ -599,7 +599,7 @@ func TestSecretReceiptDirSyncFailureRetainsReceipt(t *testing.T) {
 	if err := s2.loadSecretReceipts(dir); err != nil {
 		t.Fatal(err)
 	}
-	if !s2.secretReceipts[key] {
+	if _, ok := s2.secretReceipts[key]; !ok {
 		t.Fatal("restart/later persist lost the published secret receipt")
 	}
 }

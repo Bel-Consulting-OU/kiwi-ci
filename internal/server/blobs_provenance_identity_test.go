@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -112,16 +114,11 @@ func TestArtifactUploadMemoryRunMissingFailsClosed(t *testing.T) {
 	}
 }
 
-func TestArtifactUploadProvenanceCarriesFullIdentity(t *testing.T) {
-	s, _, _, hdrs := artifactIdentityFixture(t)
-	w := fcUploadBlobArtifact(t, s, hdrs, "payload")
-	if w.Code != http.StatusCreated {
-		t.Fatalf("upload = %d, want 201: %s", w.Code, w.Body.String())
-	}
-	var rec model.ArtifactRecord
-	if err := json.Unmarshal(w.Body.Bytes(), &rec); err != nil {
-		t.Fatal(err)
-	}
+// provenanceStatementForUpload extracts and signature-verifies the DSSE
+// statement an artifact upload published, returning the decoded statement
+// and its signed payload bytes.
+func provenanceStatementForUpload(t *testing.T, s *Server, rec model.ArtifactRecord) (provenance.Statement, []byte) {
+	t.Helper()
 	if !strings.HasPrefix(rec.ProvenancePath, "cas:") || rec.ProvenanceSHA256 == "" {
 		t.Fatalf("provenance refs = %q/%q, want cas: digest", rec.ProvenancePath, rec.ProvenanceSHA256)
 	}
@@ -149,6 +146,36 @@ func TestArtifactUploadProvenanceCarriesFullIdentity(t *testing.T) {
 	if err := json.Unmarshal(payload, &st); err != nil {
 		t.Fatal(err)
 	}
+	return st, payload
+}
+
+func TestArtifactUploadProvenanceCarriesFullIdentity(t *testing.T) {
+	s, f, _, hdrs := artifactIdentityFixture(t)
+	started := time.Now().UTC().Add(-2 * time.Minute).Truncate(time.Second)
+	compiled := &model.CompiledJobPayload{
+		SchemaVersion:   3,
+		CompilerVersion: "kiwi-compiler/1.2.3",
+		PipelineDigest:  strings.Repeat("a", 64),
+		JobDigest:       strings.Repeat("b", 64),
+		EffectiveJob:    map[string]any{"name": "build", "steps": []any{map[string]any{"run": "make"}}},
+		EffectivePolicy: map[string]any{"oidc": false, "network": map[string]any{"allow": true, "hosts": []any{"a", "b"}}},
+	}
+	f.mu.Lock()
+	j := f.jobs["job-a"]
+	j.StartedAt = &started
+	j.CompiledJobPayload = compiled
+	f.jobs["job-a"] = j
+	f.mu.Unlock()
+
+	w := fcUploadBlobArtifact(t, s, hdrs, "payload")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("upload = %d, want 201: %s", w.Code, w.Body.String())
+	}
+	var rec model.ArtifactRecord
+	if err := json.Unmarshal(w.Body.Bytes(), &rec); err != nil {
+		t.Fatal(err)
+	}
+	st, payloadBytes := provenanceStatementForUpload(t, s, rec)
 	want := map[string]string{
 		"repository": "github.com/o/repo-a",
 		"ref":        "refs/heads/main",
@@ -164,9 +191,140 @@ func TestArtifactUploadProvenanceCarriesFullIdentity(t *testing.T) {
 	if len(st.Subject) != 1 || st.Subject[0].Digest["sha256"] != rec.SHA256 {
 		t.Fatalf("provenance subject = %+v, want artifact digest %s", st.Subject, rec.SHA256)
 	}
-	if got := st.Predicate.RunDetails.Metadata.InvocationID; got != "run-c/job-a" {
-		t.Fatalf("provenance invocationId = %q, want run-c/job-a", got)
+	// The invocation string carries the canonical attempt ID, and the
+	// dedicated field lets consumers match it without parsing.
+	if got := st.Predicate.RunDetails.Metadata.InvocationID; got != "run-c/job-a:5" {
+		t.Fatalf("provenance invocationId = %q, want run-c/job-a:5", got)
 	}
+	if st.AttemptID != "job-a:5" {
+		t.Fatalf("provenance attemptId = %q, want job-a:5", st.AttemptID)
+	}
+	wantCapsule, err := provenance.CapsuleDigest(compiled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.CapsuleDigest == "" || st.CapsuleDigest != wantCapsule {
+		t.Fatalf("provenance capsuleDigest = %q, want %q", st.CapsuleDigest, wantCapsule)
+	}
+	// The digest is deterministic over the persisted payload.
+	again, err := provenance.CapsuleDigest(compiled)
+	if err != nil || again != st.CapsuleDigest {
+		t.Fatalf("capsule digest unstable: %q vs %q (%v)", st.CapsuleDigest, again, err)
+	}
+	if st.PipelineDigest != compiled.PipelineDigest || st.CompilerVersion != compiled.CompilerVersion {
+		t.Fatalf("pipeline identity = %q/%q, want %q/%q", st.PipelineDigest, st.CompilerVersion, compiled.PipelineDigest, compiled.CompilerVersion)
+	}
+	policyJSON, err := json.Marshal(compiled.EffectivePolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policySum := sha256.Sum256(policyJSON)
+	if st.EffectivePolicyDigest != hex.EncodeToString(policySum[:]) {
+		t.Fatalf("effectivePolicyDigest = %q, want %s", st.EffectivePolicyDigest, hex.EncodeToString(policySum[:]))
+	}
+	if st.RunnerIdentity != "runner-a" {
+		t.Fatalf("runnerIdentity = %q, want runner-a", st.RunnerIdentity)
+	}
+	if st.ArtifactSize != int64(len("payload")) {
+		t.Fatalf("artifactSize = %d, want %d", st.ArtifactSize, len("payload"))
+	}
+	if st.StartTime == nil || !st.StartTime.Equal(started) {
+		t.Fatalf("startTime = %v, want %v", st.StartTime, started)
+	}
+	// The job is still running: no completion claim, only publication time.
+	if st.Predicate.RunDetails.Metadata.FinishedOn != nil {
+		t.Fatalf("running job statement claimed finishedOn %v", st.Predicate.RunDetails.Metadata.FinishedOn)
+	}
+	if strings.Contains(string(payloadBytes), "finishedOn") {
+		t.Fatalf("signed payload contains finishedOn for a running job: %s", payloadBytes)
+	}
+	if st.ArtifactPublishedAt == nil {
+		t.Fatal("artifactPublishedAt missing from statement")
+	}
+}
+
+// TestArtifactProvenanceWithoutCapsulePayloadStillUploads proves the explicit
+// degraded binding: a job without a persisted CompiledJobPayload still
+// uploads (201) and the statement simply omits the capsule/pipeline fields
+// instead of fabricating evidence.
+func TestArtifactProvenanceWithoutCapsulePayloadStillUploads(t *testing.T) {
+	s, _, _, hdrs := artifactIdentityFixture(t)
+	w := fcUploadBlobArtifact(t, s, hdrs, "payload")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("upload without compiled payload = %d, want 201: %s", w.Code, w.Body.String())
+	}
+	var rec model.ArtifactRecord
+	if err := json.Unmarshal(w.Body.Bytes(), &rec); err != nil {
+		t.Fatal(err)
+	}
+	st, payloadBytes := provenanceStatementForUpload(t, s, rec)
+	if st.CapsuleDigest != "" || st.PipelineDigest != "" || st.CompilerVersion != "" || st.EffectivePolicyDigest != "" {
+		t.Fatalf("capsule fields fabricated without a payload: %q/%q/%q/%q", st.CapsuleDigest, st.PipelineDigest, st.CompilerVersion, st.EffectivePolicyDigest)
+	}
+	if strings.Contains(string(payloadBytes), "capsuleDigest") {
+		t.Fatalf("signed payload carries capsuleDigest without a payload: %s", payloadBytes)
+	}
+	// The rest of the identity is still bound.
+	if st.AttemptID != "job-a:5" || st.Predicate.RunDetails.Metadata.InvocationID != "run-c/job-a:5" {
+		t.Fatalf("attempt identity lost: %q / %q", st.AttemptID, st.Predicate.RunDetails.Metadata.InvocationID)
+	}
+}
+
+// TestArtifactProvenanceNeverClaimsFinishedBeforeTerminal proves artifact
+// publication records its own timestamp and only claims build completion when
+// the job carries a real terminal timestamp.
+func TestArtifactProvenanceNeverClaimsFinishedBeforeTerminal(t *testing.T) {
+	t.Run("running job omits finishedOn", func(t *testing.T) {
+		s, _, _, hdrs := artifactIdentityFixture(t)
+		w := fcUploadBlobArtifact(t, s, hdrs, "payload")
+		if w.Code != http.StatusCreated {
+			t.Fatalf("upload = %d, want 201: %s", w.Code, w.Body.String())
+		}
+		var rec model.ArtifactRecord
+		if err := json.Unmarshal(w.Body.Bytes(), &rec); err != nil {
+			t.Fatal(err)
+		}
+		st, payloadBytes := provenanceStatementForUpload(t, s, rec)
+		if st.Predicate.RunDetails.Metadata.FinishedOn != nil {
+			t.Fatalf("running job statement claimed finishedOn %v", st.Predicate.RunDetails.Metadata.FinishedOn)
+		}
+		if strings.Contains(string(payloadBytes), "finishedOn") {
+			t.Fatalf("signed payload carries finishedOn for a running job: %s", payloadBytes)
+		}
+		if st.ArtifactPublishedAt == nil {
+			t.Fatal("artifactPublishedAt missing")
+		}
+		if since := time.Since(*st.ArtifactPublishedAt); since < 0 || since > time.Minute {
+			t.Fatalf("artifactPublishedAt = %v, want upload time", *st.ArtifactPublishedAt)
+		}
+	})
+
+	t.Run("terminal job records its real finishedAt", func(t *testing.T) {
+		s, f, _, hdrs := artifactIdentityFixture(t)
+		finished := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+		f.mu.Lock()
+		j := f.jobs["job-a"]
+		j.FinishedAt = &finished
+		f.jobs["job-a"] = j
+		f.mu.Unlock()
+
+		w := fcUploadBlobArtifact(t, s, hdrs, "payload")
+		if w.Code != http.StatusCreated {
+			t.Fatalf("upload = %d, want 201: %s", w.Code, w.Body.String())
+		}
+		var rec model.ArtifactRecord
+		if err := json.Unmarshal(w.Body.Bytes(), &rec); err != nil {
+			t.Fatal(err)
+		}
+		st, _ := provenanceStatementForUpload(t, s, rec)
+		got := st.Predicate.RunDetails.Metadata.FinishedOn
+		if got == nil || !got.Equal(finished) {
+			t.Fatalf("finishedOn = %v, want the real terminal %v (never upload time)", got, finished)
+		}
+		if st.ArtifactPublishedAt == nil || st.ArtifactPublishedAt.Equal(finished) {
+			t.Fatalf("artifactPublishedAt = %v, want a separate publication timestamp", st.ArtifactPublishedAt)
+		}
+	})
 }
 
 // fenceRecorder wraps a cas.Fencer and tracks which digests are currently

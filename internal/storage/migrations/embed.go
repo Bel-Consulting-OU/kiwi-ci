@@ -142,18 +142,118 @@ func versionOf(name string) (int, error) {
 	return v, nil
 }
 
-// SplitStatements splits raw SQL on semicolons, drops comment-only lines,
-// and trims whitespace. It assumes statements contain no semicolons inside
-// string literals.
+// SplitStatements splits raw SQL on semicolons that appear OUTSIDE string
+// literals, quoted identifiers, line comments, block comments and
+// dollar-quoted bodies, then drops comment-only lines and trims whitespace.
+// The dollar-quote awareness is what lets a migration carry a PL/pgSQL
+// trigger function whose body contains semicolons: the body is one
+// statement, exactly as PostgreSQL sees it. Comment-only lines are stripped
+// AFTER splitting so a semicolon inside a comment can no longer cut the
+// comment in half.
 func SplitStatements(sql string) []string {
 	var out []string
-	for _, part := range strings.Split(sql, ";") {
-		stmt := strings.TrimSpace(stripSQLComments(part))
-		if stmt != "" {
-			out = append(out, stmt)
+	var b strings.Builder
+	i, n := 0, len(sql)
+	for i < n {
+		c := sql[i]
+		switch {
+		case c == '\'':
+			j := scanQuoted(sql, i, '\'')
+			b.WriteString(sql[i:j])
+			i = j
+		case c == '"':
+			j := scanQuoted(sql, i, '"')
+			b.WriteString(sql[i:j])
+			i = j
+		case c == '-' && i+1 < n && sql[i+1] == '-':
+			j := strings.IndexByte(sql[i:], '\n')
+			if j < 0 {
+				j = n - i
+			}
+			b.WriteString(sql[i : i+j])
+			i += j
+		case c == '/' && i+1 < n && sql[i+1] == '*':
+			end := strings.Index(sql[i+2:], "*/")
+			if end < 0 {
+				b.WriteString(sql[i:])
+				i = n
+				break
+			}
+			j := i + 2 + end + 2
+			b.WriteString(sql[i:j])
+			i = j
+		case c == '$':
+			if tag, ok := dollarQuoteTag(sql[i:]); ok {
+				end := strings.Index(sql[i+len(tag):], tag)
+				if end < 0 {
+					b.WriteString(sql[i:])
+					i = n
+					break
+				}
+				j := i + len(tag) + end + len(tag)
+				b.WriteString(sql[i:j])
+				i = j
+				break
+			}
+			b.WriteByte(c)
+			i++
+		case c == ';':
+			stmt := strings.TrimSpace(stripSQLComments(b.String()))
+			if stmt != "" {
+				out = append(out, stmt)
+			}
+			b.Reset()
+			i++
+		default:
+			b.WriteByte(c)
+			i++
 		}
 	}
+	if stmt := strings.TrimSpace(stripSQLComments(b.String())); stmt != "" {
+		out = append(out, stmt)
+	}
 	return out
+}
+
+// scanQuoted returns the index just past the closing quote of the literal or
+// quoted identifier starting at i, honoring the doubled-quote escape. An
+// unterminated quote consumes the rest of the input (PostgreSQL reports the
+// syntax error when it executes the statement).
+func scanQuoted(sql string, i int, quote byte) int {
+	j := i + 1
+	for j < len(sql) {
+		if sql[j] != quote {
+			j++
+			continue
+		}
+		if j+1 < len(sql) && sql[j+1] == quote {
+			j += 2
+			continue
+		}
+		return j + 1
+	}
+	return len(sql)
+}
+
+// dollarQuoteTag reports whether s starts a dollar-quoted string ($tag$) and
+// returns the full delimiter. A bare $ followed by a digit or punctuation is
+// not a tag (it is a bind-parameter-looking token, which migrations do not
+// use, or money); such input is emitted verbatim.
+func dollarQuoteTag(s string) (string, bool) {
+	if len(s) < 2 || s[0] != '$' {
+		return "", false
+	}
+	for i := 1; i < len(s); i++ {
+		c := s[i]
+		if c == '$' {
+			return s[:i+1], true
+		}
+		if c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (i > 1 && c >= '0' && c <= '9') {
+			continue
+		}
+		return "", false
+	}
+	return "", false
 }
 
 func stripSQLComments(s string) string {

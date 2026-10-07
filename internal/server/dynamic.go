@@ -243,8 +243,12 @@ func replayGeneratedResponse(parent model.Job, depth int, rec storage.GeneratedF
 // It is the shared admission path for both storage modes. The body must carry
 // the deterministic fragment_id (sha256 hex of the canonical {jobs, deps});
 // the server recomputes it and rejects a missing or mismatching id with 400.
-// A fragment already admitted under the same (parent, lease generation,
-// fragment id) is answered idempotently with the originally created children.
+// A fragment already admitted under the same canonical mutation key (parent
+// job, fragment id) is answered idempotently with the originally created
+// children. The lease generation AUTHORIZES the mutation (the caller has
+// already validated the active lease before this function runs) but never
+// defines it: an infrastructure retry of the same logical parent under a new
+// generation re-submits the identical fragment and replays the SAME children.
 func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job, in generatedFragment) (*generatedResponse, error) {
 	fragmentID, err := in.Digest()
 	if err != nil {
@@ -259,8 +263,11 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 	childDepth := parent.DynamicDepth + 1
 	// Replay fast path: a committed receipt returns the original children
 	// without re-running admission (a replay must survive policy edits and a
-	// changed compiler exactly as the original admission did).
-	if rec, found, rerr := s.generatedFragmentReceipt(ctx, parent.ID, parent.LeaseGeneration, fragmentID); rerr != nil {
+	// changed compiler exactly as the original admission did). The caller
+	// (the generateJobs handler) has already validated the CURRENT live lease
+	// through authorizeRunnerLease, so a stale generation or token never
+	// reaches this lookup.
+	if rec, found, rerr := s.generatedFragmentReceipt(ctx, parent.ID, fragmentID); rerr != nil {
 		return nil, rerr
 	} else if found {
 		return replayGeneratedResponse(parent, childDepth, rec), nil
@@ -552,13 +559,18 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 		s.mu.Unlock()
 		return nil, lerr
 	}
+	// Replay AFTER authorization and BEFORE the graph/cap checks, mirroring
+	// the SQL transaction: an identical fragment always replays the original
+	// children, even if the run has since grown past a limit the original
+	// admission satisfied. A stale generation never reaches this lookup (the
+	// lease predicate above rejected it).
+	if rec, found := s.memoryGeneratedFragment(parent.ID, fragmentID); found {
+		s.mu.Unlock()
+		return replayGeneratedResponse(parent, childDepth, rec), nil
+	}
 	if verr := verifyGeneratedFragmentGraph(parent, current, childDepth, runJobCount, len(created)); verr != nil {
 		s.mu.Unlock()
 		return nil, verr
-	}
-	if rec, found := s.memoryGeneratedFragment(parent.ID, parent.LeaseGeneration, fragmentID); found {
-		s.mu.Unlock()
-		return replayGeneratedResponse(parent, childDepth, rec), nil
 	}
 	rb := s.captureStateRollbackLocked()
 	for id, j := range created {
@@ -567,44 +579,53 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 			s.contracts[id] = contracts
 		}
 	}
-	if perr := s.persistCheckedErrLocked("generated.fragment"); perr != nil {
-		// The children never became durable: restore every map this path
-		// touched and fail closed with a 5xx. The idempotency receipt is
-		// recorded only AFTER the snapshot write, so a retry can never
-		// replay an admission the disk does not contain.
-		s.rollbackStateLocked(rb)
-		s.mu.Unlock()
-		return nil, notDurable(perr)
-	}
-	// The children are durable: record the in-memory idempotency receipt so
-	// a retry returns the SAME children instead of re-admitting. The
-	// receipt table is process-local fs state (a restart re-admits, the
-	// documented pre-receipt behavior); it is only ever populated for an
-	// admission whose children are already on disk.
-	s.generatedFragments[generatedFragmentKey(parent.ID, parent.LeaseGeneration, fragmentID)] = storage.GeneratedFragmentReceipt{
+	// The in-memory idempotency receipt is recorded BEFORE the snapshot write
+	// so the receipts and the children they describe become durable in the
+	// SAME atomic snapshot. A failed write rolls both back together, and a
+	// restart restores the receipt alongside its children: a resubmitted
+	// identical fragment replays the SAME child IDs instead of re-admitting a
+	// duplicate graph with fresh random IDs. The key is the canonical
+	// mutation identity (parent, fragment id); the generation only authorized
+	// this admission.
+	s.generatedFragments[generatedFragmentKey(parent.ID, fragmentID)] = storage.GeneratedFragmentReceipt{
 		ParentJobID:     parent.ID,
 		LeaseGeneration: parent.LeaseGeneration,
 		FragmentID:      fragmentID,
 		Children:        children,
 		CreatedAt:       commitNow,
 	}
+	if perr := s.persistCheckedErrLocked("generated.fragment"); perr != nil {
+		// Neither the children nor the receipt became durable: restore every
+		// map this path touched (including the receipt) and fail closed with
+		// a 5xx.
+		s.rollbackStateLocked(rb)
+		s.mu.Unlock()
+		return nil, notDurable(perr)
+	}
 	s.mu.Unlock()
 	return &generatedResponse{ParentJobID: parent.ID, RunID: parent.RunID, Depth: childDepth, JobIDs: ids, Keys: keys}, nil
 }
 
-// generatedFragmentKey is the in-memory primary key of the fragment
-// receipts, mirroring the generated_fragments table key.
-func generatedFragmentKey(parentJobID string, generation int64, fragmentID string) string {
-	return parentJobID + "\x00" + strconv.FormatInt(generation, 10) + "\x00" + fragmentID
+// generatedFragmentKey is the canonical mutation key of the generated-fragment
+// receipts: parent job ID + ":" + fragment ID. Parent job IDs are 32 hex
+// chars and fragment IDs are 64 hex chars, so the ':'-concatenation is
+// unambiguous. The lease generation is deliberately NOT part of the key: it
+// authorizes an upload but does not define it, so an infrastructure retry of
+// the same logical parent under a new generation replays the original
+// children. Mirrors fragmentKey in internal/storage/faultstore.go and the
+// generated_fragments_mutation_idx unique index (migration 0043).
+func generatedFragmentKey(parentJobID, fragmentID string) string {
+	return parentJobID + ":" + fragmentID
 }
 
 // generatedFragmentReceipt resolves the idempotency receipt of a fragment:
 // from the durable store in DB mode (when it implements the receipt store),
-// from the in-memory map otherwise.
-func (s *Server) generatedFragmentReceipt(ctx context.Context, parentJobID string, generation int64, fragmentID string) (storage.GeneratedFragmentReceipt, bool, error) {
+// from the in-memory map otherwise. The caller must have authorized the
+// CURRENT lease first; the receipt read itself carries no lease authority.
+func (s *Server) generatedFragmentReceipt(ctx context.Context, parentJobID, fragmentID string) (storage.GeneratedFragmentReceipt, bool, error) {
 	if s.DB != nil {
 		if gs, ok := s.DB.(storage.GeneratedFragmentStore); ok {
-			return gs.GetGeneratedFragment(ctx, parentJobID, generation, fragmentID)
+			return gs.GetGeneratedFragment(ctx, parentJobID, fragmentID)
 		}
 		// Stores without the receipt read still dedupe inside
 		// InsertGeneratedFragmentTx; the fast path is simply skipped.
@@ -612,15 +633,50 @@ func (s *Server) generatedFragmentReceipt(ctx context.Context, parentJobID strin
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rec, ok := s.memoryGeneratedFragment(parentJobID, generation, fragmentID)
+	rec, ok := s.memoryGeneratedFragment(parentJobID, fragmentID)
 	return rec, ok, nil
 }
 
 // memoryGeneratedFragment reads the in-memory receipt map. The caller holds
 // s.mu.
-func (s *Server) memoryGeneratedFragment(parentJobID string, generation int64, fragmentID string) (storage.GeneratedFragmentReceipt, bool) {
-	rec, ok := s.generatedFragments[generatedFragmentKey(parentJobID, generation, fragmentID)]
+func (s *Server) memoryGeneratedFragment(parentJobID, fragmentID string) (storage.GeneratedFragmentReceipt, bool) {
+	rec, ok := s.generatedFragments[generatedFragmentKey(parentJobID, fragmentID)]
 	return rec, ok
+}
+
+// restoreGeneratedFragmentsLocked rebuilds the fs-mode generated-fragment
+// receipt table from the persisted snapshot. Receipts are validated against
+// the restored job map: a receipt whose parent or any child is missing (a
+// corrupt or hand-edited snapshot) is dropped instead of replaying phantom
+// child IDs. The canonical key is recomputed from the receipt fields, never
+// trusted from the snapshot map key. The caller holds s.mu.
+func (s *Server) restoreGeneratedFragmentsLocked(in map[string]storage.GeneratedFragmentReceipt) {
+	if len(in) == 0 {
+		return
+	}
+	for _, rec := range in {
+		if rec.ParentJobID == "" || rec.FragmentID == "" || len(rec.Children) == 0 {
+			continue
+		}
+		if _, ok := s.jobs[rec.ParentJobID]; !ok {
+			continue
+		}
+		valid := true
+		for _, c := range rec.Children {
+			if c.ID == "" {
+				valid = false
+				break
+			}
+			if _, ok := s.jobs[c.ID]; !ok {
+				valid = false
+				break
+			}
+		}
+		if !valid {
+			continue
+		}
+		s.generatedFragments[generatedFragmentKey(rec.ParentJobID, rec.FragmentID)] = rec
+	}
 }
 
 // generatedChildCapabilities derives the capability ceiling for generated

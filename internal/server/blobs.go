@@ -455,9 +455,21 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 	}
 	// Provenance signs with the dedicated provenance key — never the OIDC
 	// key — so the two trust roots stay independent.
-	finished := time.Now().UTC()
+	//
+	// The statement binds the attempt identity to the exact lease generation
+	// the artifact record commits under. authorizeRunnerLease already matched
+	// the request's generation to the loaded job; this re-assertion mirrors
+	// the commit fence so a statement can never name a generation the durable
+	// record does not carry.
+	if gen != j.LeaseGeneration {
+		removeStagedArtifact(dst, casMode)
+		s.auditLocked("artifact.lease_lost_at_commit", runnerID, j.RunID, j.ID, "lease generation changed before provenance signing", map[string]string{"name": name})
+		http.Error(w, "lease expired during upload", http.StatusConflict)
+		return
+	}
+	publishedAt := time.Now().UTC()
 	signer := s.ensureProvenanceKey()
-	st := provenance.ArtifactStatement(provenance.ArtifactInput{Name: name, SHA256: rec.SHA256, RunID: j.RunID, JobID: j.ID, JobKey: j.Key, Repository: repoIDForRun(run), Ref: run.Ref, Commit: run.SHA, Runner: runnerID, Trusted: j.Trusted, Started: jobStart(j), Finished: finished})
+	st := provenance.ArtifactStatement(artifactProvenanceInput(j, run, rec, runnerID, gen, publishedAt))
 	st.Builder = provenance.BuilderPlaceholder
 	// Fence ordering (deadlock-free): the CAS fences of one handler are
 	// acquired in PUBLICATION order — the payload digest's fence was taken
@@ -829,6 +841,59 @@ func jobStart(j model.Job) time.Time {
 		return *j.StartedAt
 	}
 	return time.Now().UTC()
+}
+
+// artifactProvenanceInput assembles the signed provenance statement's input
+// for one published artifact from the persisted lease and compilation
+// records. The attempt identity uses the same lease generation the artifact
+// record commits under, and the capsule digest is computed only from the
+// PERSISTED CompiledJobPayload, so the evidence binds exactly the admitted
+// computation. Missing optional identity (no payload, no real terminal
+// timestamp) is omitted — never fabricated; an unresolvable capsule digest
+// degrades to an empty field and never fails the upload.
+func artifactProvenanceInput(j model.Job, run model.Run, rec model.ArtifactRecord, runnerID string, gen int64, publishedAt time.Time) provenance.ArtifactInput {
+	in := provenance.ArtifactInput{
+		Name: rec.Name, SHA256: rec.SHA256, RunID: j.RunID, JobID: j.ID, JobKey: j.Key,
+		Repository: repoIDForRun(run), Ref: run.Ref, Commit: run.SHA,
+		Runner: runnerID, Trusted: j.Trusted, Started: jobStart(j),
+		AttemptID:           model.AttemptID(j.ID, gen),
+		ArtifactPublishedAt: publishedAt,
+		RunnerIdentity:      runnerID,
+		ArtifactSize:        rec.Size,
+	}
+	if j.StartedAt != nil {
+		in.StartTime = j.StartedAt
+	}
+	// FinishedOn is ONLY the job's real terminal timestamp. Publication while
+	// the job is still running must not claim completion.
+	if j.FinishedAt != nil {
+		in.Finished = *j.FinishedAt
+	}
+	if p := j.CompiledJobPayload; p != nil {
+		in.PipelineDigest = p.PipelineDigest
+		in.CompilerVersion = p.CompilerVersion
+		in.EffectivePolicyDigest = effectivePolicyDigest(p)
+		if d, err := provenance.CapsuleDigest(p); err == nil {
+			in.CapsuleDigest = d
+		}
+	}
+	return in
+}
+
+// effectivePolicyDigest returns the sha256 of the canonical JSON of the
+// persisted effective policy, or "" when there is nothing to bind.
+// encoding/json emits map keys in sorted order, so the digest is canonical
+// for JSON-decoded policy values.
+func effectivePolicyDigest(p *model.CompiledJobPayload) string {
+	if p == nil || p.EffectivePolicy == nil {
+		return ""
+	}
+	b, err := json.Marshal(p.EffectivePolicy)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 func (s *Server) listArtifacts(w http.ResponseWriter, r *http.Request) {

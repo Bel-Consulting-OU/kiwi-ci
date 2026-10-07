@@ -26,7 +26,10 @@ func writeReceiptJournal(t *testing.T, path string, keys []string) {
 
 // TestSecretReceiptCompactionBounds is the G2-F regression half one: an
 // oversized append-only receipt journal is compacted to a bounded live set
-// (memory and file), keeping the most recent receipts.
+// (memory and file). Every seeded key belongs to no job, so all of them are
+// evictable and the lifecycle-aware rule falls back to keeping the most
+// recent receipts (see TestCompactedReceiptsLifecycleRetention for the live
+// retention half).
 func TestSecretReceiptCompactionBounds(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, secretReceiptsFile)
@@ -57,10 +60,10 @@ func TestSecretReceiptCompactionBounds(t *testing.T) {
 	if lines := countJournalLines(t, path); lines > secretReceiptsMaxEntries {
 		t.Fatalf("journal has %d records, want <= %d", lines, secretReceiptsMaxEntries)
 	}
-	if !s.secretReceipts[keys[len(keys)-1]] {
+	if _, ok := s.secretReceipts[keys[len(keys)-1]]; !ok {
 		t.Fatal("most recent receipt was compacted away")
 	}
-	if s.secretReceipts[keys[0]] {
+	if _, ok := s.secretReceipts[keys[0]]; ok {
 		t.Fatal("oldest receipt survived the bounded window")
 	}
 }
@@ -73,7 +76,7 @@ func TestSecretReceiptAppendOnlyAndRelease(t *testing.T) {
 	dir := t.TempDir()
 	s := New("t")
 	s.dataDir = dir
-	s.secretReceipts = map[string]bool{}
+	s.secretReceipts = map[string]secretReceipt{}
 	if ok, err := s.markSecretDelivered("a"); err != nil || !ok {
 		t.Fatalf("mark a = %v,%v", ok, err)
 	}
@@ -98,10 +101,10 @@ func TestSecretReceiptAppendOnlyAndRelease(t *testing.T) {
 	if err := s2.loadSecretReceipts(dir); err != nil {
 		t.Fatal(err)
 	}
-	if s2.secretReceipts["a"] {
+	if _, ok := s2.secretReceipts["a"]; ok {
 		t.Fatal("released receipt survived a restart")
 	}
-	if !s2.secretReceipts["b"] {
+	if _, ok := s2.secretReceipts["b"]; !ok {
 		t.Fatal("unrelated receipt lost across restart")
 	}
 }
@@ -119,7 +122,10 @@ func TestSecretReceiptLegacyArrayMigration(t *testing.T) {
 	if err := s.loadSecretReceipts(dir); err != nil {
 		t.Fatal(err)
 	}
-	if !s.secretReceipts["a|1|tok"] || !s.secretReceipts["b|2|tok"] {
+	if _, a := s.secretReceipts["a|1|tok"]; !a {
+		t.Fatalf("legacy receipts not loaded: %v", s.secretReceipts)
+	}
+	if _, b := s.secretReceipts["b|2|tok"]; !b {
 		t.Fatalf("legacy receipts not loaded: %v", s.secretReceipts)
 	}
 	raw, err := os.ReadFile(path)

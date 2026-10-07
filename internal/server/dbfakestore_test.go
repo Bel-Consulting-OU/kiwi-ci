@@ -85,7 +85,10 @@ type dbFakeStore struct {
 	quotas         map[string][2]int
 	cacheMans      map[string]storage.CacheManifestRecord
 	cacheManErr    error
-	secretClaims   map[string]bool
+	// secretClaims mirrors secret_claims (migrations 0005 and 0044): the
+	// once-only claim plus the sealed envelope persisted with it, so an
+	// identical retry replays the stored bytes.
+	secretClaims map[string]storage.StoredSecretIssuance
 	// pendingSidecars mirrors artifact_pending_sidecars (migration 0012):
 	// durable pending SBOM/sigstore digests across replicas.
 	pendingSidecars map[string]fakePendingSidecar
@@ -355,7 +358,7 @@ func newDBFakeStore() *dbFakeStore {
 		runIdempotency:    map[string]storage.RunIdempotencyClaim{},
 		quotas:            map[string][2]int{},
 		cacheMans:         map[string]storage.CacheManifestRecord{},
-		secretClaims:      map[string]bool{},
+		secretClaims:      map[string]storage.StoredSecretIssuance{},
 		pendingSidecars:   map[string]fakePendingSidecar{},
 		outboxClaims:      map[string]fakeOutboxClaim{},
 		outboxMeta:        map[string]fakeOutboxMeta{},
@@ -3462,30 +3465,31 @@ func (f *dbFakeStore) ExpireDownstreamReservations(ctx context.Context, olderTha
 	return n, nil
 }
 
-func (f *dbFakeStore) GetGeneratedFragment(ctx context.Context, parentJobID string, generation int64, fragmentID string) (storage.GeneratedFragmentReceipt, bool, error) {
+func (f *dbFakeStore) GetGeneratedFragment(ctx context.Context, parentJobID, fragmentID string) (storage.GeneratedFragmentReceipt, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	rec, ok := f.fragments[fragmentReceiptKey(parentJobID, generation, fragmentID)]
+	rec, ok := f.fragments[fragmentReceiptKey(parentJobID, fragmentID)]
 	return rec, ok, nil
 }
 
-// fragmentReceiptKey mirrors the generated_fragments primary key.
-func fragmentReceiptKey(parentJobID string, generation int64, fragmentID string) string {
-	return parentJobID + "|" + strconv.FormatInt(generation, 10) + "|" + fragmentID
+// fragmentReceiptKey mirrors the canonical generated_fragments mutation key
+// (parent job, fragment id): the lease generation authorizes an upload but
+// never defines the mutation.
+func fragmentReceiptKey(parentJobID, fragmentID string) string {
+	return parentJobID + ":" + fragmentID
 }
 
-// InsertGeneratedFragmentTx mirrors the SQL transaction under f.mu: a
-// committed receipt is returned with replayed=true and nothing is inserted;
-// otherwise the storage-owned lease predicate runs at the fake store's clock
-// under the same lock, then the verifier runs with the run's job count read
-// under that lock and the fragment + receipt commit atomically.
+// InsertGeneratedFragmentTx mirrors the SQL transaction under f.mu: the
+// storage-owned lease predicate runs FIRST at the fake store's clock under
+// the lock (authorization always precedes the receipt replay, so a stale
+// generation or token can never observe the stored children), then a
+// committed receipt for the canonical (parent, fragment id) mutation key is
+// returned with replayed=true and nothing is inserted; otherwise the
+// verifier runs with the run's job count read under that lock and the
+// fragment + receipt commit atomically.
 func (f *dbFakeStore) InsertGeneratedFragmentTx(ctx context.Context, req storage.GeneratedFragmentRequest, verify storage.GeneratedJobVerifier) (storage.GeneratedFragmentReceipt, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	key := fragmentReceiptKey(req.ParentJobID, req.LeaseGeneration, req.FragmentID)
-	if rec, ok := f.fragments[key]; ok {
-		return rec, true, nil
-	}
 	parent, ok := f.jobs[req.ParentJobID]
 	if !ok {
 		return storage.GeneratedFragmentReceipt{}, false, storage.ErrNotFound
@@ -3493,6 +3497,10 @@ func (f *dbFakeStore) InsertGeneratedFragmentTx(ctx context.Context, req storage
 	commitNow := time.Now().UTC()
 	if err := storage.ValidateGeneratedParentLease(parent, req, commitNow); err != nil {
 		return storage.GeneratedFragmentReceipt{}, false, err
+	}
+	key := fragmentReceiptKey(req.ParentJobID, req.FragmentID)
+	if rec, ok := f.fragments[key]; ok {
+		return rec, true, nil
 	}
 	count := 0
 	for _, j := range f.jobs {
@@ -3641,10 +3649,10 @@ func (f *dbFakeStore) ClaimSecretDelivery(ctx context.Context, jobID string, gen
 		return false, f.claimErr
 	}
 	key := jobID + "|" + itoa(generation) + "|" + secretName
-	if f.secretClaims[key] {
+	if _, exists := f.secretClaims[key]; exists {
 		return false, nil
 	}
-	f.secretClaims[key] = true
+	f.secretClaims[key] = storage.StoredSecretIssuance{}
 	return true, nil
 }
 
@@ -3655,44 +3663,68 @@ func (f *dbFakeStore) ReleaseSecretDelivery(ctx context.Context, jobID string, g
 	return nil
 }
 
+// LookupSecretIssuance is the read side of the fake's replay protocol.
+func (f *dbFakeStore) LookupSecretIssuance(ctx context.Context, jobID string, generation int64, secretName string) (storage.StoredSecretIssuance, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	stored, ok := f.secretClaims[jobID+"|"+itoa(generation)+"|"+secretName]
+	if !ok {
+		return storage.StoredSecretIssuance{}, false, nil
+	}
+	return stored, true, nil
+}
+
 // CommitSecretIssuance mirrors the transactional delivery commit: under the
 // fake's lock the authoritative job is re-read, the shared issuance predicate
-// is evaluated against the fake clock, and the once-only claim and the
-// secret.issued audit are recorded together. A claim error fails closed; an
-// audit failure rolls the claim back, exactly like the SQL transaction, so a
-// delivery is never consumed without its durable audit.
-func (f *dbFakeStore) CommitSecretIssuance(ctx context.Context, req storage.SecretIssuance) error {
+// is evaluated against the fake clock, and the once-only claim, the sealed
+// envelope and the secret.issued audit are recorded together. A claim error
+// fails closed; an audit failure rolls the claim back, exactly like the SQL
+// transaction, so a delivery is never consumed without its durable audit. A
+// duplicate whose stored recipient key matches is a REPLAY of the stored
+// envelope; a different key stays a duplicate refusal.
+func (f *dbFakeStore) CommitSecretIssuance(ctx context.Context, req storage.SecretIssuance) (storage.SealedSecretDelivery, bool, error) {
 	if err := storage.ValidateSecretIssuanceRequest(req); err != nil {
-		return err
+		return storage.SealedSecretDelivery{}, false, err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	j, ok := f.jobs[req.JobID]
 	if !ok {
-		return storage.ErrNotFound
+		return storage.SealedSecretDelivery{}, false, storage.ErrNotFound
 	}
 	if err := storage.ValidateSecretIssuance(storage.LockedSecretLeaseForJob(j), req, time.Now().UTC()); err != nil {
-		return err
+		return storage.SealedSecretDelivery{}, false, err
 	}
 	if f.claimErr != nil {
-		return f.claimErr
+		return storage.SealedSecretDelivery{}, false, f.claimErr
 	}
 	key := req.JobID + "|" + itoa(req.LeaseGeneration) + "|" + req.SecretName
-	if f.secretClaims[key] {
-		return fmt.Errorf("%w: job %s generation %d secret %q", storage.ErrSecretIssuanceDuplicate, req.JobID, req.LeaseGeneration, req.SecretName)
+	if stored, exists := f.secretClaims[key]; exists {
+		if storage.ReplayableSecretIssuance(stored, req) {
+			return stored.Envelope, true, nil
+		}
+		return storage.SealedSecretDelivery{}, false, fmt.Errorf("%w: job %s generation %d secret %q", storage.ErrSecretIssuanceDuplicate, req.JobID, req.LeaseGeneration, req.SecretName)
 	}
-	f.secretClaims[key] = true
+	stored := storage.StoredSecretIssuance{
+		RecipientPublic: append([]byte(nil), req.RecipientPublic...),
+		Envelope: storage.SealedSecretDelivery{
+			Ciphertext:      append([]byte(nil), req.Ciphertext...),
+			EphemeralPublic: append([]byte(nil), req.EphemeralPublic...),
+			Nonce:           append([]byte(nil), req.Nonce...),
+		},
+	}
+	f.secretClaims[key] = stored
 	if f.auditErr != nil {
 		delete(f.secretClaims, key)
-		return f.auditErr
+		return storage.SealedSecretDelivery{}, false, f.auditErr
 	}
 	auditID, err := newID()
 	if err != nil {
 		delete(f.secretClaims, key)
-		return err
+		return storage.SealedSecretDelivery{}, false, err
 	}
 	f.audit = append(f.audit, storage.SecretIssuanceAuditEvent(req, j.RunID, auditID))
-	return nil
+	return stored.Envelope, false, nil
 }
 
 func (f *dbFakeStore) UpsertProfile(ctx context.Context, p model.RunnerProfile) error {

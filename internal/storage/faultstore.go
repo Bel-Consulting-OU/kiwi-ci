@@ -175,6 +175,7 @@ var (
 	_ ArtifactIdempotentStore        = (*FaultyStore)(nil)
 	_ GeneratedFragmentStore         = (*FaultyStore)(nil)
 	_ RecoveryStore                  = (*FaultyStore)(nil)
+	_ ExecutionEventStore            = (*FaultyStore)(nil)
 	_ RecoveryScanStore              = (*FaultyStore)(nil)
 	_ OutboxClaimBatchStore          = (*FaultyStore)(nil)
 	_ LeaderFenceStore               = (*FaultyStore)(nil)
@@ -695,6 +696,31 @@ func (f *FaultyStore) AppendAudit(ctx context.Context, e model.AuditEvent) error
 
 func (f *FaultyStore) ReadAudit(ctx context.Context, limit int) ([]model.AuditEvent, error) {
 	return f.Inner.ReadAudit(ctx, limit)
+}
+
+// AppendExecutionEvent injects the configured mutation fault, then forwards
+// to the inner store's ExecutionEventStore implementation.
+func (f *FaultyStore) AppendExecutionEvent(ctx context.Context, e model.ExecutionEvent) error {
+	inner, ok := f.Inner.(ExecutionEventStore)
+	if !ok {
+		return errMissingInnerInterface("ExecutionEventStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return err
+	}
+	return inner.AppendExecutionEvent(ctx, e)
+}
+
+// ListExecutionEvents is a read and passes through untouched (mirroring
+// ReadAudit), so a failing store still answers reads.
+func (f *FaultyStore) ListExecutionEvents(ctx context.Context, afterSeq int64, limit int, runID string) ([]model.ExecutionEvent, int64, error) {
+	inner, ok := f.Inner.(ExecutionEventStore)
+	if !ok {
+		return nil, afterSeq, errMissingInnerInterface("ExecutionEventStore")
+	}
+	return inner.ListExecutionEvents(ctx, afterSeq, limit, runID)
 }
 
 func (f *FaultyStore) InsertCompletionReceipt(ctx context.Context, r model.CompletionReceipt) error {
@@ -1405,12 +1431,12 @@ func (f *FaultyStore) InsertGeneratedFragmentTx(ctx context.Context, req Generat
 	return inner.InsertGeneratedFragmentTx(ctx, req, verify)
 }
 
-func (f *FaultyStore) GetGeneratedFragment(ctx context.Context, parentJobID string, generation int64, fragmentID string) (GeneratedFragmentReceipt, bool, error) {
+func (f *FaultyStore) GetGeneratedFragment(ctx context.Context, parentJobID, fragmentID string) (GeneratedFragmentReceipt, bool, error) {
 	inner, ok := f.Inner.(GeneratedFragmentStore)
 	if !ok {
 		return GeneratedFragmentReceipt{}, false, errMissingInnerInterface("GeneratedFragmentStore")
 	}
-	return inner.GetGeneratedFragment(ctx, parentJobID, generation, fragmentID)
+	return inner.GetGeneratedFragment(ctx, parentJobID, fragmentID)
 }
 
 func (f *FaultyStore) PutCacheManifest(ctx context.Context, rec CacheManifestRecord) error {
@@ -1538,20 +1564,36 @@ func (f *FaultyStore) ReleaseSecretDelivery(ctx context.Context, jobID string, g
 
 // CommitSecretIssuance forwards the faulted backend's inner implementation
 // while injecting the configured mutation fault, exactly like the other
-// mutating extension methods: the predicate, the once-only claim and the
-// durable audit are the inner implementation's contract and the wrapper never
-// writes anything itself, so a forwarding call cannot bypass either.
-func (f *FaultyStore) CommitSecretIssuance(ctx context.Context, req SecretIssuance) error {
+// mutating extension methods: the predicate, the once-only claim, the sealed
+// envelope and the durable audit are the inner implementation's contract and
+// the wrapper never writes anything itself, so a forwarding call cannot
+// bypass either.
+func (f *FaultyStore) CommitSecretIssuance(ctx context.Context, req SecretIssuance) (SealedSecretDelivery, bool, error) {
 	inner, ok := f.Inner.(SecretIssuanceStore)
 	if !ok {
-		return errMissingInnerInterface("SecretIssuanceStore")
+		return SealedSecretDelivery{}, false, errMissingInnerInterface("SecretIssuanceStore")
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
-		return err
+		return SealedSecretDelivery{}, false, err
 	}
 	return inner.CommitSecretIssuance(ctx, req)
+}
+
+// LookupSecretIssuance forwards the read to the inner implementation so
+// replay lookups observe the same injected faults as every other call.
+func (f *FaultyStore) LookupSecretIssuance(ctx context.Context, jobID string, generation int64, secretName string) (StoredSecretIssuance, bool, error) {
+	inner, ok := f.Inner.(SecretIssuanceStore)
+	if !ok {
+		return StoredSecretIssuance{}, false, errMissingInnerInterface("SecretIssuanceStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return StoredSecretIssuance{}, false, err
+	}
+	return inner.LookupSecretIssuance(ctx, jobID, generation, secretName)
 }
 
 func (f *FaultyStore) UpsertProfile(ctx context.Context, p model.RunnerProfile) error {
@@ -1940,6 +1982,15 @@ func (f *FaultyStore) ListTestHistoryRepoIDs(ctx context.Context, limit int) ([]
 	return inner.ListTestHistoryRepoIDs(ctx, limit)
 }
 
+// memSecretClaim is one memory-store once-only secret delivery claim: the
+// claim instant plus the sealed envelope persisted with it, so an identical
+// retry (same job, generation, secret and recipient public key) replays the
+// stored bytes instead of a second claim.
+type memSecretClaim struct {
+	At     time.Time
+	Stored StoredSecretIssuance
+}
+
 // memStore is a fully functional in-memory Store used as the fault-free
 // baseline underneath FaultyStore in fault-injection tests.
 type memStore struct {
@@ -1987,7 +2038,7 @@ type memStore struct {
 	downstream     map[string]DownstreamLink
 	quotas         map[string]quotaCounts
 	cacheMans      map[string]CacheManifestRecord
-	claims         map[string]time.Time
+	claims         map[string]memSecretClaim
 	// pendingSidecars mirrors artifact_pending_sidecars (migration 0012).
 	pendingSidecars map[string]pendingSidecar
 
@@ -2048,6 +2099,13 @@ type memStore struct {
 	// in-memory and real-PostgreSQL recovery semantics stay in parity.
 	// Production paths never populate it.
 	undecodableJobs map[string]bool
+
+	// events is the in-memory mirror of execution_events: an append-ordered
+	// slice with the seq watermark eventSeq. AppendExecutionEvent allocates
+	// the next seq under mu (mirroring the BIGSERIAL cursor), so the memStore
+	// stream pages exactly like the SQL and fs stores.
+	events   []model.ExecutionEvent
+	eventSeq int64
 }
 
 // quotaCounts is the in-memory reserved counter pair for one quota key.
@@ -2083,9 +2141,12 @@ type outboxMeta struct {
 	deadAt    time.Time
 }
 
-// fragmentKey is the in-memory generated-fragments primary key.
-func fragmentKey(parentJobID string, generation int64, fragmentID string) string {
-	return fmt.Sprintf("%s|%d|%s", parentJobID, generation, fragmentID)
+// fragmentKey is the in-memory generated-fragments mutation key: the
+// canonical (parent job, fragment id) identity. The lease generation
+// authorizes an upload but never defines it, so an infrastructure retry of
+// the same logical parent under a new generation still replays.
+func fragmentKey(parentJobID, fragmentID string) string {
+	return parentJobID + ":" + fragmentID
 }
 
 func newMemStore() *memStore {
@@ -2106,7 +2167,7 @@ func newMemStore() *memStore {
 		downstream:        map[string]DownstreamLink{},
 		quotas:            map[string]quotaCounts{},
 		cacheMans:         map[string]CacheManifestRecord{},
-		claims:            map[string]time.Time{},
+		claims:            map[string]memSecretClaim{},
 		pendingSidecars:   map[string]pendingSidecar{},
 		profiles:          map[string]model.RunnerProfile{},
 		certProfiles:      map[string]string{},
@@ -2128,6 +2189,8 @@ func newMemStore() *memStore {
 }
 
 var _ Store = (*memStore)(nil)
+
+var _ ExecutionEventStore = (*memStore)(nil)
 
 var (
 	_ OutboxStore                    = (*memStore)(nil)
@@ -3410,6 +3473,48 @@ func (m *memStore) ReadAudit(ctx context.Context, limit int) ([]model.AuditEvent
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return append([]model.AuditEvent(nil), m.audit...), nil
+}
+
+// AppendExecutionEvent mirrors the fs Repository's append: the seq is
+// allocated from the in-memory watermark (never from the caller), so the
+// stream is monotonic across appends regardless of what callers pass.
+func (m *memStore) AppendExecutionEvent(_ context.Context, e model.ExecutionEvent) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if e.SchemaVersion <= 0 {
+		e.SchemaVersion = 1
+	}
+	if e.CreatedAt.IsZero() {
+		e.CreatedAt = time.Now().UTC()
+	}
+	m.eventSeq++
+	e.Seq = m.eventSeq
+	m.events = append(m.events, e)
+	return nil
+}
+
+// ListExecutionEvents mirrors the SQL keyset read: seq > after, ascending,
+// run-filtered, bounded, returning the next cursor.
+func (m *memStore) ListExecutionEvents(_ context.Context, afterSeq int64, limit int, runID string) ([]model.ExecutionEvent, int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	limit = ClampExecutionEventLimit(limit)
+	out := []model.ExecutionEvent{}
+	cursor := afterSeq
+	for _, e := range m.events {
+		if e.Seq <= afterSeq {
+			continue
+		}
+		if runID != "" && e.RunID != runID {
+			continue
+		}
+		out = append(out, e)
+		cursor = e.Seq
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, cursor, nil
 }
 
 // InsertCompletionReceipt persists one completion idempotency receipt with
@@ -5413,25 +5518,26 @@ func (m *memStore) QuotaCounts(ctx context.Context, repoKey, teamKey string) (in
 }
 
 // GetGeneratedFragment returns the idempotency receipt of an admitted
-// fragment.
-func (m *memStore) GetGeneratedFragment(ctx context.Context, parentJobID string, generation int64, fragmentID string) (GeneratedFragmentReceipt, bool, error) {
+// fragment by its canonical mutation key (parent job, fragment id),
+// regardless of the lease generation that admitted it.
+func (m *memStore) GetGeneratedFragment(ctx context.Context, parentJobID, fragmentID string) (GeneratedFragmentReceipt, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	rec, ok := m.fragments[fragmentKey(parentJobID, generation, fragmentID)]
+	rec, ok := m.fragments[fragmentKey(parentJobID, fragmentID)]
 	return rec, ok, nil
 }
 
-// InsertGeneratedFragmentTx mirrors the SQL transaction under m.mu: a
-// committed receipt is returned with replayed=true and nothing is inserted;
-// otherwise the parent is re-validated (via the verifier, with the run's job
-// count read under the same lock), the whole fragment is staged, and the
-// receipt commits with the jobs.
+// InsertGeneratedFragmentTx mirrors the SQL transaction under m.mu: the
+// parent lease predicate is validated FOR THE CURRENT REQUEST first, then a
+// committed receipt for the canonical (parent, fragment id) mutation key is
+// returned with replayed=true and nothing is inserted; otherwise the parent
+// is re-validated (via the verifier, with the run's job count read under the
+// same lock), the whole fragment is staged, and the receipt commits with the
+// jobs. The lease generation authorizes the mutation but never defines it: a
+// retry under a new generation of the same logical parent still replays.
 func (m *memStore) InsertGeneratedFragmentTx(ctx context.Context, req GeneratedFragmentRequest, verify GeneratedJobVerifier) (GeneratedFragmentReceipt, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if rec, ok := m.fragments[fragmentKey(req.ParentJobID, req.LeaseGeneration, req.FragmentID)]; ok {
-		return rec, true, nil
-	}
 	parent, ok := m.jobs[req.ParentJobID]
 	if !ok {
 		return GeneratedFragmentReceipt{}, false, ErrNotFound
@@ -5439,10 +5545,14 @@ func (m *memStore) InsertGeneratedFragmentTx(ctx context.Context, req GeneratedF
 	// The store owns the complete lease predicate in memory mode too: the
 	// clock is sampled inside the same critical section that reads the parent
 	// and inserts the fragment, so a skewed handler clock can never launder
-	// an expired lease.
+	// an expired lease. Authorization ALWAYS precedes the receipt replay: a
+	// stale generation or token must never observe the stored children.
 	commitNow := time.Now().UTC()
 	if err := ValidateGeneratedParentLease(parent, req, commitNow); err != nil {
 		return GeneratedFragmentReceipt{}, false, err
+	}
+	if rec, ok := m.fragments[fragmentKey(req.ParentJobID, req.FragmentID)]; ok {
+		return rec, true, nil
 	}
 	count := 0
 	for _, j := range m.jobs {
@@ -5494,7 +5604,7 @@ func (m *memStore) InsertGeneratedFragmentTx(ctx context.Context, req GeneratedF
 		Children:        append([]GeneratedFragmentChild(nil), req.Children...),
 		CreatedAt:       commitNow,
 	}
-	m.fragments[fragmentKey(req.ParentJobID, req.LeaseGeneration, req.FragmentID)] = rec
+	m.fragments[fragmentKey(req.ParentJobID, req.FragmentID)] = rec
 	return rec, false, nil
 }
 
@@ -5645,7 +5755,7 @@ func (m *memStore) ClaimSecretDelivery(ctx context.Context, jobID string, genera
 	if _, exists := m.claims[key]; exists {
 		return false, nil
 	}
-	m.claims[key] = time.Now().UTC()
+	m.claims[key] = memSecretClaim{At: time.Now().UTC()}
 	return true, nil
 }
 
@@ -5661,33 +5771,61 @@ func (m *memStore) ReleaseSecretDelivery(ctx context.Context, jobID string, gene
 // delivery commit: under m.mu — this store's transaction — the authoritative
 // job is re-read, the shared issuance predicate (lease holder/generation/token
 // hash, status, expiry at the store clock, trust, declaration) is evaluated,
-// and only then are the once-only claim and the secret.issued audit event
-// recorded together. A refusal returns the same typed error as the SQL store
-// and records NOTHING.
-func (m *memStore) CommitSecretIssuance(ctx context.Context, req SecretIssuance) error {
+// and only then are the once-only claim, the sealed envelope and the
+// secret.issued audit event recorded together. A refusal returns the same
+// typed error as the SQL store and records NOTHING.
+//
+// An existing claim whose stored recipient public key matches the presented
+// one is a REPLAY: the stored envelope is returned with replayed=true and
+// nothing is written again. A different key stays ErrSecretIssuanceDuplicate.
+// The lease predicate is evaluated BEFORE the duplicate check, so a stale
+// generation can never replay.
+func (m *memStore) CommitSecretIssuance(ctx context.Context, req SecretIssuance) (SealedSecretDelivery, bool, error) {
 	if err := ValidateSecretIssuanceRequest(req); err != nil {
-		return err
+		return SealedSecretDelivery{}, false, err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	j, ok := m.jobs[req.JobID]
 	if !ok {
-		return ErrNotFound
+		return SealedSecretDelivery{}, false, ErrNotFound
 	}
 	if err := ValidateSecretIssuance(LockedSecretLeaseForJob(j), req, time.Now().UTC()); err != nil {
-		return err
+		return SealedSecretDelivery{}, false, err
 	}
 	key := fmt.Sprintf("%s|%d|%s", req.JobID, req.LeaseGeneration, req.SecretName)
-	if _, exists := m.claims[key]; exists {
-		return secretIssuanceErrorf(ErrSecretIssuanceDuplicate, "job %s generation %d secret %q", req.JobID, req.LeaseGeneration, req.SecretName)
+	if claim, exists := m.claims[key]; exists {
+		if ReplayableSecretIssuance(claim.Stored, req) {
+			return claim.Stored.Envelope, true, nil
+		}
+		return SealedSecretDelivery{}, false, secretIssuanceErrorf(ErrSecretIssuanceDuplicate, "job %s generation %d secret %q", req.JobID, req.LeaseGeneration, req.SecretName)
 	}
 	auditID, err := newID()
 	if err != nil {
-		return err
+		return SealedSecretDelivery{}, false, err
 	}
-	m.claims[key] = time.Now().UTC()
+	stored := StoredSecretIssuance{
+		RecipientPublic: cloneSecretBytes(req.RecipientPublic),
+		Envelope: SealedSecretDelivery{
+			Ciphertext:      cloneSecretBytes(req.Ciphertext),
+			EphemeralPublic: cloneSecretBytes(req.EphemeralPublic),
+			Nonce:           cloneSecretBytes(req.Nonce),
+		},
+	}
+	m.claims[key] = memSecretClaim{At: time.Now().UTC(), Stored: stored}
 	m.audit = append(m.audit, SecretIssuanceAuditEvent(req, j.RunID, auditID))
-	return nil
+	return stored.Envelope, false, nil
+}
+
+// LookupSecretIssuance reads the in-memory mirror of one committed claim.
+func (m *memStore) LookupSecretIssuance(ctx context.Context, jobID string, generation int64, secretName string) (StoredSecretIssuance, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	claim, ok := m.claims[fmt.Sprintf("%s|%d|%s", jobID, generation, secretName)]
+	if !ok {
+		return StoredSecretIssuance{}, false, nil
+	}
+	return claim.Stored, true, nil
 }
 
 // ---------------------------------------------------------------------------

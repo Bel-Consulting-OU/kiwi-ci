@@ -568,7 +568,7 @@ func TestPostgresIntegrationDroppedTableReadErrors(t *testing.T) {
 			return st.SetQueueReasons(ctx, map[string]string{ids.job: "x"})
 		}},
 		"GetGeneratedFrag": {"generated_fragments", func(t *testing.T, st *PostgresStore, ids *boomerIds) error {
-			_, _, err := st.GetGeneratedFragment(ctx, ids.job, 1, "f")
+			_, _, err := st.GetGeneratedFragment(ctx, ids.job, "f")
 			return err
 		}},
 		"GetDownstream": {"downstream_links", func(t *testing.T, st *PostgresStore, ids *boomerIds) error {

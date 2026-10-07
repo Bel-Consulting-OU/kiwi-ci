@@ -1071,8 +1071,11 @@ func TestMemStoreFragmentHelpers(t *testing.T) {
 	if pendingSidecarKey("j", 3, "a", "k") == pendingSidecarKey("j", 4, "a", "k") {
 		t.Fatal("pendingSidecarKey must include the lease generation")
 	}
-	if got := fragmentKey("j", 3, "f"); got != "j|3|f" {
+	if got := fragmentKey("j", "f"); got != "j:f" {
 		t.Fatalf("fragmentKey = %q", got)
+	}
+	if fragmentKey("j", "f") == fragmentKey("j", "g") {
+		t.Fatal("fragmentKey must include the fragment id")
 	}
 	if got := (&memStore{}).receiptKey("j", 3, "r"); got != "j|3|r" {
 		t.Fatalf("receiptKey = %q", got)

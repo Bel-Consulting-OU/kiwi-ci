@@ -32,6 +32,22 @@ func pgITSkipWrites(t *testing.T, st *PostgresStore, table, event string) {
 
 // pgITDropExpressionIndexes drops every index on table whose definition
 // references column, so the column can be retyped.
+// pgITDropExecutionEventTriggers removes the migration-0045 execution-event
+// triggers from jobs/runs. The triggers reference the status column in their
+// WHEN/UPDATE OF clauses, so ALTER TYPE status and DROP COLUMN status fail
+// with "used in a trigger definition" while they exist. Test schemas are
+// throwaway and the scanner/statement fault under test does not involve
+// event emission.
+func pgITDropExecutionEventTriggers(t *testing.T, st *PostgresStore, table string) {
+	t.Helper()
+	switch table {
+	case "jobs", "runs":
+		if _, err := st.pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS `+table+`_execution_events ON `+table); err != nil {
+			t.Fatalf("drop %s execution-event trigger: %v", table, err)
+		}
+	}
+}
+
 // pgITDropStatistics drops every extended-statistics object on the table.
 // ALTER COLUMN TYPE re-evaluates statistics expressions against the NEW
 // column type, so a statistic over `payload->'x'` turns a would-be scanner
@@ -89,6 +105,7 @@ func pgITDropExpressionIndexes(t *testing.T, st *PostgresStore, table, column st
 // string destination cannot succeed.
 func pgITBreakColumnToBytea(t *testing.T, st *PostgresStore, table, column string) {
 	t.Helper()
+	pgITDropExecutionEventTriggers(t, st, table)
 	pgITDropStatistics(t, st, table)
 	q := fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT`, table, column)
 	if _, err := st.pool.Exec(context.Background(), q); err != nil {

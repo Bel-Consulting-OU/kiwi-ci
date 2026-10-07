@@ -46,7 +46,10 @@ func dbSecretServer(t *testing.T, f *dbFakeStore) *Server {
 
 // TestIssueSecretDBModeConcurrentSingleDelivery proves the SQL claim is the
 // arbitration: two concurrent deliveries of the same (job, generation,
-// name) result in exactly one 200 and one 409.
+// name) with the SAME recipient public key result in one first commit and one
+// replay — both answered 200 with the identical envelope — and exactly one
+// claim row. A concurrent request presenting a DIFFERENT key stays 409 (see
+// TestSecretConcurrentRequestsOnlyOneReturnsEnvelope).
 func TestIssueSecretDBModeConcurrentSingleDelivery(t *testing.T) {
 	f := newDBFakeStore()
 	s := dbSecretServer(t, f)
@@ -55,23 +58,48 @@ func TestIssueSecretDBModeConcurrentSingleDelivery(t *testing.T) {
 	_, pubB64 := ephemeralKey(t)
 	req := SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pubB64}
 
+	bodies := make(chan string, 2)
 	codes := make(chan int, 2)
 	var wg sync.WaitGroup
 	for i := 0; i < 2; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			codes <- issue(t, c, jobID, req).Code
+			w := issue(t, c, jobID, req)
+			codes <- w.Code
+			bodies <- w.Body.String()
 		}()
 	}
 	wg.Wait()
 	close(codes)
+	close(bodies)
 	got := map[int]int{}
 	for code := range codes {
 		got[code]++
 	}
-	if got[http.StatusOK] != 1 || got[http.StatusConflict] != 1 {
-		t.Fatalf("concurrent deliveries = %v, want exactly one 200 and one 409", got)
+	var seenBodies []string
+	for body := range bodies {
+		seenBodies = append(seenBodies, body)
+	}
+	if got[http.StatusOK] != 2 {
+		t.Fatalf("concurrent same-key deliveries = %v bodies=%v, want two 200 replays", got, seenBodies)
+	}
+	var envelope string
+	for _, body := range seenBodies {
+		var out SecretResponse
+		if err := json.Unmarshal([]byte(body), &out); err != nil {
+			t.Fatalf("decode concurrent envelope: %v (%s)", err, body)
+		}
+		if out.Ciphertext == "" {
+			t.Fatalf("200 without envelope: %s", body)
+		}
+		if envelope == "" {
+			envelope = out.Ciphertext
+			continue
+		}
+		if out.Ciphertext != envelope {
+			t.Fatal("concurrent replay returned a different ciphertext; a second envelope was minted")
+		}
 	}
 	f.mu.Lock()
 	claimed := len(f.secretClaims)

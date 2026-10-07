@@ -37,6 +37,7 @@ func TestVerifyFlagsPlumbedToVerifyWith(t *testing.T) {
 		Name: "art-1", SHA256: artifactSHA, RunID: "run-1", JobID: "job-1",
 		JobKey: "build", Repository: "acme/app", Ref: "refs/heads/main",
 		Commit: "abc123", Runner: "runner-1", Started: started, Finished: started.Add(time.Second),
+		AttemptID: "job-1:3", CapsuleDigest: strings.Repeat("e", 64),
 	})
 	st.Builder = provenance.BuilderPlaceholder
 	st.Issuer = "https://ci.acme.example"
@@ -74,7 +75,8 @@ func TestVerifyFlagsPlumbedToVerifyWith(t *testing.T) {
 	// Pinned key + matching constraints: success.
 	err = VerifyArtifact([]string{"--server", ts.URL, "--trusted-key", keyPath,
 		"--repository", "acme/app", "--commit", "abc123", "--ref", "refs/heads/main",
-		"--job", "build", "--builder", "https://kiwi-ci.dev/runner/runner-1", "--issuer", "https://ci.acme.example", "art-1"})
+		"--job", "build", "--builder", "https://kiwi-ci.dev/runner/runner-1", "--issuer", "https://ci.acme.example",
+		"--attempt", "job-1:3", "--capsule-digest", strings.Repeat("e", 64), "art-1"})
 	if err != nil {
 		t.Fatalf("verify with pinned key: %v", err)
 	}
@@ -83,6 +85,16 @@ func TestVerifyFlagsPlumbedToVerifyWith(t *testing.T) {
 	err = VerifyArtifact([]string{"--server", ts.URL, "--trusted-key", keyPath, "--issuer", "https://evil.example", "art-1"})
 	if err == nil || !strings.Contains(err.Error(), "issuer mismatch") {
 		t.Fatalf("issuer constraint not enforced: %v", err)
+	}
+
+	// The attempt and capsule constraints are plumbed into VerifyOptions.
+	err = VerifyArtifact([]string{"--server", ts.URL, "--trusted-key", keyPath, "--attempt", "job-1:4", "art-1"})
+	if err == nil || !strings.Contains(err.Error(), "attempt id mismatch") {
+		t.Fatalf("attempt constraint not enforced: %v", err)
+	}
+	err = VerifyArtifact([]string{"--server", ts.URL, "--trusted-key", keyPath, "--capsule-digest", strings.Repeat("f", 64), "art-1"})
+	if err == nil || !strings.Contains(err.Error(), "capsule digest mismatch") {
+		t.Fatalf("capsule-digest constraint not enforced: %v", err)
 	}
 
 	// A wrong pinned key must fail signature verification.

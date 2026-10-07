@@ -356,7 +356,7 @@ func TestFlowDynamicDBTxReplay(t *testing.T) {
 func TestFlowDynamicReceiptWithoutStore(t *testing.T) {
 	s, f, _ := fcDynamicDBFixture(t)
 	s.DB = fcPlainStore{f}
-	if _, found, err := s.generatedFragmentReceipt(context.Background(), "p", 1, "f"); err != nil || found {
+	if _, found, err := s.generatedFragmentReceipt(context.Background(), "p", "f"); err != nil || found {
 		t.Fatalf("receipt without store = %v %v", found, err)
 	}
 }

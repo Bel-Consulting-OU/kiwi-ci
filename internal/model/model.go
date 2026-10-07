@@ -1,6 +1,9 @@
 package model
 
-import "time"
+import (
+	"strconv"
+	"time"
+)
 
 type Status string
 
@@ -454,6 +457,16 @@ type CompiledJobPayload struct {
 	EffectivePolicy any    `json:"effective_policy,omitempty"`
 }
 
+// AttemptID returns the canonical identity of one job execution attempt:
+// "<jobID>:<leaseGeneration>". Job IDs are opaque and never contain ":"
+// while the generation is a decimal integer, so the encoding is unambiguous.
+// Every statement about an attempt must carry this identity rather than a
+// bare job ID so a re-leased job's evidence can never be confused with an
+// earlier generation's.
+func AttemptID(jobID string, generation int64) string {
+	return jobID + ":" + strconv.FormatInt(generation, 10)
+}
+
 type ArtifactRecord struct {
 	ID               string     `json:"id"`
 	RunID            string     `json:"run_id"`
@@ -526,6 +539,31 @@ type AuditEvent struct {
 	CreatedAt time.Time         `json:"created_at"`
 }
 
+// ExecutionEvent is one record of the canonical ordered execution event
+// stream. Seq is the durable cursor: it is assigned by the durable store
+// (PostgreSQL BIGSERIAL, the fs/memory journal's monotonic counter) and is
+// the only ordering external controllers may rely on. Event types are
+// "<scope>.<status>" (job.queued, job.running, job.succeeded, job.failed,
+// job.cancelled, job.requeued, run.running, run.succeeded, ...); FromStatus
+// and ToStatus carry the transition so consumers never diff mutable
+// resources to infer what happened. Attempt is the lease generation of the
+// attempt the transition belongs to (0 when none). Actor is the runner name
+// or principal that drove the transition when known. Additive and
+// self-describing: unknown fields/event types must be ignored by consumers.
+type ExecutionEvent struct {
+	Seq           int64             `json:"seq"`
+	SchemaVersion int               `json:"schema_version"`
+	RunID         string            `json:"run_id,omitempty"`
+	JobID         string            `json:"job_id,omitempty"`
+	Attempt       int64             `json:"attempt,omitempty"`
+	Type          string            `json:"type"`
+	FromStatus    string            `json:"from_status,omitempty"`
+	ToStatus      string            `json:"to_status,omitempty"`
+	Actor         string            `json:"actor,omitempty"`
+	CreatedAt     time.Time         `json:"created_at"`
+	Payload       map[string]string `json:"payload,omitempty"`
+}
+
 type JobResult struct {
 	JobID      string            `json:"job_id"`
 	Status     Status            `json:"status"`
@@ -588,4 +626,12 @@ type SnapshotRecord struct {
 	RootSHA256 string          `json:"root_sha256"`
 	Entries    []SnapshotEntry `json:"entries,omitempty"`
 	CreatedAt  time.Time       `json:"created_at"`
+	// LeaseGeneration is the lease generation (attempt identity) the
+	// snapshot was uploaded under: the addressable "snapshot from attempt
+	// N" of a retried job (model.AttemptID pairs it with JobID). Zero for
+	// records persisted before the field existed; additive, no migration.
+	LeaseGeneration int64 `json:"lease_generation,omitempty"`
+	// Attempts is the job's attempt counter when the snapshot was uploaded.
+	// Additive; zero for legacy records.
+	Attempts int `json:"attempts,omitempty"`
 }

@@ -170,7 +170,7 @@ kiwi config check | kiwi database migrate|status
 kiwi runner [--server URL --token TOKEN] | kiwi runner list|drain|disable|enable
 kiwi dispatch | kiwi runs | kiwi jobs | kiwi logs [--follow]
 kiwi cancel | kiwi approve | kiwi rerun | kiwi artifacts
-kiwi replay RUN JOB [STEP]   (restores the exact workspace snapshot)
+kiwi replay RUN JOB [STEP]   (exact replay from the recorded pipeline + snapshot; --attempt N, --debug-rerun)
 kiwi verify [--trusted-key PATH] ARTIFACT_ID
 kiwi schedules list|trigger
 kiwi outbox dead-letters list|requeue|delete
@@ -182,6 +182,17 @@ kiwi version
 their retries and can requeue or delete one by ID (DB mode takes
 `--database-url`). See [docs/upgrades.md](docs/upgrades.md#behavioral-compatibility-notes)
 for the outbox versioning and dead-letter semantics.
+
+`kiwi replay` is exact by default: the control plane exports the persisted
+pipeline text and the enqueue-time compiled job payload for the addressed
+job (`GET /api/v1/runs/{run}/jobs/{job}/pipeline`, admin tier), the CLI
+re-verifies the pair with the same binding verifier the distributed runner
+uses, and executes the recorded effective job against the restored
+workspace snapshot. A record that no longer re-verifies is refused.
+`--attempt N` selects the snapshot uploaded under lease generation N
+(default: the newest generation for the job); `--debug-rerun` preserves the
+old debugging behavior of compiling the CURRENT local `--pipeline` file
+(warning: execution semantics may then differ from the recorded run).
 
 ## Repository layout
 

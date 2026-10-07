@@ -736,10 +736,15 @@ type GeneratedFragmentChild struct {
 }
 
 // GeneratedFragmentReceipt is the durable idempotency receipt of one
-// generated fragment upload: the (parent job, lease generation, fragment
-// digest) triple maps to the children created for it, in canonical
+// generated fragment upload: the canonical mutation key (parent job,
+// fragment digest) maps to the children created for it, in canonical
 // (sorted-key) order, so a replay reconstructs the original response
-// exactly.
+// exactly. The lease generation is NOT part of the mutation identity: it
+// authorizes the upload (the presenting lease must still be current) but an
+// infrastructure retry of the same logical parent under a new generation
+// re-submits the identical fragment and must replay THESE children instead
+// of inserting a duplicate graph. LeaseGeneration records the generation
+// that authorized the original admission.
 type GeneratedFragmentReceipt struct {
 	ParentJobID     string                   `json:"parent_job_id"`
 	LeaseGeneration int64                    `json:"lease_generation"`
@@ -749,14 +754,17 @@ type GeneratedFragmentReceipt struct {
 }
 
 // GeneratedFragmentRequest is the full transactional fragment payload: the
-// receipt identity, the presenting lease identity and the already-compiled
-// child jobs, their dependency edges and artifact contracts. The RUNNER/TOKEN
-// fields are the lease the runner presented; the store verifies them and the
-// lease expiry against the locked parent row at the storage clock. The
-// verification closure and the receipt are evaluated inside the same
-// transaction as the insertion. Children lists the created child key/ID pairs
-// in canonical (sorted fragment key) order, matching the response the
-// admitting server reported.
+// presented lease identity, the canonical mutation identity and the
+// already-compiled child jobs, their dependency edges and artifact
+// contracts. The RUNNER/TOKEN/GENERATION fields are the lease the runner
+// presented; the store verifies them and the lease expiry against the locked
+// parent row at the storage clock, BEFORE any receipt replay. The generation
+// AUTHORIZES the mutation but never defines it: the receipt identity is
+// (ParentJobID, FragmentID), so a retry under a new generation of the same
+// logical parent replays the original children. The verification closure and
+// the receipt are evaluated inside the same transaction as the insertion.
+// Children lists the created child key/ID pairs in canonical (sorted
+// fragment key) order, matching the response the admitting server reported.
 type GeneratedFragmentRequest struct {
 	ParentJobID     string
 	RunnerID        string
@@ -800,21 +808,25 @@ func ValidateGeneratedParentLease(parent model.Job, req GeneratedFragmentRequest
 }
 
 // GeneratedFragmentStore reads the idempotency receipt of a previously
-// admitted fragment so a replayed upload returns the same children without
-// re-inserting anything.
+// admitted fragment by its canonical mutation key (parent job, fragment id)
+// so a replayed upload returns the same children without re-inserting
+// anything, regardless of which lease generation admitted it. Callers must
+// have authorized the CURRENT lease before consulting the receipt; the
+// receipt read itself carries no lease authority.
 type GeneratedFragmentStore interface {
-	GetGeneratedFragment(ctx context.Context, parentJobID string, generation int64, fragmentID string) (GeneratedFragmentReceipt, bool, error)
+	GetGeneratedFragment(ctx context.Context, parentJobID, fragmentID string) (GeneratedFragmentReceipt, bool, error)
 }
 
 // DynamicStoreTx is the transactional dynamic-fragment contract. The
 // verification closure and the idempotency receipt are evaluated inside the
-// same transaction as the fragment insertion, so a stale lease or an
-// over-cap run rejects the fragment atomically and a replayed fragment
-// (same parent, generation and fragment id) returns the ORIGINAL receipt
-// with replayed=true and inserts nothing. The fragment's artifact contracts
-// commit in the SAME transaction as the jobs — a generated job with a
-// required artifact has its contract row visible before any completion can
-// run.
+// same transaction as the fragment insertion, AFTER the storage layer has
+// validated the complete parent lease predicate of the CURRENT request, so a
+// stale lease or an over-cap run rejects the fragment atomically and a
+// replayed fragment (same canonical mutation key parent+fragment id) returns
+// the ORIGINAL receipt with replayed=true and inserts nothing. The
+// fragment's artifact contracts commit in the SAME transaction as the jobs —
+// a generated job with a required artifact has its contract row visible
+// before any completion can run.
 type DynamicStoreTx interface {
 	InsertGeneratedFragmentTx(ctx context.Context, req GeneratedFragmentRequest, verify GeneratedJobVerifier) (GeneratedFragmentReceipt, bool, error)
 }

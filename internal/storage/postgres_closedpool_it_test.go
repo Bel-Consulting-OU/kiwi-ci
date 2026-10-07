@@ -114,7 +114,7 @@ func TestPostgresClosedPoolErrorPaths(t *testing.T) {
 		{"InsertGeneratedJobs", func() error {
 			return st.InsertGeneratedJobs(ctx, jobID, 1, map[string]model.Job{memJobID: {ID: memJobID}}, nil)
 		}},
-		{"GetGeneratedFragment", func() error { _, _, err := st.GetGeneratedFragment(ctx, jobID, 1, "f"); return err }},
+		{"GetGeneratedFragment", func() error { _, _, err := st.GetGeneratedFragment(ctx, jobID, "f"); return err }},
 		{"InsertGeneratedFragmentTx", func() error {
 			_, _, err := st.InsertGeneratedFragmentTx(ctx, GeneratedFragmentRequest{ParentJobID: jobID, FragmentID: "f"}, nil)
 			return err

@@ -156,12 +156,22 @@ var expectedRouteTiers = map[string]routeTier{
 	// gate (like drain), never the RBAC table.
 	"PUT /api/v1/runner-profiles/{id}/runner/{runnerID}":    tierAdmin,
 	"DELETE /api/v1/runner-profiles/{id}/runner/{runnerID}": tierAdmin,
+	// The recorded pipeline/payload export (exact replay) is an admin
+	// operation: deliberately unmapped by auth.ActionFor so it falls
+	// through to the blanket admin gate (and the handler re-asserts
+	// requireRunAdmin for store principals), never the RBAC table. The
+	// payload is exactly what the runner executed.
+	"GET /api/v1/runs/{id}/jobs/{job}/pipeline": tierAdmin,
 	// Admin: blanket admin gate.
 	"GET /metrics":                       tierAdmin,
 	"POST /api/v1/jobs/{id}/deployments": tierAdmin,
 	"POST /api/v1/drain":                 tierAdmin,
 	"GET /api/v1/drain":                  tierAdmin,
 	"GET /api/v1/audit":                  tierAdmin,
+	// The canonical execution event stream is admin tier like audit: the
+	// cursor-pull list endpoint and the SSE wrapper over the same cursor.
+	"GET /api/v1/events":        tierAdmin,
+	"GET /api/v1/events/stream": tierAdmin,
 }
 
 func tierName(t routeTier) string {

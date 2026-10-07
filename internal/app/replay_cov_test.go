@@ -65,50 +65,50 @@ func TestReplayErrorPaths(t *testing.T) {
 	pipelinePath := writePipeline(t, t.TempDir(), "version: 1\njobs:\n  build:\n    steps:\n      - run: echo ok\n")
 	// Snapshot listing fails.
 	failingList := replayServer(t, "boom", http.StatusInternalServerError, http.StatusOK, nil)
-	if err := Replay(context.Background(), []string{"--server", failingList.URL, "--pipeline", pipelinePath, "run1", "build"}); err == nil {
+	if err := Replay(context.Background(), []string{"--server", failingList.URL, "--pipeline", pipelinePath, "--debug-rerun", "run1", "build"}); err == nil {
 		t.Fatal("snapshot list failure accepted")
 	}
 	// No snapshot for the job.
 	emptyList := replayServer(t, `[]`, http.StatusOK, http.StatusOK, nil)
-	err := Replay(context.Background(), []string{"--server", emptyList.URL, "--pipeline", pipelinePath, "run1", "build"})
+	err := Replay(context.Background(), []string{"--server", emptyList.URL, "--pipeline", pipelinePath, "--debug-rerun", "run1", "build"})
 	if err == nil || !strings.Contains(err.Error(), "no workspace snapshot") {
 		t.Fatalf("missing snapshot = %v", err)
 	}
 	// A snapshot for another job does not match either.
 	otherJob := replayServer(t, `[{"id":"snap1","job_key":"other","created_at":"2026-09-14T00:00:00Z"}]`, http.StatusOK, http.StatusOK, nil)
-	if err := Replay(context.Background(), []string{"--server", otherJob.URL, "--pipeline", pipelinePath, "run1", "build"}); err == nil {
+	if err := Replay(context.Background(), []string{"--server", otherJob.URL, "--pipeline", pipelinePath, "--debug-rerun", "run1", "build"}); err == nil {
 		t.Fatal("mismatched job snapshot accepted")
 	}
 	// Download fails.
 	downloadFail := replayServer(t, `[{"id":"snap1","job_key":"build","created_at":"2026-09-14T00:00:00Z"}]`, http.StatusOK, http.StatusInternalServerError, nil)
-	if err := Replay(context.Background(), []string{"--server", downloadFail.URL, "--pipeline", pipelinePath, "run1", "build"}); err == nil {
+	if err := Replay(context.Background(), []string{"--server", downloadFail.URL, "--pipeline", pipelinePath, "--debug-rerun", "run1", "build"}); err == nil {
 		t.Fatal("snapshot download failure accepted")
 	}
 	// The downloaded archive is not a valid snapshot.
 	archive := snapshotArchive(t)
 	garbage := replayServer(t, `[{"id":"snap1","job_key":"build","created_at":"2026-09-14T00:00:00Z"}]`, http.StatusOK, http.StatusOK, []byte("not-a-archive"))
-	if err := Replay(context.Background(), []string{"--server", garbage.URL, "--pipeline", pipelinePath, "run1", "build"}); err == nil {
+	if err := Replay(context.Background(), []string{"--server", garbage.URL, "--pipeline", pipelinePath, "--debug-rerun", "run1", "build"}); err == nil {
 		t.Fatal("garbage snapshot accepted")
 	}
 	// The pipeline file is missing.
 	good := replayServer(t, `[{"id":"snap1","job_key":"build","created_at":"2026-09-14T00:00:00Z"}]`, http.StatusOK, http.StatusOK, archive)
-	if err := Replay(context.Background(), []string{"--server", good.URL, "--pipeline", filepath.Join(t.TempDir(), "nope.yaml"), "run1", "build"}); err == nil {
+	if err := Replay(context.Background(), []string{"--server", good.URL, "--pipeline", filepath.Join(t.TempDir(), "nope.yaml"), "--debug-rerun", "run1", "build"}); err == nil {
 		t.Fatal("missing pipeline accepted")
 	}
 	// The pipeline does not compile.
 	badPipeline := writePipeline(t, t.TempDir(), badCompilePipeline)
-	if err := Replay(context.Background(), []string{"--server", good.URL, "--pipeline", badPipeline, "run1", "build"}); err == nil {
+	if err := Replay(context.Background(), []string{"--server", good.URL, "--pipeline", badPipeline, "--debug-rerun", "run1", "build"}); err == nil {
 		t.Fatal("invalid pipeline accepted")
 	}
 	// The control plane is unreachable after argument validation.
 	unreachable := replayServer(t, `[]`, http.StatusOK, http.StatusOK, nil)
 	_ = unreachable
-	if err := Replay(context.Background(), []string{"--server", "http://127.0.0.1:1", "--pipeline", pipelinePath, "run1", "build"}); err == nil {
+	if err := Replay(context.Background(), []string{"--server", "http://127.0.0.1:1", "--pipeline", pipelinePath, "--debug-rerun", "run1", "build"}); err == nil {
 		t.Fatal("unreachable control plane accepted")
 	}
 	// The job key is not in the pipeline.
 	otherPipeline := writePipeline(t, t.TempDir(), "version: 1\njobs:\n  other:\n    steps:\n      - run: echo hi\n")
-	err = Replay(context.Background(), []string{"--server", good.URL, "--pipeline", otherPipeline, "run1", "build"})
+	err = Replay(context.Background(), []string{"--server", good.URL, "--pipeline", otherPipeline, "--debug-rerun", "run1", "build"})
 	if err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("unknown job = %v", err)
 	}
@@ -119,21 +119,21 @@ func TestReplaySuccessAndFailureResults(t *testing.T) {
 	srv := replayServer(t, `[{"id":"snap1","job_key":"build","created_at":"2026-09-14T00:00:00Z"}]`, http.StatusOK, http.StatusOK, archive)
 	// A passing job replays cleanly (with the optional step selector).
 	okPipeline := writePipeline(t, t.TempDir(), "version: 1\njobs:\n  build:\n    steps:\n      - name: greet\n        run: echo replay-ok\n")
-	if err := Replay(context.Background(), []string{"--server", srv.URL, "--pipeline", okPipeline, "run1", "build"}); err != nil {
+	if err := Replay(context.Background(), []string{"--server", srv.URL, "--pipeline", okPipeline, "--debug-rerun", "run1", "build"}); err != nil {
 		t.Fatalf("Replay: %v", err)
 	}
-	if err := Replay(context.Background(), []string{"--server", srv.URL, "--pipeline", okPipeline, "run1", "build", "greet"}); err != nil {
+	if err := Replay(context.Background(), []string{"--server", srv.URL, "--pipeline", okPipeline, "--debug-rerun", "run1", "build", "greet"}); err != nil {
 		t.Fatalf("Replay with step: %v", err)
 	}
 	// A failing job reports the failure.
 	failPipeline := writePipeline(t, t.TempDir(), "version: 1\njobs:\n  build:\n    steps:\n      - run: exit 3\n")
-	err := Replay(context.Background(), []string{"--server", srv.URL, "--pipeline", failPipeline, "run1", "build"})
+	err := Replay(context.Background(), []string{"--server", srv.URL, "--pipeline", failPipeline, "--debug-rerun", "run1", "build"})
 	if err == nil || !strings.Contains(err.Error(), "failures") {
 		t.Fatalf("failing replay = %v", err)
 	}
 	// A job whose ID matches a matrix variant's base ID resolves too.
 	matrixPipeline := writePipeline(t, t.TempDir(), "version: 1\njobs:\n  build:\n    matrix:\n      go: [\"1.22\"]\n    steps:\n      - run: echo matrix\n")
-	if err := Replay(context.Background(), []string{"--server", srv.URL, "--pipeline", matrixPipeline, "run1", "build"}); err != nil {
+	if err := Replay(context.Background(), []string{"--server", srv.URL, "--pipeline", matrixPipeline, "--debug-rerun", "run1", "build"}); err != nil {
 		t.Fatalf("matrix replay: %v", err)
 	}
 	// The token flag travels on the request.
@@ -149,7 +149,7 @@ func TestReplaySuccessAndFailureResults(t *testing.T) {
 			_, _ = w.Write(archive)
 		}
 	})
-	if err := Replay(context.Background(), []string{"--server", authSrv.URL, "--token", "tok", "--pipeline", okPipeline, "run1", "build"}); err != nil {
+	if err := Replay(context.Background(), []string{"--server", authSrv.URL, "--token", "tok", "--pipeline", okPipeline, "--debug-rerun", "run1", "build"}); err != nil {
 		t.Fatalf("Replay with token: %v", err)
 	}
 	if !authSeen {

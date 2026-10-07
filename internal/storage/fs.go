@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -125,6 +126,16 @@ type Snapshot struct {
 	// server treats it as empty. Entries past IdempotencyReceiptTTL are
 	// dropped at load.
 	RunIdempotency map[string]IdempotencyReceipt `json:"run_idempotency,omitempty"`
+	// GeneratedFragments persists the fs-mode generated-fragment idempotency
+	// receipts (the generated_fragments equivalents), keyed by the canonical
+	// mutation identity parent job + fragment id (see generatedFragmentKey in
+	// the server). The receipt is written in the SAME atomic snapshot as the
+	// child jobs it describes, so after a restart a resubmitted fragment
+	// replays the SAME child IDs instead of re-admitting a duplicate graph.
+	// The lease generation authorizes the upload but is not part of the key.
+	// Additive; older snapshots load with a nil map, which the server treats
+	// as empty.
+	GeneratedFragments map[string]GeneratedFragmentReceipt `json:"generated_fragments,omitempty"`
 }
 
 type Repository struct {
@@ -159,6 +170,15 @@ type Repository struct {
 	// small stores. Zero means the package default.
 	checkpointEvery int
 	checkpointDelta int64
+
+	// executionEventSeq is the in-memory watermark of the durable execution
+	// event journal (execution-events.jsonl). executionEventSeqLoaded reports
+	// whether it was initialized from the file yet; the append path
+	// initializes it lazily and Load() initializes it at startup, so a
+	// restarted process can never reuse a seq already present on disk.
+	// Guarded by mu.
+	executionEventSeq       int64
+	executionEventSeqLoaded bool
 }
 
 func New(root string) *Repository { return &Repository{Root: root} }
@@ -186,6 +206,12 @@ func (r *Repository) loadLocked() (Snapshot, error) {
 	// checkpoint immediately, and this process's later MaxLogSeq calls are
 	// O(1) reads of the in-memory watermark.
 	if _, err := r.initLogBatchMaxSeqLocked(); err != nil {
+		return s, err
+	}
+	// Load (startup) is also the execution-event watermark checkpoint: the
+	// journal is append-only with seq carried in each record, so a restart
+	// must recover the highest seq before any append can allocate a new one.
+	if err := r.initExecutionEventSeqLocked(); err != nil {
 		return s, err
 	}
 	b, err := os.ReadFile(filepath.Join(r.Root, "state.json"))
@@ -234,6 +260,9 @@ func (r *Repository) loadLocked() (Snapshot, error) {
 	if s.CRL == nil {
 		s.CRL = map[string]string{}
 	}
+	if s.GeneratedFragments == nil {
+		s.GeneratedFragments = map[string]GeneratedFragmentReceipt{}
+	}
 	return s, nil
 }
 
@@ -264,6 +293,14 @@ func (r *Repository) AppendAudit(e model.AuditEvent) error {
 func (r *Repository) appendJSONL(name string, v any) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.appendJSONLLocked(name, v)
+}
+
+// appendJSONLLocked is appendJSONL for callers already holding r.mu (the
+// execution-event append allocates its seq and writes under one critical
+// section, so a crash or a concurrent reader can never observe an event
+// whose seq was not durably assigned).
+func (r *Repository) appendJSONLLocked(name string, v any) error {
 	if err := os.MkdirAll(r.Root, 0o700); err != nil {
 		return err
 	}
@@ -737,6 +774,131 @@ func (r *Repository) ReadAudit(limit int) ([]model.AuditEvent, error) {
 		limit = 1000
 	}
 	return readJSONL[model.AuditEvent](filepath.Join(r.Root, "audit.jsonl"), limit, func(model.AuditEvent) bool { return true })
+}
+
+// executionEventsFile is the durable fs-mode execution event journal.
+const executionEventsFile = "execution-events.jsonl"
+
+// AppendExecutionEvent appends one event to the durable journal with the
+// next monotonically increasing seq, returning after the record is fsynced
+// (the same durability the audit append provides). The seq is allocated
+// under the repository lock from the journal's own watermark, so a restart
+// continues the stream instead of reusing cursors. A failed append still
+// CONSUMES its seq: the cursor may skip a value, but it can never regress or
+// duplicate one.
+func (r *Repository) AppendExecutionEvent(ctx context.Context, e model.ExecutionEvent) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.initExecutionEventSeqLocked(); err != nil {
+		return err
+	}
+	if e.SchemaVersion <= 0 {
+		e.SchemaVersion = 1
+	}
+	if e.CreatedAt.IsZero() {
+		e.CreatedAt = time.Now().UTC()
+	}
+	r.executionEventSeq++
+	e.Seq = r.executionEventSeq
+	return r.appendJSONLLocked(executionEventsFile, e)
+}
+
+// ListExecutionEvents implements ExecutionEventStore for the filesystem
+// journal by delegating to ReadExecutionEvents after honoring the caller's
+// context at the operation boundary.
+func (r *Repository) ListExecutionEvents(ctx context.Context, afterSeq int64, limit int, runID string) ([]model.ExecutionEvent, int64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, afterSeq, err
+	}
+	return r.ReadExecutionEvents(afterSeq, limit, runID)
+}
+
+// ReadExecutionEvents streams the journal in append order and returns the
+// FIRST limit events with seq > afterSeq (optionally filtered to one run),
+// ascending, plus the cursor for the next call. Unlike readJSONL it keeps
+// the OLDEST matching records (a cursorable feed must not skip the oldest
+// backlog).
+func (r *Repository) ReadExecutionEvents(afterSeq int64, limit int, runID string) ([]model.ExecutionEvent, int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	limit = ClampExecutionEventLimit(limit)
+	f, err := os.Open(filepath.Join(r.Root, executionEventsFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return []model.ExecutionEvent{}, afterSeq, nil
+	}
+	if err != nil {
+		return nil, afterSeq, err
+	}
+	defer f.Close()
+	dec := json.NewDecoder(f)
+	out := []model.ExecutionEvent{}
+	cursor := afterSeq
+	for {
+		var e model.ExecutionEvent
+		if err := dec.Decode(&e); err != nil {
+			if jsonlStreamFinished(err) {
+				return out, cursor, nil
+			}
+			return nil, afterSeq, err
+		}
+		if e.Seq <= afterSeq {
+			continue
+		}
+		if runID != "" && e.RunID != runID {
+			continue
+		}
+		out = append(out, e)
+		cursor = e.Seq
+		if len(out) >= limit {
+			return out, cursor, nil
+		}
+	}
+}
+
+// initExecutionEventSeqLocked initializes the in-memory seq watermark from
+// the durable journal once. A corrupt record fails closed (the store cannot
+// prove which seq values are already published, so continuing could reuse a
+// cursor); a missing journal simply starts at zero.
+func (r *Repository) initExecutionEventSeqLocked() error {
+	if r.executionEventSeqLoaded {
+		return nil
+	}
+	maxSeq, err := maxExecutionEventSeqLocked(r.Root)
+	if err != nil {
+		return err
+	}
+	r.executionEventSeq = maxSeq
+	r.executionEventSeqLoaded = true
+	return nil
+}
+
+// maxExecutionEventSeqLocked scans the journal for its highest seq.
+func maxExecutionEventSeqLocked(root string) (int64, error) {
+	f, err := os.Open(filepath.Join(root, executionEventsFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	dec := json.NewDecoder(f)
+	var maxSeq int64
+	for {
+		var e model.ExecutionEvent
+		if err := dec.Decode(&e); err != nil {
+			if jsonlStreamFinished(err) {
+				return maxSeq, nil
+			}
+			return 0, err
+		}
+		if e.Seq > maxSeq {
+			maxSeq = e.Seq
+		}
+	}
 }
 func readJSONL[T any](path string, limit int, keep func(T) bool) ([]T, error) {
 	f, err := os.Open(path)

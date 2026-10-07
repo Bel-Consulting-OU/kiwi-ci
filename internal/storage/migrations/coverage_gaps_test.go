@@ -5,6 +5,39 @@ import (
 	"testing"
 )
 
+// hasTopLevelSemicolon reports whether s still contains a semicolon outside
+// string literals, quoted identifiers and dollar-quoted bodies. A
+// dollar-quoted PL/pgSQL function body legitimately contains semicolons — it
+// is ONE PostgreSQL statement — so the well-formedness guard ignores them
+// exactly like SplitStatements does, while a genuinely unsplit statement
+// still fails.
+func hasTopLevelSemicolon(s string) bool {
+	i, n := 0, len(s)
+	for i < n {
+		c := s[i]
+		switch {
+		case c == '\'' || c == '"':
+			i = scanQuoted(s, i, c)
+		case c == '$':
+			tag, ok := dollarQuoteTag(s[i:])
+			if !ok {
+				i++
+				continue
+			}
+			end := strings.Index(s[i+len(tag):], tag)
+			if end < 0 {
+				return false
+			}
+			i += len(tag) + end + len(tag)
+		case c == ';':
+			return true
+		default:
+			i++
+		}
+	}
+	return false
+}
+
 func TestAllMigrationsAreWellFormed(t *testing.T) {
 	ms, err := All()
 	if err != nil {
@@ -26,7 +59,7 @@ func TestAllMigrationsAreWellFormed(t *testing.T) {
 			t.Fatalf("migration %s has no statements", m.Name)
 		}
 		for _, s := range m.Statements {
-			if strings.TrimSpace(s) == "" || strings.Contains(s, ";") {
+			if strings.TrimSpace(s) == "" || hasTopLevelSemicolon(s) {
 				t.Fatalf("migration %s has an unsplit statement %q", m.Name, s)
 			}
 		}
@@ -36,11 +69,12 @@ func TestAllMigrationsAreWellFormed(t *testing.T) {
 	}
 }
 
-// TestMigrationCommentsContainNoSemicolons pins the splitter's constraint:
-// SplitStatements splits raw SQL on ';' BEFORE stripping comment lines, so a
-// semicolon inside a comment slices the comment in half and leaves the tail
-// as a stray non-comment fragment that the migration runner then executes as
-// SQL. This is exactly the deploy-time failure this guard exists to prevent.
+// TestMigrationCommentsContainNoSemicolons pins the migration comment style:
+// comment-only lines carry no semicolons. SplitStatements is comment-aware
+// and would no longer split a comment on ';' (TestSplitStatementsAndComments
+// pins that), but keeping comments semicolon-free means every statement's
+// text stays trivially readable in the digest review, and the guard catches
+// the one shape a future splitter regression would reintroduce.
 func TestMigrationCommentsContainNoSemicolons(t *testing.T) {
 	entries, err := FS.ReadDir(".")
 	if err != nil {
@@ -97,5 +131,25 @@ func TestSplitStatementsAndComments(t *testing.T) {
 	}
 	if out := stripSQLComments("SELECT 1;\n   -- comment\nSELECT 2;"); strings.Contains(out, "comment") {
 		t.Fatalf("stripSQLComments left a comment: %q", out)
+	}
+	// A semicolon inside a comment no longer splits the statement.
+	if out := SplitStatements("SELECT 1 -- a comment with a ; semicolon\n"); len(out) != 1 {
+		t.Fatalf("semicolon in a comment split the statement: %q", out)
+	}
+	// A dollar-quoted function body is ONE statement despite its semicolons.
+	body := "CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $kiwi$\nBEGIN\n  RETURN NEW;\nEND;\n$kiwi$"
+	if out := SplitStatements(body); len(out) != 1 {
+		t.Fatalf("dollar-quoted body split into %d statements: %q", len(out), out)
+	}
+	if out := SplitStatements(body + ";\nSELECT 1"); len(out) != 2 {
+		t.Fatalf("statement after a dollar-quoted body = %q", out)
+	}
+	// Dollar-quoted bodies may carry tags other than $kiwi$, and strings may
+	// contain a semicolon without splitting.
+	if out := SplitStatements("SELECT 'a;b'"); len(out) != 1 {
+		t.Fatalf("semicolon in a string literal split the statement: %q", out)
+	}
+	if out := SplitStatements("SELECT $$a;b$$"); len(out) != 1 {
+		t.Fatalf("semicolon in an untagged dollar quote split the statement: %q", out)
 	}
 }

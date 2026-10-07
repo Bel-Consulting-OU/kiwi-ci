@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -24,8 +25,9 @@ import (
 // transaction, inserts the once-only secret_claims row and appends the durable
 // secret.issued audit event before committing.
 //
-// The sealed envelope is NOT part of the request: the value never leaves the
-// broker, and the claim + audit are the only durable state a delivery leaves.
+// The sealed envelope travels WITH the request so it can be persisted inside
+// the same transaction as the claim: the value never leaves the broker, and
+// the claim + envelope + audit are the only durable state a delivery leaves.
 type SecretIssuance struct {
 	JobID           string
 	RunnerID        string
@@ -33,6 +35,54 @@ type SecretIssuance struct {
 	LeaseTokenHash  []byte
 	SecretName      string
 	IssuedAt        time.Time
+
+	// RecipientPublic is the runner's ephemeral X25519 request public key the
+	// envelope was sealed for. It is the replay identity of the delivery: a
+	// retry that presents the same key replays the stored envelope, any other
+	// key stays a duplicate refusal.
+	RecipientPublic []byte
+	// EphemeralPublic, Ciphertext and Nonce are the sealed envelope persisted
+	// with the claim inside the same transaction, so an identical retry can be
+	// answered 200 with the exact same bytes instead of minting a second
+	// delivery. All three are set together by the handler.
+	EphemeralPublic []byte
+	Ciphertext      []byte
+	Nonce           []byte
+}
+
+// SealedSecretDelivery is one sealed secret envelope: the AEAD ciphertext,
+// the server's ephemeral X25519 public key the value was sealed under, and
+// the AEAD nonce. It is exactly what the runner needs to open the delivery
+// and what a retry of a committed delivery replays byte-for-byte.
+type SealedSecretDelivery struct {
+	Ciphertext      []byte
+	EphemeralPublic []byte
+	Nonce           []byte
+}
+
+// StoredSecretIssuance is the durable state of one committed delivery: the
+// runner's request public key the envelope was sealed for (the replay
+// identity) and the sealed envelope itself. A stored record whose envelope is
+// incomplete (a legacy row from before the envelope columns) is never
+// replayable; it still refuses a second delivery.
+type StoredSecretIssuance struct {
+	RecipientPublic []byte
+	Envelope        SealedSecretDelivery
+}
+
+// ReplayableSecretIssuance is the ONE replay predicate shared by the
+// PostgreSQL store, the memory store and the server's fs-mode journal: a
+// duplicate delivery is a replay only when the stored record carries a
+// complete sealed envelope AND the runner presented the exact same ephemeral
+// public key the envelope was sealed for. Anything else (a different key, a
+// legacy row without an envelope) is a hard duplicate refusal, so a replay
+// can never mint a new envelope for a key that did not receive the original.
+func ReplayableSecretIssuance(stored StoredSecretIssuance, req SecretIssuance) bool {
+	return len(stored.RecipientPublic) > 0 && len(req.RecipientPublic) > 0 &&
+		bytes.Equal(stored.RecipientPublic, req.RecipientPublic) &&
+		len(stored.Envelope.EphemeralPublic) > 0 &&
+		len(stored.Envelope.Ciphertext) > 0 &&
+		len(stored.Envelope.Nonce) > 0
 }
 
 // LockedSecretLease is the authoritative lease/declaration state of the job
@@ -97,8 +147,19 @@ var (
 // fails the predicate) or waits for the issuance commit. Only a successful
 // commit authorizes the handler to write the sealed envelope; refusal is a
 // typed error from the ErrSecretIssuance* set and commits NOTHING.
+//
+// The returned envelope is the sealed delivery to serve: on a first commit it
+// is the request's own envelope; on a same-key replay (replayed=true) it is
+// the stored envelope of the original commit, and NOTHING new is written (no
+// second claim, no second audit). A duplicate whose presented key differs
+// from the stored one is still ErrSecretIssuanceDuplicate.
 type SecretIssuanceStore interface {
-	CommitSecretIssuance(ctx context.Context, req SecretIssuance) error
+	CommitSecretIssuance(ctx context.Context, req SecretIssuance) (SealedSecretDelivery, bool, error)
+	// LookupSecretIssuance reads the stored record of an already committed
+	// delivery. found=false means no commit exists. It exists so the handler
+	// can answer an identical retry from the stored envelope WITHOUT
+	// re-resolving the broker or touching the commit path at all.
+	LookupSecretIssuance(ctx context.Context, jobID string, generation int64, secretName string) (StoredSecretIssuance, bool, error)
 }
 
 var (
@@ -209,9 +270,18 @@ func SecretIssuanceAuditEvent(req SecretIssuance, runID, id string) model.AuditE
 // CommitSecretIssuance is the PostgreSQL commit-time delivery authority. It
 // locks the job row FOR UPDATE, re-reads the authoritative lease/declaration
 // fields plus the database clock, evaluates the shared predicate, inserts the
-// once-only secret_claims row and the secret.issued audit row, and commits,
-// all in one transaction. Any refusal returns a typed error and rolls the
-// transaction back: no claim, no audit row, no envelope.
+// once-only secret_claims row carrying the sealed envelope and the
+// secret.issued audit row, and commits, all in one transaction. Any refusal
+// returns a typed error and rolls the transaction back: no claim, no audit
+// row, no envelope.
+//
+// A duplicate whose stored recipient public key equals the presented one is a
+// REPLAY: the transaction rolls back (it wrote nothing) and returns the
+// stored envelope with replayed=true, so the caller answers 200 with the
+// exact original bytes and never a second claim or audit. A duplicate with a
+// different key stays ErrSecretIssuanceDuplicate (409). The lease predicate is
+// evaluated BEFORE the duplicate check, so a stale generation is refused by
+// lease validation and can never replay.
 //
 // The clock must be read ONLY after the row lock is held: a plain
 // target-list clock_timestamp() is evaluated during the scan, BEFORE
@@ -221,13 +291,13 @@ func SecretIssuanceAuditEvent(req SecretIssuance, runID, id string) model.AuditE
 // FOR UPDATE clause in a materialized sub-plan (a CTE with a locking clause
 // is never inlined), so the outer clock_timestamp() is evaluated after the
 // lock has been acquired — the same construction CommitOIDCIssuance uses.
-func (s *PostgresStore) CommitSecretIssuance(ctx context.Context, req SecretIssuance) error {
+func (s *PostgresStore) CommitSecretIssuance(ctx context.Context, req SecretIssuance) (SealedSecretDelivery, bool, error) {
 	if err := ValidateSecretIssuanceRequest(req); err != nil {
-		return err
+		return SealedSecretDelivery{}, false, err
 	}
 	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
-		return err
+		return SealedSecretDelivery{}, false, err
 	}
 	defer tx.Rollback(ctx)
 	var (
@@ -253,15 +323,15 @@ func (s *PostgresStore) CommitSecretIssuance(ctx context.Context, req SecretIssu
 	FROM locked`, req.JobID).Scan(
 		&runID, &status, &leaseRunnerID, &leaseGeneration, &leaseTokenHash, &leaseExpiresAt, &trusted, &declaredJSON, &commitNow)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrNotFound
+		return SealedSecretDelivery{}, false, ErrNotFound
 	}
 	if err != nil {
-		return err
+		return SealedSecretDelivery{}, false, err
 	}
 	var declared []string
 	if len(declaredJSON) > 0 && string(declaredJSON) != "null" {
 		if err := json.Unmarshal(declaredJSON, &declared); err != nil {
-			return fmt.Errorf("storage: decode job declared_secrets: %w", err)
+			return SealedSecretDelivery{}, false, fmt.Errorf("storage: decode job declared_secrets: %w", err)
 		}
 	}
 	locked := LockedSecretLease{
@@ -276,31 +346,101 @@ func (s *PostgresStore) CommitSecretIssuance(ctx context.Context, req SecretIssu
 		locked.LeaseExpiresAt = *leaseExpiresAt
 	}
 	if err := ValidateSecretIssuance(locked, req, commitNow); err != nil {
-		return err
+		return SealedSecretDelivery{}, false, err
 	}
-	ct, err := tx.Exec(ctx, `INSERT INTO secret_claims (job_id, generation, secret_name) VALUES ($1, $2, $3) ON CONFLICT (job_id, generation, secret_name) DO NOTHING`,
-		req.JobID, req.LeaseGeneration, req.SecretName)
+	ct, err := tx.Exec(ctx, `INSERT INTO secret_claims (job_id, generation, secret_name, recipient_public, ephemeral_public, ciphertext, nonce, sealed_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (job_id, generation, secret_name) DO NOTHING`,
+		req.JobID, req.LeaseGeneration, req.SecretName,
+		nullBytes(req.RecipientPublic), nullBytes(req.EphemeralPublic), nullBytes(req.Ciphertext), nullBytes(req.Nonce), req.IssuedAt)
 	if err != nil {
-		return err
+		return SealedSecretDelivery{}, false, err
 	}
 	if ct.RowsAffected() != 1 {
-		return secretIssuanceErrorf(ErrSecretIssuanceDuplicate, "job %s generation %d secret %q", req.JobID, req.LeaseGeneration, req.SecretName)
+		stored, found, err := queryStoredSecretIssuance(ctx, tx, req.JobID, req.LeaseGeneration, req.SecretName)
+		if err != nil {
+			return SealedSecretDelivery{}, false, err
+		}
+		if found && ReplayableSecretIssuance(stored, req) {
+			return stored.Envelope, true, nil
+		}
+		return SealedSecretDelivery{}, false, secretIssuanceErrorf(ErrSecretIssuanceDuplicate, "job %s generation %d secret %q", req.JobID, req.LeaseGeneration, req.SecretName)
 	}
 	auditID, err := newID()
 	if err != nil {
-		return err
+		return SealedSecretDelivery{}, false, err
 	}
 	ev := SecretIssuanceAuditEvent(req, runID, auditID)
 	var meta []byte
 	if len(ev.Metadata) > 0 {
 		meta, err = jsonMarshal(ev.Metadata)
 		if err != nil {
-			return err
+			return SealedSecretDelivery{}, false, err
 		}
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO audit_events (id, action, actor, run_id, job_id, message, metadata, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 		ev.ID, ev.Action, nullText(ev.Actor), nullText(ev.RunID), nullText(ev.JobID), nullText(ev.Message), meta, ev.CreatedAt); err != nil {
-		return err
+		return SealedSecretDelivery{}, false, err
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return SealedSecretDelivery{}, false, err
+	}
+	return SealedSecretDelivery{
+		Ciphertext:      cloneSecretBytes(req.Ciphertext),
+		EphemeralPublic: cloneSecretBytes(req.EphemeralPublic),
+		Nonce:           cloneSecretBytes(req.Nonce),
+	}, false, nil
+}
+
+// LookupSecretIssuance reads the durable record of an already committed
+// delivery (PostgreSQL: the secret_claims row). found=false means no commit
+// exists. It is the read side of the replay protocol: the handler uses it to
+// answer an identical retry from the stored envelope without re-resolving the
+// broker or entering the commit path.
+func (s *PostgresStore) LookupSecretIssuance(ctx context.Context, jobID string, generation int64, secretName string) (StoredSecretIssuance, bool, error) {
+	if err := ValidateJobID(jobID); err != nil {
+		return StoredSecretIssuance{}, false, err
+	}
+	if generation < 0 {
+		return StoredSecretIssuance{}, false, fmt.Errorf("storage: invalid lease generation %d", generation)
+	}
+	if strings.TrimSpace(secretName) == "" {
+		return StoredSecretIssuance{}, false, fmt.Errorf("storage: empty secret name")
+	}
+	return queryStoredSecretIssuance(ctx, s.pool, jobID, generation, secretName)
+}
+
+// secretIssuanceQueryer is the shared single-row read surface of pgx.Tx and
+// pgxpool.Pool, so the commit transaction and the standalone lookup decode the
+// stored envelope through ONE query.
+type secretIssuanceQueryer interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// queryStoredSecretIssuance reads and decodes one secret_claims row.
+func queryStoredSecretIssuance(ctx context.Context, q secretIssuanceQueryer, jobID string, generation int64, secretName string) (StoredSecretIssuance, bool, error) {
+	var recipient, ephemeralPublic, ciphertext, nonce []byte
+	err := q.QueryRow(ctx, `SELECT recipient_public, ephemeral_public, ciphertext, nonce FROM secret_claims WHERE job_id=$1 AND generation=$2 AND secret_name=$3`,
+		jobID, generation, secretName).Scan(&recipient, &ephemeralPublic, &ciphertext, &nonce)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return StoredSecretIssuance{}, false, nil
+	}
+	if err != nil {
+		return StoredSecretIssuance{}, false, err
+	}
+	return StoredSecretIssuance{
+		RecipientPublic: cloneSecretBytes(recipient),
+		Envelope: SealedSecretDelivery{
+			Ciphertext:      cloneSecretBytes(ciphertext),
+			EphemeralPublic: cloneSecretBytes(ephemeralPublic),
+			Nonce:           cloneSecretBytes(nonce),
+		},
+	}, true, nil
+}
+
+// cloneSecretBytes copies a sealed-envelope byte slice so no caller can
+// mutate state that another caller still observes.
+func cloneSecretBytes(b []byte) []byte {
+	if b == nil {
+		return nil
+	}
+	return append([]byte(nil), b...)
 }

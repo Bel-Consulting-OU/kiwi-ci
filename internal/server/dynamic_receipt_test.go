@@ -199,6 +199,10 @@ func TestDynamicFragmentDigestMismatchRejected(t *testing.T) {
 type fragmentParityCase struct {
 	name   string
 	mutate func(t *testing.T, s *Server, f *dbFakeStore, parent model.Job)
+	// want, when non-empty, is a substring BOTH modes' rejection must carry.
+	// The stale-generation case pins that the refusal comes from the storage
+	// lease predicate (authorization), never from a receipt replay.
+	want string
 }
 
 func parentLeaseMutation(mut func(j *model.Job)) func(*testing.T, *Server, *dbFakeStore, model.Job) {
@@ -226,10 +230,15 @@ func parentLeaseMutation(mut func(j *model.Job)) func(*testing.T, *Server, *dbFa
 func TestGeneratedFragmentInsertionPredicateParity(t *testing.T) {
 	cases := []fragmentParityCase{
 		{
+			// The canonical mutation key is (parent, fragment id): the
+			// generation AUTHORIZES but never defines it. A stale generation
+			// must be refused by the storage lease predicate even though a
+			// generation-free receipt read would match.
 			name: "stale generation",
 			mutate: parentLeaseMutation(func(j *model.Job) {
 				j.LeaseGeneration++
 			}),
+			want: "generation",
 		},
 		{
 			name: "token mismatch",
@@ -266,6 +275,9 @@ func TestGeneratedFragmentInsertionPredicateParity(t *testing.T) {
 			}
 			if memMsg != dbMsg {
 				t.Fatalf("rejection diverged: memory=%q db=%q", memMsg, dbMsg)
+			}
+			if tc.want != "" && !strings.Contains(memMsg, tc.want) {
+				t.Fatalf("rejection %q does not mention %q", memMsg, tc.want)
 			}
 		})
 	}
@@ -454,4 +466,306 @@ func parseFragment(t *testing.T, raw string) generatedFragment {
 	}
 	frag.FragmentID = id
 	return frag
+}
+
+// ---------------------------------------------------------------------------
+// P1: infrastructure-retry idempotency under a NEW lease generation
+// ---------------------------------------------------------------------------
+
+// retryFragmentABC is a three-child fragment (canonical keys child-a/b/c) used
+// to prove an infrastructure retry replays the ORIGINAL child IDs.
+const retryFragmentABC = `{"jobs":{"child-a":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo a"}]},"child-b":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo b"}]},"child-c":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo c"}]}},"deps":{}}`
+
+// retryLeaseHeaders presents a lease identity that is not the one contained
+// in a Task, so tests can drive a simulated recovery re-lease.
+func retryLeaseHeaders(runnerID, token string, generation int64) map[string]string {
+	return map[string]string{
+		"X-Kiwi-Runner-ID":        runnerID,
+		"X-Kiwi-Lease-Token":      token,
+		"X-Kiwi-Lease-Generation": fmt.Sprint(generation),
+	}
+}
+
+// rebindParentLeaseForRetry rewrites the stored parent's lease identity to a
+// NEW generation with a fresh token, the state an infrastructure retry
+// (recovery requeue followed by a new claim) leaves behind. In db mode the
+// mutation goes through the fake store map; in memory mode through s.jobs.
+func rebindParentLeaseForRetry(t *testing.T, s *Server, f *dbFakeStore, parentID, runnerID, token string, generation int64) {
+	t.Helper()
+	exp := time.Now().UTC().Add(time.Hour)
+	apply := func(j model.Job) model.Job {
+		j.Status = model.StatusRunning
+		j.LeaseRunnerID = runnerID
+		j.LeaseGeneration = generation
+		j.LeaseTokenHash = hashLeaseToken(s.leaseKey, token)
+		j.LeaseExpiresAt = &exp
+		return j
+	}
+	if f != nil {
+		f.mu.Lock()
+		j, ok := f.jobs[parentID]
+		if !ok {
+			f.mu.Unlock()
+			t.Fatalf("parent %s missing from the fake store", parentID)
+		}
+		f.jobs[parentID] = apply(j)
+		f.mu.Unlock()
+		return
+	}
+	s.mu.Lock()
+	j, ok := s.jobs[parentID]
+	if !ok {
+		s.mu.Unlock()
+		t.Fatalf("parent %s missing from memory", parentID)
+	}
+	s.jobs[parentID] = apply(j)
+	s.mu.Unlock()
+}
+
+// generatedFragmentSetup builds the memory and dbFake fixtures for the
+// infrastructure-retry tests, returning the server, the fake store (nil in
+// memory mode), the runner ID and the leased task.
+func generatedFragmentSetup(t *testing.T, db bool) (*Server, *dbFakeStore, string, Task) {
+	t.Helper()
+	if db {
+		f := newDBFakeStore()
+		s := trustedGenerateServerDB(t, f)
+		runnerID, task := leaseRunJob(t, s)
+		return s, f, runnerID, task
+	}
+	s, _ := trustedGenerateServer(t)
+	runnerID, task := leaseRunJob(t, s)
+	return s, nil, runnerID, task
+}
+
+// TestGeneratedFragmentReplaysAcrossInfrastructureRetry is the P1 regression:
+// parent gen1 admits fragment F (children A/B/C); an infrastructure retry
+// requeues the same logical parent and claims gen2; re-submitting the
+// identical F must replay A/B/C with no new rows and a replayed response, and
+// a CHANGED fragment under gen2 must still insert new children.
+func TestGeneratedFragmentReplaysAcrossInfrastructureRetry(t *testing.T) {
+	for _, db := range []bool{false, true} {
+		name := "memory"
+		if db {
+			name = "db"
+		}
+		t.Run(name, func(t *testing.T) {
+			s, f, runnerID, task := generatedFragmentSetup(t, db)
+			path := "/api/v1/jobs/" + task.Job.ID + "/generated"
+			body := fragmentBody(t, retryFragmentABC)
+			w := doJSONHeaders(t, s, http.MethodPost, path, "token", body, leaseHeaders(task, runnerID))
+			if w.Code != http.StatusCreated {
+				t.Fatalf("first upload = %d: %s", w.Code, w.Body.String())
+			}
+			var first generatedResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &first); err != nil {
+				t.Fatal(err)
+			}
+			if len(first.JobIDs) != 3 || len(first.Keys) != 3 {
+				t.Fatalf("first response = %+v, want 3 children", first)
+			}
+			before := runJobCount(s, f, task.Job.RunID)
+			if before != 4 {
+				t.Fatalf("run jobs = %d, want parent + 3 children", before)
+			}
+
+			// Infrastructure retry: recovery requeued the same logical parent
+			// and a new generation was claimed.
+			const retryToken = "infra-retry-lease-token"
+			retryGen := task.LeaseGeneration + 1
+			rebindParentLeaseForRetry(t, s, f, task.Job.ID, runnerID, retryToken, retryGen)
+			w = doJSONHeaders(t, s, http.MethodPost, path, "token", body, retryLeaseHeaders(runnerID, retryToken, retryGen))
+			if w.Code != http.StatusOK {
+				t.Fatalf("retry replay = %d, want 200: %s", w.Code, w.Body.String())
+			}
+			var replay generatedResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &replay); err != nil {
+				t.Fatal(err)
+			}
+			if !replay.Replayed {
+				t.Fatalf("retry response not marked replayed: %s", w.Body.String())
+			}
+			if len(replay.JobIDs) != len(first.JobIDs) {
+				t.Fatalf("retry children = %v, want %v", replay.JobIDs, first.JobIDs)
+			}
+			for i := range first.JobIDs {
+				if replay.JobIDs[i] != first.JobIDs[i] || replay.Keys[i] != first.Keys[i] {
+					t.Fatalf("retry children differ: %v/%v, want %v/%v", replay.JobIDs, replay.Keys, first.JobIDs, first.Keys)
+				}
+			}
+			if after := runJobCount(s, f, task.Job.RunID); after != before {
+				t.Fatalf("retry inserted %d new children (before=%d after=%d)", after-before, before, after)
+			}
+
+			// A CHANGED fragment under the same new generation is a new
+			// mutation: new children.
+			changedBody := fragmentBody(t, replayFragmentB)
+			w = doJSONHeaders(t, s, http.MethodPost, path, "token", changedBody, retryLeaseHeaders(runnerID, retryToken, retryGen))
+			if w.Code != http.StatusCreated {
+				t.Fatalf("changed fragment = %d, want 201: %s", w.Code, w.Body.String())
+			}
+			var changed generatedResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &changed); err != nil {
+				t.Fatal(err)
+			}
+			if changed.Replayed {
+				t.Fatalf("changed fragment replayed: %s", w.Body.String())
+			}
+			for _, id := range changed.JobIDs {
+				for _, prev := range first.JobIDs {
+					if id == prev {
+						t.Fatalf("changed fragment reused original child %s", id)
+					}
+				}
+			}
+			if after := runJobCount(s, f, task.Job.RunID); after != before+1 {
+				t.Fatalf("changed fragment job count = %d, want %d", after, before+1)
+			}
+		})
+	}
+}
+
+// TestGeneratedFragmentStaleGenerationCannotReplay: after gen2 is leased, a
+// request presenting the stale gen1 identity (with its old token) is rejected
+// by authorization and NEVER observes the receipt children; the current gen2
+// identity then replays the original children.
+func TestGeneratedFragmentStaleGenerationCannotReplay(t *testing.T) {
+	for _, db := range []bool{false, true} {
+		name := "memory"
+		if db {
+			name = "db"
+		}
+		t.Run(name, func(t *testing.T) {
+			s, f, runnerID, task := generatedFragmentSetup(t, db)
+			path := "/api/v1/jobs/" + task.Job.ID + "/generated"
+			body := fragmentBody(t, retryFragmentABC)
+			w := doJSONHeaders(t, s, http.MethodPost, path, "token", body, leaseHeaders(task, runnerID))
+			if w.Code != http.StatusCreated {
+				t.Fatalf("first upload = %d: %s", w.Code, w.Body.String())
+			}
+			var first generatedResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &first); err != nil {
+				t.Fatal(err)
+			}
+			before := runJobCount(s, f, task.Job.RunID)
+
+			const retryToken = "infra-retry-lease-token"
+			retryGen := task.LeaseGeneration + 1
+			rebindParentLeaseForRetry(t, s, f, task.Job.ID, runnerID, retryToken, retryGen)
+
+			// Stale generation with the OLD token: rejected by the handler's
+			// authorizeRunnerLease before processGeneratedFragment runs.
+			w = doJSONHeaders(t, s, http.MethodPost, path, "token", body, leaseHeaders(task, runnerID))
+			if w.Code != http.StatusConflict {
+				t.Fatalf("stale generation upload = %d, want 409: %s", w.Code, w.Body.String())
+			}
+			for _, id := range first.JobIDs {
+				if strings.Contains(w.Body.String(), id) {
+					t.Fatalf("stale generation response leaked receipt child %s: %s", id, w.Body.String())
+				}
+			}
+			if after := runJobCount(s, f, task.Job.RunID); after != before {
+				t.Fatalf("stale generation inserted %d children", after-before)
+			}
+
+			// The current generation replays the original children.
+			w = doJSONHeaders(t, s, http.MethodPost, path, "token", body, retryLeaseHeaders(runnerID, retryToken, retryGen))
+			if w.Code != http.StatusOK {
+				t.Fatalf("current generation replay = %d, want 200: %s", w.Code, w.Body.String())
+			}
+			var replay generatedResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &replay); err != nil {
+				t.Fatal(err)
+			}
+			if !replay.Replayed || len(replay.JobIDs) != len(first.JobIDs) {
+				t.Fatalf("current generation replay = %+v, want the original %v", replay, first.JobIDs)
+			}
+			for i := range first.JobIDs {
+				if replay.JobIDs[i] != first.JobIDs[i] {
+					t.Fatalf("current generation children = %v, want %v", replay.JobIDs, first.JobIDs)
+				}
+			}
+		})
+	}
+}
+
+// TestGeneratedFragmentReplaysAcrossFSRestart: the generated-fragment receipt
+// is part of the same fs snapshot as its children, so after a restart a
+// resubmitted identical fragment under a NEW generation replays the ORIGINAL
+// child IDs instead of re-admitting a duplicate graph.
+func TestGeneratedFragmentReplaysAcrossFSRestart(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewPersistent("token", "token", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Policy = &policy.Config{
+		Repositories: map[string]policy.RepoPolicy{
+			"o/r": {GenerateChildGraph: boolPtr(true), CrossRepoTrigger: boolPtr(true)},
+		},
+	}
+	if _, err := s.enqueue(context.Background(), SubmitRun{
+		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
+		Ref: "refs/heads/main", SHA: "abc", Event: "push",
+		Pipeline: generatePipeline, Trusted: true,
+	}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	runnerID, task := leaseRunJob(t, s)
+	path := "/api/v1/jobs/" + task.Job.ID + "/generated"
+	body := fragmentBody(t, retryFragmentABC)
+	w := doJSONHeaders(t, s, http.MethodPost, path, "token", body, leaseHeaders(task, runnerID))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("first upload = %d: %s", w.Code, w.Body.String())
+	}
+	var first generatedResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &first); err != nil {
+		t.Fatal(err)
+	}
+
+	// Restart from the same directory WITHOUT re-submitting: the receipt and
+	// its children are restored from the one atomic snapshot.
+	s2 := fsMatrixReload(t, dir)
+
+	// New generation: rewrite the restored parent's lease and make it durable.
+	const retryToken = "restart-retry-lease-token"
+	retryGen := task.LeaseGeneration + 1
+	rebindParentLeaseForRetry(t, s2, nil, task.Job.ID, runnerID, retryToken, retryGen)
+	s2.mu.Lock()
+	perr := s2.persistCheckedErrLocked("test.generated_retry")
+	s2.mu.Unlock()
+	if perr != nil {
+		t.Fatalf("persist retry lease: %v", perr)
+	}
+
+	w = doJSONHeaders(t, s2, http.MethodPost, path, "token", body, retryLeaseHeaders(runnerID, retryToken, retryGen))
+	if w.Code != http.StatusOK {
+		t.Fatalf("post-restart resubmit = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	var replay generatedResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &replay); err != nil {
+		t.Fatal(err)
+	}
+	if !replay.Replayed {
+		t.Fatalf("post-restart resubmit not marked replayed: %s", w.Body.String())
+	}
+	if len(replay.JobIDs) != len(first.JobIDs) {
+		t.Fatalf("post-restart children = %v, want the original %v", replay.JobIDs, first.JobIDs)
+	}
+	for i := range first.JobIDs {
+		if replay.JobIDs[i] != first.JobIDs[i] || replay.Keys[i] != first.Keys[i] {
+			t.Fatalf("post-restart children differ: %v/%v, want %v/%v", replay.JobIDs, replay.Keys, first.JobIDs, first.Keys)
+		}
+	}
+	s2.mu.Lock()
+	children := 0
+	for _, j := range s2.jobs {
+		if j.RunID == task.Job.RunID && j.DynamicDepth == 1 {
+			children++
+		}
+	}
+	s2.mu.Unlock()
+	if children != 3 {
+		t.Fatalf("post-restart dynamic children = %d, want exactly the original 3", children)
+	}
 }

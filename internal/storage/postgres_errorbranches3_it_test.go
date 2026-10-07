@@ -412,7 +412,7 @@ func TestPostgresIntegrationFragmentErrorBranches(t *testing.T) {
 		if _, err := st.pool.Exec(ctx, `UPDATE generated_fragments SET children='"scalar"'::jsonb`); err != nil {
 			t.Fatalf("corrupt children: %v", err)
 		}
-		if _, _, err := st.GetGeneratedFragment(ctx, ids.job, 1, "f"); err == nil {
+		if _, _, err := st.GetGeneratedFragment(ctx, ids.job, "f"); err == nil {
 			t.Fatal("a scalar children column must fail the decode")
 		}
 		if _, _, err := st.InsertGeneratedFragmentTx(ctx, req, nil); err == nil {

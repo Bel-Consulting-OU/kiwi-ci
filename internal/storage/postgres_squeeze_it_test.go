@@ -26,6 +26,7 @@ import (
 func pgITBreakColumn(t *testing.T, st *PostgresStore, table, column string) {
 	t.Helper()
 	ctx := context.Background()
+	pgITDropExecutionEventTriggers(t, st, table)
 	pgITDropStatistics(t, st, table)
 	// Expression indexes derived from runs.payload (0026/0027/0034/0035/0036)
 	// block retyping the column, so drop ALL indexes on runs that reference it
@@ -64,6 +65,7 @@ func pgITBoomOp(t *testing.T, st *PostgresStore, table, event string, optionalCo
 // string scanners fail while the surrounding query stays valid.
 func pgITBreakColumnToArray(t *testing.T, st *PostgresStore, table, column string) {
 	t.Helper()
+	pgITDropExecutionEventTriggers(t, st, table)
 	pgITDropStatistics(t, st, table)
 	q := fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT`, table, column)
 	if _, err := st.pool.Exec(context.Background(), q); err != nil {
@@ -79,6 +81,7 @@ func pgITBreakColumnToArray(t *testing.T, st *PostgresStore, table, column strin
 // statements in the same helper succeed.
 func pgITDropColumn(t *testing.T, st *PostgresStore, table, column string) {
 	t.Helper()
+	pgITDropExecutionEventTriggers(t, st, table)
 	pgITDropStatistics(t, st, table)
 	q := fmt.Sprintf(`ALTER TABLE %s DROP COLUMN %s`, table, column)
 	if _, err := st.pool.Exec(context.Background(), q); err != nil {

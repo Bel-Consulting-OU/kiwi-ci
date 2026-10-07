@@ -39,7 +39,7 @@ package server
 //	test report upload     testintel.go:71  500 + report rollback (TestFSFindingsTestReportLeavesGhostOnPersistFailure)
 //	runner profile upsert  profiles.go:81   500 + profile rollback (TestFSFindingsProfileUpsertLeavesGhostOnPersistFailure)
 //	cert profile bind      profiles.go:138  503 + binding rollback (TestFSFindingsCertProfileBindLeavesGhostOnPersistFailure)
-//	generated fragment     dynamic.go:438   503 + map rollback, receipt only after persist (TestFSFindingsGeneratedFragmentLeavesGhostAndReplayAck)
+//	generated fragment     dynamic.go:438   503 + map rollback, children and receipt in the SAME snapshot (TestFSFindingsGeneratedFragmentLeavesGhostAndReplayAck)
 //	schedule create        schedules.go:580 500 + schedule rollback (TestFSFindingsScheduleCreateLeavesGhostOnJournalFailure)
 //	schedule fire          schedules.go:946 -> run.enqueue (covered by schedule.fire)
 //	downstream.*           downstream.go:286/523/535/562/592/622 internal outbox/maintenance paths, never client-acknowledged; fail-closed by error return
@@ -1461,9 +1461,11 @@ func TestFSFindingsCertProfileBindLeavesGhostOnPersistFailure(t *testing.T) {
 }
 
 // TestFSFindingsGeneratedFragmentLeavesGhostAndReplayAck is finding 6:
-// dynamic.go:425-441 inserts the child jobs, contracts and fragment receipt
-// before persistLocked, answers 400 on the failure, and then ACKs a retry
-// from the in-memory receipt (200 replay) although nothing was ever durable.
+// dynamic.go inserts the child jobs AND the idempotency receipt into the
+// same atomic snapshot write, answers 5xx on a persist failure and rolls the
+// whole mutation back together. A retry after the heal must therefore be a
+// FRESH 201 admission (no receipt survived), never a 200 replay of children
+// the disk never contained.
 func TestFSFindingsGeneratedFragmentLeavesGhostAndReplayAck(t *testing.T) {
 	s, _ := trustedGenerateServer(t)
 	runnerID, task := leaseRunJob(t, s)
@@ -1481,7 +1483,11 @@ func TestFSFindingsGeneratedFragmentLeavesGhostAndReplayAck(t *testing.T) {
 			children++
 		}
 	}
+	receipts := len(s.generatedFragments)
 	s.mu.Unlock()
+	if receipts != 0 {
+		t.Errorf("FINDING generated fragment receipt: a failed snapshot persist left %d in-memory receipt(s) although the children were rolled back", receipts)
+	}
 	if children == 0 {
 		if w.Code < 500 {
 			t.Fatalf("generated fragment = %d, want 5xx: %s", w.Code, w.Body.String())
@@ -1489,6 +1495,12 @@ func TestFSFindingsGeneratedFragmentLeavesGhostAndReplayAck(t *testing.T) {
 		s.persistFailForTest = nil
 		if retry := doJSONHeaders(t, s, http.MethodPost, path, "token", body, hdrs); retry.Code != http.StatusCreated {
 			t.Fatalf("healed fragment = %d: %s", retry.Code, retry.Body.String())
+		}
+		s.mu.Lock()
+		receipts = len(s.generatedFragments)
+		s.mu.Unlock()
+		if receipts != 1 {
+			t.Fatalf("healed fragment receipts = %d, want 1", receipts)
 		}
 		s2 := fsMatrixReload(t, s.dataDir)
 		s2.mu.Lock()
@@ -1498,14 +1510,18 @@ func TestFSFindingsGeneratedFragmentLeavesGhostAndReplayAck(t *testing.T) {
 				n++
 			}
 		}
+		restored := len(s2.generatedFragments)
 		s2.mu.Unlock()
 		if n == 0 {
 			t.Fatal("healed fragment children not durable")
 		}
+		if restored != 1 {
+			t.Fatalf("restored fragment receipts = %d, want 1", restored)
+		}
 		return
 	}
 
-	t.Errorf("FINDING generated fragment (internal/server/dynamic.go:425-441): a snapshot persist failure answered %d but left %d child job(s) in memory", w.Code, children)
+	t.Errorf("FINDING generated fragment (internal/server/dynamic.go): a snapshot persist failure answered %d but left %d child job(s) in memory", w.Code, children)
 
 	s.persistFailForTest = nil
 	retry := doJSONHeaders(t, s, http.MethodPost, path, "token", body, hdrs)
@@ -1517,8 +1533,9 @@ func TestFSFindingsGeneratedFragmentLeavesGhostAndReplayAck(t *testing.T) {
 			durableChildren++
 		}
 	}
+	durableReceipts := len(s2.generatedFragments)
 	s2.mu.Unlock()
-	t.Errorf("FINDING generated fragment: retry after heal answered %d (replayed from the in-memory receipt without persisting) and the reloaded snapshot holds %d dynamic child job(s)", retry.Code, durableChildren)
+	t.Errorf("FINDING generated fragment: retry after heal answered %d and the reloaded snapshot holds %d dynamic child job(s) and %d receipt(s)", retry.Code, durableChildren, durableReceipts)
 }
 
 // TestFSFindingsScheduleCreateLeavesGhostOnJournalFailure is finding 7:

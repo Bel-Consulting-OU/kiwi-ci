@@ -54,11 +54,12 @@ func secretIssueAuditCount(m *memStore) int {
 // TestMemCommitSecretIssuanceRecordsClaimAndAudit pins the memory-mode
 // transactional contract: one successful commit records exactly one once-only
 // claim and one secret.issued audit event, and a replay refuses typed without
-// recording anything else.
+// recording anything else. The bare request carries no sealed envelope, so
+// even a same-key duplicate is a hard refusal (there is nothing to replay).
 func TestMemCommitSecretIssuanceRecordsClaimAndAudit(t *testing.T) {
 	m := newMemStore()
 	req := secretIssueLeaseJob(t, m)
-	if err := m.CommitSecretIssuance(ctx(), req); err != nil {
+	if _, _, err := m.CommitSecretIssuance(ctx(), req); err != nil {
 		t.Fatalf("CommitSecretIssuance: %v", err)
 	}
 	if got := secretIssueClaimCount(m); got != 1 {
@@ -76,7 +77,7 @@ func TestMemCommitSecretIssuanceRecordsClaimAndAudit(t *testing.T) {
 	if ev.Metadata["secret"] != "TOKEN" || ev.Metadata["generation"] != "1" {
 		t.Fatalf("audit metadata = %v", ev.Metadata)
 	}
-	if err := m.CommitSecretIssuance(ctx(), req); !errors.Is(err, ErrSecretIssuanceDuplicate) {
+	if _, _, err := m.CommitSecretIssuance(ctx(), req); !errors.Is(err, ErrSecretIssuanceDuplicate) {
 		t.Fatalf("replay = %v, want ErrSecretIssuanceDuplicate", err)
 	}
 	if got := secretIssueClaimCount(m); got != 1 {
@@ -84,6 +85,71 @@ func TestMemCommitSecretIssuanceRecordsClaimAndAudit(t *testing.T) {
 	}
 	if got := secretIssueAuditCount(m); got != 1 {
 		t.Fatalf("audits after replay = %d, want 1", got)
+	}
+}
+
+// secretIssueEnvelope fills the sealed-envelope fields of a commit request so
+// the replay protocol can be exercised.
+func secretIssueEnvelope(req *SecretIssuance) {
+	req.RecipientPublic = []byte("recipient-public-32-bytes-long!!!")
+	req.EphemeralPublic = []byte("server-ephemeral-public")
+	req.Ciphertext = []byte("sealed-ciphertext")
+	req.Nonce = []byte("nonce12")
+}
+
+// TestMemCommitSecretIssuanceReplaysSealedEnvelope pins the retry-stable
+// delivery contract: an identical retry (same recipient public key) returns
+// the EXACT stored envelope with replayed=true, writes no second claim and no
+// second audit, and a retry with a different recipient key stays a duplicate
+// refusal.
+func TestMemCommitSecretIssuanceReplaysSealedEnvelope(t *testing.T) {
+	m := newMemStore()
+	req := secretIssueLeaseJob(t, m)
+	secretIssueEnvelope(&req)
+	env, replayed, err := m.CommitSecretIssuance(ctx(), req)
+	if err != nil || replayed {
+		t.Fatalf("first commit = env=%+v replayed=%v err=%v", env, replayed, err)
+	}
+	if string(env.Ciphertext) != "sealed-ciphertext" || string(env.Nonce) != "nonce12" || string(env.EphemeralPublic) != "server-ephemeral-public" {
+		t.Fatalf("first commit envelope = %+v", env)
+	}
+
+	// Identical retry: same envelope, replayed, nothing written again.
+	replayEnv, replayed, err := m.CommitSecretIssuance(ctx(), req)
+	if err != nil || !replayed {
+		t.Fatalf("replay = replayed=%v err=%v, want replayed", replayed, err)
+	}
+	if string(replayEnv.Ciphertext) != string(env.Ciphertext) || string(replayEnv.Nonce) != string(env.Nonce) || string(replayEnv.EphemeralPublic) != string(env.EphemeralPublic) {
+		t.Fatalf("replayed envelope = %+v, want identical to %+v", replayEnv, env)
+	}
+	if got := secretIssueClaimCount(m); got != 1 {
+		t.Fatalf("claims after replay = %d, want 1", got)
+	}
+	if got := secretIssueAuditCount(m); got != 1 {
+		t.Fatalf("audits after replay = %d, want 1", got)
+	}
+
+	// The stored record is readable through the lookup side of the contract.
+	stored, found, err := m.LookupSecretIssuance(ctx(), testJob.ID, 1, "TOKEN")
+	if err != nil || !found {
+		t.Fatalf("LookupSecretIssuance = found=%v err=%v", found, err)
+	}
+	if !ReplayableSecretIssuance(stored, req) {
+		t.Fatalf("stored record not replayable: %+v", stored)
+	}
+	if _, found, err := m.LookupSecretIssuance(ctx(), testJob.ID, 1, "OTHER"); err != nil || found {
+		t.Fatalf("missing lookup = found=%v err=%v, want not found", found, err)
+	}
+
+	// A retry presenting a DIFFERENT recipient key is a hard duplicate: the
+	// stored envelope is never re-minted for a key that did not receive it.
+	other := req
+	other.RecipientPublic = []byte("a-different-recipient-key-32byte")
+	if _, replayed, err := m.CommitSecretIssuance(ctx(), other); !errors.Is(err, ErrSecretIssuanceDuplicate) || replayed {
+		t.Fatalf("different-key retry = replayed=%v err=%v, want duplicate", replayed, err)
+	}
+	if got := secretIssueClaimCount(m); got != 1 {
+		t.Fatalf("claims after different-key retry = %d, want 1", got)
 	}
 }
 
@@ -146,7 +212,7 @@ func TestMemCommitSecretIssuanceRefusals(t *testing.T) {
 			if tc.edit != nil {
 				tc.edit(&req)
 			}
-			if err := m.CommitSecretIssuance(ctx(), req); !errors.Is(err, tc.want) {
+			if _, _, err := m.CommitSecretIssuance(ctx(), req); !errors.Is(err, tc.want) {
 				t.Fatalf("CommitSecretIssuance = %v, want %v", err, tc.want)
 			}
 			if got := secretIssueClaimCount(m); got != 0 {
@@ -200,17 +266,20 @@ func TestFaultyStoreCommitSecretIssuance(t *testing.T) {
 	inner := newMemStore()
 	req := secretIssueLeaseJob(t, inner)
 	fs := &FaultyStore{Inner: inner}
-	if err := fs.CommitSecretIssuance(ctx(), req); err != nil {
+	if _, _, err := fs.CommitSecretIssuance(ctx(), req); err != nil {
 		t.Fatalf("pass-through: %v", err)
 	}
 	if got := secretIssueClaimCount(inner); got != 1 {
 		t.Fatalf("pass-through claims = %d, want 1", got)
 	}
+	if _, found, err := fs.LookupSecretIssuance(ctx(), testJob.ID, 1, "TOKEN"); err != nil || !found {
+		t.Fatalf("pass-through lookup = found=%v err=%v", found, err)
+	}
 
 	faulted := newMemStore()
 	faultReq := secretIssueLeaseJob(t, faulted)
 	armed := &FaultyStore{Inner: faulted, FailAfter: 1, Err: errBoom}
-	if err := armed.CommitSecretIssuance(ctx(), faultReq); !errors.Is(err, errBoom) {
+	if _, _, err := armed.CommitSecretIssuance(ctx(), faultReq); !errors.Is(err, errBoom) {
 		t.Fatalf("armed fault = %v, want errBoom", err)
 	}
 	if got := secretIssueClaimCount(faulted); got != 0 {
@@ -221,10 +290,15 @@ func TestFaultyStoreCommitSecretIssuance(t *testing.T) {
 	}
 
 	missing := &FaultyStore{Inner: storeOnlyInner{}}
-	if err := missing.CommitSecretIssuance(ctx(), SecretIssuance{}); err == nil {
+	if _, _, err := missing.CommitSecretIssuance(ctx(), SecretIssuance{}); err == nil {
 		t.Fatal("missing inner interface = nil error")
 	} else if want := errMissingInnerInterface("SecretIssuanceStore"); err.Error() != want.Error() {
 		t.Fatalf("missing inner interface = %v, want %v", err, want)
+	}
+	if _, _, err := missing.LookupSecretIssuance(ctx(), "", 0, ""); err == nil {
+		t.Fatal("missing inner lookup interface = nil error")
+	} else if want := errMissingInnerInterface("SecretIssuanceStore"); err.Error() != want.Error() {
+		t.Fatalf("missing inner lookup interface = %v, want %v", err, want)
 	}
 }
 

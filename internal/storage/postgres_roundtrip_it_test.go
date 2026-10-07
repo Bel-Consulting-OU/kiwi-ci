@@ -1188,7 +1188,7 @@ func TestPostgresIntegrationGeneratedJobsAndFragments(t *testing.T) {
 		t.Fatalf("generated job with unknown run must fail the FK: %v", err)
 	}
 
-	if _, ok, err := st.GetGeneratedFragment(ctx, parentID, 1, "frag"); err != nil || ok {
+	if _, ok, err := st.GetGeneratedFragment(ctx, parentID, "frag"); err != nil || ok {
 		t.Fatalf("missing fragment = %v, %v", ok, err)
 	}
 	// The fragment transaction owns the lease predicate, so the parent must
@@ -1219,7 +1219,7 @@ func TestPostgresIntegrationGeneratedJobsAndFragments(t *testing.T) {
 	if err != nil || !replayed || again.FragmentID != receipt.FragmentID {
 		t.Fatalf("fragment replay = %+v, %v, %v", again, replayed, err)
 	}
-	got, ok, err := st.GetGeneratedFragment(ctx, parentID, 1, "frag-1")
+	got, ok, err := st.GetGeneratedFragment(ctx, parentID, "frag-1")
 	if err != nil || !ok || got.ParentJobID != parentID {
 		t.Fatalf("GetGeneratedFragment = %+v, %v, %v", got, ok, err)
 	}
@@ -1254,7 +1254,7 @@ func TestPostgresIntegrationGeneratedJobsAndFragments(t *testing.T) {
 	if _, _, err := st.InsertGeneratedFragmentTx(ctx, GeneratedFragmentRequest{ParentJobID: parentID, FragmentID: "", Jobs: map[string]model.Job{}}, nil); err == nil {
 		t.Fatal("empty fragment id must fail")
 	}
-	if _, _, err := st.GetGeneratedFragment(ctx, parentID, 1, ""); err == nil {
+	if _, _, err := st.GetGeneratedFragment(ctx, parentID, ""); err == nil {
 		t.Fatal("empty fragment id lookup must fail")
 	}
 	if _, _, err := st.InsertGeneratedFragmentTx(ctx, GeneratedFragmentRequest{ParentJobID: parentID, Jobs: map[string]model.Job{"bad": {ID: "bad"}}}, nil); err == nil {

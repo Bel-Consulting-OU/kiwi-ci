@@ -344,7 +344,7 @@ func faultyWrapperCases() map[string]wrapperCase {
 			return err
 		}},
 		"GetGeneratedFragment": {seed: fragment, call: func(f *FaultyStore) error {
-			_, _, err := f.GetGeneratedFragment(ctx(), testJob.ID, 1, "frag")
+			_, _, err := f.GetGeneratedFragment(ctx(), testJob.ID, "frag")
 			return err
 		}},
 		"PutCacheManifest": {mutates: true, call: func(f *FaultyStore) error {
@@ -390,10 +390,11 @@ func faultyWrapperCases() map[string]wrapperCase {
 			j.LeaseExpiresAt = &exp
 			_ = m.InsertJob(ctx(), j)
 		}, call: func(f *FaultyStore) error {
-			return f.CommitSecretIssuance(ctx(), SecretIssuance{
+			_, _, err := f.CommitSecretIssuance(ctx(), SecretIssuance{
 				JobID: testJob.ID, RunnerID: testRunner.ID, LeaseGeneration: 1,
 				LeaseTokenHash: []byte("hash"), SecretName: "TOKEN", IssuedAt: time.Now().UTC(),
 			})
+			return err
 		}},
 		"UpsertProfile": {mutates: true, call: func(f *FaultyStore) error {
 			return f.UpsertProfile(ctx(), model.RunnerProfile{ID: memProfileID, MaxCapacity: 2})
@@ -935,7 +936,7 @@ func missingOptionalInterfaceCases() map[string]missingIfaceCase {
 			return err
 		}},
 		"GetGeneratedFragment": {iface: "GeneratedFragmentStore", call: func(f *FaultyStore) error {
-			_, _, err := f.GetGeneratedFragment(ctx(), "", 0, "")
+			_, _, err := f.GetGeneratedFragment(ctx(), "", "")
 			return err
 		}},
 		"PutCacheManifest": {mutates: true, iface: "CacheManifestStore", call: func(f *FaultyStore) error {
@@ -970,7 +971,12 @@ func missingOptionalInterfaceCases() map[string]missingIfaceCase {
 			return f.ReleaseSecretDelivery(ctx(), "", 0, "")
 		}},
 		"CommitSecretIssuance": {mutates: true, iface: "SecretIssuanceStore", call: func(f *FaultyStore) error {
-			return f.CommitSecretIssuance(ctx(), SecretIssuance{})
+			_, _, err := f.CommitSecretIssuance(ctx(), SecretIssuance{})
+			return err
+		}},
+		"LookupSecretIssuance": {iface: "SecretIssuanceStore", call: func(f *FaultyStore) error {
+			_, _, err := f.LookupSecretIssuance(ctx(), "", 0, "")
+			return err
 		}},
 		"RevokeRunnerLeases": {mutates: true, iface: "RecoveryStore", call: func(f *FaultyStore) error {
 			_, err := f.RevokeRunnerLeases(ctx(), "", "")

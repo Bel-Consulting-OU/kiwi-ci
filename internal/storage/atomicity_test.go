@@ -523,7 +523,7 @@ func TestMemStoreInsertGeneratedFragmentTxVerifier(t *testing.T) {
 	if got, ok, _ := m.GetJobContracts(ctx(), child.ID); ok || got != nil {
 		t.Fatalf("rejected fragment leaked contracts: %v", got)
 	}
-	if _, found, _ := m.GetGeneratedFragment(ctx(), testJob.ID, 0, "frag-1"); found {
+	if _, found, _ := m.GetGeneratedFragment(ctx(), testJob.ID, "frag-1"); found {
 		t.Fatal("rejected fragment left a receipt")
 	}
 	// Acceptance inserts the fragment AND its contracts atomically.

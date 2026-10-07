@@ -189,10 +189,14 @@ type Server struct {
 	completionReceiptsCacheVer    uint64
 	completionReceiptsCacheOK     bool
 	completionReceiptsCacheExpiry time.Time
-	// generatedFragments is the in-memory generated-fragment idempotency
-	// receipt table (migration 0010's generated_fragments in DB mode). It is
-	// NOT part of the fs snapshot: a dev-mode restart re-admits a replayed
-	// fragment, which is the pre-receipt behavior.
+	// generatedFragments is the generated-fragment idempotency receipt table
+	// keyed by the canonical mutation identity (parent job + fragment id; the
+	// lease generation authorizes an upload but never defines it). In DB mode
+	// the durable generated_fragments table is authoritative; in fs mode the
+	// table rides the state snapshot, written in the SAME atomic snapshot as
+	// the child jobs it describes, so a restart restores it and a resubmitted
+	// fragment replays the SAME child IDs instead of re-admitting a duplicate
+	// graph. Guarded by s.mu.
 	generatedFragments map[string]storage.GeneratedFragmentReceipt
 	leaseKey           []byte
 	logSeq             int64
@@ -502,8 +506,10 @@ type Server struct {
 
 	// secretReceipts is the durable one-time secret delivery record keyed by
 	// (jobID, generation, secret name); persisted as secrets-receipts.json
-	// under dataDir (secret.go). Guarded by s.mu.
-	secretReceipts map[string]bool
+	// under dataDir (secret.go), carrying the runner's recipient public key
+	// and the sealed envelope so an identical retry replays the exact same
+	// delivery. Guarded by s.mu.
+	secretReceipts map[string]secretReceipt
 
 	// historyCache is the keyed, versioned per-repository test-history cache
 	// (testshards.go): one entry per repository holding the decoded snapshot
@@ -973,6 +979,10 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 	s.mu.Lock()
 	s.restoreCompletionReceiptsLocked(snap.CompletionReceipts)
 	s.restoreRunIdempotencyLocked(snap.RunIdempotency)
+	// Generated-fragment receipts are restored before any request can be
+	// served so a resubmitted fragment after a restart replays the SAME child
+	// IDs instead of re-admitting a duplicate graph.
+	s.restoreGeneratedFragmentsLocked(snap.GeneratedFragments)
 	s.mu.Unlock()
 	// The trailing-24h cost/energy budget window is rebuilt from the restored
 	// jobs: only live completions append to s.usage, so without this an fs
@@ -1182,6 +1192,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/jobs/{id}/snapshots", s.uploadSnapshot)
 	mux.HandleFunc("GET /api/v1/runs/{id}/snapshots", s.listSnapshots)
 	mux.HandleFunc("GET /api/v1/runs/{id}/snapshots/{sid}", s.downloadSnapshot)
+	mux.HandleFunc("GET /api/v1/runs/{id}/jobs/{job}/pipeline", s.exportRunJobPipeline)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/deployments", s.recordDeployment)
 	mux.HandleFunc("GET /api/v1/runs/{id}/deployments", s.listDeployments)
 	mux.HandleFunc("POST /api/v1/drain", s.drainServer)
@@ -1205,6 +1216,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/v1/runner-profiles/{id}/runner/{runnerID}", s.bindRunnerProfileRunner)
 	mux.HandleFunc("DELETE /api/v1/runner-profiles/{id}/runner/{runnerID}", s.unbindRunnerProfileRunner)
 	mux.HandleFunc("GET /api/v1/audit", s.listAudit)
+	// Canonical ordered execution event stream (admin tier, same gate as
+	// audit). The list endpoint is the cursor-pull contract (after/limit/
+	// run_id); the stream endpoint is the SSE wrapper over the same cursor.
+	mux.HandleFunc("GET /api/v1/events", s.listEvents)
+	mux.HandleFunc("GET /api/v1/events/stream", s.streamExecutionEvents)
 	// The auth middleware runs inside statusLogger/recoverer and outside
 	// s.auth so authenticated principals are available to handlers; s.auth
 	// keeps the legacy bearer checks and classifies routes. The rate
@@ -2076,7 +2092,7 @@ func (s *Server) enqueueID(ctx context.Context, in SubmitRun, preRunID string) (
 		for id, old := range s.runs {
 			if old.ID != runID && old.ConcurrencyGroup == group && !old.Status.Terminal() && newRepoID != "" && storage.RepoIDForRun(old) == newRepoID {
 				reason := "superseded by run " + runID
-				s.cancelRunLocked(id, reason)
+				s.cancelRunLocked(id, reason, "scheduler")
 				// The scheduler path keeps the historical best-effort audit:
 				// the supersession transition is not an admin mutation, and
 				// the enclosing enqueue's own audit row covers the change.
@@ -2115,6 +2131,12 @@ func (s *Server) enqueueID(ctx context.Context, in SubmitRun, preRunID string) (
 		s.downstreamLinks[in.DownstreamLaunch.LinkKey] = link
 	}
 	s.auditLocked("run.queued", "scheduler", runID, "", "run queued", map[string]string{"event": in.Event})
+	// Execution event parity with the PostgreSQL INSERT triggers: the run and
+	// every job enter the stream at enqueue with from_status empty.
+	s.appendRunEventLocked(runID, "", model.StatusQueued)
+	for _, j := range created {
+		s.appendJobEventLocked(j, "", model.StatusQueued, "scheduler", map[string]string{"job": j.Key})
+	}
 	s.scheduleStateLocked()
 	if err := ctx.Err(); err != nil {
 		// Canceled before the snapshot write: roll the in-memory mutation
@@ -2999,6 +3021,7 @@ func (s *Server) revokeRunnerLeasesLocked(runnerID, reason string, now time.Time
 			action = "job.runner_disabled_requeued"
 		}
 		s.auditLocked(action, "admin", j.RunID, j.ID, reason, map[string]string{"job": j.Key, "runner": runnerID})
+		s.appendJobEventLocked(j, model.StatusRunning, j.Status, "admin", map[string]string{"job": j.Key, "runner": runnerID})
 		revoked = append(revoked, id)
 	}
 	return revoked
@@ -3535,6 +3558,7 @@ func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
 		j.LeaseTokenHash = nil
 		j.LeaseExpiresAt = nil
 		s.jobs[jobID] = j
+		s.appendJobEventLocked(j, model.StatusRunning, model.StatusCancelled, "admin", map[string]string{"job": j.Key, "reason": "runner disabled"})
 	}
 	ri.ActiveJobs = nil
 	ri.Busy = false
@@ -4132,6 +4156,10 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	// The lease is durable: only now record the evidence and the latency
 	// observation, so neither can claim a lease the disk never saw.
 	s.auditLocked("job.leased", ri.Name, j.RunID, j.ID, "job leased", map[string]string{"job": j.Key, "generation": strconv.FormatInt(j.LeaseGeneration, 10)})
+	// The execution event is emitted only after the durable snapshot, so a
+	// failed lease leaves no event claiming a lease the disk never saw
+	// (mirroring the audit's ordering at this site).
+	s.appendJobEventLocked(j, model.StatusQueued, model.StatusRunning, ri.Name, map[string]string{"job": j.Key, "runner": id})
 	s.metricObserve("kiwi_queue_latency_seconds", now.Sub(j.CreatedAt).Seconds(), nil)
 	// The raw token travels on the wire once; the hash is not needed by the
 	// runner and is stripped from the task job.
@@ -4720,6 +4748,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	j = cur
+	completionFrom := j.Status
 	if !j.Status.Terminal() {
 		st := in.Status
 		if st != model.StatusSuccess && st != model.StatusFailure && st != model.StatusCancelled && st != model.StatusSkipped {
@@ -4823,6 +4852,18 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.auditLocked("job.completed", in.RunnerID, runID, j.ID, string(j.Status), map[string]string{"job": j.Key})
+	// Execution event next to the completion evidence: the transition from
+	// the pre-completion status to the terminal one, with the attempt and the
+	// run timings, emitted only after the durable snapshot (like the audit
+	// above, a failed persist leaves no event). A replay that found the job
+	// already terminal has from == to and appends nothing.
+	if completionFrom != j.Status {
+		payload := map[string]string{"job": j.Key, "runner": in.RunnerID}
+		for k, v := range storage.ExecutionEventTimingPayload(j.StartedAt, j.FinishedAt) {
+			payload[k] = v
+		}
+		s.appendJobEventLocked(j, completionFrom, j.Status, in.RunnerID, payload)
+	}
 	if j.StartedAt != nil && j.FinishedAt != nil {
 		s.metricObserve("kiwi_job_duration_seconds", j.FinishedAt.Sub(*j.StartedAt).Seconds(), nil)
 	}
@@ -5178,22 +5219,29 @@ type stateRollback struct {
 	// the revocation into the same snapshot write as the runner flag, so a
 	// rolled-back disable must restore the CRL too.
 	crl map[string]string
+	// generatedFragments is the generated-fragment idempotency receipt table.
+	// The fs-mode fragment admission commits the receipt into the same
+	// snapshot write as its child jobs, so a rolled-back admission must
+	// restore the receipt table too (never leaving a receipt whose children
+	// were rolled back, or children whose receipt was).
+	generatedFragments map[string]storage.GeneratedFragmentReceipt
 }
 
 // captureStateRollbackLocked snapshots every map the fs-mode authoritative
 // handlers in this file mutate. The caller holds s.mu.
 func (s *Server) captureStateRollbackLocked() stateRollback {
 	rb := stateRollback{
-		runs:            make(map[string]model.Run, len(s.runs)),
-		jobs:            make(map[string]model.Job, len(s.jobs)),
-		runners:         make(map[string]model.Runner, len(s.runners)),
-		contracts:       make(map[string]map[string]storage.ArtifactContract, len(s.contracts)),
-		deliveries:      make(map[string]string, len(s.deliveries)),
-		idempotency:     make(map[string]storage.IdempotencyReceipt, len(s.idempotency)),
-		downstreamLinks: make(map[string]storage.DownstreamLink, len(s.downstreamLinks)),
-		occurrences:     make(map[string]map[int64]string, len(s.occurrences)),
-		deployments:     make(map[string]model.Deployment, len(s.deployments)),
-		crl:             make(map[string]string, len(s.crl)),
+		runs:               make(map[string]model.Run, len(s.runs)),
+		jobs:               make(map[string]model.Job, len(s.jobs)),
+		runners:            make(map[string]model.Runner, len(s.runners)),
+		contracts:          make(map[string]map[string]storage.ArtifactContract, len(s.contracts)),
+		deliveries:         make(map[string]string, len(s.deliveries)),
+		idempotency:        make(map[string]storage.IdempotencyReceipt, len(s.idempotency)),
+		downstreamLinks:    make(map[string]storage.DownstreamLink, len(s.downstreamLinks)),
+		occurrences:        make(map[string]map[int64]string, len(s.occurrences)),
+		deployments:        make(map[string]model.Deployment, len(s.deployments)),
+		crl:                make(map[string]string, len(s.crl)),
+		generatedFragments: make(map[string]storage.GeneratedFragmentReceipt, len(s.generatedFragments)),
 	}
 	for id, v := range s.runs {
 		rb.runs[id] = v
@@ -5233,6 +5281,9 @@ func (s *Server) captureStateRollbackLocked() stateRollback {
 	}
 	for serial, id := range s.crl {
 		rb.crl[serial] = id
+	}
+	for key, rec := range s.generatedFragments {
+		rb.generatedFragments[key] = rec
 	}
 	return rb
 }
@@ -5289,6 +5340,7 @@ func (s *Server) rollbackStateLocked(rb stateRollback) {
 	restoreMap(s.occurrences, rb.occurrences)
 	restoreMap(s.deployments, rb.deployments)
 	restoreMap(s.crl, rb.crl)
+	restoreMap(s.generatedFragments, rb.generatedFragments)
 }
 
 // completionReplayReadyLocked recognizes an idempotent completion replay from
@@ -5466,6 +5518,17 @@ func (s *Server) approveJob(w http.ResponseWriter, r *http.Request) {
 	if aerr := s.auditFirstLocked(r.Context(), "job.approved", actor, j.RunID, j.ID, "environment approved", map[string]string{"environment": j.Environment}); aerr != nil {
 		http.Error(w, "audit unavailable", http.StatusServiceUnavailable)
 		return
+	}
+	// The approval's status transition is evidence-first too: an unwritable
+	// event journal refuses the approval (503) exactly like the audit above,
+	// so a durable waiting_approval -> queued move can never be missing from
+	// the stream. A non-waiting approval changes no status and appends
+	// nothing.
+	if j.Status == model.StatusWaitingApproval {
+		if eerr := s.appendExecutionEventErrLocked(r.Context(), jobExecutionEvent(j, model.StatusWaitingApproval, model.StatusQueued, actor, nil)); eerr != nil {
+			http.Error(w, "event stream unavailable", http.StatusServiceUnavailable)
+			return
+		}
 	}
 	rb := s.captureStateRollbackLocked()
 	j.ApprovedBy = actor
@@ -5782,7 +5845,7 @@ func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rb := s.captureStateRollbackLocked()
-	s.cancelRunLocked(id, reason)
+	s.cancelRunLocked(id, reason, actor)
 	run = s.runs[id]
 	if perr := s.persistCheckedErrLocked("job.cancel"); perr != nil {
 		// A pre-rename failure means the cancellation was definitely not
@@ -5854,7 +5917,12 @@ func (s *Server) cancelRunDB(w http.ResponseWriter, r *http.Request, id, actor s
 // It does NOT audit: the admin cancel path audits first (auditFirstLocked)
 // and the scheduler supersession path audits at its call site, so this helper
 // performs exactly the state mutation the caller can capture for rollback.
-func (s *Server) cancelRunLocked(runID, reason string) {
+// It DOES append the execution stream's cancel events (best-effort, next to
+// the caller's audit semantics) because this is the single funnel every
+// in-memory cancellation passes through, so no cancellation can be missing
+// from the stream. actor names who drove the cancellation ("scheduler" for
+// supersession, the authenticated principal for the admin path).
+func (s *Server) cancelRunLocked(runID, reason, actor string) {
 	now := time.Now().UTC()
 	for id, j := range s.jobs {
 		if j.RunID != runID || j.Status.Terminal() {
@@ -5862,6 +5930,7 @@ func (s *Server) cancelRunLocked(runID, reason string) {
 		}
 		wasRunning := j.Status == model.StatusRunning
 		runnerID := j.LeaseRunnerID
+		prev := j.Status
 		j.Status = model.StatusCancelled
 		j.Error = reason
 		j.FinishedAt = &now
@@ -5871,6 +5940,7 @@ func (s *Server) cancelRunLocked(runID, reason string) {
 		j.LeaseTokenHash = nil
 		j.LeaseExpiresAt = nil
 		s.jobs[id] = j
+		s.appendJobEventLocked(j, prev, j.Status, actor, map[string]string{"job": j.Key, "reason": reason})
 		// A cancelled RUNNING job releases its runner slot in the same
 		// critical section: the runner becomes immediately schedulable
 		// again instead of leaking the slot until the lease expires.
@@ -5880,9 +5950,11 @@ func (s *Server) cancelRunLocked(runID, reason string) {
 	}
 	run, ok := s.runs[runID]
 	if ok && !run.Status.Terminal() {
+		prev := run.Status
 		run.Status = model.StatusCancelled
 		run.FinishedAt = &now
 		s.runs[runID] = run
+		s.appendRunEventLocked(runID, prev, run.Status)
 	}
 	// A cancelled run may be a wait=true downstream child of another run:
 	// re-aggregate the parents.
@@ -5910,36 +5982,44 @@ func (s *Server) scheduleStateLocked() {
 			j.DependencyStatus = depStatus
 			if depStatus != model.StatusSuccess && !scheduler.ConditionAllows(j.Condition, depStatus) {
 				now := time.Now().UTC()
+				prev := j.Status
 				j.Status = model.StatusBlocked
 				j.Error = "dependency failed"
 				j.FinishedAt = &now
 				s.jobs[id] = j
+				s.appendJobEventLocked(j, prev, j.Status, "scheduler", nil)
 				changed = true
 				continue
 			}
 			s.jobs[id] = j
 			if len(j.EnvironmentBranches) > 0 && !environmentBranchAllowed(s.runs[j.RunID].Ref, j.EnvironmentBranches) {
 				now := time.Now().UTC()
+				prev := j.Status
 				j.Status = model.StatusBlocked
 				j.Error = "ref is not allowed to deploy to environment " + j.Environment
 				j.FinishedAt = &now
 				s.jobs[id] = j
+				s.appendJobEventLocked(j, prev, j.Status, "scheduler", nil)
 				changed = true
 				continue
 			}
 			if j.ApprovalRequired && j.ApprovedBy == "" {
 				if j.Status != model.StatusWaitingApproval {
+					prev := j.Status
 					j.Status = model.StatusWaitingApproval
 					if j.WaitingSince == nil {
 						w := time.Now().UTC()
 						j.WaitingSince = &w
 					}
 					s.jobs[id] = j
+					s.appendJobEventLocked(j, prev, j.Status, "scheduler", nil)
 					changed = true
 				}
 			} else if j.Status == model.StatusWaitingApproval {
+				prev := j.Status
 				j.Status = model.StatusQueued
 				s.jobs[id] = j
+				s.appendJobEventLocked(j, prev, j.Status, "scheduler", nil)
 				changed = true
 			}
 		}
@@ -6015,6 +6095,10 @@ func (s *Server) refreshRunLocked(runID string) {
 	if run.Status == model.StatusCancelled {
 		return
 	}
+	// The pre-aggregation status is the event's from_status. It is captured
+	// before the switch so the stream records the run's own transition and
+	// not just its final value.
+	runEventFrom := run.Status
 	switch {
 	case terminal == total:
 		if anyFailure {
@@ -6043,6 +6127,7 @@ func (s *Server) refreshRunLocked(runID string) {
 	// open until the children finish and inherits their failures.
 	s.applyDownstreamChildrenLocked(runID, &run)
 	s.runs[runID] = run
+	s.appendRunEventLocked(runID, runEventFrom, run.Status)
 }
 
 func (s *Server) recoverLeasesLocked(now time.Time, startup bool) (expirations, lost, timedOut int) {
@@ -6062,6 +6147,7 @@ func (s *Server) recoverLeasesLocked(now time.Time, startup bool) (expirations, 
 				continue
 			}
 			fin := now
+			prev := j.Status
 			j.Status = model.StatusCancelled
 			j.Error = "queue timeout"
 			j.FinishedAt = &fin
@@ -6070,6 +6156,7 @@ func (s *Server) recoverLeasesLocked(now time.Time, startup bool) (expirations, 
 			j.LeaseExpiresAt = nil
 			s.jobs[id] = j
 			s.auditLocked("job.queue_timeout", "scheduler", j.RunID, j.ID, "job cancelled after queue deadline", map[string]string{"job": j.Key})
+			s.appendJobEventLocked(j, prev, j.Status, "scheduler", map[string]string{"job": j.Key, "reason": "queue_timeout"})
 			timedOut++
 			continue
 		}
@@ -6089,6 +6176,7 @@ func (s *Server) recoverLeasesLocked(now time.Time, startup bool) (expirations, 
 			j.LeaseTokenHash = nil
 			j.LeaseExpiresAt = nil
 			s.auditLocked("job.lease_expired", "scheduler", j.RunID, j.ID, "job requeued after lost runner", map[string]string{"job": j.Key})
+			s.appendJobEventLocked(j, model.StatusRunning, j.Status, "scheduler", map[string]string{"job": j.Key, "runner": runnerID})
 		} else {
 			lost++
 			j.Status = model.StatusFailure
@@ -6098,6 +6186,7 @@ func (s *Server) recoverLeasesLocked(now time.Time, startup bool) (expirations, 
 			j.LeaseTokenHash = nil
 			j.LeaseExpiresAt = nil
 			s.auditLocked("job.lost_runner", "scheduler", j.RunID, j.ID, j.Error, map[string]string{"job": j.Key})
+			s.appendJobEventLocked(j, model.StatusRunning, j.Status, "scheduler", map[string]string{"job": j.Key, "runner": runnerID})
 		}
 		s.jobs[id] = j
 		s.releaseRunnerLocked(runnerID, j.ID, model.StatusFailure)
@@ -6238,7 +6327,7 @@ func (s *Server) persistLocked() error {
 		s.notePersistResult(s.persistFailForTest)
 		return s.persistFailForTest
 	}
-	err := s.store.Save(storage.Snapshot{Version: 1, Runs: s.runs, Jobs: s.jobs, Runners: s.runners, Artifacts: s.artifacts, Reports: s.reports, DownstreamLinks: s.downstreamLinks, Profiles: s.profiles, CertProfileLinks: s.certProfiles, RunnerProfileLinks: s.runnerProfiles, Snapshots: s.snapshots, CompletionReceipts: s.completionReceiptRecordsLocked(), Deployments: s.deployments, CRL: s.crl, PendingSidecars: s.pendingSidecarSnapshotLocked(), RunIdempotency: s.idempotency})
+	err := s.store.Save(storage.Snapshot{Version: 1, Runs: s.runs, Jobs: s.jobs, Runners: s.runners, Artifacts: s.artifacts, Reports: s.reports, DownstreamLinks: s.downstreamLinks, Profiles: s.profiles, CertProfileLinks: s.certProfiles, RunnerProfileLinks: s.runnerProfiles, Snapshots: s.snapshots, CompletionReceipts: s.completionReceiptRecordsLocked(), Deployments: s.deployments, CRL: s.crl, PendingSidecars: s.pendingSidecarSnapshotLocked(), RunIdempotency: s.idempotency, GeneratedFragments: s.generatedFragments})
 	s.noteSnapshotPersistResult(err)
 	return err
 }

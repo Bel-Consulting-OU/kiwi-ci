@@ -352,14 +352,14 @@ func (f *fcStore) PendingSidecar(ctx context.Context, jobID string, generation i
 	return f.dbFakeStore.PendingSidecar(ctx, jobID, generation, artifactName, kind)
 }
 
-func (f *fcStore) GetGeneratedFragment(ctx context.Context, parentJobID string, generation int64, fragmentID string) (storage.GeneratedFragmentReceipt, bool, error) {
+func (f *fcStore) GetGeneratedFragment(ctx context.Context, parentJobID, fragmentID string) (storage.GeneratedFragmentReceipt, bool, error) {
 	if f.fragmentGetErr != nil {
 		return storage.GeneratedFragmentReceipt{}, false, f.fragmentGetErr
 	}
 	if f.fragmentGetMiss {
 		return storage.GeneratedFragmentReceipt{}, false, nil
 	}
-	return f.dbFakeStore.GetGeneratedFragment(ctx, parentJobID, generation, fragmentID)
+	return f.dbFakeStore.GetGeneratedFragment(ctx, parentJobID, fragmentID)
 }
 
 func (f *fcStore) ListSnapshotsByRun(ctx context.Context, runID string) ([]model.SnapshotRecord, error) {

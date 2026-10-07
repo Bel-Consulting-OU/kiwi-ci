@@ -25,6 +25,7 @@ func provKey(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {
 func extendedStatement() Statement {
 	start := time.Unix(100, 0).UTC()
 	end := time.Unix(200, 0).UTC()
+	published := time.Unix(150, 0).UTC()
 	return Statement{
 		Type: StatementType,
 		Subject: []Subject{{
@@ -41,7 +42,7 @@ func extendedStatement() Statement {
 			},
 			RunDetails: RunDetails{
 				Builder:  Builder{ID: "https://kiwi-ci.dev/runner/runner-7"},
-				Metadata: Metadata{InvocationID: "run1/job1"},
+				Metadata: Metadata{InvocationID: "run1/job1:9", FinishedOn: &end},
 			},
 		},
 		ResolvedPipelineSHA256: strings.Repeat("a", 64),
@@ -49,6 +50,8 @@ func extendedStatement() Statement {
 		Builder:                "kiwi-ci@0.1.0",
 		CompilerVersion:        "go1.23",
 		RunnerIdentity:         "runner-7",
+		AttemptID:              "job1:9",
+		CapsuleDigest:          strings.Repeat("0", 64),
 		Runtime:                "container",
 		ImageDigest:            "sha256:" + strings.Repeat("d", 64),
 		Issuer:                 "https://issuer.example",
@@ -57,6 +60,7 @@ func extendedStatement() Statement {
 		StartTime:              &start,
 		EndTime:                &end,
 		ArtifactSize:           999,
+		ArtifactPublishedAt:    &published,
 	}
 }
 
@@ -96,6 +100,15 @@ func TestExtendedFieldsRoundTrip(t *testing.T) {
 	}
 	if got.StartTime == nil || !got.StartTime.Equal(*st.StartTime) || got.EndTime == nil || !got.EndTime.Equal(*st.EndTime) {
 		t.Fatalf("timestamps lost: %+v", got)
+	}
+	if got.AttemptID != st.AttemptID || got.CapsuleDigest != st.CapsuleDigest {
+		t.Fatalf("attempt/capsule identity lost: %+v", got)
+	}
+	if got.ArtifactPublishedAt == nil || !got.ArtifactPublishedAt.Equal(*st.ArtifactPublishedAt) {
+		t.Fatalf("artifactPublishedAt lost: %+v", got.ArtifactPublishedAt)
+	}
+	if got.Predicate.RunDetails.Metadata.FinishedOn == nil || !got.Predicate.RunDetails.Metadata.FinishedOn.Equal(*st.Predicate.RunDetails.Metadata.FinishedOn) {
+		t.Fatalf("finishedOn lost: %+v", got.Predicate.RunDetails.Metadata.FinishedOn)
 	}
 }
 

@@ -595,7 +595,7 @@ func TestPostgresIntegrationCommitSecretIssuanceSchemaFenceBarrier(t *testing.T)
 	ctx := context.Background()
 	jobID := pgITNewID(t)
 	pgITSchemaFenceBarrier(t, st, func(ctx context.Context) error {
-		return st.CommitSecretIssuance(ctx, SecretIssuance{
+		_, _, err := st.CommitSecretIssuance(ctx, SecretIssuance{
 			JobID:           jobID,
 			RunnerID:        pgITNewID(t),
 			LeaseGeneration: 1,
@@ -603,6 +603,7 @@ func TestPostgresIntegrationCommitSecretIssuanceSchemaFenceBarrier(t *testing.T)
 			SecretName:      "DEPLOY_TOKEN",
 			IssuedAt:        time.Now().UTC(),
 		})
+		return err
 	})
 	var n int
 	if err := st.pool.QueryRow(ctx, `SELECT count(*) FROM secret_claims WHERE job_id=$1`, jobID).Scan(&n); err != nil {

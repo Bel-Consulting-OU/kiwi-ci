@@ -76,7 +76,13 @@ func TestIDCovLoadSecretReceiptsPaths(t *testing.T) {
 	if err := s3.loadSecretReceipts(good); err != nil {
 		t.Fatal(err)
 	}
-	if len(s3.secretReceipts) != 2 || !s3.secretReceipts["a|1|tok"] || !s3.secretReceipts["b|2|tok"] {
+	if len(s3.secretReceipts) != 2 {
+		t.Fatalf("loaded receipts = %v", s3.secretReceipts)
+	}
+	if _, a := s3.secretReceipts["a|1|tok"]; !a {
+		t.Fatalf("loaded receipts = %v", s3.secretReceipts)
+	}
+	if _, b := s3.secretReceipts["b|2|tok"]; !b {
 		t.Fatalf("loaded receipts = %v", s3.secretReceipts)
 	}
 }
@@ -328,11 +334,11 @@ func TestIDCovMarkAndReleaseReceiptHelpers(t *testing.T) {
 	blocker := filepath.Join(t.TempDir(), "blocker")
 	writeTestFile(t, blocker, []byte("x"))
 	s.dataDir = blocker
-	s.secretReceipts = map[string]bool{}
+	s.secretReceipts = map[string]secretReceipt{}
 	if ok, err := s.markSecretDelivered("k2"); ok || err == nil {
 		t.Fatalf("failing mark = %v, %v", ok, err)
 	}
-	if s.secretReceipts["k2"] {
+	if _, exists := s.secretReceipts["k2"]; exists {
 		t.Fatal("failed mark left the receipt behind")
 	}
 	// releaseSecretReceipt surfaces the persistence failure too.

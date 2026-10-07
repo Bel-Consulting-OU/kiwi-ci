@@ -106,8 +106,8 @@ func TestPostgresIntegrationValidationSweep(t *testing.T) {
 	bad("ReleaseRunnerJob/bad-runner", st.ReleaseRunnerJob(ctx, "bad", jobID, model.StatusSuccess), true)
 	bad("ReleaseRunnerJob/bad-job", st.ReleaseRunnerJob(ctx, good, "bad", model.StatusSuccess), true)
 	bad("InsertGeneratedJobs/bad-parent", st.InsertGeneratedJobs(ctx, "bad", 1, nil, nil), true)
-	bad("GetGeneratedFragment/bad-parent", func() error { _, _, err := st.GetGeneratedFragment(ctx, "bad", 1, "f"); return err }(), true)
-	bad("GetGeneratedFragment/empty-fragment", func() error { _, _, err := st.GetGeneratedFragment(ctx, jobID, 1, ""); return err }(), true)
+	bad("GetGeneratedFragment/bad-parent", func() error { _, _, err := st.GetGeneratedFragment(ctx, "bad", "f"); return err }(), true)
+	bad("GetGeneratedFragment/empty-fragment", func() error { _, _, err := st.GetGeneratedFragment(ctx, jobID, ""); return err }(), true)
 	bad("InsertGeneratedFragmentTx/bad-parent", func() error {
 		_, _, err := st.InsertGeneratedFragmentTx(ctx, GeneratedFragmentRequest{ParentJobID: "bad", FragmentID: "f"}, nil)
 		return err

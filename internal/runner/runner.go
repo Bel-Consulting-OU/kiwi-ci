@@ -2855,9 +2855,11 @@ type generatedFragment = v1.GeneratedFragment
 // no-follow) and POSTs it to /api/v1/jobs/{id}/generated under the active
 // lease. The body carries the deterministic fragment_id derived from the
 // parsed {jobs, deps} pair: the control plane recomputes it and rejects a
-// mismatch (400), and a replayed upload with the same (job, lease
-// generation, fragment_id) is answered idempotently with the originally
-// created child IDs, so a lost response never duplicates children. A non-2xx
+// mismatch (400), and a replayed upload of the same (parent job, fragment_id)
+// is answered idempotently with the originally created child IDs even across
+// infrastructure retries that mint a new lease generation, so neither a lost
+// response nor a requeued parent duplicates children. The active generation
+// still authorizes the upload. A non-2xx
 // response is returned as an error; the executor fails the job unless the
 // job declared generate.optional=true.
 func (r *Runner) uploadGeneratedFragmentData(ctx context.Context, t server.Task, path string, data []byte) error {

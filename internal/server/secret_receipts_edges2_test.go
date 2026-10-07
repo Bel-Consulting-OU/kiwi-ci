@@ -3,16 +3,21 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
-// TestCompactedReceiptKeysArrayAndJournal covers both on-disk forms
-// compactedReceiptKeysLocked understands: the legacy JSON array (with
+// TestCompactedReceiptRecordsArrayAndJournal covers both on-disk forms
+// compactedReceiptRecordsLocked understands: the legacy JSON array (with
 // duplicates and blanks) and the append-only journal (adds, deletes and
-// duplicate re-adds preserve most-recent order).
-func TestCompactedReceiptKeysArrayAndJournal(t *testing.T) {
+// duplicate re-adds preserve most-recent order, coalesced to the latest state
+// per key).
+func TestCompactedReceiptRecordsArrayAndJournal(t *testing.T) {
 	s := &Server{}
 	dir := t.TempDir()
 
@@ -20,12 +25,12 @@ func TestCompactedReceiptKeysArrayAndJournal(t *testing.T) {
 	if err := os.WriteFile(arrayPath, []byte(`["a","b","","a","c"]`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	got, err := s.compactedReceiptKeysLocked(arrayPath)
+	got, err := s.compactedReceiptRecordsLocked(arrayPath)
 	if err != nil {
 		t.Fatalf("array compact: %v", err)
 	}
-	if len(got) != 3 || got[0] != "a" || got[1] != "b" || got[2] != "c" {
-		t.Fatalf("array compact = %v, want [a b c]", got)
+	if keys := recordKeys(got); len(keys) != 3 || keys[0] != "a" || keys[1] != "b" || keys[2] != "c" {
+		t.Fatalf("array compact = %v, want [a b c]", keys)
 	}
 
 	journalPath := filepath.Join(dir, "journal.jsonl")
@@ -46,18 +51,127 @@ func TestCompactedReceiptKeysArrayAndJournal(t *testing.T) {
 	if err := os.WriteFile(journalPath, buf.Bytes(), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	got, err = s.compactedReceiptKeysLocked(journalPath)
+	got, err = s.compactedReceiptRecordsLocked(journalPath)
 	if err != nil {
 		t.Fatalf("journal compact: %v", err)
 	}
-	if len(got) != 3 || got[0] != "b" || got[1] != "c" || got[2] != "a" {
-		t.Fatalf("journal compact = %v, want [b c a]", got)
+	if keys := recordKeys(got); len(keys) != 3 || keys[0] != "b" || keys[1] != "c" || keys[2] != "a" {
+		t.Fatalf("journal compact = %v, want [b c a]", keys)
 	}
 }
 
-// TestCompactedReceiptKeysErrors covers the corrupt-journal and non-ENOENT
+// recordKeys extracts the ordered keys of compacted records for assertions.
+func recordKeys(records []secretReceiptRecord) []string {
+	keys := make([]string, 0, len(records))
+	for _, rec := range records {
+		keys = append(keys, rec.Key)
+	}
+	return keys
+}
+
+// TestCompactedReceiptsLifecycleRetention pins the finding-6 rule: a receipt
+// whose job is still live (same generation, non-terminal, unexpired lease) is
+// never evicted to satisfy the cap, while terminal/absent keys are trimmed
+// oldest first. Once the job turns terminal the live receipt becomes
+// evictable.
+func TestCompactedReceiptsLifecycleRetention(t *testing.T) {
+	s := &Server{}
+	dir := t.TempDir()
+	exp := time.Now().UTC().Add(time.Hour)
+	s.jobs = map[string]model.Job{
+		"live-job": {ID: "live-job", Status: model.StatusRunning, LeaseGeneration: 3, LeaseExpiresAt: &exp},
+	}
+	liveKey := secretReceiptKey("live-job", 3, "tok")
+
+	// One live receipt plus more evictable receipts than the cap allows.
+	records := []secretReceiptRecord{{Key: liveKey, RecipientPublic: []byte("pub"), Ciphertext: []byte("ct")}}
+	for i := 0; i < secretReceiptsMaxEntries; i++ {
+		records = append(records, secretReceiptRecord{Key: fmt.Sprintf("dead-job|1|s%06d", i)})
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	for _, rec := range records {
+		if err := enc.Encode(rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := filepath.Join(dir, "lifecycle.jsonl")
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.compactedReceiptRecordsLocked(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) > secretReceiptsMaxEntries {
+		t.Fatalf("compacted records = %d, want <= %d", len(got), secretReceiptsMaxEntries)
+	}
+	kept := map[string]bool{}
+	for _, rec := range got {
+		kept[rec.Key] = true
+	}
+	if !kept[liveKey] {
+		t.Fatal("live receipt was evicted to satisfy the cap")
+	}
+	if kept[records[1].Key] {
+		t.Fatal("oldest evictable receipt survived the bounded window")
+	}
+	if !kept[records[len(records)-1].Key] {
+		t.Fatal("newest evictable receipt was dropped")
+	}
+
+	// Generation advance makes the previously live receipt evictable.
+	s.jobs["live-job"] = model.Job{ID: "live-job", Status: model.StatusRunning, LeaseGeneration: 4, LeaseExpiresAt: &exp}
+	got, err = s.compactedReceiptRecordsLocked(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rec := range got {
+		if rec.Key == liveKey {
+			t.Fatal("receipt of a superseded generation was retained")
+		}
+	}
+
+	// Terminal status makes it evictable too.
+	s.jobs["live-job"] = model.Job{ID: "live-job", Status: model.StatusSuccess, LeaseGeneration: 3, LeaseExpiresAt: &exp}
+	got, err = s.compactedReceiptRecordsLocked(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rec := range got {
+		if rec.Key == liveKey {
+			t.Fatal("receipt of a terminal job was retained")
+		}
+	}
+
+	// A live set larger than the cap is retained in full (documented
+	// overshoot): live claims must never be evicted.
+	s.jobs = map[string]model.Job{}
+	liveTotal := secretReceiptsMaxEntries + 10
+	var liveBuf bytes.Buffer
+	liveEnc := json.NewEncoder(&liveBuf)
+	for i := 0; i < liveTotal; i++ {
+		jobID := fmt.Sprintf("live-%06d", i)
+		s.jobs[jobID] = model.Job{ID: jobID, Status: model.StatusRunning, LeaseGeneration: 1, LeaseExpiresAt: &exp}
+		if err := liveEnc.Encode(secretReceiptRecord{Key: secretReceiptKey(jobID, 1, "tok")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(path, liveBuf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.compactedReceiptRecordsLocked(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != liveTotal {
+		t.Fatalf("live set compaction = %d records, want the full %d (overshoot allowed)", len(got), liveTotal)
+	}
+}
+
+// TestCompactedReceiptRecordsErrors covers the corrupt-journal and non-ENOENT
 // read-error arms.
-func TestCompactedReceiptKeysErrors(t *testing.T) {
+func TestCompactedReceiptRecordsErrors(t *testing.T) {
 	s := &Server{}
 	dir := t.TempDir()
 
@@ -65,7 +179,7 @@ func TestCompactedReceiptKeysErrors(t *testing.T) {
 	if err := os.WriteFile(corrupt, []byte("{not json}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.compactedReceiptKeysLocked(corrupt); err == nil {
+	if _, err := s.compactedReceiptRecordsLocked(corrupt); err == nil {
 		t.Fatal("corrupt journal compact succeeded")
 	}
 
@@ -74,7 +188,7 @@ func TestCompactedReceiptKeysErrors(t *testing.T) {
 	if err := os.WriteFile(badArray, []byte("[not-an-array"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.compactedReceiptKeysLocked(badArray); err == nil {
+	if _, err := s.compactedReceiptRecordsLocked(badArray); err == nil {
 		t.Fatal("corrupt legacy array compact succeeded")
 	}
 
@@ -83,17 +197,17 @@ func TestCompactedReceiptKeysErrors(t *testing.T) {
 	if err := os.Mkdir(dirPath, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.compactedReceiptKeysLocked(dirPath); err == nil {
+	if _, err := s.compactedReceiptRecordsLocked(dirPath); err == nil {
 		t.Fatal("read error was not surfaced")
 	}
 }
 
-// TestCompactedReceiptKeysNoFileUsesMemory covers the in-memory fallback when
-// the journal does not exist.
-func TestCompactedReceiptKeysNoFileUsesMemory(t *testing.T) {
-	s := &Server{secretReceipts: map[string]bool{"in-memory": true}}
-	got, err := s.compactedReceiptKeysLocked(filepath.Join(t.TempDir(), "missing.jsonl"))
-	if err != nil || len(got) != 1 || got[0] != "in-memory" {
+// TestCompactedReceiptRecordsNoFileUsesMemory covers the in-memory fallback
+// when the journal does not exist.
+func TestCompactedReceiptRecordsNoFileUsesMemory(t *testing.T) {
+	s := &Server{secretReceipts: map[string]secretReceipt{"in-memory": {}}}
+	got, err := s.compactedReceiptRecordsLocked(filepath.Join(t.TempDir(), "missing.jsonl"))
+	if err != nil || len(got) != 1 || got[0].Key != "in-memory" {
 		t.Fatalf("in-memory compact = %v, %v", got, err)
 	}
 }
@@ -135,7 +249,10 @@ func TestLoadSecretReceiptsEdges(t *testing.T) {
 	if err := journal.loadSecretReceipts(dir); err != nil {
 		t.Fatalf("journal replay: %v", err)
 	}
-	if journal.secretReceipts["x"] || !journal.secretReceipts["y"] {
+	if _, x := journal.secretReceipts["x"]; x {
+		t.Fatalf("journal replay set = %v, want only y", journal.secretReceipts)
+	}
+	if _, y := journal.secretReceipts["y"]; !y {
 		t.Fatalf("journal replay set = %v, want only y", journal.secretReceipts)
 	}
 

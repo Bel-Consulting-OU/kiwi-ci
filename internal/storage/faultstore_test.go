@@ -35,7 +35,7 @@ type memSnapshot struct {
 	downstream      map[string]DownstreamLink
 	quotas          map[string]quotaCounts
 	cacheMans       map[string]CacheManifestRecord
-	claims          map[string]time.Time
+	claims          map[string]memSecretClaim
 	outboxClaims    map[string]outboxClaim
 	fragments       map[string]GeneratedFragmentReceipt
 	pendingSidecars map[string]pendingSidecar
@@ -104,8 +104,8 @@ func cloneFragments(in map[string]GeneratedFragmentReceipt) map[string]Generated
 	return out
 }
 
-func cloneClaims(in map[string]time.Time) map[string]time.Time {
-	out := make(map[string]time.Time, len(in))
+func cloneClaims(in map[string]memSecretClaim) map[string]memSecretClaim {
+	out := make(map[string]memSecretClaim, len(in))
 	for k, v := range in {
 		out[k] = v
 	}

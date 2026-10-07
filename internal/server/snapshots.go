@@ -338,16 +338,18 @@ func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rec := model.SnapshotRecord{
-		ID:         id,
-		RunID:      j.RunID,
-		JobID:      j.ID,
-		JobKey:     j.Key,
-		Path:       dst,
-		Size:       n,
-		SHA256:     hex.EncodeToString(h.Sum(nil)),
-		Version:    m.Version,
-		RootSHA256: m.RootSHA256,
-		CreatedAt:  time.Now().UTC(),
+		ID:              id,
+		RunID:           j.RunID,
+		JobID:           j.ID,
+		JobKey:          j.Key,
+		Path:            dst,
+		Size:            n,
+		SHA256:          hex.EncodeToString(h.Sum(nil)),
+		Version:         m.Version,
+		RootSHA256:      m.RootSHA256,
+		CreatedAt:       time.Now().UTC(),
+		LeaseGeneration: gen,
+		Attempts:        j.Attempts,
 	}
 	for _, e := range m.Entries {
 		rec.Entries = append(rec.Entries, model.SnapshotEntry{Path: e.Path, Mode: e.Mode, Size: e.Size, SHA256: e.SHA256})
@@ -601,16 +603,18 @@ func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j mode
 		return
 	}
 	rec := model.SnapshotRecord{
-		ID:         id,
-		RunID:      j.RunID,
-		JobID:      j.ID,
-		JobKey:     j.Key,
-		Path:       "cas:" + obj.SHA256,
-		Size:       n,
-		SHA256:     obj.SHA256,
-		Version:    m.Version,
-		RootSHA256: m.RootSHA256,
-		CreatedAt:  time.Now().UTC(),
+		ID:              id,
+		RunID:           j.RunID,
+		JobID:           j.ID,
+		JobKey:          j.Key,
+		Path:            "cas:" + obj.SHA256,
+		Size:            n,
+		SHA256:          obj.SHA256,
+		Version:         m.Version,
+		RootSHA256:      m.RootSHA256,
+		CreatedAt:       time.Now().UTC(),
+		LeaseGeneration: gen,
+		Attempts:        j.Attempts,
 	}
 	for _, e := range m.Entries {
 		rec.Entries = append(rec.Entries, model.SnapshotEntry{Path: e.Path, Mode: e.Mode, Size: e.Size, SHA256: e.SHA256})
@@ -1008,6 +1012,109 @@ func (s *Server) downloadSnapshotDB(w http.ResponseWriter, r *http.Request) {
 func redactSnapshot(rec model.SnapshotRecord) model.SnapshotRecord {
 	rec.Path = ""
 	return rec
+}
+
+// runJobPipeline is the exact-replay export of one persisted job: the
+// canonical pipeline text the job was compiled from plus its enqueue-time
+// compilation record. It is admin tier because the payload carries the full
+// effective job (steps, env, images) and the pipeline text may embed
+// workspace-relative build detail; the public /api/v1/runs/{id}/jobs DTO
+// keeps the pipeline redacted.
+type runJobPipeline struct {
+	RunID              string                    `json:"run_id"`
+	JobID              string                    `json:"id"`
+	Key                string                    `json:"key"`
+	BaseKey            string                    `json:"base_key,omitempty"`
+	LeaseGeneration    int64                     `json:"lease_generation,omitempty"`
+	Attempts           int                       `json:"attempts,omitempty"`
+	Pipeline           string                    `json:"pipeline"`
+	CompiledJobPayload *model.CompiledJobPayload `json:"compiled_job_payload,omitempty"`
+}
+
+// jobInRun resolves a job addressed by ID, key or base key within one run.
+// DB mode uses GetJob first (the primary address) and only falls back to the
+// run's job list for a key/base-key reference; memory mode scans the
+// run-scoped jobs. Not found and cross-run references both report ok=false so
+// the caller answers 404.
+func (s *Server) jobInRun(ctx context.Context, runID, ref string) (model.Job, bool, error) {
+	if ref == "" {
+		return model.Job{}, false, nil
+	}
+	if s.DB != nil {
+		j, err := s.DB.GetJob(ctx, ref)
+		switch {
+		case err == nil && j.RunID == runID:
+			return j, true, nil
+		case err != nil && !errors.Is(err, storage.ErrNotFound):
+			return model.Job{}, false, err
+		}
+		jobs, err := s.DB.ListJobsByRun(ctx, runID)
+		if err != nil {
+			return model.Job{}, false, err
+		}
+		for _, j := range jobs {
+			if j.Key == ref || j.BaseKey == ref {
+				return j, true, nil
+			}
+		}
+		return model.Job{}, false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, j := range s.jobs {
+		if j.RunID != runID {
+			continue
+		}
+		if j.ID == ref || j.Key == ref || j.BaseKey == ref {
+			return j, true, nil
+		}
+	}
+	return model.Job{}, false, nil
+}
+
+// exportRunJobPipeline is GET /api/v1/runs/{id}/jobs/{job}/pipeline: the
+// exact-replay export of the persisted canonical pipeline text and the
+// enqueue-time compiled job payload the runner verified at execution time.
+// The {job} segment is a job ID or its key/base key within the run. The route
+// demands the same admin action as the snapshot reads (requireRunAdmin,
+// auth.ActionAdmin, scoped to the run's canonical repository identity): the
+// payload is the exact bytes the runner executed and the pipeline text is
+// not part of any public job DTO. A missing payload is returned as-is (the
+// caller refuses exact replay); the endpoint never recompiles or invents a
+// record.
+func (s *Server) exportRunJobPipeline(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("id")
+	run, err := s.runForAuth(r.Context(), runID)
+	if errors.Is(err, storage.ErrNotFound) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		s.internalError(w, r, err, "")
+		return
+	}
+	if !s.requireRunAdmin(w, r, run) {
+		return
+	}
+	j, ok, err := s.jobInRun(r.Context(), runID, r.PathValue("job"))
+	if err != nil {
+		s.internalError(w, r, err, "")
+		return
+	}
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	writeJSON(w, http.StatusOK, runJobPipeline{
+		RunID:              j.RunID,
+		JobID:              j.ID,
+		Key:                j.Key,
+		BaseKey:            j.BaseKey,
+		LeaseGeneration:    j.LeaseGeneration,
+		Attempts:           j.Attempts,
+		Pipeline:           j.Pipeline,
+		CompiledJobPayload: j.CompiledJobPayload,
+	})
 }
 
 // fileSHA256 hashes a staged file so the digest fence can be taken before

@@ -450,7 +450,7 @@ func TestMemStoreFragmentJobKeyIDMismatchRejected(t *testing.T) {
 	if _, err := m.GetJob(ctx(), "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("mismatched fragment leaked a job: %v", err)
 	}
-	if _, found, _ := m.GetGeneratedFragment(ctx(), testJob.ID, 1, "frag-mismatch"); found {
+	if _, found, _ := m.GetGeneratedFragment(ctx(), testJob.ID, "frag-mismatch"); found {
 		t.Fatal("mismatched fragment left a receipt")
 	}
 	// Contracts outside the fragment are rejected too.

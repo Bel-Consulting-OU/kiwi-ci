@@ -4813,10 +4813,13 @@ func (s *PostgresStore) InsertGeneratedJobs(ctx context.Context, parentJobID str
 	return tx.Commit(ctx)
 }
 
-// GetGeneratedFragment reads one fragment idempotency receipt. found=false
-// means the fragment was never admitted under this (parent, generation,
-// fragment id) triple.
-func (s *PostgresStore) GetGeneratedFragment(ctx context.Context, parentJobID string, generation int64, fragmentID string) (GeneratedFragmentReceipt, bool, error) {
+// GetGeneratedFragment reads one fragment idempotency receipt by its
+// canonical mutation key (parent job, fragment id). found=false means the
+// fragment was never admitted under this parent, regardless of the lease
+// generation that admitted it. The caller must have authorized the CURRENT
+// lease before consulting the receipt: the generation authorizes the
+// mutation but never defines it, and this read carries no lease authority.
+func (s *PostgresStore) GetGeneratedFragment(ctx context.Context, parentJobID, fragmentID string) (GeneratedFragmentReceipt, bool, error) {
 	if err := ValidateJobID(parentJobID); err != nil {
 		return GeneratedFragmentReceipt{}, false, err
 	}
@@ -4824,11 +4827,16 @@ func (s *PostgresStore) GetGeneratedFragment(ctx context.Context, parentJobID st
 		return GeneratedFragmentReceipt{}, false, error(fmt.Errorf("storage: empty fragment id"))
 	}
 	var (
-		raw []byte
-		ts  time.Time
+		raw        []byte
+		generation int64
+		ts         time.Time
 	)
-	err := s.pool.QueryRow(ctx, `SELECT children, created_at FROM generated_fragments WHERE parent_job_id=$1 AND lease_generation=$2 AND fragment_id=$3`,
-		parentJobID, generation, fragmentID).Scan(&raw, &ts)
+	// The (parent_job_id, fragment_id) unique index allows exactly one row;
+	// the newest created_at is selected defensively for a database upgraded
+	// from a pre-0043 schema where a pair could in theory occur more than
+	// once.
+	err := s.pool.QueryRow(ctx, `SELECT children, lease_generation, created_at FROM generated_fragments WHERE parent_job_id=$1 AND fragment_id=$2 ORDER BY created_at DESC LIMIT 1`,
+		parentJobID, fragmentID).Scan(&raw, &generation, &ts)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return GeneratedFragmentReceipt{}, false, nil
 	}
@@ -4845,14 +4853,19 @@ func (s *PostgresStore) GetGeneratedFragment(ctx context.Context, parentJobID st
 // InsertGeneratedFragmentTx inserts the fragment and its idempotency receipt
 // and runs the verification closure in the SAME transaction:
 //
-//  1. a committed receipt for the same (parent, generation, fragment id) is
-//     returned with replayed=true and nothing is inserted (the lost-response
-//     replay path);
-//  2. the parent job is locked FOR UPDATE and the run's current job count is
-//     read inside the transaction, then the verifier re-checks {job, runner,
-//     generation, token, expiry} and the max-jobs-per-run bound against that
-//     fresh state;
-//  3. the child jobs, dependency edges, artifact contracts and the receipt
+//  1. the parent job is locked FOR UPDATE and the storage clock is sampled
+//     after the lock, then ValidateGeneratedParentLease re-checks {running,
+//     runner, generation, token, expiry} against that locked state for the
+//     CURRENT request;
+//  2. only AFTER the lease is authorized, a committed receipt for the same
+//     canonical mutation key (parent, fragment id) is returned with
+//     replayed=true and nothing is inserted (the lost-response replay path,
+//     including an infrastructure retry under a NEW generation: the
+//     generation authorizes but never defines the mutation);
+//  3. the run's current job count is read inside the transaction and the
+//     verifier re-checks graph invariants and the max-jobs-per-run bound
+//     against that fresh state;
+//  4. the child jobs, dependency edges, artifact contracts and the receipt
 //     commit together — a generated job with a Required artifact has its
 //     contract row present before any completion can run, and a crash can
 //     never leave a receipt without its children (or children without a
@@ -4873,20 +4886,6 @@ func (s *PostgresStore) InsertGeneratedFragmentTx(ctx context.Context, req Gener
 		return GeneratedFragmentReceipt{}, false, err
 	}
 	defer tx.Rollback(ctx)
-	// Replay fast path inside the transaction.
-	var raw []byte
-	err = tx.QueryRow(ctx, `SELECT children FROM generated_fragments WHERE parent_job_id=$1 AND lease_generation=$2 AND fragment_id=$3 FOR UPDATE`,
-		req.ParentJobID, req.LeaseGeneration, req.FragmentID).Scan(&raw)
-	if err == nil {
-		rec := GeneratedFragmentReceipt{ParentJobID: req.ParentJobID, LeaseGeneration: req.LeaseGeneration, FragmentID: req.FragmentID}
-		if err := json.Unmarshal(raw, &rec.Children); err != nil {
-			return GeneratedFragmentReceipt{}, false, err
-		}
-		return rec, true, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return GeneratedFragmentReceipt{}, false, err
-	}
 	js := jobScanner{}
 	var commitNow time.Time
 	// The parent row is locked and the STORAGE clock is sampled after the
@@ -4911,8 +4910,31 @@ func (s *PostgresStore) InsertGeneratedFragmentTx(ctx context.Context, req Gener
 	}
 	// The store owns the complete lease predicate, decided at the storage
 	// clock sampled after the lock. The verifier below only sees graph
-	// checks.
+	// checks. Authorization ALWAYS precedes the receipt replay: a request
+	// presenting a stale generation or token must never observe the receipt
+	// children, even though the mutation key itself is generation-free.
 	if err := ValidateGeneratedParentLease(parent, req, commitNow); err != nil {
+		return GeneratedFragmentReceipt{}, false, err
+	}
+	// Replay path inside the transaction, after authorization. A committed
+	// receipt for the SAME (parent, fragment id) mutation key returns the
+	// original children and inserts nothing, whatever lease generation
+	// admitted them.
+	var (
+		raw           []byte
+		replayGen     int64
+		replayCreated time.Time
+	)
+	err = tx.QueryRow(ctx, `SELECT children, lease_generation, created_at FROM generated_fragments WHERE parent_job_id=$1 AND fragment_id=$2 ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,
+		req.ParentJobID, req.FragmentID).Scan(&raw, &replayGen, &replayCreated)
+	if err == nil {
+		rec := GeneratedFragmentReceipt{ParentJobID: req.ParentJobID, LeaseGeneration: replayGen, FragmentID: req.FragmentID, CreatedAt: replayCreated}
+		if err := json.Unmarshal(raw, &rec.Children); err != nil {
+			return GeneratedFragmentReceipt{}, false, err
+		}
+		return rec, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
 		return GeneratedFragmentReceipt{}, false, err
 	}
 	var runJobCount int
@@ -4956,20 +4978,25 @@ func (s *PostgresStore) InsertGeneratedFragmentTx(ctx context.Context, req Gener
 	if err != nil {
 		return GeneratedFragmentReceipt{}, false, err
 	}
-	ct, err := tx.Exec(ctx, `INSERT INTO generated_fragments (parent_job_id, lease_generation, fragment_id, children, created_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (parent_job_id, lease_generation, fragment_id) DO NOTHING`,
+	ct, err := tx.Exec(ctx, `INSERT INTO generated_fragments (parent_job_id, lease_generation, fragment_id, children, created_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (parent_job_id, fragment_id) DO NOTHING`,
 		req.ParentJobID, req.LeaseGeneration, req.FragmentID, cb, commitNow)
 	if err != nil {
 		return GeneratedFragmentReceipt{}, false, err
 	}
 	if ct.RowsAffected() == 0 {
 		// A concurrent duplicate committed first: discard this transaction's
-		// job rows and return the winner's receipt.
-		var winner []byte
-		if err := tx.QueryRow(ctx, `SELECT children FROM generated_fragments WHERE parent_job_id=$1 AND lease_generation=$2 AND fragment_id=$3`,
-			req.ParentJobID, req.LeaseGeneration, req.FragmentID).Scan(&winner); err != nil {
+		// job rows and return the winner's receipt for the canonical
+		// mutation key (newest created_at).
+		var (
+			winner        []byte
+			winnerGen     int64
+			winnerCreated time.Time
+		)
+		if err := tx.QueryRow(ctx, `SELECT children, lease_generation, created_at FROM generated_fragments WHERE parent_job_id=$1 AND fragment_id=$2 ORDER BY created_at DESC LIMIT 1`,
+			req.ParentJobID, req.FragmentID).Scan(&winner, &winnerGen, &winnerCreated); err != nil {
 			return GeneratedFragmentReceipt{}, false, err
 		}
-		rec := GeneratedFragmentReceipt{ParentJobID: req.ParentJobID, LeaseGeneration: req.LeaseGeneration, FragmentID: req.FragmentID}
+		rec := GeneratedFragmentReceipt{ParentJobID: req.ParentJobID, LeaseGeneration: winnerGen, FragmentID: req.FragmentID, CreatedAt: winnerCreated}
 		if err := json.Unmarshal(winner, &rec.Children); err != nil {
 			return GeneratedFragmentReceipt{}, false, err
 		}

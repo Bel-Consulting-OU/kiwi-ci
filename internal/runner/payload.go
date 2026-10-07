@@ -1,9 +1,6 @@
 package runner
 
 import (
-	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -15,10 +12,12 @@ import (
 
 // verifyCompiledPayload checks the enqueue-time compilation record the
 // control plane attached to the task and returns the effective compiled job
-// the runner must execute. The pipeline digest is recomputed from the
-// already-trusted job pipeline the runner parsed itself; the job digest is
-// recomputed by round-tripping EffectiveJob through pipeline.CompiledJob
-// and re-marshalling (struct field order makes this deterministic). The
+// the runner must execute. The schema, pipeline-digest, job-digest and
+// local-recompilation binding checks are delegated to the shared
+// pipeline.VerifyCompiledJobBinding verifier — the same code the exact replay
+// path runs — so a payload the runner accepts can never be rejected (or
+// silently differ) on replay, and vice versa. What stays runner-local is the
+// TRUST policy: the effective capabilities and the untrusted floor. The
 // returned caps are the effective policy capabilities to re-check admission
 // against; policyOK is false when the payload carries no policy (legacy
 // compiler) and the caller keeps only the baseline admission check.
@@ -34,60 +33,15 @@ func verifyCompiledPayload(spec *pipeline.Spec, key string, p *model.CompiledJob
 	if p == nil {
 		return cj, caps, false, nil
 	}
-	if p.SchemaVersion != 1 {
-		return cj, caps, false, fmt.Errorf("compiled payload: unsupported schema version %d (want 1)", p.SchemaVersion)
-	}
-	wantPipeline, err := pipeline.PipelineDigest(spec)
-	if err != nil {
-		return cj, caps, false, fmt.Errorf("compiled payload: pipeline digest: %w", err)
-	}
-	if wantPipeline != p.PipelineDigest {
-		return cj, caps, false, fmt.Errorf("compiled payload digest mismatch: pipeline digest %q does not match %q", p.PipelineDigest, wantPipeline)
-	}
-	raw, err := json.Marshal(p.EffectiveJob)
-	if err != nil {
-		return cj, caps, false, fmt.Errorf("compiled payload: encode effective job: %w", err)
-	}
-	if err := json.Unmarshal(raw, &cj); err != nil {
-		return cj, caps, false, fmt.Errorf("compiled payload: decode effective job: %w", err)
-	}
-	cjJSON, err := json.Marshal(cj)
-	if err != nil {
-		return cj, caps, false, fmt.Errorf("compiled payload: re-encode effective job: %w", err)
-	}
-	sum := sha256.Sum256(cjJSON)
-	if got := hex.EncodeToString(sum[:]); got != p.JobDigest {
-		return cj, caps, false, fmt.Errorf("compiled payload digest mismatch: job digest %q does not match %q", p.JobDigest, got)
-	}
 	if payloadLocalBindingCheck {
-		// The job digest above only proves the payload is internally consistent.
-		// Bind the payload to a LOCAL recompilation of the digest-verified
-		// pipeline spec: a malicious control plane could otherwise serve a benign
-		// spec (digest passes) alongside an arbitrary compiled job (steps, image,
-		// sandbox/network, env) whose self-hash it also controls.
-		recompiled, cerr := pipeline.Compile(spec)
-		if cerr != nil {
-			return cj, caps, false, fmt.Errorf("compiled payload: recompile pipeline: %w", cerr)
-		}
-		local, ok := recompiled.Jobs[key]
-		if !ok {
-			return cj, caps, false, fmt.Errorf("compiled payload: pipeline has no job %q", key)
-		}
-		localRaw, err := json.Marshal(local)
-		if err != nil {
-			return cj, caps, false, fmt.Errorf("compiled payload: encode local job: %w", err)
-		}
-		var localNorm pipeline.CompiledJob
-		if err := json.Unmarshal(localRaw, &localNorm); err != nil {
-			return cj, caps, false, fmt.Errorf("compiled payload: decode local job: %w", err)
-		}
-		localJSON, err := json.Marshal(localNorm)
-		if err != nil {
-			return cj, caps, false, fmt.Errorf("compiled payload: re-encode local job: %w", err)
-		}
-		if !bytes.Equal(localJSON, cjJSON) {
-			return cj, caps, false, fmt.Errorf("compiled payload does not match the digest-verified pipeline's local compilation")
-		}
+		cj, err = pipeline.VerifyCompiledJobBinding(spec, key, p)
+	} else {
+		// Seam: a fixture deliberately serves a mutated effective job; keep
+		// the digest binding but skip the local-recompilation equality.
+		cj, err = pipeline.VerifyCompiledJobDigests(spec, key, p)
+	}
+	if err != nil {
+		return cj, caps, false, err
 	}
 	if p.EffectivePolicy == nil {
 		return cj, caps, false, nil

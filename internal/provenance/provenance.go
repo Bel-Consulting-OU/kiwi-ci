@@ -10,12 +10,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/version"
 )
 
@@ -40,19 +43,31 @@ type Statement struct {
 	PredicateType string    `json:"predicateType"`
 	Predicate     Predicate `json:"predicate"`
 
-	ResolvedPipelineSHA256 string          `json:"resolvedPipelineSHA256,omitempty"`
-	PipelineDigest         string          `json:"pipelineDigest,omitempty"`
-	Builder                string          `json:"builder,omitempty"`
-	CompilerVersion        string          `json:"compilerVersion,omitempty"`
-	RunnerIdentity         string          `json:"runnerIdentity,omitempty"`
-	Runtime                string          `json:"runtime,omitempty"`
-	ImageDigest            string          `json:"imageDigest,omitempty"`
-	Issuer                 string          `json:"issuer,omitempty"`
-	Materials              []MaterialEntry `json:"materials,omitempty"`
-	EffectivePolicyDigest  string          `json:"effectivePolicyDigest,omitempty"`
-	StartTime              *time.Time      `json:"startTime,omitempty"`
-	EndTime                *time.Time      `json:"endTime,omitempty"`
-	ArtifactSize           int64           `json:"artifactSize,omitempty"`
+	ResolvedPipelineSHA256 string `json:"resolvedPipelineSHA256,omitempty"`
+	PipelineDigest         string `json:"pipelineDigest,omitempty"`
+	Builder                string `json:"builder,omitempty"`
+	CompilerVersion        string `json:"compilerVersion,omitempty"`
+	RunnerIdentity         string `json:"runnerIdentity,omitempty"`
+	// AttemptID is the canonical execution-attempt identity
+	// (<jobID>:<leaseGeneration>, see model.AttemptID). Consumers must match
+	// it exactly instead of parsing RunDetails.Metadata.InvocationID.
+	AttemptID string `json:"attemptId,omitempty"`
+	// CapsuleDigest is the canonical, versioned digest of the PERSISTED
+	// CompiledJobPayload (see CapsuleDigest): the exact admitted computation
+	// the evidence binds.
+	CapsuleDigest         string          `json:"capsuleDigest,omitempty"`
+	Runtime               string          `json:"runtime,omitempty"`
+	ImageDigest           string          `json:"imageDigest,omitempty"`
+	Issuer                string          `json:"issuer,omitempty"`
+	Materials             []MaterialEntry `json:"materials,omitempty"`
+	EffectivePolicyDigest string          `json:"effectivePolicyDigest,omitempty"`
+	StartTime             *time.Time      `json:"startTime,omitempty"`
+	EndTime               *time.Time      `json:"endTime,omitempty"`
+	ArtifactSize          int64           `json:"artifactSize,omitempty"`
+	// ArtifactPublishedAt records when the artifact bytes were published. It
+	// is explicitly NOT the build completion time: FinishedOn is only set
+	// from a real terminal job timestamp.
+	ArtifactPublishedAt *time.Time `json:"artifactPublishedAt,omitempty"`
 }
 
 // MaterialEntry records one consumed input file and its digest.
@@ -88,7 +103,10 @@ type Builder struct {
 type Metadata struct {
 	InvocationID string    `json:"invocationId"`
 	StartedOn    time.Time `json:"startedOn,omitempty"`
-	FinishedOn   time.Time `json:"finishedOn"`
+	// FinishedOn is set ONLY when the job has a real terminal timestamp. An
+	// artifact published while the job is still running must not claim
+	// completion, so the field is omitted (nil) in that case.
+	FinishedOn *time.Time `json:"finishedOn,omitempty"`
 }
 type Signature struct {
 	KeyID string `json:"keyid"`
@@ -107,9 +125,50 @@ type ArtifactInput struct {
 	// record a stable builder identity such as
 	// "https://kiwi-ci.dev/builders/release-tool@1.2.3" instead of a runner
 	// URL that only exists inside the control plane.
-	Builder           string
-	Trusted           bool
-	Started, Finished time.Time
+	Builder string
+	Trusted bool
+	// Started is the SLSA Metadata.StartedOn value.
+	Started time.Time
+	// Finished is the job's REAL terminal timestamp when one exists. The zero
+	// value omits Metadata.FinishedOn: an artifact publication must never
+	// fabricate build completion.
+	Finished time.Time
+	// AttemptID is the canonical attempt identity
+	// (model.AttemptID(jobID, generation)). When non-empty,
+	// Metadata.InvocationID is runID + "/" + AttemptID; when empty the legacy
+	// runID + "/" + JobID shape is kept for callers with no lease generation.
+	AttemptID string
+	// CapsuleDigest is the canonical digest of the persisted
+	// CompiledJobPayload the computation was admitted under (see
+	// CapsuleDigest). Empty when no payload exists.
+	CapsuleDigest string
+	// ArtifactPublishedAt is when the artifact bytes were published. It is
+	// emitted on the statement (never as FinishedOn).
+	ArtifactPublishedAt time.Time
+	// PipelineDigest, CompilerVersion and EffectivePolicyDigest carry the
+	// persisted compilation identity when available.
+	PipelineDigest        string
+	CompilerVersion       string
+	EffectivePolicyDigest string
+	// RunnerIdentity is the runner that produced the artifact.
+	RunnerIdentity string
+	// ArtifactSize is the published artifact's byte count.
+	ArtifactSize int64
+	// StartTime, when non-nil, is the job's real start timestamp.
+	StartTime *time.Time
+	// ResolvedPipelineSHA256 is populated only when it is already available
+	// to the caller; no lookup is performed here.
+	ResolvedPipelineSHA256 string
+}
+
+// InvocationID shapes the SLSA RunDetails.Metadata.InvocationID from the run
+// ID and the canonical attempt identity, falling back to the legacy
+// run/job ID shape for callers that do not carry a lease generation.
+func InvocationID(runID, jobID, attemptID string) string {
+	if attemptID == "" {
+		attemptID = jobID
+	}
+	return runID + "/" + attemptID
 }
 
 func ArtifactStatement(in ArtifactInput) Statement {
@@ -117,7 +176,93 @@ func ArtifactStatement(in ArtifactInput) Statement {
 	if builderID == "" {
 		builderID = "https://kiwi-ci.dev/runner/" + in.Runner
 	}
-	return Statement{Type: StatementType, Subject: []Subject{{Name: in.Name, Digest: map[string]string{"sha256": in.SHA256}}}, PredicateType: PredicateType, Predicate: Predicate{BuildDefinition: BuildDefinition{BuildType: "https://kiwi-ci.dev/build/v1", ExternalParameters: map[string]any{"repository": in.Repository, "ref": in.Ref, "commit": in.Commit, "job": in.JobKey, "trusted": in.Trusted}}, RunDetails: RunDetails{Builder: Builder{ID: builderID}, Metadata: Metadata{InvocationID: in.RunID + "/" + in.JobID, StartedOn: in.Started, FinishedOn: in.Finished}}}}
+	st := Statement{
+		Type:                   StatementType,
+		Subject:                []Subject{{Name: in.Name, Digest: map[string]string{"sha256": in.SHA256}}},
+		PredicateType:          PredicateType,
+		AttemptID:              in.AttemptID,
+		CapsuleDigest:          in.CapsuleDigest,
+		PipelineDigest:         in.PipelineDigest,
+		CompilerVersion:        in.CompilerVersion,
+		RunnerIdentity:         in.RunnerIdentity,
+		ArtifactSize:           in.ArtifactSize,
+		EffectivePolicyDigest:  in.EffectivePolicyDigest,
+		ResolvedPipelineSHA256: in.ResolvedPipelineSHA256,
+		StartTime:              in.StartTime,
+		Predicate: Predicate{
+			BuildDefinition: BuildDefinition{
+				BuildType: "https://kiwi-ci.dev/build/v1",
+				ExternalParameters: map[string]any{
+					"repository": in.Repository, "ref": in.Ref, "commit": in.Commit,
+					"job": in.JobKey, "trusted": in.Trusted,
+				},
+			},
+			RunDetails: RunDetails{
+				Builder: Builder{ID: builderID},
+				Metadata: Metadata{
+					InvocationID: InvocationID(in.RunID, in.JobID, in.AttemptID),
+					StartedOn:    in.Started,
+				},
+			},
+		},
+	}
+	if !in.Finished.IsZero() {
+		finished := in.Finished
+		st.Predicate.RunDetails.Metadata.FinishedOn = &finished
+	}
+	if !in.ArtifactPublishedAt.IsZero() {
+		published := in.ArtifactPublishedAt
+		st.ArtifactPublishedAt = &published
+	}
+	return st
+}
+
+// capsuleDigestVersion is part of the capsule digest preimage: any change to
+// the canonical encoding bumps this tag so digests from different encodings
+// can never collide.
+const capsuleDigestVersion = "kiwi-ci/capsule/v1"
+
+// CapsuleDigest returns the canonical, versioned SHA-256 digest of the
+// PERSISTED compilation record: a length-prefixed encoding of the schema
+// version, compiler version, pipeline and job digests, and the canonical
+// JSON of the effective job and effective policy. The `any` values are
+// canonicalized with encoding/json (map keys sorted); nil encodes as empty.
+// The digest binds provenance evidence to exactly the admitted computation.
+func CapsuleDigest(p *model.CompiledJobPayload) (string, error) {
+	if p == nil {
+		return "", errors.New("provenance: nil compiled job payload")
+	}
+	h := sha256.New()
+	field := func(label, value string) {
+		fmt.Fprintf(h, "%d:%s=%d:", len(label), label, len(value))
+		_, _ = io.WriteString(h, value)
+	}
+	field("capsuleVersion", capsuleDigestVersion)
+	field("schemaVersion", strconv.Itoa(p.SchemaVersion))
+	field("compilerVersion", p.CompilerVersion)
+	field("pipelineDigest", p.PipelineDigest)
+	field("jobDigest", p.JobDigest)
+	effectiveJob, err := canonicalJSON(p.EffectiveJob)
+	if err != nil {
+		return "", fmt.Errorf("provenance: canonicalize effective job: %w", err)
+	}
+	field("effectiveJob", string(effectiveJob))
+	effectivePolicy, err := canonicalJSON(p.EffectivePolicy)
+	if err != nil {
+		return "", fmt.Errorf("provenance: canonicalize effective policy: %w", err)
+	}
+	field("effectivePolicy", string(effectivePolicy))
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// canonicalJSON marshals a decoded JSON value canonically: encoding/json
+// sorts map keys, and nil values encode as empty (not "null") so an absent
+// effective value is distinct from an explicit JSON null.
+func canonicalJSON(v any) ([]byte, error) {
+	if v == nil {
+		return nil, nil
+	}
+	return json.Marshal(v)
 }
 func Sign(st Statement, keyID string, priv ed25519.PrivateKey) (Envelope, error) {
 	return SignWith(st, keyID, priv, SignOptions{})
@@ -171,8 +316,14 @@ type VerifyOptions struct {
 	// Digest, when non-empty, must equal the sha256 digest of the first
 	// subject. Callers that consumed artifact bytes should always set it so
 	// the signature is bound to exactly those bytes.
-	Digest     string
-	TrustedKey ed25519.PublicKey
+	Digest string
+	// AttemptID, when non-empty, must equal the statement's canonical attempt
+	// identity (<jobID>:<leaseGeneration>).
+	AttemptID string
+	// CapsuleDigest, when non-empty, must equal the statement's canonical
+	// compiled-payload capsule digest.
+	CapsuleDigest string
+	TrustedKey    ed25519.PublicKey
 }
 
 // VerifyWith parses, verifies and constraint-checks a serialized DSSE
@@ -249,6 +400,8 @@ func VerifyWith(envelope []byte, jwksOrKey func(kid string) (ed25519.PublicKey, 
 		{opts.Builder, st.Predicate.RunDetails.Builder.ID, "builder"},
 		{opts.Issuer, st.Issuer, "issuer"},
 		{opts.Digest, st.Subject[0].Digest["sha256"], "subject digest"},
+		{opts.AttemptID, st.AttemptID, "attempt id"},
+		{opts.CapsuleDigest, st.CapsuleDigest, "capsule digest"},
 	} {
 		if c.want != "" && c.got != c.want {
 			return Statement{}, fmt.Errorf("provenance: %s mismatch: want %q, got %q", c.label, c.want, c.got)

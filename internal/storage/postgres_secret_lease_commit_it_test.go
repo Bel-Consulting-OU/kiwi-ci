@@ -8,6 +8,7 @@ package storage
 // final issuance transaction.
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"testing"
@@ -76,7 +77,7 @@ func TestIntegrationSecretIssuanceCommitLive(t *testing.T) {
 	st := pgITStore(t)
 	ctx := context.Background()
 	runID, jobID, runnerID, j := secretITLeasedJob(t, st)
-	if err := st.CommitSecretIssuance(ctx, secretITRequest(j, "TOKEN")); err != nil {
+	if _, _, err := st.CommitSecretIssuance(ctx, secretITRequest(j, "TOKEN")); err != nil {
 		t.Fatalf("CommitSecretIssuance: %v", err)
 	}
 	if n := secretITClaimCount(t, st, jobID, "TOKEN"); n != 1 {
@@ -101,7 +102,7 @@ func TestIntegrationSecretIssuanceCommitLive(t *testing.T) {
 	if !found {
 		t.Fatal("no secret.issued audit row for the committed delivery")
 	}
-	if err := st.CommitSecretIssuance(ctx, secretITRequest(j, "TOKEN")); !errors.Is(err, ErrSecretIssuanceDuplicate) {
+	if _, _, err := st.CommitSecretIssuance(ctx, secretITRequest(j, "TOKEN")); !errors.Is(err, ErrSecretIssuanceDuplicate) {
 		t.Fatalf("replay = %v, want ErrSecretIssuanceDuplicate", err)
 	}
 	if n := secretITClaimCount(t, st, jobID, "TOKEN"); n != 1 {
@@ -146,7 +147,7 @@ func TestIntegrationSecretIssuanceCommitRefusals(t *testing.T) {
 			if tc.mutate != nil {
 				tc.mutate(&req)
 			}
-			if err := st.CommitSecretIssuance(ctx, req); !errors.Is(err, tc.want) {
+			if _, _, err := st.CommitSecretIssuance(ctx, req); !errors.Is(err, tc.want) {
 				t.Fatalf("CommitSecretIssuance = %v, want %v", err, tc.want)
 			}
 			if n := secretITClaimCount(t, st, jobID, "TOKEN"); n != 0 {
@@ -182,7 +183,8 @@ func TestIntegrationSecretIssuanceCommitConcurrentCancelBarrier(t *testing.T) {
 	commitDone := make(chan error, 1)
 	go func() {
 		close(commitStarted)
-		commitDone <- st.CommitSecretIssuance(ctx, secretITRequest(j, "TOKEN"))
+		_, _, err := st.CommitSecretIssuance(ctx, secretITRequest(j, "TOKEN"))
+		commitDone <- err
 	}()
 	<-commitStarted
 	// The commit holds no lock of its own yet: it must be blocked on the
@@ -230,7 +232,8 @@ func TestIntegrationSecretIssuanceCommitConcurrentGenerationBarrier(t *testing.T
 	commitDone := make(chan error, 1)
 	go func() {
 		close(commitStarted)
-		commitDone <- st.CommitSecretIssuance(ctx, secretITRequest(j, "TOKEN"))
+		_, _, err := st.CommitSecretIssuance(ctx, secretITRequest(j, "TOKEN"))
+		commitDone <- err
 	}()
 	<-commitStarted
 	select {
@@ -288,7 +291,8 @@ func TestIntegrationSecretIssuanceCommitBarrierLeaseExpiry(t *testing.T) {
 	commitDone := make(chan error, 1)
 	go func() {
 		close(commitStarted)
-		commitDone <- st.CommitSecretIssuance(ctx, req)
+		_, _, err := st.CommitSecretIssuance(ctx, req)
+		commitDone <- err
 	}()
 	<-commitStarted
 	// Hold the row lock past the lease expiry: the commit is still waiting on
@@ -326,7 +330,8 @@ func TestIntegrationSecretIssuanceCommitConcurrentSingleClaim(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		go func() {
 			<-start
-			results <- st.CommitSecretIssuance(ctx, req)
+			_, _, err := st.CommitSecretIssuance(ctx, req)
+			results <- err
 		}()
 	}
 	close(start)
@@ -361,6 +366,98 @@ func (r *secretITFixedRand) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+// secretITSealedRequest builds a commit request carrying a sealed envelope
+// (the recipient key is the runner's request public key).
+func secretITSealedRequest(j model.Job, name string) SecretIssuance {
+	req := secretITRequest(j, name)
+	req.RecipientPublic = []byte("runner-ephemeral-request-public")
+	req.EphemeralPublic = []byte("server-ephemeral-envelope-public")
+	req.Ciphertext = []byte("sealed-ciphertext-bytes")
+	req.Nonce = []byte("nonce12bytes")
+	return req
+}
+
+// TestIntegrationSecretIssuanceReplayAfterLostResponse is the finding-7
+// regression on real PostgreSQL: the first commit succeeds and the response
+// is lost. The identical retry (same recipient public key) replays the EXACT
+// stored envelope with replayed=true and writes no second claim and no second
+// audit; a different key stays a duplicate; and a stale generation is refused
+// by lease validation BEFORE the duplicate/replay logic can even run.
+func TestIntegrationSecretIssuanceReplayAfterLostResponse(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	_, jobID, _, j := secretITLeasedJob(t, st)
+	req := secretITSealedRequest(j, "TOKEN")
+
+	// First commit: durable, but the caller discards the response.
+	first, replayed, err := st.CommitSecretIssuance(ctx, req)
+	if err != nil || replayed {
+		t.Fatalf("first commit = replayed=%v err=%v", replayed, err)
+	}
+	if !bytes.Equal(first.Ciphertext, req.Ciphertext) || !bytes.Equal(first.EphemeralPublic, req.EphemeralPublic) || !bytes.Equal(first.Nonce, req.Nonce) {
+		t.Fatalf("first commit envelope = %+v, want the request's own", first)
+	}
+	if n := secretITClaimCount(t, st, jobID, "TOKEN"); n != 1 {
+		t.Fatalf("claims = %d, want 1", n)
+	}
+	if n := secretITIssuedAudits(t, st, jobID); n != 1 {
+		t.Fatalf("secret.issued audits = %d, want 1", n)
+	}
+
+	// Identical retry: the exact same envelope, no second claim or audit.
+	retry, replayed, err := st.CommitSecretIssuance(ctx, req)
+	if err != nil || !replayed {
+		t.Fatalf("same-key retry = replayed=%v err=%v, want replay", replayed, err)
+	}
+	if !bytes.Equal(retry.Ciphertext, first.Ciphertext) || !bytes.Equal(retry.EphemeralPublic, first.EphemeralPublic) || !bytes.Equal(retry.Nonce, first.Nonce) {
+		t.Fatalf("replay envelope = %+v, want the exact stored %+v", retry, first)
+	}
+	if n := secretITClaimCount(t, st, jobID, "TOKEN"); n != 1 {
+		t.Fatalf("claims after replay = %d, want 1", n)
+	}
+	if n := secretITIssuedAudits(t, st, jobID); n != 1 {
+		t.Fatalf("secret.issued audits after replay = %d, want 1", n)
+	}
+
+	// The read side exposes the stored record for the server's pre-check.
+	stored, found, err := st.LookupSecretIssuance(ctx, jobID, j.LeaseGeneration, "TOKEN")
+	if err != nil || !found {
+		t.Fatalf("LookupSecretIssuance = found=%v err=%v", found, err)
+	}
+	if !bytes.Equal(stored.RecipientPublic, req.RecipientPublic) || !bytes.Equal(stored.Envelope.Ciphertext, first.Ciphertext) {
+		t.Fatalf("stored record = %+v, want the committed envelope", stored)
+	}
+	if _, found, err := st.LookupSecretIssuance(ctx, jobID, j.LeaseGeneration, "OTHER"); err != nil || found {
+		t.Fatalf("missing lookup = found=%v err=%v, want not found", found, err)
+	}
+
+	// A different recipient key is a hard duplicate: the stored envelope is
+	// never re-minted for a key that did not receive it.
+	other := req
+	other.RecipientPublic = []byte("a-different-recipient-public!!")
+	if _, replayed, err := st.CommitSecretIssuance(ctx, other); !errors.Is(err, ErrSecretIssuanceDuplicate) || replayed {
+		t.Fatalf("different-key retry = replayed=%v err=%v, want duplicate", replayed, err)
+	}
+	if n := secretITClaimCount(t, st, jobID, "TOKEN"); n != 1 {
+		t.Fatalf("claims after different-key retry = %d, want 1", n)
+	}
+
+	// Stale generation: the lease predicate refuses BEFORE any replay, so a
+	// runner holding a superseded lease can never obtain the stored envelope.
+	if _, err := st.pool.Exec(ctx, `UPDATE jobs SET lease_generation = lease_generation + 1 WHERE id=$1`, jobID); err != nil {
+		t.Fatalf("replace lease generation: %v", err)
+	}
+	if _, replayed, err := st.CommitSecretIssuance(ctx, req); !errors.Is(err, ErrSecretIssuanceGeneration) || replayed {
+		t.Fatalf("stale-generation retry = replayed=%v err=%v, want ErrSecretIssuanceGeneration", replayed, err)
+	}
+	if n := secretITClaimCount(t, st, jobID, "TOKEN"); n != 1 {
+		t.Fatalf("claims after stale retry = %d, want 1", n)
+	}
+	if n := secretITIssuedAudits(t, st, jobID); n != 1 {
+		t.Fatalf("secret.issued audits after stale retry = %d, want 1", n)
+	}
+}
+
 // TestIntegrationSecretIssuanceAuditFailureRollsBackClaim proves the claim and
 // the audit are in ONE transaction: when the audit INSERT fails (here: a
 // duplicate id planted before the commit), the commit returns an error and the
@@ -378,7 +475,7 @@ func TestIntegrationSecretIssuanceAuditFailureRollsBackClaim(t *testing.T) {
 	}
 	old := randReader
 	randReader = &secretITFixedRand{b: raw}
-	err := st.CommitSecretIssuance(ctx, secretITRequest(j, "TOKEN"))
+	_, _, err := st.CommitSecretIssuance(ctx, secretITRequest(j, "TOKEN"))
 	randReader = old
 	if err == nil {
 		t.Fatal("commit with a colliding audit id = nil error")
@@ -390,7 +487,7 @@ func TestIntegrationSecretIssuanceAuditFailureRollsBackClaim(t *testing.T) {
 		t.Fatalf("failed audit committed %d secret.issued rows", n)
 	}
 
-	if err := st.CommitSecretIssuance(ctx, secretITRequest(j, "TOKEN")); err != nil {
+	if _, _, err := st.CommitSecretIssuance(ctx, secretITRequest(j, "TOKEN")); err != nil {
 		t.Fatalf("commit after entropy recovery: %v", err)
 	}
 	if n := secretITClaimCount(t, st, jobID, "TOKEN"); n != 1 {

@@ -3,6 +3,7 @@ package secretbroker
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secrets"
 )
@@ -31,6 +33,15 @@ const maxSecretDeliveryBytes = 1 << 20
 // process that requested it and only in the exact job/lease context it was
 // sealed for. It is the only secret provider distributed runners use; host
 // environment and Keychain providers are local-CLI-only.
+//
+// The ephemeral keypair is CACHED per (job, generation, secret) until the
+// delivery opens successfully, so a transport-error retry — the response to a
+// committed delivery was lost — presents the SAME public key and the control
+// plane replays the exact committed envelope instead of refusing a second
+// delivery. A successful decode clears the entry; a generation change
+// invalidates every old entry, and the cache is bounded. A retry after the
+// runner process died mints a new keypair and the control plane answers 409
+// (documented: no re-delivery on an unknown key).
 type RemoteProvider struct {
 	Server, Token   string
 	JobID           string
@@ -38,6 +49,24 @@ type RemoteProvider struct {
 	LeaseGeneration int64
 	RunnerID        string
 	Client          *http.Client
+
+	// keyMu guards keys and keyOrder: the bounded retry keypair cache.
+	keyMu    sync.Mutex
+	keys     map[string]cachedRemoteKey
+	keyOrder []string
+}
+
+// remoteKeyCacheMax bounds the retry keypair cache: only failed/unacknowledged
+// deliveries are cached (a successful open deletes its entry), so a healthy
+// run holds at most one entry per in-flight secret and the bound is defense in
+// depth against a job declaring an unbounded secret list of failures.
+const remoteKeyCacheMax = 64
+
+// cachedRemoteKey is one cached runner ephemeral keypair for a delivery that
+// has not opened successfully yet.
+type cachedRemoteKey struct {
+	priv       *ecdh.PrivateKey
+	generation int64
 }
 
 // secretDeliveryAAD renders the authenticated data for one remote delivery.
@@ -45,6 +74,56 @@ type RemoteProvider struct {
 // generation, and secret name, each NUL-separated.
 func secretDeliveryAAD(runnerID, jobID string, generation int64, name string) []byte {
 	return []byte(remoteSecretAADPrefix + runnerID + "\x00" + jobID + "\x00" + strconv.FormatInt(generation, 10) + "\x00" + name)
+}
+
+// keyCacheKey keys the retry keypair cache exactly like the control plane's
+// delivery receipt: job, generation and secret name.
+func (p *RemoteProvider) keyCacheKey(name string) string {
+	return p.JobID + "|" + strconv.FormatInt(p.LeaseGeneration, 10) + "|" + name
+}
+
+// cachedEphemeralKey returns the cached keypair for (job, generation, name),
+// minting and caching a fresh one on a miss. Entries of a different lease
+// generation are dropped first: a new generation must never reuse a key.
+func (p *RemoteProvider) cachedEphemeralKey(name string) (*ecdh.PrivateKey, error) {
+	key := p.keyCacheKey(name)
+	p.keyMu.Lock()
+	defer p.keyMu.Unlock()
+	if entry, ok := p.keys[key]; ok {
+		return entry.priv, nil
+	}
+	for k, entry := range p.keys {
+		if entry.generation != p.LeaseGeneration {
+			delete(p.keys, k)
+		}
+	}
+	priv, err := generateX25519Key()
+	if err != nil {
+		return nil, err
+	}
+	if p.keys == nil {
+		p.keys = map[string]cachedRemoteKey{}
+	}
+	if len(p.keys) >= remoteKeyCacheMax {
+		for len(p.keyOrder) > 0 && len(p.keys) >= remoteKeyCacheMax {
+			oldest := p.keyOrder[0]
+			p.keyOrder = p.keyOrder[1:]
+			delete(p.keys, oldest)
+		}
+	}
+	p.keys[key] = cachedRemoteKey{priv: priv, generation: p.LeaseGeneration}
+	p.keyOrder = append(p.keyOrder, key)
+	return priv, nil
+}
+
+// clearCachedEphemeralKey drops the retry keypair of one (job, generation,
+// secret) delivery. It is called after a successful open (the cache exists
+// only for retries of unacknowledged deliveries) and on a hard 409 (the
+// stored delivery was sealed for a different key, so no retry can replay it).
+func (p *RemoteProvider) clearCachedEphemeralKey(name string) {
+	p.keyMu.Lock()
+	defer p.keyMu.Unlock()
+	delete(p.keys, p.keyCacheKey(name))
 }
 
 // client returns a hardened copy of the configured HTTP client: bounded
@@ -61,7 +140,7 @@ func (p *RemoteProvider) Get(ctx context.Context, name string) (string, error) {
 	if strings.TrimSpace(name) == "" {
 		return "", fmt.Errorf("remote secret: empty secret name")
 	}
-	priv, err := generateX25519Key()
+	priv, err := p.cachedEphemeralKey(name)
 	if err != nil {
 		return "", classError("remote", ErrUnavailable, "generate ephemeral key", err)
 	}
@@ -98,6 +177,13 @@ func (p *RemoteProvider) Get(ctx context.Context, name string) (string, error) {
 		return "", classError("remote", ErrMalformedResponse, fmt.Sprintf("delivery for secret %q exceeds %d bytes", name, maxSecretDeliveryBytes), nil)
 	}
 	if resp.StatusCode != http.StatusOK {
+		// A 409 means the committed delivery was sealed for a DIFFERENT
+		// key (or predates envelope replay), so no retry can recover it:
+		// drop the cached key instead of pinning a keypair that can never
+		// succeed.
+		if resp.StatusCode == http.StatusConflict {
+			p.clearCachedEphemeralKey(name)
+		}
 		// Never echo the response body: the error travels into runner/job
 		// error surfaces. Only the status class and code are included.
 		return "", classError("remote", httpStatusClass(resp.StatusCode), fmt.Sprintf("secret %q: status %d", name, resp.StatusCode), nil)
@@ -138,6 +224,9 @@ func (p *RemoteProvider) Get(ctx context.Context, name string) (string, error) {
 	if err != nil {
 		return "", decodeError("remote", fmt.Sprintf("secret %q: open envelope", name), err)
 	}
+	// The delivery is acknowledged: the cached keypair has done its job and
+	// the next request for this identity mints a fresh one.
+	p.clearCachedEphemeralKey(name)
 	return string(plain), nil
 }
 

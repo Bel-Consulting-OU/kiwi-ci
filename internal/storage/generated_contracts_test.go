@@ -204,7 +204,7 @@ func TestMemStoreGeneratedFragmentRejectsLeaseMismatch(t *testing.T) {
 	if got, ok, _ := m.GetJobContracts(ctx(), child.ID); ok || got != nil {
 		t.Fatalf("refused fragment leaked contracts: %v", got)
 	}
-	if _, found, _ := m.GetGeneratedFragment(ctx(), testJob.ID, generation, "frag-lease-mismatch"); found {
+	if _, found, _ := m.GetGeneratedFragment(ctx(), testJob.ID, "frag-lease-mismatch"); found {
 		t.Fatal("refused fragment left a receipt")
 	}
 }
