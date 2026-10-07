@@ -52,6 +52,7 @@ import (
 	"context"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -201,6 +202,22 @@ func NormalizeQueuedJobPageLimit(limit int) int {
 // the planner can satisfy the ordering from the index instead of sorting.
 const queuedJobAgedOrderSQL = "((priority + queue_boost))"
 
+// queuedJobTraversalIndexName / queuedJobTraversalOrderSQL are the migration
+// 0042 partial index and the EXACT ordering it serves for the immutable
+// creation-order traversal. The pair is pinned by
+// TestQueuedJobsTraversalIndexOrderParity (unit, migration text vs query
+// builder) and by the traversal EXPLAIN integration tests (Index Scan on this
+// index with no Sort or Incremental Sort), so a mismatch between the query's
+// ORDER BY and the dedicated index cannot silently return. The
+// jobs_queued_boost_sweep_idx index is NOT the traversal index: its
+// (created_at, queue_boost, id) key serves the PROMOTION sweep in
+// PromoteQueuedJobBoosts, and ordering (created_at, id) from it would require
+// an Incremental Sort inside every created_at tie group.
+const (
+	queuedJobTraversalIndexName = "jobs_queued_traversal_idx"
+	queuedJobTraversalOrderSQL  = "created_at ASC, id ASC"
+)
+
 // queuedJobRuntimeSQLExpr is the SQL mirror of storage.JobRuntime: the
 // compiled payload's effective job runtime, defaulting to "native" when the
 // payload (or the key) is absent — the same "" -> native normalization
@@ -319,7 +336,7 @@ func queuedJobNumberSQL(jsonbExpr, textExpr string) string {
 // of the job's own request and the service envelope request, the dimension's
 // suffix in the migration index/statistics names, and the capacity renderer
 // used to bind the filter's bound. The list is the SINGLE source of truth for
-// both queuedJobResourcePredicateSQL and the migration-expression parity
+// both queuedJobResourcePredicateFragments and the migration-expression parity
 // test: the migration 0041 index/statistics expressions are generated from
 // queuedJobNumberSQL with these same paths, so a dimension can never drift
 // between the query and the schema it depends on.
@@ -354,16 +371,19 @@ var queuedJobResourceDimensions = []queuedJobResourceDimension{
 		func(c model.ResourceCapacity) bool { return c.PIDs > 0 }},
 }
 
-// queuedJobResourcePredicateSQL applies the per-dimension capacity predicate
-// for every dimension MaxRequested constrains (zero = unconstrained), summing
-// the job field and — unless IgnoreServiceEnvelope — the service envelope
-// field, exactly like model.AddResourceCapacity + ResourceAdmission.
-func queuedJobResourcePredicateSQL(filter QueuedJobFilter, args *[]any) string {
+// queuedJobResourcePredicateFragments renders the per-dimension capacity
+// predicate for every dimension MaxRequested constrains (zero =
+// unconstrained), summing the job field and — unless IgnoreServiceEnvelope —
+// the service envelope field, exactly like model.AddResourceCapacity +
+// ResourceAdmission. Each fragment is self-contained (leading AND included)
+// so queuedJobFilterPredicateSQL can reorder the conjunction for the
+// clause-order plan invariance tests without touching the bound parameters.
+func queuedJobResourcePredicateFragments(filter QueuedJobFilter, args *[]any) []string {
 	addArg := func(v any) string {
 		*args = append(*args, v)
 		return "$" + strconv.Itoa(len(*args))
 	}
-	out := ""
+	frags := make([]string, 0, len(queuedJobResourceDimensions))
 	for _, d := range queuedJobResourceDimensions {
 		if !d.constrained(filter.MaxRequested) {
 			continue
@@ -372,10 +392,19 @@ func queuedJobResourcePredicateSQL(filter QueuedJobFilter, args *[]any) string {
 		if !filter.IgnoreServiceEnvelope {
 			expr = `(` + expr + ` + ` + queuedJobNumberSQL(d.envJSON, d.envText) + `)`
 		}
-		out += ` AND ` + expr + ` <= ` + addArg(d.cap(filter.MaxRequested)) + `::numeric`
+		frags = append(frags, ` AND `+expr+` <= `+addArg(d.cap(filter.MaxRequested))+`::numeric`)
 	}
-	return out
+	return frags
 }
+
+// queuedJobPredicateOrderOverride, when non-nil, permutes the rendered
+// predicate fragments before they are joined. It exists only so the planner
+// tests can prove clause ORDER cannot decide plan semantics: the conjunction
+// is commutative, and the planner must reach the same index/selectivity
+// decisions whether the rare dimension is written first or last. Production
+// leaves it nil and keeps the canonical runtimes -> labels -> region ->
+// resources order.
+var queuedJobPredicateOrderOverride func([]string) []string
 
 // queuedJobFilterPredicateSQL renders the coarse-eligibility SQL for f and
 // appends its bound parameters to args. It returns "" for the unconstrained
@@ -388,23 +417,26 @@ func queuedJobFilterPredicateSQL(filter QueuedJobFilter, args *[]any) string {
 		*args = append(*args, v)
 		return "$" + strconv.Itoa(len(*args))
 	}
-	out := ""
+	frags := make([]string, 0, len(queuedJobResourceDimensions)+3)
 	if filter.Runtimes != nil {
-		out += ` AND ` + queuedJobRuntimeSQLExpr + ` = ANY(` + addArg(filter.Runtimes) + `::text[])`
+		frags = append(frags, ` AND `+queuedJobRuntimeSQLExpr+` = ANY(`+addArg(filter.Runtimes)+`::text[])`)
 	}
 	if filter.RunnerLabels != nil {
-		out += ` AND ` + queuedJobLabelsColumn + ` <@ ` + addArg(filter.RunnerLabels) + `::text[]`
+		frags = append(frags, ` AND `+queuedJobLabelsColumn+` <@ `+addArg(filter.RunnerLabels)+`::text[]`)
 	}
 	if filter.RunnerRegion == "" {
-		out += ` AND ` + queuedJobRegionsColumn + ` = '{}'::text[]`
+		frags = append(frags, ` AND `+queuedJobRegionsColumn+` = '{}'::text[]`)
 	} else {
 		// The two arms are indexable by the same array GIN index (= '{}' and
 		// && $n), so the planner can form a BitmapOr and never needs a heap
 		// filter for the region dimension.
-		out += ` AND (` + queuedJobRegionsColumn + ` = '{}'::text[] OR ` + queuedJobRegionsColumn + ` && ` + addArg([]string{filter.RunnerRegion}) + `::text[])`
+		frags = append(frags, ` AND (`+queuedJobRegionsColumn+` = '{}'::text[] OR `+queuedJobRegionsColumn+` && `+addArg([]string{filter.RunnerRegion})+`::text[])`)
 	}
-	out += queuedJobResourcePredicateSQL(filter, args)
-	return out
+	frags = append(frags, queuedJobResourcePredicateFragments(filter, args)...)
+	if queuedJobPredicateOrderOverride != nil {
+		frags = queuedJobPredicateOrderOverride(append([]string(nil), frags...))
+	}
+	return strings.Join(frags, "")
 }
 
 // queuedJobPageExecMode forces the page queries to be planned with the bound
@@ -447,10 +479,14 @@ func queuedJobsPageQuery(filter QueuedJobFilter, after *QueuedJobCursor, limit i
 // its arguments: the SAME jobCols projection, status/deadline and
 // runner-coarse filter predicates as queuedJobsPageQuery, ordered by
 // created_at ASC, id ASC with a (created_at, id) keyset cursor and LIMIT
-// limit+1 (so HasMore is exact). jobs_queued_boost_sweep_idx
-// ON (created_at, queue_boost, id) WHERE status='queued' stores created_at
-// first, so the page walk can stop after limit+1 index entries instead of
-// sorting the queued population.
+// limit+1 (so HasMore is exact). The dedicated migration 0042 partial index
+// jobs_queued_traversal_idx ON (created_at ASC, id ASC) WHERE status='queued'
+// carries EXACTLY the ORDER BY columns, so the page walk stops after limit+1
+// index entries with no Sort or Incremental Sort. The separate
+// jobs_queued_boost_sweep_idx (created_at, queue_boost, id) is the PROMOTION
+// sweep's order (see PromoteQueuedJobBoosts), not the traversal index; no
+// traversal read may fall back to it, because the differing id position
+// inside a created_at tie group forces an Incremental Sort there.
 func queuedJobsTraversalQuery(filter QueuedJobFilter, after *QueuedJobTraversalCursor, limit int, now time.Time) (string, []any) {
 	args := []any{now}
 	where := ` WHERE status='queued' AND (queue_deadline IS NULL OR queue_deadline > $1::timestamptz)`
@@ -463,7 +499,7 @@ func queuedJobsTraversalQuery(filter QueuedJobFilter, after *QueuedJobTraversalC
 	}
 	args = append(args, limit+1)
 	query := `SELECT ` + jobCols + ` FROM jobs` + where +
-		` ORDER BY created_at ASC, id ASC LIMIT $` + strconv.Itoa(len(args))
+		` ORDER BY ` + queuedJobTraversalOrderSQL + ` LIMIT $` + strconv.Itoa(len(args))
 	return query, args
 }
 
@@ -701,6 +737,10 @@ func (m *memStore) ListQueuedJobsByCreation(ctx context.Context, filter QueuedJo
 // iteration updates at most `want` = batchLimit - promoted rows inside a
 // schema-fenced transaction using the jobs_queued_boost_sweep_idx order
 // (created_at, queue_boost, id), then stops early once a batch is not filled.
+// That index is the PROMOTION sweep's dedicated order, the only place it is
+// used: the immutable traversal is served by jobs_queued_traversal_idx
+// (migration 0042), because (created_at, queue_boost, id) cannot stream
+// (created_at, id) without an Incremental Sort inside each tie group.
 func (s *PostgresStore) PromoteQueuedJobBoosts(ctx context.Context, now time.Time, batchLimit int) (int64, error) {
 	if batchLimit <= 0 {
 		return 0, nil

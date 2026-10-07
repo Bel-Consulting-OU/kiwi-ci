@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cache"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executor"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 )
@@ -290,6 +291,16 @@ func (r *Runner) reconcileRuntimeLedger(runInstanceID string) (ledgerReconcileRe
 				continue
 			}
 			if err := removeLedgerPath(p); err != nil && !os.IsNotExist(err) {
+				ok = false
+			}
+		}
+		// A SIGKILL between cache publication renames cannot run Go
+		// rollback, so the restore's workspace-scoped staging siblings are
+		// reclaimed here, right after the workspace they belonged to. A
+		// failure keeps the entry retryable instead of leaking the staged
+		// remainder forever.
+		if ok && entry.Workspace != "" && ledgerPathIsRunnerOwned(entry.Workspace) {
+			if _, err := cache.RemoveStaleStagesForWorkspace(entry.Workspace); err != nil {
 				ok = false
 			}
 		}

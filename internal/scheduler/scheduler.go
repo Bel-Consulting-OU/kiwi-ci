@@ -398,6 +398,20 @@ func (s *DBScheduler) Enqueue(ctx context.Context, run model.Run, jobs map[strin
 // independent sweep reclaims cursors whose runner never returns, the state
 // map is capped, and a claim or an exhausted traversal clears the cursor.
 //
+// The frontier advance is a GUARANTEE, not an emergent property: every
+// unsuccessful scan moves the traversal past at least
+// min(candidatePageSize, max(1, maxCandidateRows/4)) returned rows (or the
+// whole remaining traversal when it is smaller), and the head window may
+// consume at most the scan budget — it can never consume the traversal's
+// reserved minimum. A deep queue position behind a permanently ineligible
+// head prefix is therefore reached in ceil(position/minAdvance) scans plus a
+// constant, independent of how long that prefix stays ineligible. When
+// maxCandidateRows <= candidatePageSize the head window consumes the entire
+// budget and the request still walks one full traversal page
+// (candidatePageSize rows), so the guarantee holds in that edge too. One
+// attempt therefore materializes at most maxCandidateRows plus the guaranteed
+// advance (or plus one page in the small-budget edge).
+//
 // RESERVATION POLICY (anti-backfill): the first resource-blocked candidate
 // in aged order that is still eligible on every other gate becomes the
 // request's RESERVATION HEAD — the job that would run on this runner once
@@ -552,10 +566,20 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 //  3. STATE: a claim clears the cursor; a full sweep with no claim clears it;
 //     a budget exhaustion mid-sweep stores the last evaluated position so the
 //     next poll for the same runner resumes instead of re-materializing the
-//     same prefix. When the head window alone consumes the whole budget
-//     (maxRows <= pageSize) the request still walks one traversal page, so
-//     the round-robin always advances; the request stays bounded by
-//     maxRows + pageSize.
+//     same prefix.
+//
+// FRONTIER-ADVANCE GUARANTEE: on every UNSUCCESSFUL scan the traversal itself
+// must advance by at least min(pageSize, max(1, maxRows/4)) returned rows —
+// or the whole remaining traversal when that is smaller. The head window may
+// consume at most the scan budget (maxRows, and at most pageSize rows), and
+// the guarantee is reserved ON TOP of whatever the head consumed, so a
+// permanently ineligible head prefix can never pin the round-robin to the
+// same rows. When maxRows <= pageSize the head window can consume the whole
+// budget and the request still walks one full traversal page (pageSize rows),
+// which is the edge the earlier implementation already handled; it is now an
+// explicit part of the contract. The request therefore stays bounded by
+// maxRows + min(pageSize, max(1, maxRows/4)) when maxRows > pageSize, and by
+// maxRows + pageSize in the small-budget edge.
 func (s *DBScheduler) leasePaged(ctx context.Context, pageStore storage.QueuedJobPageStore, traversalStore storage.QueuedJobTraversalStore, filter storage.QueuedJobFilter, walk *leaseCandidateWalk, runnerID string, pageSize, maxRows int, now time.Time) (leaseWalkResult, error) {
 	headLimit := pageSize
 	if maxRows < headLimit {
@@ -577,6 +601,14 @@ func (s *DBScheduler) leasePaged(ctx context.Context, pageStore storage.QueuedJo
 		}
 		return res, nil
 	}
+	// The guaranteed traversal advance: min(pageSize, max(1, maxRows/4)).
+	minAdvance := maxRows / 4
+	if minAdvance > pageSize {
+		minAdvance = pageSize
+	}
+	if minAdvance < 1 {
+		minAdvance = 1
+	}
 	// Round-robin sweep over the immutable creation order. The stored
 	// cursor (if any) is this runner's position in that order; nil starts at
 	// the oldest queued row.
@@ -586,11 +618,17 @@ func (s *DBScheduler) leasePaged(ctx context.Context, pageStore storage.QueuedJo
 		cursor = &c
 	}
 	remaining := maxRows - scanned
-	if remaining <= 0 {
+	switch {
+	case maxRows <= pageSize:
 		// The head window consumed the entire budget (maxRows <= pageSize):
-		// walk at least one traversal page so the round-robin advances
+		// walk at least one full traversal page so the round-robin advances
 		// instead of re-walking the same aged head forever.
 		remaining = pageSize
+	case remaining < minAdvance:
+		// The head window may consume the remaining budget, but never the
+		// traversal's guaranteed minimum: reserve it on top of the head's
+		// spend so a full ineligible head window cannot stall the frontier.
+		remaining = minAdvance
 	}
 	var last storage.QueuedJobTraversalCursor
 	progress := false

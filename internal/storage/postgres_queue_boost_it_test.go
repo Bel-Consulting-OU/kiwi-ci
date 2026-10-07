@@ -157,15 +157,18 @@ func TestPostgresIntegrationQueuedBoostPromotion(t *testing.T) {
 // explainNode is the subset of an EXPLAIN (FORMAT JSON) plan node the tests
 // assert on (recursively flattened).
 type explainNode struct {
-	NodeType     string        `json:"Node Type"`
-	RelationName string        `json:"Relation Name"`
-	IndexName    string        `json:"Index Name"`
-	ActualRows   float64       `json:"Actual Rows"`
-	ActualLoops  float64       `json:"Actual Loops"`
-	RowsRemoved  float64       `json:"Rows Removed by Filter"`
-	SharedHit    float64       `json:"Shared Hit Blocks"`
-	SharedRead   float64       `json:"Shared Read Blocks"`
-	Plans        []explainNode `json:"Plans"`
+	NodeType       string        `json:"Node Type"`
+	RelationName   string        `json:"Relation Name"`
+	IndexName      string        `json:"Index Name"`
+	ActualRows     float64       `json:"Actual Rows"`
+	ActualLoops    float64       `json:"Actual Loops"`
+	RowsRemoved    float64       `json:"Rows Removed by Filter"`
+	RemovedRecheck float64       `json:"Rows Removed by Index Recheck"`
+	SharedHit      float64       `json:"Shared Hit Blocks"`
+	SharedRead     float64       `json:"Shared Read Blocks"`
+	HeapFetches    float64       `json:"Heap Fetches"`
+	SortKeys       []string      `json:"Sort Key"`
+	Plans          []explainNode `json:"Plans"`
 }
 
 type explainRoot struct {

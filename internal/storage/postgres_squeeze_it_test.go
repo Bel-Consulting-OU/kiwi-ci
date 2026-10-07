@@ -1129,9 +1129,10 @@ func TestPostgresIntegrationMiscStatementBreaks(t *testing.T) {
 		// queued-candidate index and carries the same status predicate; 0041
 		// replaced the jsonb label/region GINs with the normalized array GINs
 		// and added the combined- and own-request resource expression indexes,
-		// all partial on status='queued'.
+		// and 0042 added the immutable-traversal index, all partial on
+		// status='queued'.
 		if _, err := st.pool.Exec(context.Background(), `DROP INDEX jobs_running_lease_recovery_idx, jobs_queue_deadline_recovery_idx, jobs_queued_priority_idx,
-			jobs_queued_aged_idx, jobs_queued_boost_sweep_idx, jobs_queued_runtime_idx, jobs_queued_labels_arr_idx, jobs_queued_regions_arr_idx,
+			jobs_queued_aged_idx, jobs_queued_boost_sweep_idx, jobs_queued_traversal_idx, jobs_queued_runtime_idx, jobs_queued_labels_arr_idx, jobs_queued_regions_arr_idx,
 			jobs_queued_cpu_idx, jobs_queued_memory_idx, jobs_queued_pids_idx, jobs_queued_disk_idx,
 			jobs_queued_cpu_own_idx, jobs_queued_memory_own_idx, jobs_queued_pids_own_idx, jobs_queued_disk_own_idx`); err != nil {
 			t.Fatal(err)

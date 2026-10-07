@@ -9,11 +9,16 @@ package storage
 // creation order (created_at ASC, id ASC) regardless of priority or
 // queue_boost, HasMore/Last are exact, the persisted queue_deadline pushdown
 // excludes elapsed rows, memStore and Postgres agree, and the plan is an
-// index-backed early stop on jobs_queued_boost_sweep_idx.
+// index-backed early stop on the dedicated jobs_queued_traversal_idx
+// (migration 0042) with no Sort or Incremental Sort — including when many
+// rows share created_at with mixed queue_boost values, the case that made the
+// old promotion-sweep index look correct only by incrementally sorting each
+// timestamp group.
 
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -186,10 +191,11 @@ func TestPostgresIntegrationQueuedJobsTraversalMemoryParity(t *testing.T) {
 
 // TestPostgresIntegrationQueuedJobsTraversalExplain seeds ~20k queued rows
 // with unique created_at values and proves the creation-order page is an
-// index-backed early stop on jobs_queued_boost_sweep_idx: no sequential scan,
-// an index scan on that index, and at most 2048 actually examined rows for
-// limit 256 (which excludes both a full and an incremental sort, since either
-// would have to materialize the whole queued population first).
+// index-backed early stop on jobs_queued_traversal_idx: no sequential scan,
+// no Sort/Incremental Sort anywhere, an index scan on that index, and at most
+// 2048 actually examined rows for limit 256 (which excludes a full or
+// incremental sort, since either would have to materialize the whole queued
+// population first).
 func TestPostgresIntegrationQueuedJobsTraversalExplain(t *testing.T) {
 	st := pgITStore(t)
 	ctx := context.Background()
@@ -201,8 +207,9 @@ func TestPostgresIntegrationQueuedJobsTraversalExplain(t *testing.T) {
 
 	const total = 20000
 	jobs := pgITBoostSeed(runID, total, now, func(i int, j *model.Job) {
-		// Unique created_at: the (created_at, queue_boost, id) index order is
-		// then exactly the requested (created_at, id) order.
+		// Unique created_at: every index order is then trivially compatible,
+		// so this case isolates the index selection from tie handling (the
+		// tied adversarial case is TestPostgresIntegrationQueuedJobsTraversalTiedTimestamps).
 		j.CreatedAt = now.Add(-time.Duration(i+1) * time.Second)
 	})
 	pgITBulkInsertQueuedJobs(t, st, runID, jobs)
@@ -218,18 +225,182 @@ func TestPostgresIntegrationQueuedJobsTraversalExplain(t *testing.T) {
 	}); found {
 		t.Fatalf("traversal plan sequentially scans: %+v", n)
 	}
-	sweep, found := pgITFindNode(plan, func(n explainNode) bool {
-		return (n.NodeType == "Index Scan" || n.NodeType == "Index Only Scan") && n.IndexName == "jobs_queued_boost_sweep_idx"
+	if n, found := pgITFindNode(plan, func(n explainNode) bool {
+		return strings.Contains(n.NodeType, "Sort")
+	}); found {
+		t.Fatalf("traversal plan contains a %s node; the creation order must come from %s with no sort\nplan: %+v",
+			n.NodeType, queuedJobTraversalIndexName, plan)
+	}
+	scan, found := pgITFindNode(plan, func(n explainNode) bool {
+		return (n.NodeType == "Index Scan" || n.NodeType == "Index Only Scan") && n.IndexName == queuedJobTraversalIndexName
 	})
 	if !found {
-		t.Fatalf("traversal plan has no index scan on jobs_queued_boost_sweep_idx\nplan: %+v", plan)
+		t.Fatalf("traversal plan has no index scan on %s\nplan: %+v", queuedJobTraversalIndexName, plan)
 	}
-	if sweep.ActualRows > 2048 {
-		t.Fatalf("creation-order index scan examined %.0f rows, want <= 2048 (bounded early stop)", sweep.ActualRows)
+	if scan.ActualRows > 2048 {
+		t.Fatalf("creation-order index scan examined %.0f rows, want <= 2048 (bounded early stop)", scan.ActualRows)
 	}
 	pgITWalkPlan(plan, func(n explainNode) {
 		if n.RelationName == "jobs" && n.ActualRows > 2048 {
 			t.Fatalf("scan node %q on jobs examined %.0f rows, want <= 2048 (bounded path)", n.NodeType, n.ActualRows)
 		}
 	})
+}
+
+// pgITPlanBuffers sums the shared-buffer touches of every plan node, the
+// measure of how much of the table one traversal page physically reads.
+func pgITPlanBuffers(plan explainNode) float64 {
+	total := 0.0
+	pgITWalkPlan(plan, func(n explainNode) {
+		total += n.SharedHit + n.SharedRead
+	})
+	return total
+}
+
+// TestPostgresIntegrationQueuedJobsTraversalTiedTimestamps is the audit's
+// exact false positive: 100k queued rows share created_at in groups of 100
+// with MIXED queue_boost values inside each group. The old traversal reused
+// jobs_queued_boost_sweep_idx (created_at, queue_boost, id); from that index
+// the requested (created_at, id) order differs inside every tie group, so the
+// plan could keep an index scan's bounded "loops/rows" while paying an
+// Incremental Sort over each group — the early stop was not the index's. The
+// dedicated jobs_queued_traversal_idx (created_at, id) WHERE status='queued'
+// removes the sort entirely, and this test proves it with a production-query
+// EXPLAIN (ANALYZE, BUFFERS) plus an exact keyset walk over the ties.
+func TestPostgresIntegrationQueuedJobsTraversalTiedTimestamps(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	runID := pgITNewID(t)
+	pgITBulkInsertRuns(t, st, []model.Run{{
+		ID: runID, Status: model.StatusQueued, CreatedAt: now.Add(-2 * time.Hour),
+	}})
+
+	const groups = 1000
+	const perGroup = 100
+	base := now.Add(-2 * time.Hour)
+	jobs := pgITBoostSeed(runID, groups*perGroup, now, func(i int, j *model.Job) {
+		g, r := i/perGroup, i%perGroup
+		j.CreatedAt = base.Add(time.Duration(g) * time.Second)
+		// Mixed boosts inside the tie group: the promotion sweep index order
+		// (created_at, queue_boost, id) interleaves the group, so streaming
+		// (created_at, id) from it would need an Incremental Sort.
+		j.QueueBoost = (r*7 + 3) % 11
+		j.BoostKnown = true
+	})
+	pgITBulkInsertQueuedJobs(t, st, runID, jobs)
+	if _, err := st.pool.Exec(ctx, `ANALYZE jobs`); err != nil {
+		t.Fatalf("ANALYZE: %v", err)
+	}
+
+	// 1. The production traversal query for limit 256 must be a plain index
+	// scan on the dedicated traversal index: no Sort/Incremental Sort node
+	// anywhere, bounded examined rows and buffers.
+	query, args := queuedJobsTraversalQuery(QueuedJobFilter{}, nil, 256, now)
+	plan := pgITExplain(t, st, query, args...)
+	if n, found := pgITFindNode(plan, func(n explainNode) bool {
+		return strings.Contains(n.NodeType, "Sort")
+	}); found {
+		t.Fatalf("tied traversal plan contains a %s node; (created_at, id) must stream from %s\nplan: %+v",
+			n.NodeType, queuedJobTraversalIndexName, plan)
+	}
+	if n, found := pgITFindNode(plan, func(n explainNode) bool {
+		return n.NodeType == "Seq Scan" || n.NodeType == "Parallel Seq Scan"
+	}); found {
+		t.Fatalf("tied traversal plan sequentially scans: %+v", n)
+	}
+	if n, found := pgITFindNode(plan, func(n explainNode) bool {
+		return n.NodeType == "Index Scan" && n.IndexName == "jobs_queued_boost_sweep_idx"
+	}); found {
+		t.Fatalf("tied traversal plan uses the promotion sweep index instead of %s: %+v", queuedJobTraversalIndexName, n)
+	}
+	scan, found := pgITFindNode(plan, func(n explainNode) bool {
+		return (n.NodeType == "Index Scan" || n.NodeType == "Index Only Scan") && n.IndexName == queuedJobTraversalIndexName
+	})
+	if !found {
+		t.Fatalf("tied traversal plan has no index scan on %s\nplan: %+v", queuedJobTraversalIndexName, plan)
+	}
+	if scan.ActualRows > 2048 {
+		t.Fatalf("tied traversal index scan examined %.0f rows, want <= 2048 (limit+1 bounded early stop)", scan.ActualRows)
+	}
+	if buffers := pgITPlanBuffers(plan); buffers > 256 {
+		t.Fatalf("tied traversal plan touched %.0f buffers, want <= 256 (bounded by the page, not %d queued rows)", buffers, groups*perGroup)
+	} else {
+		t.Logf("tied traversal plan: rows=%.0f buffers=%.0f index=%s", scan.ActualRows, buffers, scan.IndexName)
+	}
+
+	// 2. Several keyset pages walk the ties in exact (created_at, id) order
+	// with no duplicates and no gaps, even though each tie group mixes boosts.
+	expected := make([]model.Job, len(jobs))
+	copy(expected, jobs)
+	sortQueuedJobsByCreation(expected)
+	const pageSize = 100
+	const pages = 8
+	seen := make(map[string]bool, pageSize*pages)
+	var after *QueuedJobTraversalCursor
+	for page := 0; page < pages; page++ {
+		got, err := st.ListQueuedJobsByCreation(ctx, QueuedJobFilter{}, after, pageSize, now)
+		if err != nil {
+			t.Fatalf("page %d: %v", page+1, err)
+		}
+		if len(got.Jobs) != pageSize {
+			t.Fatalf("page %d returned %d jobs, want %d", page+1, len(got.Jobs), pageSize)
+		}
+		for i, j := range got.Jobs {
+			want := expected[page*pageSize+i]
+			if j.ID != want.ID || !j.CreatedAt.Equal(want.CreatedAt) {
+				t.Fatalf("page %d row %d = (%s, %s), want (%s, %s)",
+					page+1, i, j.ID, j.CreatedAt, want.ID, want.CreatedAt)
+			}
+			if seen[j.ID] {
+				t.Fatalf("duplicate job %s in the tied walk", j.ID)
+			}
+			seen[j.ID] = true
+		}
+		last := got.Jobs[len(got.Jobs)-1]
+		if got.Last.ID != last.ID || !got.Last.CreatedAt.Equal(last.CreatedAt) {
+			t.Fatalf("page %d Last = %+v, want cursor of %s", page+1, got.Last, last.ID)
+		}
+		if !got.HasMore {
+			t.Fatalf("page %d HasMore = false with %d queued rows behind it", page+1, len(expected)-len(seen))
+		}
+		cursor := got.Last
+		after = &cursor
+	}
+
+	// 3. Memory parity on a small version of the same fixture: the first
+	// 3000 tied rows walked through memStore must page identically to the
+	// Postgres prefix (the same IDs, boundaries and HasMore).
+	const parityRows = 3000
+	mem := newMemStore()
+	for i := 0; i < parityRows; i++ {
+		if err := mem.InsertJob(ctx, jobs[i]); err != nil {
+			t.Fatalf("mem seed %d: %v", i, err)
+		}
+	}
+	var pgAfter, memAfter *QueuedJobTraversalCursor
+	for page := 0; page < pages; page++ {
+		pgPage, err := st.ListQueuedJobsByCreation(ctx, QueuedJobFilter{}, pgAfter, pageSize, now)
+		if err != nil {
+			t.Fatalf("parity pg page %d: %v", page+1, err)
+		}
+		memPage, err := mem.ListQueuedJobsByCreation(ctx, QueuedJobFilter{}, memAfter, pageSize, now)
+		if err != nil {
+			t.Fatalf("parity mem page %d: %v", page+1, err)
+		}
+		if len(pgPage.Jobs) != len(memPage.Jobs) || pgPage.HasMore != memPage.HasMore ||
+			pgPage.Last.ID != memPage.Last.ID || !pgPage.Last.CreatedAt.Equal(memPage.Last.CreatedAt) {
+			t.Fatalf("parity page %d differs: pg %d/%v/%+v mem %d/%v/%+v",
+				page+1, len(pgPage.Jobs), pgPage.HasMore, pgPage.Last, len(memPage.Jobs), memPage.HasMore, memPage.Last)
+		}
+		for i := range pgPage.Jobs {
+			if pgPage.Jobs[i].ID != memPage.Jobs[i].ID || !pgPage.Jobs[i].CreatedAt.Equal(memPage.Jobs[i].CreatedAt) {
+				t.Fatalf("parity page %d row %d: pg %s mem %s", page+1, i, pgPage.Jobs[i].ID, memPage.Jobs[i].ID)
+			}
+		}
+		cursor := pgPage.Last
+		pgAfter = &cursor
+		memCursor := memPage.Last
+		memAfter = &memCursor
+	}
 }

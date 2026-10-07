@@ -32,6 +32,20 @@ import (
 // Authorization, policy, and malformed-response failures must NEVER be
 // masked by falling through to a later broker, and the configuration layer
 // refuses a chain policy that names them (see ParseFallbackOn).
+//
+// Declared class precedence lattice (highest wins):
+//
+//	rank 4  forbidden, unauthorized   authorization/policy: terminal, never fallback-able
+//	rank 3  malformed                 unusable response: terminal, never fallback-able
+//	rank 2  unavailable               outage/timeout/cancellation: terminal unless opted in
+//	rank 1  not_found                 absence: terminal unless opted in
+//	rank 0  unknown                   unclassified: never fallback-able, stops the chain
+//
+// ClassPrecedence exposes these ranks. When a chain exhausts every broker the
+// returned aggregate error takes the highest-ranked class among the
+// encountered failures (see ChainBroker.Resolve), so an outage is never
+// reported as an absence. An unclassified error never participates in
+// fallback and stops the chain as-is.
 var (
 	ErrSecretNotFound    = errors.New("secretbroker: secret not found")
 	ErrUnauthorized      = errors.New("secretbroker: provider unauthorized")
@@ -94,37 +108,98 @@ func classError(provider string, class error, detail string, cause error) error 
 	return &ProviderError{Provider: provider, Class: class, Detail: detail, Err: cause}
 }
 
-// ErrorClass returns the fallback-policy class name of err ("not_found",
+// ErrorClass returns the declared class name of err ("not_found",
 // "unauthorized", "forbidden", "unavailable", "malformed") or "unknown" for
-// an unclassified error. It is used to annotate chain decisions and to
-// evaluate a FallbackOn policy.
+// an unclassified error; nil yields "". It is used to annotate chain
+// decisions, to evaluate a FallbackOn policy, and for telemetry. When an
+// error aggregates several classes, the highest-precedence class wins (see
+// the lattice above), so ErrorClass agrees with terminalClass and telemetry
+// never mistakes an outage for an absence.
 func ErrorClass(err error) string {
-	switch {
-	case err == nil:
+	if err == nil {
 		return ""
-	case errors.Is(err, ErrSecretNotFound):
-		return FallbackClassNotFound
-	case errors.Is(err, ErrUnauthorized):
-		return "unauthorized"
-	case errors.Is(err, ErrForbidden):
-		return "forbidden"
-	case errors.Is(err, ErrUnavailable):
-		return FallbackClassUnavailable
-	case errors.Is(err, ErrMalformedResponse):
-		return "malformed"
-	default:
-		return "unknown"
 	}
+	for _, entry := range classPrecedenceTable {
+		if errors.Is(err, entry.sentinel) {
+			return entry.name
+		}
+	}
+	return ClassUnknown
 }
 
 // FallbackClassNotFound and FallbackClassUnavailable are the only error
 // classes a chain may be configured to fall through on. Authorization,
 // policy and malformed-response classes are deliberately not configurable:
 // falling through on them would mask an authoritative security decision.
+//
+// ClassUnauthorized, ClassForbidden, ClassMalformed and ClassUnknown complete
+// the class-name vocabulary returned by ErrorClass.
 const (
 	FallbackClassNotFound    = "not_found"
 	FallbackClassUnavailable = "unavailable"
+	ClassUnauthorized        = "unauthorized"
+	ClassForbidden           = "forbidden"
+	ClassMalformed           = "malformed"
+	ClassUnknown             = "unknown"
 )
+
+// classPrecedenceTable is the declared precedence lattice as data, ordered
+// from the highest rank to the lowest so the first match wins. It is the
+// single source of truth for ClassPrecedence, classSentinel, terminalClass
+// and ErrorClass. Forbidden and unauthorized share the top rank; forbidden is
+// listed first so an error matching both resolves deterministically (a chain
+// itself never accumulates both: it stops at the first non-fallback class).
+var classPrecedenceTable = []struct {
+	name     string
+	rank     int
+	sentinel error
+}{
+	{ClassForbidden, 4, ErrForbidden},
+	{ClassUnauthorized, 4, ErrUnauthorized},
+	{ClassMalformed, 3, ErrMalformedResponse},
+	{FallbackClassUnavailable, 2, ErrUnavailable},
+	{FallbackClassNotFound, 1, ErrSecretNotFound},
+}
+
+// ClassPrecedence returns the declared precedence rank of a class name:
+// higher wins. Unknown, empty and unrecognized names rank 0 and never
+// participate in fallback.
+func ClassPrecedence(class string) int {
+	for _, entry := range classPrecedenceTable {
+		if entry.name == class {
+			return entry.rank
+		}
+	}
+	return 0
+}
+
+// classSentinel maps a class name to its sentinel error, or nil when the name
+// is not a declared class.
+func classSentinel(class string) error {
+	for _, entry := range classPrecedenceTable {
+		if entry.name == class {
+			return entry.sentinel
+		}
+	}
+	return nil
+}
+
+// terminalClass is a pure function returning the sentinel of the
+// highest-precedence class among errs, or nil when none of them is
+// classified. It is order-independent: the lattice decides, and the tied top
+// rank (forbidden/unauthorized) resolves to forbidden. An unclassified error
+// contributes nothing; callers must treat it as chain-stopping and return it
+// unmasked.
+func terminalClass(errs []error) error {
+	for _, entry := range classPrecedenceTable {
+		for _, err := range errs {
+			if errors.Is(err, entry.sentinel) {
+				return entry.sentinel
+			}
+		}
+	}
+	return nil
+}
 
 // DefaultFallbackOn is the built-in chain policy: a chain advances only when
 // the authoritative store reports the secret absent.

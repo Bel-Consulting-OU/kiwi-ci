@@ -212,6 +212,19 @@ func hmacSHA256(key, data []byte) []byte {
 // broker. A nil policy means DefaultFallbackOn ([not_found]); a non-nil
 // empty policy means no class permits advancing. Only "not_found" and
 // "unavailable" are valid entries; ParseFallbackOn enforces that.
+//
+// Exhaustion semantics: when every consulted broker fails with a
+// fallback-allowed class, Resolve returns a classified aggregate whose class
+// is the highest-precedence class encountered, per the declared lattice in
+// errors.go (forbidden == unauthorized > malformed > unavailable >
+// not_found). All-unavailable therefore yields ErrUnavailable, never
+// ErrSecretNotFound, and not_found+unavailable yields ErrUnavailable; only an
+// all-not-found exhaustion keeps ErrSecretNotFound. The aggregate retains
+// every per-broker cause, so errors.Is still matches each encountered class
+// and each underlying cause, while ErrorClass reports the winning class for
+// telemetry. An unclassified error is never fallback-able: it stops the chain
+// and is returned as-is. An empty chain (or one with only nil entries) yields
+// ErrSecretNotFound.
 type ChainBroker struct {
 	Brokers    []Broker
 	FallbackOn []string
@@ -225,7 +238,7 @@ func (c ChainBroker) fallbackAllowed(err error) bool {
 		policy = DefaultFallbackOn
 	}
 	class := ErrorClass(err)
-	if class == "" || class == "unknown" {
+	if class == "" || class == ClassUnknown {
 		return false
 	}
 	for _, allowed := range policy {
@@ -270,8 +283,16 @@ func (c ChainBroker) Resolve(ctx context.Context, name string, scope SecretScope
 	if consulted == 0 {
 		return "", classError("chain", ErrSecretNotFound, fmt.Sprintf("secret %q not found: empty broker chain", name), nil)
 	}
-	return "", classError("chain", ErrSecretNotFound,
-		fmt.Sprintf("secret %q not found in any configured broker", name), errors.Join(errs...))
+	winner := terminalClass(errs)
+	if winner == nil {
+		// Defensive: fallbackAllowed only advances on classified errors, so
+		// every encountered failure carries a class. If that invariant ever
+		// breaks, fail closed as not-found rather than invent a class.
+		winner = ErrSecretNotFound
+	}
+	return "", classError("chain", winner,
+		fmt.Sprintf("secret %q: chain exhausted %d broker(s), terminal class %s", name, consulted, ErrorClass(winner)),
+		errors.Join(errs...))
 }
 
 // brokerName names a chain broker for diagnostics. The Broker interface has

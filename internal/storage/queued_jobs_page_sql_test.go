@@ -1,11 +1,12 @@
 package storage
 
 // Unit contract tests (no PostgreSQL) binding the queued page query's SQL to
-// the migration 0041 schema objects it depends on. The migration indexes must
-// carry the query's EXACT expressions: the resource index/statistics
+// the migration 0041/0042 schema objects it depends on. The migration indexes
+// must carry the query's EXACT expressions: the resource index/statistics
 // expressions are generated here from the same queuedJobNumberSQL renderer
-// the query uses, so editing the query without editing the migration (or the
-// reverse) fails before any integration run.
+// the query uses, and the traversal ORDER BY is compared against the
+// dedicated migration 0042 index definition, so editing the query without
+// editing the migration (or the reverse) fails before any integration run.
 
 import (
 	"strings"
@@ -159,4 +160,48 @@ func TestQueuedJobsPageMigrationIndexExpressionParity(t *testing.T) {
 			t.Errorf("0041 backfill guard missing %q", want)
 		}
 	}
+}
+
+// TestQueuedJobsTraversalIndexOrderParity pins the immutable traversal's SQL
+// to its dedicated migration 0042 index. The traversal query ORDER BY and the
+// index key are both rendered from queuedJobTraversalOrderSQL, and the
+// migration text is compared against that same constant, so a query that
+// falls back to the promotion sweep's (created_at, queue_boost, id) ordering
+// (which would force an Incremental Sort inside every created_at tie group)
+// fails this unit contract before the database is involved.
+func TestQueuedJobsTraversalIndexOrderParity(t *testing.T) {
+	raw42, err := migrations.FS.ReadFile("0042_queued_traversal_index.sql")
+	if err != nil {
+		t.Fatalf("read migration 0042: %v", err)
+	}
+	m42 := normalizeSQLSpace(string(raw42))
+
+	wantIndex := normalizeSQLSpace("CREATE INDEX IF NOT EXISTS " + queuedJobTraversalIndexName +
+		" ON jobs (" + queuedJobTraversalOrderSQL + ") WHERE status='queued'")
+	if !strings.Contains(m42, wantIndex) {
+		t.Errorf("migration 0042 must define the traversal index on the query's exact ordering:\nwant %s", wantIndex)
+	}
+	// The promotion sweep index stays owned by the promotion order; 0042 must
+	// not redefine it as a traversal index.
+	if strings.Contains(normalizeSQLSpace(removeSQLComments(string(raw42))), "CREATE INDEX IF NOT EXISTS jobs_queued_boost_sweep_idx") {
+		t.Errorf("0042 must not (re)create the promotion sweep index")
+	}
+
+	query, _ := queuedJobsTraversalQuery(QueuedJobFilter{}, nil, 256, time.Now().UTC())
+	if !strings.Contains(query, " ORDER BY "+queuedJobTraversalOrderSQL+" LIMIT ") {
+		t.Errorf("traversal query must order by the dedicated index key %q:\n%s", queuedJobTraversalOrderSQL, query)
+	}
+}
+
+// removeSQLComments strips whole-line SQL comments so migration comments can
+// be excluded from statement-shape assertions.
+func removeSQLComments(s string) string {
+	var out []string
+	for _, line := range strings.Split(s, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "--") {
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
 }

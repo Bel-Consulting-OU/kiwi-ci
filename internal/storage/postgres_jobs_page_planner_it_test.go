@@ -514,7 +514,11 @@ func TestPostgresIntegrationQueuedJobsPlannerIndexContract(t *testing.T) {
 		fragment []string
 	}{
 		{"jobs_queued_aged_idx", []string{"priority + queue_boost", "created_at", "id", "status = 'queued'"}},
+		// (created_at, queue_boost, id) is the PROMOTION sweep's order only
+		// (PromoteQueuedJobBoosts); the immutable traversal is served by
+		// jobs_queued_traversal_idx below, whose key is the traversal order.
 		{"jobs_queued_boost_sweep_idx", []string{"created_at", "queue_boost", "status = 'queued'"}},
+		{"jobs_queued_traversal_idx", []string{"created_at", "id", "status = 'queued'"}},
 		{"jobs_queued_runtime_idx", []string{"compiled_job_payload", "effective_job", "native", "status = 'queued'"}},
 		{"jobs_queued_labels_arr_idx", []string{"gin", "required_labels", "status = 'queued'"}},
 		{"jobs_queued_regions_arr_idx", []string{"gin", "placement_regions", "status = 'queued'"}},

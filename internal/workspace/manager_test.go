@@ -248,6 +248,60 @@ func TestCloseSerializesWithPrepare(t *testing.T) {
 	}
 }
 
+// TestPrepareNeverReusesAnAbandonedWorkspace pins the reuse-safety invariant
+// for the local CLI: a crashed run's job workspace (with partial cache files)
+// must never be handed to a new job. The same Manager refuses the existing
+// target fail-closed, and a NEW run (fresh root) gets a different path, so a
+// crashed workspace can never bleed partial contents into a new job.
+func TestPrepareNeverReusesAnAbandonedWorkspace(t *testing.T) {
+	src := t.TempDir()
+	writeFile(t, filepath.Join(src, "app.txt"), "app")
+	m1, err := NewManager(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m1.Close()
+	dir, cleanup, err := m1.Prepare(context.Background(), "job-reuse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a crash mid cache restore: partial content in the workspace
+	// and NO cleanup call.
+	writeFile(t, filepath.Join(dir, "restored-partial.txt"), "partial")
+
+	// Same Manager, same job id, while the abandoned target exists: refuse,
+	// never return the crashed directory.
+	if again, _, err := m1.Prepare(context.Background(), "job-reuse"); err == nil {
+		t.Fatalf("Prepare reused the abandoned workspace %q", again)
+	}
+
+	// A later run (new root) for the same job id gets a DIFFERENT path that
+	// cannot contain the crashed run's partial files.
+	m2, err := NewManager(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m2.Close()
+	dir2, cleanup2, err := m2.Prepare(context.Background(), "job-reuse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup2()
+	if dir2 == dir {
+		t.Fatalf("two run roots produced the same workspace path %q", dir)
+	}
+	if got := readFile(t, filepath.Join(dir, "restored-partial.txt")); got != "partial" {
+		t.Fatalf("abandoned workspace was mutated: %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir2, "restored-partial.txt")); !os.IsNotExist(err) {
+		t.Fatalf("the crashed run's partial file reached the new workspace (err=%v)", err)
+	}
+	if got := readFile(t, filepath.Join(dir2, "app.txt")); got != "app" {
+		t.Fatalf("new workspace snapshot = %q, want app", got)
+	}
+	cleanup()
+}
+
 // TestCopyTreeExcludesItsOwnDestination: a destination under the source (a
 // TMPDIR inside the repository) must not be copied into itself; without the
 // exclusion the walk recurses until ENAMETOOLONG.

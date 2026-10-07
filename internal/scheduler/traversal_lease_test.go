@@ -259,3 +259,193 @@ func hasStateOf(s *DBScheduler, runnerID string) bool {
 	_, ok := s.scan[runnerID]
 	return ok
 }
+
+// TestSchedulerTraversalFrontierAdvancesUnderPermanentHeadPrefix pins the
+// head-vs-traversal budget contract. A permanently replenished high-priority
+// dependency-blocked prefix keeps the aged head window full on every poll,
+// and the scan budget is deliberately small relative to the page size
+// (pageSize 8, maxRows 9 => minAdvance = max(1, 9/4) = 2), exactly the regime
+// where the head window would otherwise consume all but one row of the
+// traversal budget. The deep eligible row must be leased within
+// ceil(depth/minAdvance)+2 polls, and every unsuccessful scan must have moved
+// the immutable traversal frontier by at least the guaranteed minimum.
+func TestSchedulerTraversalFrontierAdvancesUnderPermanentHeadPrefix(t *testing.T) {
+	ctx := context.Background()
+	p := newPagedFakeStore()
+	now := time.Now().UTC()
+	base := now.Add(-time.Hour)
+
+	const depth = 40
+	const pageSize, maxRows = 8, 9
+	minAdvance := maxRows / 4
+	if minAdvance > pageSize {
+		minAdvance = pageSize
+	}
+	if minAdvance < 1 {
+		minAdvance = 1
+	}
+	const replenish = 8
+	maxPolls := (depth+minAdvance-1)/minAdvance + 2
+
+	runnerID := "runner-frontier-guarantee"
+	jobs := make([]model.Job, 0, depth+replenish+1)
+	for i := 0; i < depth; i++ {
+		jobs = append(jobs, dependencyBlockedJob(fmt.Sprintf("blocked-%03d", i), base.Add(time.Duration(i)*time.Millisecond)))
+	}
+	deep := model.Job{ID: "deep-eligible", Key: "deep-eligible", Status: model.StatusQueued,
+		CreatedAt: base.Add(time.Duration(depth) * time.Millisecond)}
+	jobs = append(jobs, deep)
+	// The head-window blockers are created AFTER the deep row, so they can
+	// never hide it from the creation-order traversal: they only occupy the
+	// aged head with priority-1000 ineligible rows.
+	creationOrder := make([]string, 0, depth+replenish+maxPolls)
+	for i := 0; i < replenish; i++ {
+		j := dependencyBlockedJob(fmt.Sprintf("head-%03d", i), base.Add(time.Duration(100+i)*time.Millisecond))
+		j.Priority = 1000
+		jobs = append(jobs, j)
+	}
+	for _, j := range jobs {
+		creationOrder = append(creationOrder, j.ID)
+	}
+	s := pagedLeaseStore(t, p, runnerID, now, jobs...)
+	s.SetLeaseScanLimits(pageSize, maxRows, 0)
+
+	position := func(id string) int {
+		for i, want := range creationOrder {
+			if want == id {
+				return i
+			}
+		}
+		t.Fatalf("cursor names %s, which is not in the fixture creation order", id)
+		return -1
+	}
+
+	previous := -1
+	for poll := 1; poll <= maxPolls; poll++ {
+		// Permanently replenish the head prefix: each new blocker outranks
+		// every real candidate but is created after the deep row.
+		extra := dependencyBlockedJob(fmt.Sprintf("head-live-%03d", poll), base.Add(time.Duration(200+poll)*time.Millisecond))
+		extra.Priority = 1000
+		extra.RunID = "run-" + runnerID
+		if err := p.InsertJob(ctx, extra); err != nil {
+			t.Fatalf("replenish poll %d: %v", poll, err)
+		}
+		creationOrder = append(creationOrder, extra.ID)
+
+		j, _, _, err := s.Lease(ctx, runnerID, now)
+		if err == nil {
+			if j.ID != deep.ID {
+				t.Fatalf("poll %d leased %s, want the deep eligible %s", poll, j.ID, deep.ID)
+			}
+			if _, ok := scanCursorFor(s, runnerID); ok {
+				t.Fatal("a successful claim must clear the traversal frontier")
+			}
+			return
+		}
+		if !errors.Is(err, ErrNoJobs) {
+			t.Fatalf("poll %d lease = %v, want ErrNoJobs or the deep claim", poll, err)
+		}
+		cursor, ok := scanCursorFor(s, runnerID)
+		if !ok {
+			t.Fatalf("poll %d: unsuccessful scan did not advance the traversal frontier", poll)
+		}
+		pos := position(cursor.ID)
+		if advance := pos - previous; advance < minAdvance {
+			t.Fatalf("poll %d: frontier advanced by %d rows, want at least minAdvance=%d (cursor %s at position %d)",
+				poll, advance, minAdvance, cursor.ID, pos)
+		}
+		previous = pos
+	}
+	t.Fatalf("deep eligible row not leased within %d polls (depth=%d, minAdvance=%d)", maxPolls, depth, minAdvance)
+}
+
+// TestSchedulerHeadLatencyUnaffectedByTraversal pins the other half of the
+// contract: the head window is read BEFORE the round-robin resumes, so a
+// newly enqueued top-priority eligible job is claimed on the very next poll
+// while a deep traversal frontier is pending — without fetching one further
+// traversal page for it.
+func TestSchedulerHeadLatencyUnaffectedByTraversal(t *testing.T) {
+	ctx := context.Background()
+	p := newPagedFakeStore()
+	now := time.Now().UTC()
+	base := now.Add(-time.Hour)
+	jobs := make([]model.Job, 0, 1024)
+	for i := 0; i < 1024; i++ {
+		jobs = append(jobs, dependencyBlockedJob(fmt.Sprintf("old-%04d", i), base.Add(time.Duration(i)*time.Millisecond)))
+	}
+	runnerID := "runner-head-latency"
+	s := pagedLeaseStore(t, p, runnerID, now, jobs...)
+	s.SetLeaseScanLimits(32, 64, 0)
+
+	// Prime a deep traversal frontier behind the ineligible prefix.
+	if _, _, _, err := s.Lease(ctx, runnerID, now); !errors.Is(err, ErrNoJobs) {
+		t.Fatalf("priming lease = %v, want ErrNoJobs", err)
+	}
+	if _, ok := scanCursorFor(s, runnerID); !ok {
+		t.Fatal("priming lease did not record a traversal frontier")
+	}
+	p.mu.Lock()
+	pagesBefore := p.traversalPages
+	p.mu.Unlock()
+
+	hot := model.Job{ID: "hot-new", RunID: "run-" + runnerID, Key: "hot-new",
+		Status: model.StatusQueued, Priority: 1000, CreatedAt: now}
+	if err := p.InsertJob(ctx, hot); err != nil {
+		t.Fatalf("insert hot job: %v", err)
+	}
+	j, _, _, err := s.Lease(ctx, runnerID, now)
+	if err != nil {
+		t.Fatalf("head-window lease = %v, want the hot job on the next poll", err)
+	}
+	if j.ID != hot.ID {
+		t.Fatalf("leased %s, want %s from the head window", j.ID, hot.ID)
+	}
+	p.mu.Lock()
+	pagesAfter := p.traversalPages
+	p.mu.Unlock()
+	if pagesAfter != pagesBefore {
+		t.Fatalf("head-window claim fetched %d traversal page(s); the pending frontier must not delay it", pagesAfter-pagesBefore)
+	}
+	if _, ok := scanCursorFor(s, runnerID); ok {
+		t.Fatal("a successful claim must clear the traversal frontier")
+	}
+}
+
+// TestSchedulerTraversalSmallBudgetGuaranteesOneTraversalPage pins the
+// maxCandidateRows <= pageSize edge: the head window consumes the whole scan
+// budget, and the request still walks one FULL traversal page so the
+// round-robin frontier advances even though nothing else fits.
+func TestSchedulerTraversalSmallBudgetGuaranteesOneTraversalPage(t *testing.T) {
+	ctx := context.Background()
+	p := newPagedFakeStore()
+	now := time.Now().UTC()
+	base := now.Add(-time.Hour)
+	jobs := make([]model.Job, 0, 100)
+	for i := 0; i < 100; i++ {
+		jobs = append(jobs, dependencyBlockedJob(fmt.Sprintf("blocked-%03d", i), base.Add(time.Duration(i)*time.Millisecond)))
+	}
+	runnerID := "runner-small-budget"
+	s := pagedLeaseStore(t, p, runnerID, now, jobs...)
+	const pageSize, maxRows = 16, 4
+	s.SetLeaseScanLimits(pageSize, maxRows, 0)
+
+	if _, _, _, err := s.Lease(ctx, runnerID, now); !errors.Is(err, ErrNoJobs) {
+		t.Fatalf("lease = %v, want ErrNoJobs", err)
+	}
+	p.mu.Lock()
+	pages, returned := p.traversalPages, p.jobsReturned
+	p.mu.Unlock()
+	if pages != 1 {
+		t.Fatalf("traversal pages = %d, want exactly one full traversal page", pages)
+	}
+	if returned != maxRows+pageSize {
+		t.Fatalf("materialized rows = %d, want head %d + one traversal page %d", returned, maxRows, pageSize)
+	}
+	cursor, ok := scanCursorFor(s, runnerID)
+	if !ok {
+		t.Fatal("unsuccessful scan did not store a traversal frontier")
+	}
+	if cursor.ID != fmt.Sprintf("blocked-%03d", pageSize-1) {
+		t.Fatalf("frontier = %s, want blocked-%03d (one full page past the head)", cursor.ID, pageSize-1)
+	}
+}

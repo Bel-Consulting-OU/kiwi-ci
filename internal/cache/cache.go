@@ -770,7 +770,96 @@ func (s *Store) restoreLocalWithReporter(ctx context.Context, key, workspace str
 // filesystem as every publish destination) so every publish rename is a
 // same-filesystem atomic move while the live workspace stays untouched until
 // publication.
+//
+// The full prefix embeds a sanitized workspace basename
+// (stagePrefixForWorkspace), so the runner's crash-recovery ledger can
+// reclaim exactly the staging siblings that belonged to a crashed
+// execution's workspace. Without the scoping a crashed staging tree would
+// leak silently; deleting by the generic prefix alone would risk another
+// execution's live staging tree.
 const cacheStagePrefix = ".kiwi-cache-stage-"
+
+// StagePrefixForWorkspace returns the workspace-scoped staging prefix. It is
+// exported for the runner's crash-recovery ledger tests (and diagnostics),
+// which must recognize exactly this execution's staging siblings. The
+// workspace basename is sanitized to [A-Za-z0-9._-] (capped at 48 bytes) so
+// the prefix is a safe single path component; the random MkdirTemp suffix
+// still makes each staging tree private to one restore.
+func StagePrefixForWorkspace(workspaceCanonical string) string {
+	return stagePrefixForWorkspace(workspaceCanonical)
+}
+
+func stagePrefixForWorkspace(workspaceCanonical string) string {
+	base := filepath.Base(filepath.Clean(workspaceCanonical))
+	if base == "" || base == "." || base == string(filepath.Separator) {
+		base = "ws"
+	}
+	var b strings.Builder
+	for i := 0; i < len(base) && b.Len() < 48; i++ {
+		c := base[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '_', c == '-':
+			b.WriteByte(c)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	if b.Len() == 0 {
+		b.WriteString("ws")
+	}
+	return cacheStagePrefix + b.String() + "-"
+}
+
+// RemoveStaleStagesForWorkspace removes the staging siblings that belong
+// EXACTLY to this workspace (its scoped prefix) after a crashed execution.
+// It is the crash-recovery counterpart of createCacheStage: a SIGKILL
+// between publication renames cannot run Go rollback, and the runner's
+// ledger reconcile calls this right after removing the workspace so the
+// staged remainder cannot leak in the shared parent directory.
+//
+// Safety: only entries matching the exact workspace-scoped prefix are
+// considered; each candidate must be a real directory (never a symlink)
+// owned by the current user. An unrelated or foreign entry is left alone.
+// The first removal failure is returned so the caller keeps its ledger
+// entry retryable instead of claiming a reclaim it could not prove.
+func RemoveStaleStagesForWorkspace(workspaceCanonical string) (int, error) {
+	clean := filepath.Clean(workspaceCanonical)
+	if clean == "" || clean == "." {
+		return 0, fmt.Errorf("cache stage reclaim: empty workspace path")
+	}
+	parent := filepath.Dir(clean)
+	prefix := stagePrefixForWorkspace(clean)
+	entries, err := os.ReadDir(parent)
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("cache stage reclaim: read %q: %w", parent, err)
+	}
+	removed := 0
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		full := filepath.Join(parent, name)
+		info, err := os.Lstat(full)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return removed, fmt.Errorf("cache stage reclaim: stat %q: %w", full, err)
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !stageOwnedByCurrentUser(info) {
+			continue
+		}
+		if err := removeStagingDir(full); err != nil {
+			return removed, fmt.Errorf("cache stage reclaim: remove %q: %w", full, err)
+		}
+		removed++
+	}
+	return removed, nil
+}
 
 // createCacheStage creates the restore staging directory as a SIBLING of
 // workspaceCanonical and opens it as an extraction root. The parent must be a
@@ -791,7 +880,7 @@ func createCacheStage(workspaceCanonical string) (string, *safefs.Root, error) {
 	if err := anchor.Close(); err != nil {
 		return "", nil, fmt.Errorf("cache restore: close staging parent %q: %w", parent, err)
 	}
-	dir, err := os.MkdirTemp(canonicalParent, cacheStagePrefix+"*")
+	dir, err := os.MkdirTemp(canonicalParent, stagePrefixForWorkspace(workspaceCanonical)+"*")
 	if err != nil {
 		return "", nil, fmt.Errorf("cache restore: create staging directory in %q: %w", canonicalParent, err)
 	}

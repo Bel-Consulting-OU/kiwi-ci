@@ -25,7 +25,9 @@ import (
 // 0041 serves the queued page predicates from). The materialized scheduling
 // key is seeded to the value the promotion sweep would compute for the row's
 // age (floor(age/600s)), so the aged index order matches a freshly promoted
-// table exactly.
+// table exactly; a fixture that sets BoostKnown writes its QueueBoost
+// verbatim instead, which lets the traversal tests seed deliberately stale or
+// mixed boosts inside a created_at tie group.
 func pgITBulkInsertQueuedJobs(t *testing.T, st *PostgresStore, runID string, jobs []model.Job) {
 	t.Helper()
 	if len(jobs) == 0 {
@@ -59,7 +61,11 @@ func pgITBulkInsertQueuedJobs(t *testing.T, st *PostgresStore, runID string, job
 		}
 		ids[i] = j.ID
 		priorities[i] = int32(j.Priority)
-		boosts[i] = int32(queuedJobComputedBoost(j, seedNow))
+		if j.BoostKnown {
+			boosts[i] = int32(j.QueueBoost)
+		} else {
+			boosts[i] = int32(queuedJobComputedBoost(j, seedNow))
+		}
 		created[i] = j.CreatedAt.UTC().Format(time.RFC3339Nano)
 		if j.QueueDeadline != nil {
 			deadlines[i] = j.QueueDeadline.UTC().Format(time.RFC3339Nano)
