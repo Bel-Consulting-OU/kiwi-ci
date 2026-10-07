@@ -778,6 +778,13 @@ func (s *Server) issueOIDC(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid job token", http.StatusUnauthorized)
 		return
 	}
+	// A valid lease token is not enough: the runner process holding it must
+	// be the CURRENT registration session. A superseded process sharing the
+	// stable runner identity may not mint OIDC tokens for the remaining
+	// lease TTL (see requireCurrentRunnerIncarnation).
+	if !s.requireCurrentRunnerIncarnation(w, r, j.LeaseRunnerID) {
+		return
+	}
 	// Lease authority shares the runner gate's clock domain: DB mode asks the
 	// store (LiveLeaseStore -> clock_timestamp()), so a skewed serving replica
 	// can neither reject a DB-live lease (denying a valid token) nor admit a

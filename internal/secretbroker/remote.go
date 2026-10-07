@@ -63,7 +63,7 @@ func (p *RemoteProvider) Get(ctx context.Context, name string) (string, error) {
 	}
 	priv, err := generateX25519Key()
 	if err != nil {
-		return "", fmt.Errorf("remote secret: generate ephemeral key: %w", err)
+		return "", classError("remote", ErrUnavailable, "generate ephemeral key", err)
 	}
 	ephemeralPublic := base64.StdEncoding.EncodeToString(priv.PublicKey().Bytes())
 	body, err := json.Marshal(map[string]any{
@@ -74,12 +74,12 @@ func (p *RemoteProvider) Get(ctx context.Context, name string) (string, error) {
 		"ephemeral_public": ephemeralPublic,
 	})
 	if err != nil {
-		return "", err
+		return "", classError("remote", ErrUnavailable, "marshal request", err)
 	}
 	endpoint := strings.TrimRight(p.Server, "/") + "/api/v1/jobs/" + p.JobID + "/secrets"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return "", err
+		return "", classError("remote", ErrUnavailable, "build request", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if p.Token != "" {
@@ -87,18 +87,20 @@ func (p *RemoteProvider) Get(ctx context.Context, name string) (string, error) {
 	}
 	resp, err := p.client().Do(req)
 	if err != nil {
-		return "", err
+		return "", transportError("remote", "request failed", err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxSecretDeliveryBytes+1))
 	if err != nil {
-		return "", err
+		return "", transportError("remote", "read response", err)
 	}
 	if len(raw) > maxSecretDeliveryBytes {
-		return "", fmt.Errorf("remote secret %q: delivery exceeds %d bytes", name, maxSecretDeliveryBytes)
+		return "", classError("remote", ErrMalformedResponse, fmt.Sprintf("delivery for secret %q exceeds %d bytes", name, maxSecretDeliveryBytes), nil)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("remote secret %q: %s: %s", name, resp.Status, strings.TrimSpace(string(raw)))
+		// Never echo the response body: the error travels into runner/job
+		// error surfaces. Only the status class and code are included.
+		return "", classError("remote", httpStatusClass(resp.StatusCode), fmt.Sprintf("secret %q: status %d", name, resp.StatusCode), nil)
 	}
 	var delivery struct {
 		Ciphertext      string `json:"ciphertext"`
@@ -107,22 +109,22 @@ func (p *RemoteProvider) Get(ctx context.Context, name string) (string, error) {
 		LeaseGeneration int64  `json:"lease_generation"`
 	}
 	if err := json.Unmarshal(raw, &delivery); err != nil {
-		return "", fmt.Errorf("remote secret %q: decode delivery: %w", name, err)
+		return "", decodeError("remote", fmt.Sprintf("secret %q: decode delivery", name), err)
 	}
 	ciphertext, err := base64.StdEncoding.DecodeString(delivery.Ciphertext)
 	if err != nil {
-		return "", fmt.Errorf("remote secret %q: decode ciphertext: %w", name, err)
+		return "", decodeError("remote", fmt.Sprintf("secret %q: decode ciphertext", name), err)
 	}
 	ephPub, err := base64.StdEncoding.DecodeString(delivery.EphemeralPublic)
 	if err != nil {
-		return "", fmt.Errorf("remote secret %q: decode ephemeral public: %w", name, err)
+		return "", decodeError("remote", fmt.Sprintf("secret %q: decode ephemeral public", name), err)
 	}
 	nonce, err := base64.StdEncoding.DecodeString(delivery.Nonce)
 	if err != nil {
-		return "", fmt.Errorf("remote secret %q: decode nonce: %w", name, err)
+		return "", decodeError("remote", fmt.Sprintf("secret %q: decode nonce", name), err)
 	}
 	if delivery.LeaseGeneration != p.LeaseGeneration {
-		return "", fmt.Errorf("remote secret %q: delivery sealed for lease generation %d, want %d", name, delivery.LeaseGeneration, p.LeaseGeneration)
+		return "", classError("remote", ErrMalformedResponse, fmt.Sprintf("secret %q: delivery sealed for lease generation %d, want %d", name, delivery.LeaseGeneration, p.LeaseGeneration), nil)
 	}
 	aad := secretDeliveryAAD(p.RunnerID, p.JobID, p.LeaseGeneration, name)
 	var own [32]byte
@@ -134,7 +136,7 @@ func (p *RemoteProvider) Get(ctx context.Context, name string) (string, error) {
 		LeaseGeneration: delivery.LeaseGeneration,
 	}, own, aad)
 	if err != nil {
-		return "", fmt.Errorf("remote secret %q: open envelope: %w", name, err)
+		return "", decodeError("remote", fmt.Sprintf("secret %q: open envelope", name), err)
 	}
 	return string(plain), nil
 }

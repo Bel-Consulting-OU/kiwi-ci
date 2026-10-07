@@ -65,13 +65,28 @@ const outboxDoneMaxIDs = 4096
 // delivered state. The map is otherwise lifetime-accumulating — one entry
 // per logical key ever delivered, in fs mode and in DB mode — which is
 // unbounded for a long-lived process. Once the cap is exceeded the OLDEST
-// watermark (by delivery recency, mirroring doneOrder) is evicted. That
-// eviction has the same class of tradeoff as the retained done-ID window
-// above: a resurrected stale item for a logical key that has been quiet
-// longer than the window may be re-delivered, because its watermark (and its
-// idempotency evidence) was forgotten. The window is far larger than the
-// live check set and re-publication is idempotent by stable identity, so
-// this is accepted; it MUST stay called out here.
+// watermark (by delivery recency, mirroring doneOrder) is evicted, but ONLY
+// when no durable evidence of a lower version can remain:
+//
+//   - a key with a retained done-ID record that resolves to it
+//     (parseVersionedRowID, e.g. "key#3" still in outbox.done.jsonl /
+//     doneOrder) is NOT evicted, because forgetting the watermark while the
+//     acked lower version is still remembered would let that lower version be
+//     re-delivered and regress a stable forge-check identity
+//     (success -> running); and
+//   - a key referenced by any pending item is NOT evicted, because the
+//     journal still carries a durable intent whose version may be below the
+//     watermark.
+//
+// Eligible keys are still evicted oldest-first, so the cap is honoured
+// whenever the oldest watermarks have no evidence. While EVERY over-cap key
+// is ineligible the map temporarily exceeds the cap instead of sacrificing
+// monotonicity; that overshoot is bounded by the retained done-ID window
+// (outboxDoneMaxIDs distinct keys) plus the bounded pending journal
+// (outboxFSMaxItems in fs mode, the claim window in DB mode), and eviction
+// resumes as soon as evidence ages out (compaction/ack). This is a strictly
+// smaller forgetting window than the old pure-LRU eviction: it never forgets
+// a watermark whose evidence is still durable.
 const outboxDeliveredMaxKeys = 4096
 
 // outboxDoneRecord is one line of the fs done journal. ID is the acked
@@ -290,13 +305,13 @@ func (o *Outbox) loadLocked() error {
 	o.done = done
 	o.doneOrder = doneOrder
 	o.doneCompactAt = outboxDoneMaxIDs
-	// Rebuild the fs-mode delivered watermark from the done records, then
-	// bound it: only the most-recent outboxDeliveredMaxKeys logical keys
-	// survive the load (the oldest are forgotten, with the stale re-delivery
-	// tradeoff documented at outboxDeliveredMaxKeys).
+	// Rebuild the fs-mode delivered watermark from the done records. It is
+	// still UNBOUNDED here: pending journal items are part of the eviction
+	// evidence (a key may only be evicted when no durable record of a lower
+	// version can remain), so bounding runs only after the pending items are
+	// loaded below.
 	o.delivered = delivered
 	o.deliveredOrder = deliveredOrder
-	o.boundDeliveredLocked()
 
 	items, err := o.readItems()
 	if err != nil {
@@ -316,6 +331,11 @@ func (o *Outbox) loadLocked() error {
 		}
 		o.items = append(o.items, it)
 	}
+	// Bound the watermark cardinality now that BOTH evidence sources (the
+	// retained done IDs and the pending items) are loaded: ineligible keys
+	// keep their watermark even past the cap, eligible keys are evicted
+	// oldest-first (see outboxDeliveredMaxKeys).
+	o.boundDeliveredLocked()
 	return nil
 }
 
@@ -648,27 +668,59 @@ func touchOrderedKey(order []string, key string) []string {
 	return append(order, key)
 }
 
-// trimDeliveredOrder drops the oldest keys of a delivered watermark map
-// beyond outboxDeliveredMaxKeys and returns the trimmed order. The map and
-// order are kept in sync by every production writer; direct map writes are
-// reconciled by boundDeliveredLocked.
-func trimDeliveredOrder(delivered map[string]int64, order []string) []string {
+// deliveredEvictionEvidenceLocked builds the set of logical keys that may NOT
+// have their delivered watermark evicted because durable evidence of a lower
+// version can still remain: every retained done-ID that resolves to a
+// versioned row ID, plus every key referenced by a pending queued item. The
+// caller holds o.mu. It is built once per over-cap trim pass (never per
+// candidate) so the common under-cap path pays nothing.
+func (o *Outbox) deliveredEvictionEvidenceLocked() map[string]bool {
+	blocked := make(map[string]bool)
+	for _, id := range o.doneOrder {
+		if key, _, ok := parseVersionedRowID(id); ok {
+			blocked[key] = true
+		}
+	}
+	for i := range o.items {
+		if key := o.items[i].LogicalKey; key != "" {
+			blocked[key] = true
+		}
+	}
+	return blocked
+}
+
+// trimDeliveredOrderLocked drops the OLDEST eligible delivered watermarks
+// until the recency order fits outboxDeliveredMaxKeys, then returns the
+// trimmed order. A watermark is eligible only when no durable evidence of a
+// lower version remains for its key (see deliveredEvictionEvidenceLocked):
+// ineligible keys stay even though the cap is exceeded, and eviction resumes
+// for them once their evidence is compacted/acked away. The map and order are
+// kept in sync by every production writer; direct map writes are reconciled
+// by boundDeliveredLocked. The caller holds o.mu.
+func (o *Outbox) trimDeliveredOrderLocked(delivered map[string]int64, order []string) []string {
 	if len(order) <= outboxDeliveredMaxKeys {
 		return order
 	}
 	drop := len(order) - outboxDeliveredMaxKeys
-	for _, key := range order[:drop] {
-		delete(delivered, key)
+	blocked := o.deliveredEvictionEvidenceLocked()
+	kept := make([]string, 0, len(order))
+	for _, key := range order {
+		if drop > 0 && !blocked[key] {
+			delete(delivered, key)
+			drop--
+			continue
+		}
+		kept = append(kept, key)
 	}
-	return append([]string(nil), order[drop:]...)
+	return kept
 }
 
 // boundDeliveredLocked reconciles deliveredOrder with the delivered map and
-// evicts the oldest watermarks beyond outboxDeliveredMaxKeys. It drops empty
-// watermarks (empty key, non-positive version) and duplicate order entries,
-// and appends map keys missing from the order. This is the load/compaction
-// entry point; the per-ack fast path is setDeliveredLocked. The caller holds
-// o.mu.
+// evicts the oldest ELIGIBLE watermarks beyond outboxDeliveredMaxKeys. It
+// drops empty watermarks (empty key, non-positive version) and duplicate
+// order entries, and appends map keys missing from the order. This is the
+// load/compaction entry point; the per-ack fast path is setDeliveredLocked.
+// The caller holds o.mu.
 func (o *Outbox) boundDeliveredLocked() {
 	if o.delivered == nil {
 		o.delivered = map[string]int64{}
@@ -693,13 +745,15 @@ func (o *Outbox) boundDeliveredLocked() {
 			o.deliveredOrder = append(o.deliveredOrder, key)
 		}
 	}
-	o.deliveredOrder = trimDeliveredOrder(o.delivered, o.deliveredOrder)
+	o.deliveredOrder = o.trimDeliveredOrderLocked(o.delivered, o.deliveredOrder)
 }
 
 // setDeliveredLocked advances the in-memory delivered watermark for one
-// logical key and updates its recency, evicting the oldest watermark once
-// the cap is exceeded. It never lowers an existing watermark and ignores
-// empty identities (empty key, non-positive version). The caller holds o.mu.
+// logical key and updates its recency, evicting the oldest ELIGIBLE watermark
+// once the cap is exceeded (a key whose retained done-ID or pending item is
+// still durable evidence is never evicted; see trimDeliveredOrderLocked). It
+// never lowers an existing watermark and ignores empty identities (empty key,
+// non-positive version). The caller holds o.mu.
 func (o *Outbox) setDeliveredLocked(key string, version int64) {
 	if key == "" || version <= 0 {
 		return
@@ -711,7 +765,7 @@ func (o *Outbox) setDeliveredLocked(key string, version int64) {
 		return
 	}
 	o.delivered[key] = version
-	o.deliveredOrder = trimDeliveredOrder(o.delivered, touchOrderedKey(o.deliveredOrder, key))
+	o.deliveredOrder = o.trimDeliveredOrderLocked(o.delivered, touchOrderedKey(o.deliveredOrder, key))
 }
 
 // recordDeliveredLocked advances the local delivered watermark for a
@@ -919,21 +973,22 @@ func (o *Outbox) compactDoneIfNeeded() {
 // trimDoneLocked keeps only the most-recent outboxDoneMaxIDs acked IDs in
 // memory and bounds the delivered watermark cardinality (the DB-mode
 // compaction path has no fs journal to rewrite, so this is where its
-// watermark order is trimmed). The caller holds o.mu.
+// watermark order is trimmed). The done set is trimmed FIRST so the eviction
+// evidence reflects the post-trim state: a watermark whose done-ID evidence
+// this trim removes becomes eligible in the same pass. The caller holds o.mu.
 func (o *Outbox) trimDoneLocked() {
+	if len(o.doneOrder) > outboxDoneMaxIDs {
+		keep := o.doneOrder[len(o.doneOrder)-outboxDoneMaxIDs:]
+		bounded := append([]string(nil), keep...)
+		next := make(map[string]bool, len(bounded))
+		for _, id := range bounded {
+			next[id] = true
+		}
+		o.done = next
+		o.doneOrder = bounded
+		o.doneCompactAt = len(bounded) + outboxDoneMaxIDs
+	}
 	o.boundDeliveredLocked()
-	if len(o.doneOrder) <= outboxDoneMaxIDs {
-		return
-	}
-	keep := o.doneOrder[len(o.doneOrder)-outboxDoneMaxIDs:]
-	bounded := append([]string(nil), keep...)
-	next := make(map[string]bool, len(bounded))
-	for _, id := range bounded {
-		next[id] = true
-	}
-	o.done = next
-	o.doneOrder = bounded
-	o.doneCompactAt = len(bounded) + outboxDoneMaxIDs
 }
 
 // compactLocked rewrites the fs journals atomically (fsutil.AtomicWriteFile):

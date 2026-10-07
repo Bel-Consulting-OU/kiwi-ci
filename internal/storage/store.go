@@ -1014,6 +1014,26 @@ type RunnerDisableStore interface {
 	DisableRunnerAndRevokeCert(ctx context.Context, runnerID, certSerial, actor string) (revoked int, err error)
 }
 
+// RunnerRegistrationStore is the ATOMIC re-registration swap: the new
+// incarnation's runner row and the revocation of every lease the PREVIOUS
+// incarnation held commit together. It exists because a plain profile write
+// left the predecessor's leases live (capacity held) and let the superseded
+// process keep reaching the lease-token-authenticated durable-write
+// endpoints for the remaining TTL. Stores without this capability remain
+// supported through the guarded profile write plus a separate best-effort
+// RevokeRunnerLeases.
+type RunnerRegistrationStore interface {
+	// RegisterRunnerAndRevokeLeases writes the runner's new registration
+	// (profile/admin fields merged under the runner row lock, lease-owned
+	// fields preserved) and invalidates every running lease it holds
+	// (requeue while the infrastructure-retry budget allows it, otherwise
+	// terminal-cancel with reason; release resource reservations/capacity
+	// slots and clear the lease columns; recompute dependents and affected
+	// runs; write one audit event per revoked job) in the SAME transaction.
+	// It returns the IDs of the revoked jobs.
+	RegisterRunnerAndRevokeLeases(ctx context.Context, runner model.Runner, reason string) ([]string, error)
+}
+
 // RunnerProfileUpdateStore is the guarded runner-profile write contract.
 //
 // A runner row mixes two owners:

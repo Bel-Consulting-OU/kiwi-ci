@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -30,11 +31,13 @@ type pagedFakeStore struct {
 
 	mu              sync.Mutex
 	pagesRequested  int
+	traversalPages  int
 	jobsReturned    int
 	wholeQueueCalls int
 }
 
 var _ storage.QueuedJobPageStore = (*pagedFakeStore)(nil)
+var _ storage.QueuedJobTraversalStore = (*pagedFakeStore)(nil)
 
 func newPagedFakeStore() *pagedFakeStore {
 	return &pagedFakeStore{resourceFakeStore: newResourceFakeStore()}
@@ -101,6 +104,54 @@ func pagedJobAfterCursor(j model.Job, c storage.QueuedJobCursor, now time.Time) 
 		return j.CreatedAt.After(c.CreatedAt)
 	}
 	return j.ID > c.ID
+}
+
+// ListQueuedJobsByCreation mirrors the immutable-traversal store contract:
+// the SAME runner-coarse filter/deadline predicates as ListQueuedJobsPage,
+// ordered by (created_at ASC, id ASC) with a (CreatedAt, ID) keyset cursor
+// and limit+1 fetched for an exact HasMore.
+func (p *pagedFakeStore) ListQueuedJobsByCreation(ctx context.Context, filter storage.QueuedJobFilter, after *storage.QueuedJobTraversalCursor, limit int, now time.Time) (storage.QueuedJobTraversalPage, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.traversalPages++
+	eligible := make([]model.Job, 0, len(p.fakeStore.jobs))
+	for _, j := range p.fakeStore.jobs {
+		if j.Status != model.StatusQueued {
+			continue
+		}
+		if j.QueueDeadline != nil && !j.QueueDeadline.After(now) {
+			continue
+		}
+		if !storage.QueuedJobMatchesFilter(j, filter) {
+			continue
+		}
+		if after != nil {
+			if j.CreatedAt.Before(after.CreatedAt) {
+				continue
+			}
+			if j.CreatedAt.Equal(after.CreatedAt) && j.ID <= after.ID {
+				continue
+			}
+		}
+		eligible = append(eligible, j)
+	}
+	sort.Slice(eligible, func(i, j int) bool {
+		if !eligible[i].CreatedAt.Equal(eligible[j].CreatedAt) {
+			return eligible[i].CreatedAt.Before(eligible[j].CreatedAt)
+		}
+		return eligible[i].ID < eligible[j].ID
+	})
+	page := storage.QueuedJobTraversalPage{Jobs: eligible}
+	if len(eligible) > limit {
+		page.Jobs = eligible[:limit]
+		page.HasMore = true
+	}
+	if len(page.Jobs) > 0 {
+		last := page.Jobs[len(page.Jobs)-1]
+		page.Last = storage.QueuedJobTraversalCursor{CreatedAt: last.CreatedAt, ID: last.ID}
+	}
+	p.jobsReturned += len(page.Jobs)
+	return page, nil
 }
 
 // pagedLeaseStore builds the scheduler over the paged wrapper after seeding
@@ -175,8 +226,9 @@ func TestSetLeaseScanLimitsClampsHardCap(t *testing.T) {
 	}
 }
 
-// scanCursorFor reads one runner's continuation state for assertions.
-func scanCursorFor(s *DBScheduler, runnerID string) (storage.QueuedJobCursor, bool) {
+// scanCursorFor reads one runner's traversal continuation state for
+// assertions.
+func scanCursorFor(s *DBScheduler, runnerID string) (storage.QueuedJobTraversalCursor, bool) {
 	s.scanMu.Lock()
 	defer s.scanMu.Unlock()
 	st, ok := s.scan[runnerID]
@@ -233,13 +285,13 @@ func TestSchedulerLeaseUsesBoundedPages(t *testing.T) {
 		t.Fatalf("lease = %v, want ErrNoJobs (no job passes the dependency gate)", err)
 	}
 	p.mu.Lock()
-	pages, returned := p.pagesRequested, p.jobsReturned
+	pages, returned := p.pagesRequested+p.traversalPages, p.jobsReturned
 	p.mu.Unlock()
 	if returned != 25 {
 		t.Fatalf("jobs materialized = %d, want exactly the 25-row budget", returned)
 	}
 	if pages != 3 {
-		t.Fatalf("pages requested = %d, want 3", pages)
+		t.Fatalf("pages requested = %d, want 3 (one aged head + two traversal)", pages)
 	}
 }
 
@@ -270,10 +322,12 @@ func TestSchedulerLeaseFindsCandidateAcrossPages(t *testing.T) {
 		t.Fatalf("leased %s, want job-target (third page)", j.ID)
 	}
 	p.mu.Lock()
-	pages := p.pagesRequested
+	pages := p.pagesRequested + p.traversalPages
 	p.mu.Unlock()
-	if pages != 3 {
-		t.Fatalf("pages requested = %d, want 3 (5+5+3)", pages)
+	// One aged head page plus the three immutable-traversal pages the target
+	// sits behind (12 blocked rows in pages of 5: 5+5+3).
+	if pages != 4 {
+		t.Fatalf("pages requested = %d, want 4 (head + 5+5+3 traversal)", pages)
 	}
 }
 

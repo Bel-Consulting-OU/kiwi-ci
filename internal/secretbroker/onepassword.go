@@ -35,30 +35,30 @@ type onePasswordItemResponse struct {
 // the password field, and returns its value.
 func (c *OnePasswordClient) Resolve(ctx context.Context, name string, _ SecretScope) (string, error) {
 	if err := validateProviderEndpoint(c.Host, true); err != nil {
-		return "", fmt.Errorf("onepassword: %w", err)
+		return "", classError("onepassword", ErrUnavailable, "invalid endpoint", err)
 	}
 	u := strings.TrimRight(c.Host, "/") + "/v1/vaults/" + url.PathEscape(c.VaultID) +
 		"/items/" + url.PathEscape(name) + "?fields=password"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return "", fmt.Errorf("onepassword: build request: %w", err)
+		return "", classError("onepassword", ErrUnavailable, "build request", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.Token)
 	resp, err := c.client().Do(req)
 	if err != nil {
-		return "", fmt.Errorf("onepassword: %w", err)
+		return "", transportError("onepassword", "request failed", err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return "", fmt.Errorf("onepassword: read response: %w", err)
+		return "", transportError("onepassword", "read response", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("onepassword: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return "", classError("onepassword", httpStatusClass(resp.StatusCode), fmt.Sprintf("status %d", resp.StatusCode), nil)
 	}
 	var out onePasswordItemResponse
 	if err := json.Unmarshal(body, &out); err != nil {
-		return "", fmt.Errorf("onepassword: decode response: %w", err)
+		return "", decodeError("onepassword", "decode response", err)
 	}
 	for _, f := range out.Fields {
 		if f.Value != "" {
@@ -68,5 +68,5 @@ func (c *OnePasswordClient) Resolve(ctx context.Context, name string, _ SecretSc
 	if out.Value != "" {
 		return out.Value, nil
 	}
-	return "", fmt.Errorf("onepassword: item %q has no password field", name)
+	return "", classError("onepassword", ErrMalformedResponse, fmt.Sprintf("item %q has no password field", name), nil)
 }

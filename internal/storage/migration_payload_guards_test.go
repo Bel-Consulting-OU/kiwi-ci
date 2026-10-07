@@ -49,6 +49,22 @@ func TestMigrationPayloadCastGuards(t *testing.T) {
 			},
 			absent: []string{`~ '^\d{4}-\d{2}-\d{2}'`},
 		},
+		{
+			// 0041 backfills the normalized queued filter arrays with a
+			// set-returning subquery: jsonb_array_elements_text RAISES on a
+			// non-array value, which would abort the migration transaction
+			// and block every subsequent startup, so each backfill must be
+			// guarded by jsonb_typeof(...) = 'array'.
+			file: "0041_queued_filter_normalization.sql",
+			wants: []string{
+				"jsonb_typeof(payload->'required_labels') = 'array'",
+				"jsonb_typeof(payload->'placement_regions') = 'array'",
+			},
+			absent: []string{
+				"UPDATE jobs SET required_labels = COALESCE(ARRAY(SELECT jsonb_array_elements_text(payload->'required_labels')), '{}') WHERE status='queued' AND payload ? 'required_labels';",
+				"UPDATE jobs SET placement_regions = COALESCE(ARRAY(SELECT jsonb_array_elements_text(payload->'placement_regions')), '{}') WHERE status='queued' AND payload ? 'placement_regions';",
+			},
+		},
 	}
 	for _, tc := range cases {
 		raw, err := migrations.FS.ReadFile(tc.file)

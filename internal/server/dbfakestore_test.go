@@ -1363,6 +1363,38 @@ func (f *dbFakeStore) UpdateRunnerProfileFields(ctx context.Context, runner mode
 	return nil
 }
 
+// RegisterRunnerAndRevokeLeases mirrors the SQL RunnerRegistrationStore
+// transaction: the predecessor's leases are revoked and the new profile row
+// is written. The fake stages the revocation through its transactional
+// RevokeRunnerLeases (clone-then-swap) and then applies the same guarded
+// merge as UpdateRunnerProfileFields, preserving lease-owned fields and
+// counters.
+func (f *dbFakeStore) RegisterRunnerAndRevokeLeases(ctx context.Context, runner model.Runner, reason string) ([]string, error) {
+	revoked, err := f.RevokeRunnerLeases(ctx, runner.ID, reason)
+	if err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	existing, ok := f.runners[runner.ID]
+	if !ok {
+		f.runners[runner.ID] = runner
+		return revoked, nil
+	}
+	merged := runner
+	merged.ActiveJobs = append([]string(nil), existing.ActiveJobs...)
+	merged.CurrentJob = existing.CurrentJob
+	merged.Completed = existing.Completed
+	merged.Failed = existing.Failed
+	merged.LastSeen = existing.LastSeen
+	if !existing.Registered.IsZero() {
+		merged.Registered = existing.Registered
+	}
+	merged.Busy = merged.Capacity > 0 && len(merged.ActiveJobs) >= merged.Capacity
+	f.runners[runner.ID] = merged
+	return revoked, nil
+}
+
 // ApproveJob mirrors the transactional JobApprovalStore contract in memory:
 // only the approval-owned fields are written, the waiting_approval -> queued
 // transition is applied, and a lease is never touched. updateJobErr models a

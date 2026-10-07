@@ -18,6 +18,12 @@ type countingStore struct {
 
 func (c *countingStore) Put(ctx context.Context, key string, r io.Reader, size int64) (blob.Object, error) {
 	c.puts++
+	// A real backend consumes the stream it is handed; this fake must too, or
+	// the CAS dedup verification (which treats a zero-consumption success as
+	// an unverified pre-existing object) would reject it.
+	if _, err := io.Copy(io.Discard, r); err != nil {
+		return blob.Object{}, err
+	}
 	return blob.Object{Key: key, SHA256: key, Size: size}, nil
 }
 

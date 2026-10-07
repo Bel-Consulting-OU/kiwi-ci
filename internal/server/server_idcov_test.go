@@ -49,6 +49,17 @@ func (f *idcovFaultStore) DisableRunnerAndRevokeCert(ctx context.Context, runner
 	return f.dbFakeStore.DisableRunnerAndRevokeCert(ctx, runnerID, certSerial, actor)
 }
 
+// RegisterRunnerAndRevokeLeases carries the injected runner-write failure
+// onto the atomic registration capability the server prefers, so a failing
+// registration still fails closed (500) instead of falling through to the
+// promoted fake method.
+func (f *idcovFaultStore) RegisterRunnerAndRevokeLeases(ctx context.Context, runner model.Runner, reason string) ([]string, error) {
+	if f.upsertRunErr != nil {
+		return nil, f.upsertRunErr
+	}
+	return f.dbFakeStore.RegisterRunnerAndRevokeLeases(ctx, runner, reason)
+}
+
 func (f *idcovFaultStore) GetRun(ctx context.Context, id string) (model.Run, error) {
 	if f.getRunErr != nil {
 		return model.Run{}, f.getRunErr

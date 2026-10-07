@@ -20,10 +20,12 @@ import (
 )
 
 // pgITBulkInsertQueuedJobs seeds queued job rows with ONE statement (the same
-// rows InsertJob writes: the jsonMarshal payload and the relational columns).
-// The materialized scheduling key is seeded to the value the promotion sweep
-// would compute for the row's age (floor(age/600s)), so the aged index order
-// matches a freshly promoted table exactly.
+// rows InsertJob writes: the jsonMarshal payload and the relational columns,
+// including the normalized required_labels/placement_regions arrays migration
+// 0041 serves the queued page predicates from). The materialized scheduling
+// key is seeded to the value the promotion sweep would compute for the row's
+// age (floor(age/600s)), so the aged index order matches a freshly promoted
+// table exactly.
 func pgITBulkInsertQueuedJobs(t *testing.T, st *PostgresStore, runID string, jobs []model.Job) {
 	t.Helper()
 	if len(jobs) == 0 {
@@ -36,6 +38,8 @@ func pgITBulkInsertQueuedJobs(t *testing.T, st *PostgresStore, runID string, job
 	created := make([]string, len(jobs))
 	deadlines := make([]string, len(jobs))
 	payloads := make([]string, len(jobs))
+	labelsJSON := make([]string, len(jobs))
+	regionsJSON := make([]string, len(jobs))
 	for i, j := range jobs {
 		if err := ValidateJobID(j.ID); err != nil {
 			t.Fatalf("bulk insert job %d: %v", i, err)
@@ -43,6 +47,15 @@ func pgITBulkInsertQueuedJobs(t *testing.T, st *PostgresStore, runID string, job
 		p, err := jsonMarshal(j)
 		if err != nil {
 			t.Fatalf("bulk insert job %d marshal: %v", i, err)
+		}
+		labels, regions := jobNormalizedFilterLists(j)
+		lj, err := jsonMarshal(labels)
+		if err != nil {
+			t.Fatalf("bulk insert job %d labels: %v", i, err)
+		}
+		rj, err := jsonMarshal(regions)
+		if err != nil {
+			t.Fatalf("bulk insert job %d regions: %v", i, err)
 		}
 		ids[i] = j.ID
 		priorities[i] = int32(j.Priority)
@@ -52,14 +65,19 @@ func pgITBulkInsertQueuedJobs(t *testing.T, st *PostgresStore, runID string, job
 			deadlines[i] = j.QueueDeadline.UTC().Format(time.RFC3339Nano)
 		}
 		payloads[i] = string(p)
+		labelsJSON[i] = string(lj)
+		regionsJSON[i] = string(rj)
 	}
 	_, err := st.pool.Exec(context.Background(), `
-		INSERT INTO jobs (id, run_id, key, status, dependency_status, priority, queue_boost, attempts, created_at, queue_deadline, payload)
+		INSERT INTO jobs (id, run_id, key, status, dependency_status, priority, queue_boost, attempts, created_at, queue_deadline, required_labels, placement_regions, payload)
 		SELECT u.id, $1, 'build', 'queued', 'success', u.priority, u.queue_boost, 0,
-		       u.created_at::timestamptz, NULLIF(u.queue_deadline,'')::timestamptz, u.payload::jsonb
-		FROM unnest($2::text[], $3::int[], $4::int[], $5::text[], $6::text[], $7::text[])
-		     AS u(id, priority, queue_boost, created_at, queue_deadline, payload)`,
-		runID, ids, priorities, boosts, created, deadlines, payloads)
+		       u.created_at::timestamptz, NULLIF(u.queue_deadline,'')::timestamptz,
+		       ARRAY(SELECT jsonb_array_elements_text(u.required_labels::jsonb)),
+		       ARRAY(SELECT jsonb_array_elements_text(u.placement_regions::jsonb)),
+		       u.payload::jsonb
+		FROM unnest($2::text[], $3::int[], $4::int[], $5::text[], $6::text[], $7::text[], $8::text[], $9::text[])
+		     AS u(id, priority, queue_boost, created_at, queue_deadline, payload, required_labels, placement_regions)`,
+		runID, ids, priorities, boosts, created, deadlines, payloads, labelsJSON, regionsJSON)
 	if err != nil {
 		t.Fatalf("bulk insert %d jobs: %v", len(jobs), err)
 	}

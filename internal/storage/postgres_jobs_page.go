@@ -32,10 +32,24 @@ package storage
 // deadline is never a lease candidate. The scheduler still applies
 // QueueDeadlineFor in Go, because a legacy row can carry its deadline only in
 // the compiled payload.
+//
+// Filter boundedness (release blocker D, migration 0041): every predicate the
+// runner-coarse filter can add is backed by a jobs_queued_* index, and the
+// page query is planned with the runner's ACTUAL values (queuedJobPageExecMode
+// below), so the planner sees real selectivity — the list dimensions through
+// the normalized required_labels/placement_regions columns (array GIN), the
+// runtime and the combined-request / job-only resource expressions through
+// expression indexes plus their CREATE STATISTICS objects. A rare filter
+// therefore drives the plan through its own index (a bitmap scan or a
+// BitmapOr for the region disjunction) and a common one falls back to the
+// aged-order early stop; a zero-match filter terminates on an empty index
+// scan instead of walking the queue. The planner regression matrix in
+// postgres_jobs_page_planner_it_test.go pins that contract per permutation
+// and size; queued_jobs_page_sql_test.go pins that the migration's indexed
+// expressions are the exact ones this file renders.
 
 import (
 	"context"
-	"encoding/json"
 	"sort"
 	"strconv"
 	"time"
@@ -80,8 +94,9 @@ type QueuedJobFilter struct {
 	// !Enforced && empty caps).
 	Runtimes []string
 	// RunnerLabels is the runner's label key set; a job passes when every
-	// RequiredLabel is present (payload->'required_labels' <@ runnerLabels
-	// JSON array). A legacy payload without the key is NULL and passes.
+	// RequiredLabel is present (the normalized jobs.required_labels column
+	// <@ runnerLabels, served by jobs_queued_labels_arr_idx). A legacy
+	// payload without the key is '{}' and passes.
 	RunnerLabels []string
 	// RunnerRegion is the single placement region; empty means the runner
 	// has no region, so only jobs WITHOUT placement regions pass.
@@ -111,6 +126,49 @@ type QueuedJobPageStore interface {
 	// RETURNED candidate (zero on an empty page); HasMore reports whether a
 	// candidate exists past the page.
 	ListQueuedJobsPage(ctx context.Context, filter QueuedJobFilter, after *QueuedJobCursor, limit int, now time.Time) (QueuedJobPage, error)
+}
+
+// QueuedJobTraversalCursor names the last candidate of a previous traversal
+// page in the IMMUTABLE creation order (created_at ASC, id ASC). Unlike
+// QueuedJobCursor it carries no scheduling key that can change underneath a
+// paused walk: a row's created_at and id are fixed at insert, so a job can
+// never move from after this cursor to before it.
+type QueuedJobTraversalCursor struct {
+	CreatedAt time.Time
+	ID        string
+}
+
+// QueuedJobTraversalPage is one bounded page of the immutable traversal.
+type QueuedJobTraversalPage struct {
+	Jobs    []model.Job
+	HasMore bool
+	Last    QueuedJobTraversalCursor
+}
+
+// QueuedJobTraversalStore is the optional ROUND-ROBIN traversal contract: the
+// same bounded candidate selection as QueuedJobPageStore, but ordered by the
+// immutable creation key (created_at ASC, id ASC) with a (CreatedAt, ID)
+// keyset cursor. The aged page (QueuedJobPageStore) orders by
+// priority + queue_boost, and queue_boost changes asynchronously in
+// PromoteQueuedJobBoosts: a continuation cursor over that mutable key can be
+// jumped by a promoted row (or skip one that lost its position), so a runner
+// parked behind a long ineligible prefix could never reach rows that crossed
+// its cursor boundary. The creation-order walk has no such moving boundary.
+//
+// The traversal applies the SAME runner-coarse QueuedJobFilter, the same
+// status='queued' predicate and the same persisted queue-deadline pushdown as
+// ListQueuedJobsPage, so both orders expose the same candidate set.
+type QueuedJobTraversalStore interface {
+	// ListQueuedJobsByCreation returns at most limit queued candidates that
+	// pass filter, strictly after the cursor position, in the immutable
+	// creation order. after == nil starts at the first (oldest) candidate.
+	// now is the caller's scheduling clock, used for the same
+	// definitely-expired queue-deadline pushdown ListQueuedJobsPage applies
+	// (a legacy payload-only deadline is still evaluated in Go by the
+	// caller). Jobs is never nil; Last names the last RETURNED candidate
+	// (zero on an empty page); HasMore reports whether a candidate exists
+	// past the page.
+	ListQueuedJobsByCreation(ctx context.Context, filter QueuedJobFilter, after *QueuedJobTraversalCursor, limit int, now time.Time) (QueuedJobTraversalPage, error)
 }
 
 // Queued candidate page bounds: the scheduler's own defaults are 256/4096,
@@ -149,12 +207,18 @@ const queuedJobAgedOrderSQL = "((priority + queue_boost))"
 // storage.RuntimeAllowed applies.
 const queuedJobRuntimeSQLExpr = `(COALESCE(NULLIF(payload->'compiled_job_payload'->'effective_job'->'job'->>'runtime',''),'native'))`
 
-// queuedJobLabelsSQLExpr / queuedJobRegionsSQLExpr are the payload paths the
-// runner-coarse label/region predicates read; both are exactly the columns the
-// migration 0039 GIN indexes cover.
+// queuedJobLabelsColumn / queuedJobRegionsColumn are the normalized TEXT[]
+// columns migration 0041 materializes from the payload (nil/missing ->
+// '{}'). The array GIN opclass implements the operators the page predicates
+// use — <@ for labels, = and && for the region disjunction — so both
+// dimensions are index-driven instead of being heap filters over whatever
+// index drives the scan (the jsonb GIN indexes 0039 created could serve
+// NEITHER predicate, see 0041's header). The columns are written by the
+// canonical job write path from the same model fields the payload carries,
+// so for every row this binary writes the payload field and the column agree.
 const (
-	queuedJobLabelsSQLExpr  = `(payload->'required_labels')`
-	queuedJobRegionsSQLExpr = `(payload->'placement_regions')`
+	queuedJobLabelsColumn  = `required_labels`
+	queuedJobRegionsColumn = `placement_regions`
 )
 
 // queuedJobComputedBoost is the Go aged-wait term floor(max(0, wait)/10min)
@@ -210,6 +274,28 @@ func sortQueuedJobsAged(jobs []model.Job, now time.Time) {
 	})
 }
 
+// queuedJobAfterCreationCursor reports whether j sorts strictly after the
+// cursor in the immutable creation order (created_at ASC, id ASC): the
+// in-memory equivalent of the SQL keyset predicate.
+func queuedJobAfterCreationCursor(j model.Job, c QueuedJobTraversalCursor) bool {
+	if !j.CreatedAt.Equal(c.CreatedAt) {
+		return j.CreatedAt.After(c.CreatedAt)
+	}
+	return j.ID > c.ID
+}
+
+// sortQueuedJobsByCreation orders candidates by the immutable creation key
+// (created_at ASC, id ASC) — the total order every QueuedJobTraversalStore
+// returns.
+func sortQueuedJobsByCreation(jobs []model.Job) {
+	sort.Slice(jobs, func(i, j int) bool {
+		if !jobs[i].CreatedAt.Equal(jobs[j].CreatedAt) {
+			return jobs[i].CreatedAt.Before(jobs[j].CreatedAt)
+		}
+		return jobs[i].ID < jobs[j].ID
+	})
+}
+
 // queuedJobFilterUnconstrained reports whether f carries no restriction at
 // all. The entirely zero filter is the documented unconstrained value (the
 // queue-reason annotation passes it and must keep seeing every queued job,
@@ -229,6 +315,45 @@ func queuedJobNumberSQL(jsonbExpr, textExpr string) string {
 	return `(CASE WHEN jsonb_typeof(` + jsonbExpr + `) = 'number' THEN (` + textExpr + `)::numeric ELSE 0 END)`
 }
 
+// queuedJobResourceDimension names one resource dimension: the payload paths
+// of the job's own request and the service envelope request, the dimension's
+// suffix in the migration index/statistics names, and the capacity renderer
+// used to bind the filter's bound. The list is the SINGLE source of truth for
+// both queuedJobResourcePredicateSQL and the migration-expression parity
+// test: the migration 0041 index/statistics expressions are generated from
+// queuedJobNumberSQL with these same paths, so a dimension can never drift
+// between the query and the schema it depends on.
+type queuedJobResourceDimension struct {
+	jobJSON, jobText string
+	envJSON, envText string
+	name             string
+	cap              func(model.ResourceCapacity) string
+	constrained      func(model.ResourceCapacity) bool
+}
+
+var queuedJobResourceDimensions = []queuedJobResourceDimension{
+	{"payload->'cpu_request'", "payload->>'cpu_request'",
+		"payload->'service_envelope_request'->'cpu'", "payload->'service_envelope_request'->>'cpu'",
+		"cpu",
+		func(c model.ResourceCapacity) string { return strconv.FormatFloat(c.CPU, 'f', -1, 64) },
+		func(c model.ResourceCapacity) bool { return c.CPU > 0 }},
+	{"payload->'memory_request'", "payload->>'memory_request'",
+		"payload->'service_envelope_request'->'memory'", "payload->'service_envelope_request'->>'memory'",
+		"memory",
+		func(c model.ResourceCapacity) string { return strconv.FormatInt(c.Memory, 10) },
+		func(c model.ResourceCapacity) bool { return c.Memory > 0 }},
+	{"payload->'disk_request'", "payload->>'disk_request'",
+		"payload->'service_envelope_request'->'disk'", "payload->'service_envelope_request'->>'disk'",
+		"disk",
+		func(c model.ResourceCapacity) string { return strconv.FormatInt(c.Disk, 10) },
+		func(c model.ResourceCapacity) bool { return c.Disk > 0 }},
+	{"payload->'pids_request'", "payload->>'pids_request'",
+		"payload->'service_envelope_request'->'pids'", "payload->'service_envelope_request'->>'pids'",
+		"pids",
+		func(c model.ResourceCapacity) string { return strconv.Itoa(c.PIDs) },
+		func(c model.ResourceCapacity) bool { return c.PIDs > 0 }},
+}
+
 // queuedJobResourcePredicateSQL applies the per-dimension capacity predicate
 // for every dimension MaxRequested constrains (zero = unconstrained), summing
 // the job field and — unless IgnoreServiceEnvelope — the service envelope
@@ -239,33 +364,15 @@ func queuedJobResourcePredicateSQL(filter QueuedJobFilter, args *[]any) string {
 		return "$" + strconv.Itoa(len(*args))
 	}
 	out := ""
-	for _, d := range []struct {
-		jobJSON, jobText string
-		envJSON, envText string
-		cap              string
-		constrained      bool
-	}{
-		{"payload->'cpu_request'", "payload->>'cpu_request'",
-			"payload->'service_envelope_request'->'cpu'", "payload->'service_envelope_request'->>'cpu'",
-			strconv.FormatFloat(filter.MaxRequested.CPU, 'f', -1, 64), filter.MaxRequested.CPU > 0},
-		{"payload->'memory_request'", "payload->>'memory_request'",
-			"payload->'service_envelope_request'->'memory'", "payload->'service_envelope_request'->>'memory'",
-			strconv.FormatInt(filter.MaxRequested.Memory, 10), filter.MaxRequested.Memory > 0},
-		{"payload->'disk_request'", "payload->>'disk_request'",
-			"payload->'service_envelope_request'->'disk'", "payload->'service_envelope_request'->>'disk'",
-			strconv.FormatInt(filter.MaxRequested.Disk, 10), filter.MaxRequested.Disk > 0},
-		{"payload->'pids_request'", "payload->>'pids_request'",
-			"payload->'service_envelope_request'->'pids'", "payload->'service_envelope_request'->>'pids'",
-			strconv.Itoa(filter.MaxRequested.PIDs), filter.MaxRequested.PIDs > 0},
-	} {
-		if !d.constrained {
+	for _, d := range queuedJobResourceDimensions {
+		if !d.constrained(filter.MaxRequested) {
 			continue
 		}
 		expr := queuedJobNumberSQL(d.jobJSON, d.jobText)
 		if !filter.IgnoreServiceEnvelope {
 			expr = `(` + expr + ` + ` + queuedJobNumberSQL(d.envJSON, d.envText) + `)`
 		}
-		out += ` AND ` + expr + ` <= ` + addArg(d.cap) + `::numeric`
+		out += ` AND ` + expr + ` <= ` + addArg(d.cap(filter.MaxRequested)) + `::numeric`
 	}
 	return out
 }
@@ -286,18 +393,33 @@ func queuedJobFilterPredicateSQL(filter QueuedJobFilter, args *[]any) string {
 		out += ` AND ` + queuedJobRuntimeSQLExpr + ` = ANY(` + addArg(filter.Runtimes) + `::text[])`
 	}
 	if filter.RunnerLabels != nil {
-		// json.Marshal of a []string cannot fail.
-		labels, _ := json.Marshal(filter.RunnerLabels)
-		out += ` AND (` + queuedJobLabelsSQLExpr + ` IS NULL OR ` + queuedJobLabelsSQLExpr + ` <@ ` + addArg(string(labels)) + `::jsonb)`
+		out += ` AND ` + queuedJobLabelsColumn + ` <@ ` + addArg(filter.RunnerLabels) + `::text[]`
 	}
 	if filter.RunnerRegion == "" {
-		out += ` AND (` + queuedJobRegionsSQLExpr + ` IS NULL OR jsonb_array_length(` + queuedJobRegionsSQLExpr + `) = 0)`
+		out += ` AND ` + queuedJobRegionsColumn + ` = '{}'::text[]`
 	} else {
-		out += ` AND (` + queuedJobRegionsSQLExpr + ` IS NULL OR jsonb_array_length(` + queuedJobRegionsSQLExpr + `) = 0 OR ` + queuedJobRegionsSQLExpr + ` ?| ` + addArg([]string{filter.RunnerRegion}) + `::text[])`
+		// The two arms are indexable by the same array GIN index (= '{}' and
+		// && $n), so the planner can form a BitmapOr and never needs a heap
+		// filter for the region dimension.
+		out += ` AND (` + queuedJobRegionsColumn + ` = '{}'::text[] OR ` + queuedJobRegionsColumn + ` && ` + addArg([]string{filter.RunnerRegion}) + `::text[])`
 	}
 	out += queuedJobResourcePredicateSQL(filter, args)
 	return out
 }
+
+// queuedJobPageExecMode forces the page queries to be planned with the bound
+// filter values instead of reusing a generic plan. This is load-bearing for
+// boundedness: the resource/runtime predicates are expression indexes whose
+// clause selectivity is only useful when PostgreSQL sees the actual value
+// (its extended statistics estimate the request/capacity clause, the array
+// statistics estimate the label/region clauses), while a generic plan treats
+// every $n as unknown and falls back to defaults that can rate a COMMON
+// value as selective — the planner then drives the scan through an index
+// that actually matches the whole queue. QueryExecModeExec sends an unnamed
+// statement and plans it on every execution, so a poll costs one extra
+// parse/plan (bounded by query complexity, not queue size) and the plan
+// always reflects the runner's real filter values.
+const queuedJobPageExecMode = pgx.QueryExecModeExec
 
 // queuedJobsPageQuery builds the page SQL and its arguments: the shared
 // jobCols projection, the persisted-deadline and filter predicates, the exact
@@ -321,6 +443,70 @@ func queuedJobsPageQuery(filter QueuedJobFilter, after *QueuedJobCursor, limit i
 	return query, args
 }
 
+// queuedJobsTraversalQuery builds the immutable-creation-order page SQL and
+// its arguments: the SAME jobCols projection, status/deadline and
+// runner-coarse filter predicates as queuedJobsPageQuery, ordered by
+// created_at ASC, id ASC with a (created_at, id) keyset cursor and LIMIT
+// limit+1 (so HasMore is exact). jobs_queued_boost_sweep_idx
+// ON (created_at, queue_boost, id) WHERE status='queued' stores created_at
+// first, so the page walk can stop after limit+1 index entries instead of
+// sorting the queued population.
+func queuedJobsTraversalQuery(filter QueuedJobFilter, after *QueuedJobTraversalCursor, limit int, now time.Time) (string, []any) {
+	args := []any{now}
+	where := ` WHERE status='queued' AND (queue_deadline IS NULL OR queue_deadline > $1::timestamptz)`
+	where += queuedJobFilterPredicateSQL(filter, &args)
+	if after != nil {
+		args = append(args, after.CreatedAt, after.ID)
+		p := len(args) - 1
+		where += ` AND (created_at > $` + strconv.Itoa(p) + `::timestamptz OR (created_at = $` + strconv.Itoa(p) +
+			`::timestamptz AND id > $` + strconv.Itoa(p+1) + `::text COLLATE "C"))`
+	}
+	args = append(args, limit+1)
+	query := `SELECT ` + jobCols + ` FROM jobs` + where +
+		` ORDER BY created_at ASC, id ASC LIMIT $` + strconv.Itoa(len(args))
+	return query, args
+}
+
+// ListQueuedJobsByCreation implements QueuedJobTraversalStore for the durable
+// store: one index-backed keyset read in the immutable creation order, with
+// the same filter/deadline predicates as ListQueuedJobsPage and LIMIT limit+1
+// so HasMore is exact. jobCols is shared with ListQueuedJobs, so a traversal
+// candidate decodes identically to an aged-page candidate.
+func (s *PostgresStore) ListQueuedJobsByCreation(ctx context.Context, filter QueuedJobFilter, after *QueuedJobTraversalCursor, limit int, now time.Time) (QueuedJobTraversalPage, error) {
+	limit = NormalizeQueuedJobPageLimit(limit)
+	query, args := queuedJobsTraversalQuery(filter, after, limit, now)
+	rows, err := s.pool.Query(ctx, query, append([]any{queuedJobPageExecMode}, args...)...)
+	if err != nil {
+		return QueuedJobTraversalPage{}, err
+	}
+	defer rows.Close()
+	out := []model.Job{}
+	for rows.Next() {
+		js := jobScanner{}
+		if err := rows.Scan(jobTargets(&js)...); err != nil {
+			return QueuedJobTraversalPage{}, err
+		}
+		j, err := js.job()
+		if err != nil {
+			return QueuedJobTraversalPage{}, err
+		}
+		out = append(out, j)
+	}
+	if err := rows.Err(); err != nil {
+		return QueuedJobTraversalPage{}, err
+	}
+	page := QueuedJobTraversalPage{Jobs: out}
+	if len(out) > limit {
+		page.Jobs = out[:limit]
+		page.HasMore = true
+	}
+	if len(page.Jobs) > 0 {
+		last := page.Jobs[len(page.Jobs)-1]
+		page.Last = QueuedJobTraversalCursor{CreatedAt: last.CreatedAt, ID: last.ID}
+	}
+	return page, nil
+}
+
 // ListQueuedJobsPage implements QueuedJobPageStore for the durable store.
 // One index-backed keyset read: the aged ORDER BY with the row-value cursor
 // predicate and LIMIT limit+1 so HasMore is exact. jobCols is shared with
@@ -332,7 +518,7 @@ func queuedJobsPageQuery(filter QueuedJobFilter, after *QueuedJobCursor, limit i
 func (s *PostgresStore) ListQueuedJobsPage(ctx context.Context, filter QueuedJobFilter, after *QueuedJobCursor, limit int, now time.Time) (QueuedJobPage, error) {
 	limit = NormalizeQueuedJobPageLimit(limit)
 	query, args := queuedJobsPageQuery(filter, after, limit, now)
-	rows, err := s.pool.Query(ctx, query, args...)
+	rows, err := s.pool.Query(ctx, query, append([]any{queuedJobPageExecMode}, args...)...)
 	if err != nil {
 		return QueuedJobPage{}, err
 	}
@@ -465,6 +651,47 @@ func (m *memStore) ListQueuedJobsPage(ctx context.Context, filter QueuedJobFilte
 	return page, nil
 }
 
+// ListQueuedJobsByCreation implements QueuedJobTraversalStore over the
+// in-memory job map: the same status/filter/deadline predicates and materialized
+// QueueBoost the aged page applies (so both orders expose the same candidate
+// set), ordered by the immutable creation key (created_at ASC, id ASC) with
+// the same keyset cursor semantics. The map under m.mu is a complete view, so
+// paging is deterministic.
+func (m *memStore) ListQueuedJobsByCreation(ctx context.Context, filter QueuedJobFilter, after *QueuedJobTraversalCursor, limit int, now time.Time) (QueuedJobTraversalPage, error) {
+	limit = NormalizeQueuedJobPageLimit(limit)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	eligible := make([]model.Job, 0, len(m.jobs))
+	for _, j := range m.jobs {
+		if j.Status != model.StatusQueued {
+			continue
+		}
+		if j.QueueDeadline != nil && !j.QueueDeadline.After(now) {
+			continue
+		}
+		if !QueuedJobMatchesFilter(j, filter) {
+			continue
+		}
+		if after != nil && !queuedJobAfterCreationCursor(j, *after) {
+			continue
+		}
+		j.QueueBoost = queuedJobComputedBoost(j, now)
+		j.BoostKnown = true
+		eligible = append(eligible, j)
+	}
+	sortQueuedJobsByCreation(eligible)
+	page := QueuedJobTraversalPage{Jobs: eligible}
+	if len(eligible) > limit {
+		page.Jobs = eligible[:limit]
+		page.HasMore = true
+	}
+	if len(page.Jobs) > 0 {
+		last := page.Jobs[len(page.Jobs)-1]
+		page.Last = QueuedJobTraversalCursor{CreatedAt: last.CreatedAt, ID: last.ID}
+	}
+	return page, nil
+}
+
 // PromoteQueuedJobBoosts implements QueuedBoostPromoter: it recomputes the
 // materialized aged-wait term queue_boost for the queued rows whose stored
 // value is stale, in bounded ctid batches, and returns how many rows it
@@ -513,4 +740,6 @@ func (s *PostgresStore) PromoteQueuedJobBoosts(ctx context.Context, now time.Tim
 
 var _ QueuedJobPageStore = (*PostgresStore)(nil)
 var _ QueuedJobPageStore = (*memStore)(nil)
+var _ QueuedJobTraversalStore = (*PostgresStore)(nil)
+var _ QueuedJobTraversalStore = (*memStore)(nil)
 var _ QueuedBoostPromoter = (*PostgresStore)(nil)

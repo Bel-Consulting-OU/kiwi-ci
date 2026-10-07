@@ -28,14 +28,14 @@ func (c *VaultClient) client() *http.Client {
 // credential-bearing query) fails closed before any token is attached.
 func (c *VaultClient) baseURL() (*url.URL, error) {
 	if err := validateProviderEndpoint(c.Address, true); err != nil {
-		return nil, fmt.Errorf("vault: %w", err)
+		return nil, classError("vault", ErrUnavailable, "invalid endpoint", err)
 	}
 	u, err := url.Parse(c.Address)
 	if err != nil {
-		return nil, fmt.Errorf("vault: parse address: %w", err)
+		return nil, classError("vault", ErrUnavailable, "invalid endpoint", err)
 	}
 	if u.Host == "" {
-		return nil, fmt.Errorf("vault: address has no host")
+		return nil, classError("vault", ErrUnavailable, "invalid endpoint", fmt.Errorf("vault: address has no host"))
 	}
 	return u, nil
 }
@@ -98,32 +98,49 @@ func (c *VaultClient) Resolve(ctx context.Context, name string, _ SecretScope) (
 	u.Path = strings.TrimRight(u.Path, "/") + "/v1/secret/data/" + strings.TrimLeft(name, "/")
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return "", fmt.Errorf("vault: build request: %w", err)
+		return "", classError("vault", ErrUnavailable, "build request", err)
 	}
 	if c.Token != "" {
 		req.Header.Set("X-Vault-Token", c.Token)
 	}
 	resp, err := c.client().Do(req)
 	if err != nil {
-		return "", fmt.Errorf("vault: %w", err)
+		return "", transportError("vault", "request failed", err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return "", fmt.Errorf("vault: read response: %w", err)
+		return "", transportError("vault", "read response", err)
 	}
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-		return "", fmt.Errorf("vault: unexpected redirect status %d", resp.StatusCode)
+		return "", classError("vault", ErrUnavailable, fmt.Sprintf("unexpected redirect status %d (redirects are not followed)", resp.StatusCode), nil)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("vault: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		class := httpStatusClass(resp.StatusCode)
+		if class == ErrUnavailable {
+			// Vault normally uses 403 for policy denial, but a 400 with a
+			// permission marker must still fail closed as Forbidden rather
+			// than become an opt-in Unavailable fallback.
+			if marker := vaultErrorTextClass(body); marker != nil {
+				class = marker
+			}
+		}
+		return "", classError("vault", class, fmt.Sprintf("status %d", resp.StatusCode), nil)
 	}
 	var out vaultKV2Response
 	if err := json.Unmarshal(body, &out); err != nil {
-		return "", fmt.Errorf("vault: decode response: %w", err)
+		return "", decodeError("vault", "decode response", err)
 	}
 	if len(out.Errors) > 0 {
-		return "", fmt.Errorf("vault: %s", strings.Join(out.Errors, "; "))
+		class := vaultErrorTextClass(body)
+		if class == nil {
+			class = ErrMalformedResponse
+		}
+		return "", classError("vault", class, "provider reported errors", nil)
 	}
-	return firstVaultValue(out.Data.Data)
+	v, err := firstVaultValue(out.Data.Data)
+	if err != nil {
+		return "", decodeError("vault", "", err)
+	}
+	return v, nil
 }

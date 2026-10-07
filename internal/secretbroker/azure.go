@@ -40,7 +40,7 @@ type azureTokenResponse struct {
 func (c *AzureClient) accessToken(ctx context.Context) (string, error) {
 	tokenURL := c.tokenURL()
 	if err := validateProviderEndpoint(tokenURL, true); err != nil {
-		return "", fmt.Errorf("azure: %w", err)
+		return "", classError("azure", ErrUnavailable, "invalid token endpoint", err)
 	}
 	form := url.Values{
 		"grant_type":    {"client_credentials"},
@@ -50,27 +50,29 @@ func (c *AzureClient) accessToken(ctx context.Context) (string, error) {
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
-		return "", fmt.Errorf("azure: token request: %w", err)
+		return "", classError("azure", ErrUnavailable, "token request", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := c.client().Do(req)
 	if err != nil {
-		return "", fmt.Errorf("azure: token request: %w", err)
+		return "", transportError("azure", "token request failed", err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return "", fmt.Errorf("azure: token response: %w", err)
+		return "", transportError("azure", "token response read failed", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("azure: token status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		code := oauthErrorCode(body)
+		class := oauthErrorClass(code, resp.StatusCode)
+		return "", classError("azure", class, statusDetailToken(resp.StatusCode, code), nil)
 	}
 	var out azureTokenResponse
 	if err := json.Unmarshal(body, &out); err != nil {
-		return "", fmt.Errorf("azure: decode token response: %w", err)
+		return "", decodeError("azure", "decode token response", err)
 	}
 	if out.AccessToken == "" {
-		return "", fmt.Errorf("azure: empty access token")
+		return "", classError("azure", ErrMalformedResponse, "empty access token", nil)
 	}
 	return out.AccessToken, nil
 }
@@ -87,32 +89,32 @@ func (c *AzureClient) Resolve(ctx context.Context, name string, _ SecretScope) (
 		return "", err
 	}
 	if err := validateProviderEndpoint(c.VaultURL, true); err != nil {
-		return "", fmt.Errorf("azure: %w", err)
+		return "", classError("azure", ErrUnavailable, "invalid vault endpoint", err)
 	}
 	u := strings.TrimRight(c.VaultURL, "/") + "/secrets/" + url.PathEscape(name) + "?api-version=7.4"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return "", fmt.Errorf("azure: build request: %w", err)
+		return "", classError("azure", ErrUnavailable, "build request", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := c.client().Do(req)
 	if err != nil {
-		return "", fmt.Errorf("azure: %w", err)
+		return "", transportError("azure", "request failed", err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return "", fmt.Errorf("azure: read response: %w", err)
+		return "", transportError("azure", "read response", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("azure: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return "", classError("azure", httpStatusClass(resp.StatusCode), fmt.Sprintf("status %d", resp.StatusCode), nil)
 	}
 	var out azureSecretResponse
 	if err := json.Unmarshal(body, &out); err != nil {
-		return "", fmt.Errorf("azure: decode response: %w", err)
+		return "", decodeError("azure", "decode response", err)
 	}
 	if out.Value == "" {
-		return "", fmt.Errorf("azure: secret %q has no value", name)
+		return "", classError("azure", ErrMalformedResponse, fmt.Sprintf("secret %q has no value", name), nil)
 	}
 	return out.Value, nil
 }

@@ -26,6 +26,7 @@ import (
 func pgITBreakColumn(t *testing.T, st *PostgresStore, table, column string) {
 	t.Helper()
 	ctx := context.Background()
+	pgITDropStatistics(t, st, table)
 	// Expression indexes derived from runs.payload (0026/0027/0034/0035/0036)
 	// block retyping the column, so drop ALL indexes on runs that reference it
 	// in this throwaway schema first (a hardcoded list would miss migration
@@ -63,6 +64,7 @@ func pgITBoomOp(t *testing.T, st *PostgresStore, table, event string, optionalCo
 // string scanners fail while the surrounding query stays valid.
 func pgITBreakColumnToArray(t *testing.T, st *PostgresStore, table, column string) {
 	t.Helper()
+	pgITDropStatistics(t, st, table)
 	q := fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT`, table, column)
 	if _, err := st.pool.Exec(context.Background(), q); err != nil {
 		t.Fatalf("drop default %s.%s: %v", table, column, err)
@@ -77,6 +79,7 @@ func pgITBreakColumnToArray(t *testing.T, st *PostgresStore, table, column strin
 // statements in the same helper succeed.
 func pgITDropColumn(t *testing.T, st *PostgresStore, table, column string) {
 	t.Helper()
+	pgITDropStatistics(t, st, table)
 	q := fmt.Sprintf(`ALTER TABLE %s DROP COLUMN %s`, table, column)
 	if _, err := st.pool.Exec(context.Background(), q); err != nil {
 		t.Fatalf("drop %s.%s: %v", table, column, err)
@@ -1123,9 +1126,14 @@ func TestPostgresIntegrationMiscStatementBreaks(t *testing.T) {
 		// Every partial index with a status predicate must be dropped before
 		// the column type changes: PostgreSQL cannot re-evaluate the predicate
 		// for a text[] column. jobs_queued_priority_idx is the migration 0038
-		// queued-candidate index and carries the same status predicate.
+		// queued-candidate index and carries the same status predicate; 0041
+		// replaced the jsonb label/region GINs with the normalized array GINs
+		// and added the combined- and own-request resource expression indexes,
+		// all partial on status='queued'.
 		if _, err := st.pool.Exec(context.Background(), `DROP INDEX jobs_running_lease_recovery_idx, jobs_queue_deadline_recovery_idx, jobs_queued_priority_idx,
-			jobs_queued_aged_idx, jobs_queued_boost_sweep_idx, jobs_queued_runtime_idx, jobs_queued_labels_idx, jobs_queued_regions_idx`); err != nil {
+			jobs_queued_aged_idx, jobs_queued_boost_sweep_idx, jobs_queued_runtime_idx, jobs_queued_labels_arr_idx, jobs_queued_regions_arr_idx,
+			jobs_queued_cpu_idx, jobs_queued_memory_idx, jobs_queued_pids_idx, jobs_queued_disk_idx,
+			jobs_queued_cpu_own_idx, jobs_queued_memory_own_idx, jobs_queued_pids_own_idx, jobs_queued_disk_own_idx`); err != nil {
 			t.Fatal(err)
 		}
 		pgITBreakColumnToArray(t, st, "jobs", "status")

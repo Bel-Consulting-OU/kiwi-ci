@@ -106,6 +106,12 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 	// (or header-swapped) webhook performs no pipeline fetch, changed-files
 	// fetch or trigger evaluation.
 	repoID := s.forgeRepoID("github", webhookRepoCoordinate(ec))
+	// POST-HMAC stage: the delivery is authenticated, so it is limited under
+	// the forge/repository identity instead of the shared client-IP intake
+	// bucket that forged junk can exhaust.
+	if !s.allowAuthenticatedWebhook(w, r, "github", repoID) {
+		return
+	}
 	delivery := strings.TrimSpace(r.Header.Get("X-GitHub-Delivery"))
 	if delivery == "" {
 		http.Error(w, "missing X-GitHub-Delivery", http.StatusBadRequest)

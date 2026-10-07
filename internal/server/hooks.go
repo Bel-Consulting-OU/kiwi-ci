@@ -134,6 +134,12 @@ func (s *Server) gitlabWebhook(w http.ResponseWriter, r *http.Request) {
 	// already-created run, so a replay performs no pipeline/changed-files
 	// fetch and no trigger evaluation.
 	repoID := s.forgeRepoID("gitlab", webhookRepoCoordinate(ec))
+	// POST-HMAC stage: the delivery is authenticated, so it is limited under
+	// the forge/repository identity instead of the shared client-IP intake
+	// bucket that forged junk can exhaust.
+	if !s.allowAuthenticatedWebhook(w, r, "gitlab", repoID) {
+		return
+	}
 	delivery := strings.TrimSpace(r.Header.Get("X-GitLab-Event-UUID"))
 	if delivery == "" {
 		http.Error(w, "missing X-GitLab-Event-UUID", http.StatusBadRequest)
@@ -288,6 +294,12 @@ func (s *Server) forgejoWebhook(w http.ResponseWriter, r *http.Request) {
 	// already-created run, so a replay performs no pipeline/changed-files
 	// fetch and no trigger evaluation.
 	repoID := s.forgeRepoID("forgejo", webhookRepoCoordinate(ec))
+	// POST-HMAC stage: the delivery is authenticated, so it is limited under
+	// the forge/repository identity instead of the shared client-IP intake
+	// bucket that forged junk can exhaust.
+	if !s.allowAuthenticatedWebhook(w, r, "forgejo", repoID) {
+		return
+	}
 	delivery := strings.TrimSpace(r.Header.Get("X-Forgejo-Delivery"))
 	if delivery == "" {
 		http.Error(w, "missing X-Forgejo-Delivery", http.StatusBadRequest)

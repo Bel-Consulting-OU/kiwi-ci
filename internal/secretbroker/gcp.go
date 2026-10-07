@@ -120,11 +120,11 @@ type gcpTokenResponse struct {
 func (c *GCPClient) accessToken(ctx context.Context) (string, error) {
 	jwt, err := c.serviceAccountJWT()
 	if err != nil {
-		return "", err
+		return "", classError("gcp", ErrUnavailable, "service account credentials unusable", err)
 	}
 	tokenURL := c.tokenURL()
 	if err := validateProviderEndpoint(tokenURL, true); err != nil {
-		return "", fmt.Errorf("gcp: %w", err)
+		return "", classError("gcp", ErrUnavailable, "invalid token endpoint", err)
 	}
 	form := url.Values{
 		"grant_type": {"urn:ietf:params:oauth:grant-type:jwt-bearer"},
@@ -132,29 +132,40 @@ func (c *GCPClient) accessToken(ctx context.Context) (string, error) {
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
-		return "", fmt.Errorf("gcp: token request: %w", err)
+		return "", classError("gcp", ErrUnavailable, "token request", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := c.client().Do(req)
 	if err != nil {
-		return "", fmt.Errorf("gcp: token request: %w", err)
+		return "", transportError("gcp", "token request failed", err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return "", fmt.Errorf("gcp: token response: %w", err)
+		return "", transportError("gcp", "token response read failed", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("gcp: token status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		code := oauthErrorCode(body)
+		class := oauthErrorClass(code, resp.StatusCode)
+		return "", classError("gcp", class, statusDetailToken(resp.StatusCode, code), nil)
 	}
 	var out gcpTokenResponse
 	if err := json.Unmarshal(body, &out); err != nil {
-		return "", fmt.Errorf("gcp: decode token response: %w", err)
+		return "", decodeError("gcp", "decode token response", err)
 	}
 	if out.AccessToken == "" {
-		return "", fmt.Errorf("gcp: empty access token")
+		return "", classError("gcp", ErrMalformedResponse, "empty access token", nil)
 	}
 	return out.AccessToken, nil
+}
+
+// statusDetailToken renders a safe "token status N (code)" detail; the OAuth
+// error code is a fixed identifier, never a description or body.
+func statusDetailToken(status int, code string) string {
+	if code == "" {
+		return fmt.Sprintf("token status %d", status)
+	}
+	return fmt.Sprintf("token status %d (%s)", status, code)
 }
 
 // Resolve fetches the latest version of the secret and base64-decodes
@@ -166,26 +177,26 @@ func (c *GCPClient) Resolve(ctx context.Context, name string, _ SecretScope) (st
 	}
 	secretManagerURL := c.secretManagerURL()
 	if err := validateProviderEndpoint(secretManagerURL, true); err != nil {
-		return "", fmt.Errorf("gcp: %w", err)
+		return "", classError("gcp", ErrUnavailable, "invalid secret manager endpoint", err)
 	}
 	u := secretManagerURL + "/v1/projects/" + url.PathEscape(c.Project) +
 		"/secrets/" + url.PathEscape(name) + "/versions/latest:access"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return "", fmt.Errorf("gcp: build request: %w", err)
+		return "", classError("gcp", ErrUnavailable, "build request", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := c.client().Do(req)
 	if err != nil {
-		return "", fmt.Errorf("gcp: %w", err)
+		return "", transportError("gcp", "request failed", err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return "", fmt.Errorf("gcp: read response: %w", err)
+		return "", transportError("gcp", "read response", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("gcp: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return "", classError("gcp", httpStatusClass(resp.StatusCode), fmt.Sprintf("status %d", resp.StatusCode), nil)
 	}
 	var out struct {
 		Payload struct {
@@ -193,14 +204,14 @@ func (c *GCPClient) Resolve(ctx context.Context, name string, _ SecretScope) (st
 		} `json:"payload"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
-		return "", fmt.Errorf("gcp: decode response: %w", err)
+		return "", decodeError("gcp", "decode response", err)
 	}
 	if out.Payload.Data == "" {
-		return "", fmt.Errorf("gcp: secret %q has no payload data", name)
+		return "", classError("gcp", ErrMalformedResponse, fmt.Sprintf("secret %q has no payload data", name), nil)
 	}
 	decoded, err := base64.StdEncoding.DecodeString(out.Payload.Data)
 	if err != nil {
-		return "", fmt.Errorf("gcp: decode payload data: %w", err)
+		return "", decodeError("gcp", "decode payload data", err)
 	}
 	return string(decoded), nil
 }

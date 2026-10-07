@@ -13,6 +13,7 @@ import (
 	"flag"
 	"fmt"
 	"math"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -22,6 +23,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/blob"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/quotas"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/ratelimit"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secretbroker"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
 )
 
@@ -63,6 +65,14 @@ type ServerConfig struct {
 	// bound on pin-able CAS bytes). 0 uses the built-in default (64 GiB);
 	// -1 disables the byte bound.
 	MaxCacheManifestBytesPerRepo int64 `toml:"max_cache_manifest_bytes_per_repo"`
+	// TrustedProxies lists the CIDR ranges of reverse proxies whose
+	// X-Forwarded-For header is authoritative for the canonical client IP
+	// (rate limiting and audit). A request whose direct peer is NOT inside
+	// one of these ranges ignores X-Forwarded-For entirely, so a client
+	// cannot spoof its source address. When the peer is trusted, the chain
+	// is walked from the right and the first untrusted hop is the client; a
+	// malformed or entirely trusted chain falls back to the direct peer.
+	TrustedProxies []string `toml:"trusted_proxies"`
 }
 
 type DatabaseConfig struct {
@@ -266,6 +276,14 @@ type SecretBrokerConfig struct {
 	// static broker (the repeatable --secret-static flag joins the same
 	// way).
 	Static string `toml:"static"`
+	// FallbackOn lists the error classes that permit the provider chain to
+	// advance to the next broker, as a TOML array (for example
+	// fallback_on = ["not_found", "unavailable"]). Absent defaults to
+	// ["not_found"]. Only "not_found" and "unavailable" are accepted:
+	// authorization, policy and malformed-response failures must never be
+	// configured as fall-through classes, because that would mask an
+	// authoritative denial by delivering a later broker's secret.
+	FallbackOn []string `toml:"fallback_on"`
 }
 
 // ComponentsConfig configures server-side component resolution: a local
@@ -454,6 +472,18 @@ func (c *Config) Validate() error {
 	}
 	if c.Server.MaxRetainedRuns < -1 {
 		return fmt.Errorf("server.max_retained_runs must be >= -1 (0 = default, -1 = disabled), got %d", c.Server.MaxRetainedRuns)
+	}
+	// Trusted proxies gate whether X-Forwarded-For may identify a client, so
+	// a malformed entry must fail startup instead of silently trusting
+	// nothing (or, worse, a typo'd prefix).
+	for i, raw := range c.Server.TrustedProxies {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			return fmt.Errorf("server.trusted_proxies[%d] is empty: every entry must be a CIDR range such as \"10.0.0.0/8\"", i)
+		}
+		if _, _, err := net.ParseCIDR(entry); err != nil {
+			return fmt.Errorf("server.trusted_proxies[%d] %q is not a valid CIDR range: %v", i, entry, err)
+		}
 	}
 	if raw := strings.TrimSpace(c.Server.RunRetention); raw != "" {
 		d, err := time.ParseDuration(raw)
@@ -734,7 +764,14 @@ var secretBrokerProviders = map[string]bool{
 
 // validateSecretBroker enforces the per-provider credential requirements so
 // a misconfigured broker surfaces at startup instead of at first resolve.
+// The fallback policy is validated in every mode: a chain must never be
+// configured to fall through on an authorization, policy, or
+// malformed-response failure, so those entries are rejected even in dev
+// (where the fail-open consequence would otherwise be exercised silently).
 func validateSecretBroker(c SecretBrokerConfig) error {
+	if _, err := secretbroker.ParseFallbackOn(c.FallbackOn); err != nil {
+		return fmt.Errorf("secret_broker.%w", err)
+	}
 	b := c.Broker
 	if b == "" {
 		return nil
@@ -851,6 +888,17 @@ func (c *Config) ApplyEnv() error {
 			return fmt.Errorf("KIWI_METRICS_PUBLIC: %w", err)
 		}
 		c.Observability.MetricsPublic = b
+	}
+	// Trusted proxies: a comma-separated CIDR list. An empty value is not a
+	// value (an orchestrator expansion must never silently clear the trust
+	// configuration and fall back to direct-peer-only attribution).
+	for _, name := range []string{"KIWI_SERVER_TRUSTED_PROXIES", "KIWI_TRUSTED_PROXIES"} {
+		v, ok := os.LookupEnv(name)
+		if !ok || strings.TrimSpace(v) == "" {
+			continue
+		}
+		c.Server.TrustedProxies = splitCSVList(v)
+		break
 	}
 	if v, ok := os.LookupEnv("KIWI_DATABASE_MAX_CONNECTIONS"); ok {
 		n, err := strconv.Atoi(v)
@@ -1160,6 +1208,35 @@ func sensitiveEnvOverride(name string) bool {
 	return false
 }
 
+// splitCSVList parses a comma-separated environment override into trimmed,
+// non-empty entries.
+func splitCSVList(raw string) []string {
+	out := []string{}
+	for _, part := range strings.Split(raw, ",") {
+		if entry := strings.TrimSpace(part); entry != "" {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+// TrustedProxyNets parses the configured trusted-proxy CIDRs. Entries that do
+// not parse are skipped: Validate rejects them at startup, so this is the
+// hot-path accessor for a configuration that already passed validation.
+func (c *Config) TrustedProxyNets() []*net.IPNet {
+	nets := make([]*net.IPNet, 0, len(c.Server.TrustedProxies))
+	for _, raw := range c.Server.TrustedProxies {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			continue
+		}
+		if _, n, err := net.ParseCIDR(entry); err == nil && n != nil {
+			nets = append(nets, n)
+		}
+	}
+	return nets
+}
+
 // RateLimitClasses returns the effective per-class rates: each class uses
 // its *_per_second override, falling back to the global PerSecond.
 func (c *Config) RateLimitClasses() map[string]float64 {
@@ -1220,5 +1297,10 @@ func (c *Config) RateLimitMiddleware() *ratelimit.Middleware {
 	if !enabled {
 		return nil
 	}
-	return ratelimit.NewMiddleware(classes, c.RateLimitBurst())
+	m := ratelimit.NewMiddleware(classes, c.RateLimitBurst())
+	// The trusted-proxy ranges ride the middleware whose Wrap resolves and
+	// records the canonical client IP, so the existing wiring
+	// (srv.RateLimiter = cfg.RateLimitMiddleware()) carries them too.
+	m.TrustedProxies = c.TrustedProxyNets()
+	return m
 }

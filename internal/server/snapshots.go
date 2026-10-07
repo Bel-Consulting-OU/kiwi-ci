@@ -215,6 +215,11 @@ func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
 		s.writeLeaseAuthError(w, r, authErr)
 		return
 	}
+	// Durable writes are fenced to the current registration session: a
+	// superseded process may not commit snapshots under a still-valid lease.
+	if !s.requireCurrentRunnerIncarnation(w, r, runnerID) {
+		return
+	}
 	// Static wiring gate FIRST: a DB store without transactional lease-commit
 	// support is refused before the count preflight, before a body byte is read
 	// and before any staging reservation is taken, instead of failing after

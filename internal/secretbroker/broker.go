@@ -202,34 +202,114 @@ func hmacSHA256(key, data []byte) []byte {
 	return mac.Sum(nil)
 }
 
-// ChainBroker tries each broker in order and returns the first success.
-type ChainBroker []Broker
+// ChainBroker tries each broker in order and returns the first success. A
+// broker failure stops the chain unless its error class is listed in
+// FallbackOn: authorization, policy and malformed-response failures ALWAYS
+// fail closed, and a canceled context stops the chain immediately.
+//
+// Brokers holds the chain in resolution order; a nil entry is skipped.
+// FallbackOn lists the error classes that permit advancing to the next
+// broker. A nil policy means DefaultFallbackOn ([not_found]); a non-nil
+// empty policy means no class permits advancing. Only "not_found" and
+// "unavailable" are valid entries; ParseFallbackOn enforces that.
+type ChainBroker struct {
+	Brokers    []Broker
+	FallbackOn []string
+}
+
+// fallbackAllowed reports whether the class of err is listed in the chain's
+// policy. An unclassified error is never fallback-able.
+func (c ChainBroker) fallbackAllowed(err error) bool {
+	policy := c.FallbackOn
+	if policy == nil {
+		policy = DefaultFallbackOn
+	}
+	class := ErrorClass(err)
+	if class == "" || class == "unknown" {
+		return false
+	}
+	for _, allowed := range policy {
+		if allowed == class {
+			return true
+		}
+	}
+	return false
+}
 
 func (c ChainBroker) Resolve(ctx context.Context, name string, scope SecretScope) (string, error) {
+	if isContextDone(ctx) {
+		// A canceled or expired context must never trigger a broker call or
+		// a fallback: classify it Unavailable and preserve the ctx error.
+		return "", cancellationErr("chain", fmt.Sprintf("secret %q: resolution canceled before any broker was consulted", name), ctx.Err())
+	}
 	var errs []error
-	for _, b := range c {
+	consulted := 0
+	for _, b := range c.Brokers {
 		if b == nil {
 			continue
 		}
+		consulted++
 		v, err := b.Resolve(ctx, name, scope)
 		if err == nil {
 			return v, nil
 		}
 		errs = append(errs, err)
+		if isContextDone(ctx) {
+			// Cancellation/deadline: the ctx error is authoritative and no
+			// later broker may be consulted.
+			return "", cancellationErr("chain",
+				fmt.Sprintf("secret %q: broker %q: resolution canceled (class %s, never falling back)", name, brokerName(b), ErrorClass(err)), err)
+		}
+		if !c.fallbackAllowed(err) {
+			// Fail closed: the authoritative broker's error wins and the
+			// chain annotates the class that stopped it.
+			return "", fmt.Errorf("secret %q: chain stopped at broker %s (class %s is not in fallback_on): %w",
+				name, brokerName(b), ErrorClass(err), err)
+		}
 	}
-	if len(errs) == 0 {
-		return "", fmt.Errorf("secret %q not found: empty broker chain", name)
+	if consulted == 0 {
+		return "", classError("chain", ErrSecretNotFound, fmt.Sprintf("secret %q not found: empty broker chain", name), nil)
 	}
-	return "", fmt.Errorf("secret %q not found: %w", name, errors.Join(errs...))
+	return "", classError("chain", ErrSecretNotFound,
+		fmt.Sprintf("secret %q not found in any configured broker", name), errors.Join(errs...))
 }
 
-// StaticBroker serves secrets from an in-memory map.
+// brokerName names a chain broker for diagnostics. The Broker interface has
+// no name method so that third-party wrappers stay unimplementable-safe;
+// known providers are recognized by type and anything else falls back to its
+// Go type.
+func brokerName(b Broker) string {
+	switch b.(type) {
+	case *VaultClient:
+		return "vault"
+	case *SecretsManagerClient:
+		return "aws"
+	case *GCPClient:
+		return "gcp"
+	case *AzureClient:
+		return "azure"
+	case *OnePasswordClient:
+		return "onepassword"
+	case StaticBroker:
+		return "static"
+	case *OneTime:
+		return "onetime"
+	case ChainBroker:
+		return "chain"
+	default:
+		return fmt.Sprintf("%T", b)
+	}
+}
+
+// StaticBroker serves secrets from an in-memory map. A missing key is the
+// NotFound class: it is the only failure the static broker can produce, and
+// the only class a chain falls through on by default.
 type StaticBroker map[string]string
 
 func (s StaticBroker) Resolve(_ context.Context, name string, _ SecretScope) (string, error) {
 	v, ok := s[name]
 	if !ok {
-		return "", fmt.Errorf("secret %q not found", name)
+		return "", classError("static", ErrSecretNotFound, fmt.Sprintf("secret %q not found", name), nil)
 	}
 	return v, nil
 }

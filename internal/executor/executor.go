@@ -566,9 +566,24 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			if er != nil {
 				return cacheFail("cache key: " + er.Error())
 			}
-			hit, er := e.Opt.Cache.RestoreContext(ctx, key, workspace, c.Paths)
+			hit, er := e.Opt.Cache.RestoreContextWithDebt(ctx, key, workspace, c.Paths, func(_ string, path string, err error) {
+				// Both a rollback residue inside the workspace and a
+				// leftover staging tree after a SUCCESSFUL restore reach the
+				// runner's recovery ledger through the existing debt
+				// reporter, exactly like any other unproven removal.
+				e.reportCleanupDebt(CleanupCacheRestore, path, err)
+			})
 			if er != nil {
-				return cacheFail("cache restore: " + er.Error())
+				// A rollback that could not remove every path it published
+				// leaves a hybrid workspace: the job must fail, the debt
+				// callback above retained the coordinates, and the error
+				// text tells the operator the workspace is partial.
+				var residue *cache.PublishRollbackError
+				msg := "cache restore: " + er.Error()
+				if errors.As(er, &residue) && !strings.Contains(msg, "partially restored") {
+					msg += "; the workspace may contain partially restored files"
+				}
+				return cacheFail(msg)
 			}
 			if hit {
 				label := "primary"
@@ -1385,6 +1400,10 @@ const (
 	CleanupVM          CleanupKind = "tart-vm"
 	CleanupCgroup      CleanupKind = "job-cgroup"
 	CleanupXFSQuota    CleanupKind = "xfs-project-quota"
+	// CleanupCacheRestore names a workspace path a failed cache restore left
+	// live because its publish rollback could not remove it: the workspace
+	// contains partially restored files and must be retained for recovery.
+	CleanupCacheRestore CleanupKind = "cache-restore-residue"
 	// Runner-observed teardown failures (reported by the runner itself).
 	CleanupWorkspaceQuota  CleanupKind = "workspace-quota-teardown"
 	CleanupWorkspace       CleanupKind = "workspace-removal"

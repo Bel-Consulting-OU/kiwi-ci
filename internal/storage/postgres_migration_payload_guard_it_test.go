@@ -67,6 +67,19 @@ func TestPostgresIntegrationMigrationPayloadCastsGuarded(t *testing.T) {
 		('j-valid',     'guard-run', 'build', 'queued', now(), '{"queue_deadline":"2024-01-02T15:04:05Z"}'::jsonb),
 		('j-valid-frac','guard-run', 'build', 'queued', now(), '{"queue_deadline":"2024-02-29T23:59:59.123Z"}'::jsonb)`)
 
+	// 0041: malformed normalized-filter payload shapes. jsonb_array_elements_text
+	// raises on any non-array jsonb, so every backfill must skip them instead of
+	// aborting the migration transaction.
+	seed(`INSERT INTO jobs (id, run_id, key, status, created_at, payload) VALUES
+		('j-labels-str',     'guard-run', 'build', 'queued', now(), '{"required_labels":"abc"}'::jsonb),
+		('j-labels-obj',     'guard-run', 'build', 'queued', now(), '{"required_labels":{"x":1}}'::jsonb),
+		('j-labels-null',    'guard-run', 'build', 'queued', now(), '{"required_labels":null}'::jsonb),
+		('j-labels-num',     'guard-run', 'build', 'queued', now(), '{"required_labels":7}'::jsonb),
+		('j-regions-str',    'guard-run', 'build', 'queued', now(), '{"placement_regions":"abc"}'::jsonb),
+		('j-regions-obj',    'guard-run', 'build', 'queued', now(), '{"placement_regions":{"x":1}}'::jsonb),
+		('j-filter-arrays',  'guard-run', 'build', 'queued', now(), '{"required_labels":["linux","x64"],"placement_regions":["eu","us"]}'::jsonb),
+		('j-filter-empty',   'guard-run', 'build', 'queued', now(), '{"required_labels":[],"placement_regions":[]}'::jsonb)`)
+
 	// The normal startup migration applies 0009/0010/0022 (and the rest). The
 	// bare pre-fix casts raised here and blocked startup.
 	if err := st.Migrate(ctx); err != nil {
@@ -143,5 +156,47 @@ func TestPostgresIntegrationMigrationPayloadCastsGuarded(t *testing.T) {
 	}
 	if want := time.Date(2024, 1, 2, 15, 4, 5, 0, time.UTC); !valid.Equal(want) {
 		t.Errorf("j-valid queue_deadline = %v, want %v", valid, want)
+	}
+
+	// 0041: every malformed shape stayed at the empty-array default; the
+	// valid arrays were backfilled verbatim (order preserved).
+	for _, tc := range []struct {
+		id   string
+		want []string
+	}{
+		{"j-labels-str", nil},
+		{"j-labels-obj", nil},
+		{"j-labels-null", nil},
+		{"j-labels-num", nil},
+		{"j-regions-str", nil},
+		{"j-regions-obj", nil},
+		{"j-filter-arrays", []string{"linux", "x64"}},
+		{"j-filter-empty", []string{}},
+	} {
+		var labels []string
+		if err := st.pool.QueryRow(ctx, `SELECT required_labels FROM jobs WHERE id=$1`, tc.id).Scan(&labels); err != nil {
+			t.Fatalf("read job %s required_labels: %v", tc.id, err)
+		}
+		if tc.want == nil {
+			if len(labels) != 0 {
+				t.Errorf("job %s required_labels = %v, want empty", tc.id, labels)
+			}
+		} else if len(labels) != len(tc.want) {
+			t.Errorf("job %s required_labels = %v, want %v", tc.id, labels, tc.want)
+		} else {
+			for i := range labels {
+				if labels[i] != tc.want[i] {
+					t.Errorf("job %s required_labels = %v, want %v", tc.id, labels, tc.want)
+					break
+				}
+			}
+		}
+	}
+	var regions []string
+	if err := st.pool.QueryRow(ctx, `SELECT placement_regions FROM jobs WHERE id='j-filter-arrays'`).Scan(&regions); err != nil {
+		t.Fatalf("read j-filter-arrays placement_regions: %v", err)
+	}
+	if len(regions) != 2 || regions[0] != "eu" || regions[1] != "us" {
+		t.Errorf("j-filter-arrays placement_regions = %v, want [eu us]", regions)
 	}
 }

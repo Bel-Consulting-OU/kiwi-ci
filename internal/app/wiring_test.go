@@ -219,14 +219,51 @@ func TestBuildSecretBroker(t *testing.T) {
 			t.Fatal(err)
 		}
 		ch, ok := b.(secretbroker.ChainBroker)
-		if !ok || len(ch) != 2 {
+		if !ok || len(ch.Brokers) != 2 {
 			t.Fatalf("chain = %#v", b)
 		}
-		if _, ok := ch[0].(*secretbroker.VaultClient); !ok {
-			t.Fatalf("chain[0] = %T", ch[0])
+		if ch.FallbackOn != nil {
+			t.Fatalf("absent fallback_on must keep the default policy, got %v", ch.FallbackOn)
 		}
-		if _, ok := ch[1].(secretbroker.StaticBroker); !ok {
-			t.Fatalf("chain[1] = %T", ch[1])
+		if _, ok := ch.Brokers[0].(*secretbroker.VaultClient); !ok {
+			t.Fatalf("chain[0] = %T", ch.Brokers[0])
+		}
+		if _, ok := ch.Brokers[1].(secretbroker.StaticBroker); !ok {
+			t.Fatalf("chain[1] = %T", ch.Brokers[1])
+		}
+	})
+	t.Run("chain fallback policy wired", func(t *testing.T) {
+		b, err := buildSecretBroker(config.SecretBrokerConfig{
+			Broker: "vault", VaultAddr: "https://vault.example", Static: "a=1",
+			FallbackOn: []string{"not_found", "unavailable"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ch, ok := b.(secretbroker.ChainBroker)
+		if !ok {
+			t.Fatalf("chain = %#v", b)
+		}
+		if len(ch.FallbackOn) != 2 || ch.FallbackOn[0] != "not_found" || ch.FallbackOn[1] != "unavailable" {
+			t.Fatalf("fallback policy = %v", ch.FallbackOn)
+		}
+		// An explicit empty policy means no class may fall through.
+		b, err = buildSecretBroker(config.SecretBrokerConfig{
+			Broker: "vault", VaultAddr: "https://vault.example", Static: "a=1",
+			FallbackOn: []string{},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ch, ok := b.(secretbroker.ChainBroker); !ok || ch.FallbackOn == nil || len(ch.FallbackOn) != 0 {
+			t.Fatalf("empty fallback policy = %#v", b)
+		}
+		// Authorization/security classes are rejected at construction too.
+		if _, err := buildSecretBroker(config.SecretBrokerConfig{
+			Broker: "vault", VaultAddr: "https://vault.example", Static: "a=1",
+			FallbackOn: []string{"forbidden"},
+		}); err == nil {
+			t.Fatal("forbidden fallback class accepted by buildSecretBroker")
 		}
 	})
 }

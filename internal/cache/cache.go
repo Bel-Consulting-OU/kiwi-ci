@@ -2,7 +2,6 @@ package cache
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -65,7 +64,34 @@ type Store struct {
 	// saves and remote restores reserve capacity through it before writing
 	// bytes, and Prune delegates to its shared lock.
 	Manager *Manager
+	// ReportCleanupDebt, when non-nil, receives one report for every cache
+	// filesystem artifact whose removal could not be proven: a restore
+	// rollback that could not remove a path it had already published (the
+	// live workspace then contains partially restored files) and a staging
+	// tree left behind by a restore. It is the same "unproven removal is
+	// durable debt" contract as the executor's OnCleanupDebt, and
+	// RestoreContextWithDebt lets one call use a caller-owned reporter
+	// without mutating this field (set it before concurrent use). A rollback
+	// residue is ALSO surfaced in the returned PublishRollbackError even when
+	// no reporter is configured; the only reporter-less residue is a leftover
+	// staging tree after a successful restore (outside the live workspace, so
+	// it cannot corrupt the job).
+	ReportCleanupDebt func(kind, path string, err error)
 }
+
+// Cleanup kinds reported through Store.ReportCleanupDebt. They are stable
+// strings so a consumer (the executor, the runner's recovery ledger) can map
+// them onto its own debt taxonomy.
+const (
+	// CleanupKindRestoreRollback names one workspace path a failed publish's
+	// rollback could not remove: the path is still live, so the workspace
+	// holds a partially restored tree.
+	CleanupKindRestoreRollback = "cache-restore-rollback"
+	// CleanupKindStagingResidue names a restore staging tree whose removal
+	// failed. Staging lives OUTSIDE the live workspace (a sibling), so the
+	// residue occupies disk but never corrupts the restored tree.
+	CleanupKindStagingResidue = "cache-staging-residue"
+)
 
 func Default() *Store {
 	home, _ := os.UserHomeDir()
@@ -401,13 +427,31 @@ func (s *Store) Restore(key, workspace string, paths []string) (bool, error) {
 // workspace-relative roots (validated by cleanRoots). An empty list restores
 // NOTHING; it is never treated as "everything".
 func (s *Store) RestoreContext(ctx context.Context, key, workspace string, paths []string) (bool, error) {
+	return s.restoreContext(ctx, key, workspace, paths, s.ReportCleanupDebt)
+}
+
+// RestoreContextWithDebt is RestoreContext with a per-call cleanup-debt
+// reporter. A non-nil report takes precedence over the Store's
+// ReportCleanupDebt field for this call only; it lets a caller that already
+// owns a debt ledger (the executor's OnCleanupDebt) receive debt from a
+// SUCCESSFUL restore (a staging tree whose removal failed) without mutating
+// the shared Store. The reporter receives the same kinds and coordinates as
+// the Store field.
+func (s *Store) RestoreContextWithDebt(ctx context.Context, key, workspace string, paths []string, report func(kind, path string, err error)) (bool, error) {
+	if report == nil {
+		report = s.ReportCleanupDebt
+	}
+	return s.restoreContext(ctx, key, workspace, paths, report)
+}
+
+func (s *Store) restoreContext(ctx context.Context, key, workspace string, paths []string, report func(kind, path string, err error)) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
 	if !validKey(key) {
 		return false, fmt.Errorf("cache: invalid cache key")
 	}
-	hit, err := s.restoreLocal(ctx, key, workspace, paths)
+	hit, err := s.restoreLocalWithReporter(ctx, key, workspace, paths, report)
 	if hit {
 		s.touchLocal(key)
 		return true, nil
@@ -426,7 +470,7 @@ func (s *Store) RestoreContext(ctx context.Context, key, workspace string, paths
 		}
 		return false, ferr
 	}
-	return s.restoreLocal(ctx, key, workspace, paths)
+	return s.restoreLocalWithReporter(ctx, key, workspace, paths, report)
 }
 
 var errRemoteNotFound = fmt.Errorf("cache entry not found on remote")
@@ -452,6 +496,52 @@ var (
 	removeCacheTemp = os.Remove
 	copyCacheDigest = io.Copy
 )
+
+// renameFn, removeFn and removeAllFn are test-only seams over the filesystem
+// primitives restore publication and rollback are built from (rename a staged
+// entry into place, remove one published path, remove a created directory or
+// staging tree). Production behavior is unchanged; tests replace them to
+// inject rename/removal faults and prove a failed rollback surfaces its
+// residue as durable cleanup debt instead of discarding the removal error.
+var (
+	renameFn    = os.Rename
+	removeFn    = os.Remove
+	removeAllFn = os.RemoveAll
+)
+
+// removeStagingDir removes one restore staging tree, returning the removal
+// error (nil when the tree is already gone). It exists so a removal error is
+// never discarded with `_ =`: callers either report it as cleanup debt or
+// join it into the error they are already returning.
+func removeStagingDir(dir string) error {
+	if dir == "" {
+		return nil
+	}
+	if err := removeAllFn(dir); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// reportCleanupDebt forwards one unproven-removal report to the reporter for
+// the current call (a per-call reporter, else the Store field). A nil error
+// or a nil reporter is never a report.
+func reportCleanupDebt(report func(kind, path string, err error), kind, path string, err error) {
+	if err == nil || report == nil {
+		return
+	}
+	report(kind, path, err)
+}
+
+// discardStaging removes a staging tree and reports a failure as cleanup debt
+// through the call's reporter. It is the failure-path helper: the caller is
+// already returning a restore error, so the leftover tree is debt instead of
+// a second return value.
+func discardStaging(report func(kind, path string, err error), dir string) {
+	if err := removeStagingDir(dir); err != nil {
+		reportCleanupDebt(report, CleanupKindStagingResidue, dir, err)
+	}
+}
 
 // countWriter counts the bytes written through it so Save can report the
 // archive size without a second read of the file.
@@ -528,7 +618,12 @@ func (s *Store) MaxStoredBytes() int64 {
 	return s.maxStoredBytes()
 }
 
+// restoreLocal is restoreLocalWithReporter with the Store's own debt reporter.
 func (s *Store) restoreLocal(ctx context.Context, key, workspace string, paths []string) (bool, error) {
+	return s.restoreLocalWithReporter(ctx, key, workspace, paths, s.ReportCleanupDebt)
+}
+
+func (s *Store) restoreLocalWithReporter(ctx context.Context, key, workspace string, paths []string, report func(kind, path string, err error)) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
@@ -606,24 +701,21 @@ func (s *Store) restoreLocal(ctx context.Context, key, workspace string, paths [
 	}
 	limits.MaxArchiveBytes = bound
 	// Restores are transactional: the archive is extracted into a fresh
-	// job-private staging directory on the SAME filesystem as the
-	// destination (a sibling under the opened extract root) and is only
-	// published after the whole extraction and every collision check
-	// succeeded. Extraction streams through the context reader too: a large
-	// archive stops being unpacked when the job context ends instead of
-	// finishing its filesystem walk under a dead deadline.
-	stageName, err := newCacheStageName()
+	// job-private staging directory that is a SIBLING of the workspace root
+	// (same filesystem as every publish destination, but OUTSIDE the live
+	// workspace) and is only published after the whole extraction and every
+	// collision check succeeded. The live workspace is therefore untouched
+	// until every archive member has validated and the pre-check passed.
+	// Extraction streams through the context reader too: a large archive
+	// stops being unpacked when the job context ends instead of finishing
+	// its filesystem walk under a dead deadline.
+	stageDir, stage, err := createCacheStage(root.Canonical)
 	if err != nil {
-		return false, fmt.Errorf("cache restore: staging name: %w", err)
+		return false, err
 	}
-	stage, err := safefs.OpenRootBeneath(root, stageName)
-	if err != nil {
-		return false, fmt.Errorf("cache restore: create staging directory: %w", err)
-	}
-	stageDir := stage.Canonical
 	if _, err := extractCacheArchive(stage, safefs.NewContextReader(ctx, f), limits); err != nil {
 		_ = stage.Close()
-		_ = os.RemoveAll(stageDir)
+		discardStaging(report, stageDir)
 		if cerr := ctx.Err(); cerr != nil {
 			return false, cerr
 		}
@@ -632,50 +724,106 @@ func (s *Store) restoreLocal(ctx context.Context, key, workspace string, paths [
 	// Close the staging handle before any cleanup: Windows cannot remove an
 	// open directory.
 	if err := stage.Close(); err != nil {
-		_ = os.RemoveAll(stageDir)
+		discardStaging(report, stageDir)
 		return false, fmt.Errorf("cache restore: close staging directory: %w", err)
 	}
 	entries, err := collectStagedEntries(stageDir)
 	if err != nil {
-		_ = os.RemoveAll(stageDir)
+		discardStaging(report, stageDir)
 		return false, fmt.Errorf("cache restore: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
-		_ = os.RemoveAll(stageDir)
+		discardStaging(report, stageDir)
 		return false, err
 	}
 	// Nothing before this point touched the live workspace; publishStaged
 	// pre-checks every destination path and rolls back every path it created
 	// on failure, so a restore error leaves the workspace byte-for-byte
-	// unchanged (no new files, no removed files, no overwritten files).
+	// unchanged (no new files, no removed files, no overwritten files). A
+	// rollback that could not remove every path is FIRST CLASS: the typed
+	// error names the residue, the caller is told the workspace may contain
+	// partially restored files, and every residue path is reported as
+	// cleanup debt.
 	if err := publishStaged(root, stageDir, entries); err != nil {
-		_ = os.RemoveAll(stageDir)
+		var residue *PublishRollbackError
+		if errors.As(err, &residue) {
+			for _, rel := range residue.Remaining {
+				reportCleanupDebt(report, CleanupKindRestoreRollback, filepath.Join(root.Canonical, filepath.FromSlash(rel)), residue)
+			}
+		}
+		discardStaging(report, stageDir)
 		return false, fmt.Errorf("cache restore: %w", err)
 	}
-	if err := os.RemoveAll(stageDir); err != nil {
-		return false, fmt.Errorf("cache restore: remove staging directory: %w", err)
+	// Publication succeeded: the restored files are live and the restore is a
+	// SUCCESS. A staging tree that cannot be removed is cleanup debt, never a
+	// restore failure (it lives outside the workspace, so it cannot affect
+	// the job), and the removal error is reported instead of discarded.
+	if rerr := removeStagingDir(stageDir); rerr != nil {
+		reportCleanupDebt(report, CleanupKindStagingResidue, stageDir, rerr)
 	}
 	return true, nil
 }
 
 // cacheStagePrefix names the job-private staging directory a local cache
 // restore extracts into before publishing. The staging directory is created
-// beneath the opened destination root with the safefs no-follow Root API, so
-// staged bytes are always on the same filesystem as their final paths and
-// every publish rename is a same-filesystem atomic move.
+// as a SIBLING of the workspace root (same parent directory, hence the same
+// filesystem as every publish destination) so every publish rename is a
+// same-filesystem atomic move while the live workspace stays untouched until
+// publication.
 const cacheStagePrefix = ".kiwi-cache-stage-"
 
-// newCacheStageName returns a fresh staging directory name. The random
-// suffix keeps the staged tree private to this restore: a collision with
-// workspace content (or a concurrent restore) is not practically possible,
-// and an existing symlink at the name is rejected by OpenRootBeneath.
-func newCacheStageName() (string, error) {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", err
+// createCacheStage creates the restore staging directory as a SIBLING of
+// workspaceCanonical and opens it as an extraction root. The parent must be a
+// real directory: it is opened through the no-follow root API first, which
+// rejects a symlinked parent and resolves the canonical path, and the staging
+// directory is created there with os.MkdirTemp (its random suffix keeps the
+// tree private to this restore). An unwritable or symlinked parent is a clean
+// error: there is deliberately NO fallback that stages inside the live
+// workspace, because that would break the "workspace is untouched until
+// publication" invariant.
+func createCacheStage(workspaceCanonical string) (string, *safefs.Root, error) {
+	parent := filepath.Dir(workspaceCanonical)
+	anchor, err := safefs.OpenRootNoFollow(parent)
+	if err != nil {
+		return "", nil, fmt.Errorf("cache restore: open staging parent %q: %w", parent, err)
 	}
-	return cacheStagePrefix + hex.EncodeToString(b[:]), nil
+	canonicalParent := anchor.Canonical
+	if err := anchor.Close(); err != nil {
+		return "", nil, fmt.Errorf("cache restore: close staging parent %q: %w", parent, err)
+	}
+	dir, err := os.MkdirTemp(canonicalParent, cacheStagePrefix+"*")
+	if err != nil {
+		return "", nil, fmt.Errorf("cache restore: create staging directory in %q: %w", canonicalParent, err)
+	}
+	stage, err := safefs.OpenRootNoFollow(dir)
+	if err != nil {
+		if rerr := removeStagingDir(dir); rerr != nil {
+			return "", nil, fmt.Errorf("cache restore: open staging directory %q: %w (leftover removal also failed: %v)", dir, err, rerr)
+		}
+		return "", nil, fmt.Errorf("cache restore: open staging directory %q: %w", dir, err)
+	}
+	return dir, stage, nil
 }
+
+// PublishRollbackError reports a failed publish whose rollback could not
+// remove every path the publish had already created. Remaining lists exactly
+// the workspace-relative paths that survived the rollback pass: the live
+// workspace therefore contains partially restored files and the job must fail
+// rather than run against a hybrid tree. PublishErr is the original publish
+// failure; RollbackErr aggregates every removal error (errors.Join).
+type PublishRollbackError struct {
+	PublishErr  error
+	RollbackErr error
+	Remaining   []string
+}
+
+func (e *PublishRollbackError) Error() string {
+	return fmt.Sprintf("publish failed (%v); rollback could not remove %d path(s) [%s] (%v); the workspace may contain partially restored files",
+		e.PublishErr, len(e.Remaining), strings.Join(e.Remaining, ", "), e.RollbackErr)
+}
+
+// Unwrap exposes the original publish failure to errors.Is/As callers.
+func (e *PublishRollbackError) Unwrap() error { return e.PublishErr }
 
 // stagedEntry is one directory or regular file extracted into the staging
 // tree, identified by its workspace-relative slash path.
@@ -737,7 +885,7 @@ func collectStagedEntries(stageDir string) ([]stagedEntry, error) {
 }
 
 // publishStaged moves every staged entry into the destination workspace,
-// which must be the opened extract root the staging tree was created under.
+// which must be the opened extract root whose sibling holds the staging tree.
 //
 // Merge-safe, overwrite-hostile semantics: a cache is routinely restored OVER
 // an existing repository checkout, so an existing destination DIRECTORY is
@@ -746,7 +894,8 @@ func collectStagedEntries(stageDir string) ([]stagedEntry, error) {
 // moves: an existing regular file/symlink/special where the archive stages a
 // file or a directory, and an existing regular file where the archive stages
 // a directory. Nothing ever overwrites a pre-existing path, and the
-// workspace stays byte-for-byte unchanged on any error.
+// workspace stays byte-for-byte unchanged on any error whose rollback
+// completes.
 //
 // Entries are published parent-first: files are renamed from the staging tree
 // (atomic within one filesystem) and only the directories extraction created
@@ -755,6 +904,12 @@ func collectStagedEntries(stageDir string) ([]stagedEntry, error) {
 // those paths back in reverse order; pre-existing directories are never
 // tracked, so a mid-publish failure cannot delete workspace content that was
 // already there.
+//
+// Rollback is FIRST CLASS: every removal error is captured (never `_ =`), a
+// path is reported as residue only if it still exists after the whole
+// rollback pass (a parent's RemoveAll can have removed a child whose own
+// removal failed), and if anything survives, the returned error is a
+// *PublishRollbackError naming exactly those paths.
 //
 // Every destination parent is re-verified through safefs.OpenRootBeneath,
 // which walks each component relative to the held root descriptor with
@@ -778,27 +933,56 @@ func publishStaged(dst *safefs.Root, stageDir string, entries []stagedEntry) err
 		}
 	}
 	created := make([]stagedEntry, 0, len(entries))
-	rollback := func() {
+	// rollback removes every path this publish created, newest first. It
+	// returns the relative paths that STILL EXIST afterwards together with
+	// the aggregate removal error, so no removal failure is discarded and
+	// the residue list is exact.
+	rollback := func() ([]string, error) {
+		var remaining []string
+		var errs []error
 		for i := len(created) - 1; i >= 0; i-- {
 			p := filepath.Join(dst.Canonical, filepath.FromSlash(created[i].rel))
+			var err error
 			if created[i].isDir {
 				// Only directories this publish created are tracked, so
 				// RemoveAll cannot delete pre-existing workspace content.
-				_ = os.RemoveAll(p)
+				err = removeAllFn(p)
 			} else {
-				_ = os.Remove(p)
+				err = removeFn(p)
+			}
+			if err != nil && !os.IsNotExist(err) {
+				remaining = append(remaining, created[i].rel)
+				errs = append(errs, fmt.Errorf("rollback %q: %w", created[i].rel, err))
 			}
 		}
+		// A later RemoveAll of a created parent can have removed a child
+		// whose individual removal failed; verify what actually survived so
+		// the residue list names exactly the live paths.
+		if len(remaining) > 0 {
+			survived := remaining[:0]
+			for _, rel := range remaining {
+				if _, err := os.Lstat(filepath.Join(dst.Canonical, filepath.FromSlash(rel))); err == nil || !os.IsNotExist(err) {
+					survived = append(survived, rel)
+				}
+			}
+			remaining = survived
+		}
+		return remaining, errors.Join(errs...)
+	}
+	fail := func(cause error) error {
+		remaining, rerr := rollback()
+		if len(remaining) == 0 {
+			return cause
+		}
+		return &PublishRollbackError{PublishErr: cause, RollbackErr: rerr, Remaining: remaining}
 	}
 	for _, e := range entries {
 		parent, err := safefs.OpenRootBeneath(dst, path.Dir(e.rel))
 		if err != nil {
-			rollback()
-			return fmt.Errorf("publish %q: %w", e.rel, err)
+			return fail(fmt.Errorf("publish %q: %w", e.rel, err))
 		}
 		if err := parent.Close(); err != nil {
-			rollback()
-			return fmt.Errorf("publish %q: %w", e.rel, err)
+			return fail(fmt.Errorf("publish %q: %w", e.rel, err))
 		}
 		dest := filepath.Join(dst.Canonical, filepath.FromSlash(e.rel))
 		if e.isDir {
@@ -809,21 +993,17 @@ func publishStaged(dst *safefs.Root, stageDir string, entries []stagedEntry) err
 				if fi.IsDir() && fi.Mode()&os.ModeSymlink == 0 {
 					continue
 				}
-				rollback()
-				return fmt.Errorf("publish destination %q already exists", e.rel)
+				return fail(fmt.Errorf("publish destination %q already exists", e.rel))
 			} else if !os.IsNotExist(err) {
-				rollback()
-				return fmt.Errorf("publish %q: %w", e.rel, err)
+				return fail(fmt.Errorf("publish %q: %w", e.rel, err))
 			}
 			if err := os.Mkdir(dest, 0o755); err != nil {
-				rollback()
-				return fmt.Errorf("publish %q: %w", e.rel, err)
+				return fail(fmt.Errorf("publish %q: %w", e.rel, err))
 			}
 		} else {
 			src := filepath.Join(stageDir, filepath.FromSlash(e.rel))
-			if err := os.Rename(src, dest); err != nil {
-				rollback()
-				return fmt.Errorf("publish %q: %w", e.rel, err)
+			if err := renameFn(src, dest); err != nil {
+				return fail(fmt.Errorf("publish %q: %w", e.rel, err))
 			}
 		}
 		created = append(created, e)

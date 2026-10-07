@@ -1378,12 +1378,33 @@ func (s *PostgresStore) ListRuns(ctx context.Context, limit int) ([]model.Run, e
 // jobs
 // ---------------------------------------------------------------------------
 
+// jobNormalizedFilterLists returns the job's required labels and placement
+// regions as the normalized TEXT[] values migration 0041 stores in the jobs
+// columns of the same name. A nil list is written as an empty array, never
+// NULL: the queued page predicates are only index-served over a NOT NULL
+// column, and '{}' is exactly the model's zero value (no required label, no
+// placement region), so the column agrees with the payload for every row
+// this binary writes.
+func jobNormalizedFilterLists(j model.Job) (labels, regions []string) {
+	labels, regions = j.RequiredLabels, j.PlacementRegions
+	if labels == nil {
+		labels = []string{}
+	}
+	if regions == nil {
+		regions = []string{}
+	}
+	return labels, regions
+}
+
 // jobWriteArgs marshals a job into the real-column + payload argument list
 // used by both INSERT and the upsert path of UpdateJob. queue_deadline is a
 // DERIVED index of the payload's QueueDeadline (migration 0021): stamping it
 // here keeps the bounded queue-timeout discovery (ListQueueTimedOutJobs, via
 // jobs_queue_deadline_recovery_idx) in sync with the authoritative payload
-// without touching the payload itself.
+// without touching the payload itself. required_labels/placement_regions are
+// the same kind of derived index for the runner-coarse queued page predicates
+// (migration 0041); all write paths that can leave a job queued stamp them
+// from the same model fields the payload carries.
 func jobWriteArgs(j model.Job) ([]any, error) {
 	payload, err := jsonMarshal(j)
 	if err != nil {
@@ -1395,12 +1416,14 @@ func jobWriteArgs(j model.Job) ([]any, error) {
 			return nil, err
 		}
 	}
+	labels, regions := jobNormalizedFilterLists(j)
 	return []any{
 		j.ID, j.RunID, j.Key, string(j.Status), string(j.DependencyStatus),
 		j.Priority, j.Attempts,
 		nullText(j.Error), outputsJSON,
 		nullText(j.LeaseRunnerID), nullBytes(j.LeaseTokenHash), j.LeaseGeneration,
-		j.LeaseExpiresAt, j.StartedAt, j.FinishedAt, j.CreatedAt, j.QueueDeadline, payload,
+		j.LeaseExpiresAt, j.StartedAt, j.FinishedAt, j.CreatedAt, j.QueueDeadline,
+		labels, regions, payload,
 	}, nil
 }
 
@@ -1420,7 +1443,7 @@ func (s *PostgresStore) insertJobRowTx(ctx context.Context, tx pgx.Tx, j model.J
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO jobs (id, run_id, key, status, dependency_status, priority, attempts, error, outputs, lease_runner_id, lease_token_hash, lease_generation, lease_expires_at, started_at, finished_at, created_at, queue_deadline, payload) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`, args...)
+	_, err = tx.Exec(ctx, `INSERT INTO jobs (id, run_id, key, status, dependency_status, priority, attempts, error, outputs, lease_runner_id, lease_token_hash, lease_generation, lease_expires_at, started_at, finished_at, created_at, queue_deadline, required_labels, placement_regions, payload) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`, args...)
 	return err
 }
 
@@ -1593,7 +1616,7 @@ func (s *PostgresStore) UpdateJob(ctx context.Context, job model.Job) error {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `INSERT INTO jobs (id, run_id, key, status, dependency_status, priority, attempts, error, outputs, lease_runner_id, lease_token_hash, lease_generation, lease_expires_at, started_at, finished_at, created_at, queue_deadline, payload) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) ON CONFLICT (id) DO UPDATE SET run_id=EXCLUDED.run_id, key=EXCLUDED.key, status=EXCLUDED.status, dependency_status=EXCLUDED.dependency_status, priority=EXCLUDED.priority, attempts=EXCLUDED.attempts, error=EXCLUDED.error, outputs=EXCLUDED.outputs, lease_runner_id=EXCLUDED.lease_runner_id, lease_token_hash=EXCLUDED.lease_token_hash, lease_generation=EXCLUDED.lease_generation, lease_expires_at=EXCLUDED.lease_expires_at, started_at=EXCLUDED.started_at, finished_at=EXCLUDED.finished_at, created_at=EXCLUDED.created_at, queue_deadline=EXCLUDED.queue_deadline, payload=EXCLUDED.payload`, args...); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO jobs (id, run_id, key, status, dependency_status, priority, attempts, error, outputs, lease_runner_id, lease_token_hash, lease_generation, lease_expires_at, started_at, finished_at, created_at, queue_deadline, required_labels, placement_regions, payload) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) ON CONFLICT (id) DO UPDATE SET run_id=EXCLUDED.run_id, key=EXCLUDED.key, status=EXCLUDED.status, dependency_status=EXCLUDED.dependency_status, priority=EXCLUDED.priority, attempts=EXCLUDED.attempts, error=EXCLUDED.error, outputs=EXCLUDED.outputs, lease_runner_id=EXCLUDED.lease_runner_id, lease_token_hash=EXCLUDED.lease_token_hash, lease_generation=EXCLUDED.lease_generation, lease_expires_at=EXCLUDED.lease_expires_at, started_at=EXCLUDED.started_at, finished_at=EXCLUDED.finished_at, created_at=EXCLUDED.created_at, queue_deadline=EXCLUDED.queue_deadline, required_labels=EXCLUDED.required_labels, placement_regions=EXCLUDED.placement_regions, payload=EXCLUDED.payload`, args...); err != nil {
 		return err
 	}
 	if err := s.replaceDependenciesTx(ctx, tx, job); err != nil {
@@ -1647,7 +1670,8 @@ func (s *PostgresStore) ApproveJob(ctx context.Context, jobID, actor string) (mo
 	if err != nil {
 		return model.Job{}, err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE jobs SET status=$2, payload=$3 WHERE id=$1`, jobID, string(j.Status), newPayload); err != nil {
+	labels, regions := jobNormalizedFilterLists(j)
+	if _, err := tx.Exec(ctx, `UPDATE jobs SET status=$2, payload=$3, required_labels=$4, placement_regions=$5 WHERE id=$1`, jobID, string(j.Status), newPayload, labels, regions); err != nil {
 		return model.Job{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -1661,6 +1685,29 @@ var _ JobApprovalStore = (*PostgresStore)(nil)
 // ---------------------------------------------------------------------------
 // leases
 // ---------------------------------------------------------------------------
+
+// queuedClaimDeadlinePredicateSQL is the durable queue-deadline predicate
+// every claim re-asserts INSIDE its own transaction. A queued candidate's
+// persisted queue_deadline is authoritative: when it has elapsed at the
+// DATABASE clock, the row is not claimable even if the claiming replica's
+// application clock is stale (or the row's Go-side deadline gate passed on a
+// skewed `now`). The predicate is deliberately separate from the status/lease
+// checks so a row excluded ONLY by the deadline is indistinguishable from a
+// claim race: the caller observes the ordinary contended sentinel and tries
+// the next candidate, exactly as the scheduler's "try next" path expects.
+const queuedClaimDeadlinePredicateSQL = `(queue_deadline IS NULL OR queue_deadline > clock_timestamp())`
+
+// acquireLeaseClaimSQL and acquireLeaseAtomicClaimSQL are the two claim
+// UPDATE statements (without the shared RETURNING jobCols projection). Both
+// re-assert the durable queue deadline above; acquireLeaseAtomicClaimSQL
+// carries the TTL-derived database-clock expiry, acquireLeaseClaimSQL the
+// caller's absolute instant. Kept as constants so the SQL-shape regression
+// test pins the deadline predicate in BOTH claim paths.
+const (
+	acquireLeaseClaimSQL = `UPDATE jobs SET status='running', attempts = attempts + 1, started_at = COALESCE(started_at, now()), lease_runner_id=$2, lease_token_hash=$3, lease_generation=$4, lease_expires_at=$5 WHERE id=$1 AND status='queued' AND COALESCE(payload->>'repo_identity_quarantined','') <> 'true' AND ` + LeaseParentRunEligibleSQL + ` AND ` + queuedClaimDeadlinePredicateSQL + ` AND (lease_expires_at IS NULL OR lease_expires_at < clock_timestamp()) RETURNING `
+
+	acquireLeaseAtomicClaimSQL = `UPDATE jobs SET status='running', attempts = attempts + 1, started_at = COALESCE(started_at, now()), lease_runner_id=$2, lease_token_hash=$3, lease_generation=$4, lease_expires_at = CASE WHEN $6::bigint > 0 THEN clock_timestamp() + ($6::bigint * interval '1 microsecond') ELSE $5 END WHERE id=$1 AND status='queued' AND ` + queuedClaimDeadlinePredicateSQL + ` AND (lease_expires_at IS NULL OR lease_expires_at < clock_timestamp()) RETURNING `
+)
 
 // AcquireLease is the non-atomic claim used only by callers whose store has
 // no AtomicLeaseStore contract: it flips the job row without touching the
@@ -1681,7 +1728,7 @@ func (s *PostgresStore) AcquireLease(ctx context.Context, jobID, runnerID string
 	// preserve the original start time. A quarantined job is denied here too:
 	// the durable flag is checked in the claim statement itself. The write
 	// runs in a schema-fenced transaction like every other mutation.
-	err := s.queryRowSchemaCompatible(ctx, `UPDATE jobs SET status='running', attempts = attempts + 1, started_at = COALESCE(started_at, now()), lease_runner_id=$2, lease_token_hash=$3, lease_generation=$4, lease_expires_at=$5 WHERE id=$1 AND status='queued' AND COALESCE(payload->>'repo_identity_quarantined','') <> 'true' AND `+LeaseParentRunEligibleSQL+` AND (lease_expires_at IS NULL OR lease_expires_at < clock_timestamp()) RETURNING `+jobCols,
+	err := s.queryRowSchemaCompatible(ctx, acquireLeaseClaimSQL+jobCols,
 		[]any{jobID, runnerID, tokenHash, generation, expiresAt}, func(row pgx.Row) error {
 			return row.Scan(jobTargets(&js)...)
 		})
@@ -1944,11 +1991,13 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 	// A positive TTL makes the stored expiry DATABASE-CLOCK authoritative
 	// (clock_timestamp() + TTL) inside this transaction; otherwise the
 	// caller's absolute instant is kept for stores/callers without a live DB
-	// clock. Eligibility is judged against the DB clock either way.
+	// clock. Eligibility is judged against the DB clock either way, and the
+	// durable queue deadline is re-asserted in SQL (see
+	// queuedClaimDeadlinePredicateSQL): a candidate whose Go-side deadline
+	// gate passed on a stale replica clock is still rejected here with the
+	// ordinary contended sentinel.
 	js := jobScanner{}
-	err = tx.QueryRow(ctx, `UPDATE jobs SET status='running', attempts = attempts + 1, started_at = COALESCE(started_at, now()), lease_runner_id=$2, lease_token_hash=$3, lease_generation=$4,
-			lease_expires_at = CASE WHEN $6::bigint > 0 THEN clock_timestamp() + ($6::bigint * interval '1 microsecond') ELSE $5 END
-		 WHERE id=$1 AND status='queued' AND (lease_expires_at IS NULL OR lease_expires_at < clock_timestamp()) RETURNING `+jobCols,
+	err = tx.QueryRow(ctx, acquireLeaseAtomicClaimSQL+jobCols,
 		claim.JobID, claim.RunnerID, claim.TokenHash, claim.Generation, claim.ExpiresAt, claim.TTL.Microseconds()).Scan(jobTargets(&js)...)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return model.Job{}, ErrLeaseConflict
@@ -2645,8 +2694,9 @@ func (s *PostgresStore) recomputeDependentTx(ctx context.Context, tx pgx.Tx, dep
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `UPDATE jobs SET status=$2, dependency_status=$3, error=$4, finished_at=$5, payload=$6 WHERE id=$1`,
-		depID, string(d.Status), string(d.DependencyStatus), nullText(d.Error), d.FinishedAt, dp)
+	labels, regions := jobNormalizedFilterLists(d)
+	_, err = tx.Exec(ctx, `UPDATE jobs SET status=$2, dependency_status=$3, error=$4, finished_at=$5, payload=$6, required_labels=$7, placement_regions=$8 WHERE id=$1`,
+		depID, string(d.Status), string(d.DependencyStatus), nullText(d.Error), d.FinishedAt, dp, labels, regions)
 	return err
 }
 
@@ -3166,14 +3216,18 @@ var _ ClockStore = (*PostgresStore)(nil)
 // while preserving the lease-owned fields; requireExisting fails closed with
 // ErrNotFound instead of creating a row.
 func (s *PostgresStore) writeRunnerProfile(ctx context.Context, runner model.Runner, requireExisting bool) error {
-	tx, err := s.beginSchemaCompatibleTx(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
+	return s.withSchemaCompatibleTx(ctx, func(tx pgx.Tx) error {
+		return s.writeRunnerProfileTx(ctx, tx, runner, requireExisting)
+	})
+}
 
+// writeRunnerProfileTx is the transaction-scoped body of writeRunnerProfile.
+// Callers that must join additional writes — the registration swap's lease
+// revocation — run it inside their own schema-fenced transaction so the
+// effects commit or roll back together.
+func (s *PostgresStore) writeRunnerProfileTx(ctx context.Context, tx pgx.Tx, runner model.Runner, requireExisting bool) error {
 	rs := runnerScanner{}
-	err = tx.QueryRow(ctx, `SELECT `+runnerCols+` FROM runners WHERE id=$1 FOR UPDATE`, runner.ID).Scan(rs.targets()...)
+	err := tx.QueryRow(ctx, `SELECT `+runnerCols+` FROM runners WHERE id=$1 FOR UPDATE`, runner.ID).Scan(rs.targets()...)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		if requireExisting {
@@ -3181,9 +3235,7 @@ func (s *PostgresStore) writeRunnerProfile(ctx context.Context, runner model.Run
 		}
 		// A fresh registration seeds the supplied fields: there is no lease
 		// state to preserve.
-		if err := s.insertRunnerRowTx(ctx, tx, runner); err != nil {
-			return err
-		}
+		return s.insertRunnerRowTx(ctx, tx, runner)
 	case err != nil:
 		return err
 	default:
@@ -3191,11 +3243,8 @@ func (s *PostgresStore) writeRunnerProfile(ctx context.Context, runner model.Run
 		if err != nil {
 			return err
 		}
-		if err := s.updateRunnerProfileRowTx(ctx, tx, mergeRunnerProfile(runner, existing)); err != nil {
-			return err
-		}
+		return s.updateRunnerProfileRowTx(ctx, tx, mergeRunnerProfile(runner, existing))
 	}
-	return tx.Commit(ctx)
 }
 
 func (s *PostgresStore) insertRunnerRowTx(ctx context.Context, tx pgx.Tx, runner model.Runner) error {
@@ -4299,6 +4348,14 @@ func (s *PostgresStore) ListSchedules(ctx context.Context) ([]Schedule, error) {
 // for the same runID is idempotent and reports true. Occurrence insertion is
 // leader-only, so the claim runs in a transaction FENCED by the store's
 // leadership epoch (a stale leader claims no occurrence).
+//
+// True is returned ONLY after this call observes its own durable row: either
+// the INSERT reported one affected row, or the ownership read returned the
+// caller's runID. A zero-row INSERT followed by an ownership read that finds
+// no row is NOT proof of ownership — the conflicting row can have vanished
+// between the two statements — so the claim INSERT is re-executed once and,
+// if that also observes no row of its own, the call reports the claim as lost
+// (false) instead of awarding a nominal no durable row records.
 func (s *PostgresStore) ClaimScheduleOccurrence(ctx context.Context, scheduleID string, nominal time.Time, runID string) (bool, error) {
 	if scheduleID == "" || runID == "" {
 		return false, fmt.Errorf("storage: empty schedule or run id")
@@ -4308,26 +4365,43 @@ func (s *PostgresStore) ClaimScheduleOccurrence(ctx context.Context, scheduleID 
 		return false, err
 	}
 	defer tx.Rollback(ctx)
-	ct, err := tx.Exec(ctx, `INSERT INTO schedule_occurrences (schedule_id, nominal, run_id) VALUES ($1, $2, $3) ON CONFLICT (schedule_id, nominal) DO NOTHING`,
-		scheduleID, nominal, runID)
+	claim := func() (bool, error) {
+		ct, err := tx.Exec(ctx, `INSERT INTO schedule_occurrences (schedule_id, nominal, run_id) VALUES ($1, $2, $3) ON CONFLICT (schedule_id, nominal) DO NOTHING`,
+			scheduleID, nominal, runID)
+		if err != nil {
+			return false, err
+		}
+		return ct.RowsAffected() == 1, nil
+	}
+	won, err := claim()
 	if err != nil {
 		return false, err
 	}
-	if ct.RowsAffected() == 1 {
+	if won {
 		if err := tx.Commit(ctx); err != nil {
 			return false, err
 		}
 		return true, nil
 	}
+	// The insert did nothing: either a committed concurrent claim owns the
+	// nominal, or the conflicting row was removed before this statement.
+	// Only an observed durable row with this runID is a win.
 	var existing string
 	err = tx.QueryRow(ctx, `SELECT run_id FROM schedule_occurrences WHERE schedule_id=$1 AND nominal=$2`, scheduleID, nominal).Scan(&existing)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
-		// The insert reported no row and the follow-up read found none: a
-		// concurrent claim rolled back, so retrying is safe and this call
-		// reports the claim as won (the caller's transaction owns the
-		// nominal).
-		existing = runID
+		// No row is visible after a zero-row INSERT: re-execute the claim
+		// once. A win here is backed by RowsAffected=1 (our own durable
+		// row); a lost speculator or a vanished conflicting row is now
+		// either claimed or reported as lost, never as an unobserved win.
+		won, err = claim()
+		if err != nil {
+			return false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return false, err
+		}
+		return won, nil
 	case err != nil:
 		return false, err
 	}

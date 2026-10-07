@@ -34,16 +34,19 @@ type FS struct {
 
 func NewFS(root string) *FS { return &FS{Root: root} }
 
-func (s *FS) Put(ctx context.Context, key string, r io.Reader, size int64) (Object, error) {
+// prepareShard validates the key/size, creates the destination shard and
+// makes every directory level it may have created durable before anything is
+// published into it. It returns the destination path.
+func (s *FS) prepareShard(key string, size int64) (string, error) {
 	if !keyRE.MatchString(key) {
-		return Object{}, fmt.Errorf("blob: invalid key %q", key)
+		return "", fmt.Errorf("blob: invalid key %q", key)
 	}
 	if size < 0 {
-		return Object{}, fmt.Errorf("blob: negative size")
+		return "", fmt.Errorf("blob: negative size")
 	}
 	dir := filepath.Join(s.Root, "sha256", key[:2])
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return Object{}, err
+		return "", err
 	}
 	// Make the shard directory itself durable before anything is published
 	// into it: the directory entry a later object rename depends on must
@@ -52,16 +55,23 @@ func (s *FS) Put(ctx context.Context, key string, r io.Reader, size int64) (Obje
 	// "sha256" level and the shard, so each level is fsynced.
 	if root := filepath.Clean(s.Root); root != "" && root != "." {
 		if err := fsutil.SyncDir(root); err != nil {
-			return Object{}, fmt.Errorf("blob: sync store root: %w", err)
+			return "", fmt.Errorf("blob: sync store root: %w", err)
 		}
 	}
 	if err := fsutil.SyncDir(filepath.Dir(dir)); err != nil {
-		return Object{}, fmt.Errorf("blob: sync shard parent: %w", err)
+		return "", fmt.Errorf("blob: sync shard parent: %w", err)
 	}
 	if err := fsutil.SyncDir(dir); err != nil {
-		return Object{}, fmt.Errorf("blob: sync shard: %w", err)
+		return "", fmt.Errorf("blob: sync shard: %w", err)
 	}
-	dst := filepath.Join(dir, key)
+	return filepath.Join(dir, key), nil
+}
+
+func (s *FS) Put(ctx context.Context, key string, r io.Reader, size int64) (Object, error) {
+	dst, err := s.prepareShard(key, size)
+	if err != nil {
+		return Object{}, err
+	}
 	if _, err := fsStat(dst); err == nil {
 		// A deduplicated re-put refreshes the object's mtime. The payload
 		// is immutable, but the age floor the CAS GC applies must reflect
@@ -90,6 +100,32 @@ func (s *FS) Put(ctx context.Context, key string, r io.Reader, size int64) (Obje
 		// digest fence, which blob.FS cannot take from this package; a
 		// re-put always recreates the object, so the reference converges.
 	}
+	return s.writeObject(key, dst, r, size, false)
+}
+
+// Replace atomically re-writes the object addressed by key from r WITHOUT the
+// deduplicating shortcut Put takes when the object already exists: the bytes
+// are staged in a temp file, fsynced, verified against the key and the
+// declared size, and renamed over the destination. It is the healing
+// primitive the CAS dedup verifier uses when a stored object fails
+// verification, so a rename conflict fails closed instead of accepting the
+// object that is known to be wrong. Implements blob.Replacer.
+func (s *FS) Replace(ctx context.Context, key string, r io.Reader, size int64) (Object, error) {
+	dst, err := s.prepareShard(key, size)
+	if err != nil {
+		return Object{}, err
+	}
+	return s.writeObject(key, dst, r, size, true)
+}
+
+// writeObject stages r, fsyncs it, verifies the declared size and the digest
+// the key addresses, and atomically renames it over dst. replace selects the
+// rename-conflict policy: Put (replace=false) accepts an object a concurrent
+// writer published at dst, because Put hashes before publishing so any
+// existing object at the key is the same content; Replace (replace=true) is
+// healing a destination known to be wrong and must never acknowledge it.
+func (s *FS) writeObject(key, dst string, r io.Reader, size int64, replace bool) (Object, error) {
+	dir := filepath.Dir(dst)
 	f, err := os.CreateTemp(dir, "."+key+".tmp-*")
 	if err != nil {
 		return Object{}, err
@@ -114,8 +150,12 @@ func (s *FS) Put(ctx context.Context, key string, r io.Reader, size int64) (Obje
 	}
 	if err := fsRename(tmp, dst); err != nil {
 		// A concurrent writer won the race: the existing object is identical.
-		if _, statErr := fsStat(dst); statErr == nil {
-			return Object{Key: key, SHA256: key, Size: n}, nil
+		// A replacement is different: the destination is known to be wrong,
+		// so a rename that did not happen must fail closed.
+		if !replace {
+			if _, statErr := fsStat(dst); statErr == nil {
+				return Object{Key: key, SHA256: key, Size: n}, nil
+			}
 		}
 		_ = os.Remove(tmp)
 		return Object{}, err

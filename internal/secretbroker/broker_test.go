@@ -172,10 +172,18 @@ func TestOneTimeNilInnerFailsClosed(t *testing.T) {
 	if !errors.Is(err, ErrNilInner) {
 		t.Fatalf("nil Inner resolve = %v, want ErrNilInner", err)
 	}
-	chain := ChainBroker{ot, StaticBroker{"token": "abc123"}}
+	// ErrNilInner is an unclassified wiring failure: the chain must fail
+	// closed, never fall through to the static broker.
+	chain := ChainBroker{Brokers: []Broker{ot, StaticBroker{"token": "abc123"}}}
 	v, err := chain.Resolve(context.Background(), "token", SecretScope{})
-	if err != nil || v != "abc123" {
-		t.Fatalf("chain with nil-Inner wrapper = (%q, %v)", v, err)
+	if err == nil {
+		t.Fatalf("chain fail-open: returned fallback value %q", v)
+	}
+	if !errors.Is(err, ErrNilInner) {
+		t.Fatalf("chain err = %v, want ErrNilInner", err)
+	}
+	if v != "" {
+		t.Fatalf("value delivered despite ErrNilInner: %q", v)
 	}
 }
 
@@ -219,33 +227,47 @@ func (f failingBroker) Resolve(context.Context, string, SecretScope) (string, er
 	return "", f.err
 }
 
+// classedBroker fails with an explicit provider error class.
+type classedBroker struct{ class error }
+
+func (b classedBroker) Resolve(context.Context, string, SecretScope) (string, error) {
+	return "", classError("test", b.class, "injected failure", nil)
+}
+
 func TestChainBrokerFallback(t *testing.T) {
-	boom := errors.New("boom")
-	chain := ChainBroker{
-		failingBroker{boom},
-		StaticBroker{"k": "v1"},
-		StaticBroker{"k": "v2"},
-	}
+	notFound := classedBroker{ErrSecretNotFound}
+	chain := ChainBroker{Brokers: []Broker{notFound, StaticBroker{"k": "v1"}, StaticBroker{"k": "v2"}}}
 	v, err := chain.Resolve(context.Background(), "k", SecretScope{})
 	if err != nil {
-		t.Fatalf("chain should fall back to second broker: %v", err)
+		t.Fatalf("not_found must advance the default chain: %v", err)
 	}
 	if v != "v1" {
 		t.Fatalf("got %q, want first success v1", v)
 	}
 
-	chain2 := ChainBroker{failingBroker{boom}, failingBroker{boom}}
+	// Every broker reports the secret absent: the aggregate keeps the
+	// NotFound class.
+	chain2 := ChainBroker{Brokers: []Broker{notFound, classedBroker{ErrSecretNotFound}}}
 	_, err = chain2.Resolve(context.Background(), "k", SecretScope{})
+	if !errors.Is(err, ErrSecretNotFound) {
+		t.Fatalf("all-not-found chain err = %v, want ErrSecretNotFound", err)
+	}
+
+	// An UNCLASSIFIED failure is not in any default policy: the chain fails
+	// closed and never consults the later broker.
+	boom := errors.New("boom")
+	chain3 := ChainBroker{Brokers: []Broker{failingBroker{boom}, StaticBroker{"k": "v1"}}}
+	v, err = chain3.Resolve(context.Background(), "k", SecretScope{})
 	if err == nil {
-		t.Fatal("expected error when all brokers fail")
+		t.Fatalf("unclassified failure fall-open: got %q", v)
 	}
 	if !errors.Is(err, boom) {
-		t.Fatalf("expected joined errors to include boom: %v", err)
+		t.Fatalf("expected the unclassified cause to be preserved: %v", err)
 	}
 
 	_, err = ChainBroker{}.Resolve(context.Background(), "k", SecretScope{})
-	if err == nil {
-		t.Fatal("expected error for empty chain")
+	if !errors.Is(err, ErrSecretNotFound) {
+		t.Fatalf("empty chain err = %v, want ErrSecretNotFound", err)
 	}
 }
 

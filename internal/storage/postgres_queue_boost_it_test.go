@@ -10,12 +10,12 @@ package storage
 //
 // The EXPLAIN tests pin the plan properties the page walk relies on: the
 // exact aged ORDER BY is served by jobs_queued_aged_idx (no Sort node) and a
-// selective runtime filter is served by jobs_queued_runtime_idx with a
-// bounded number of examined rows. The label containment predicate
-// (required_labels <@ runnerLabels) is applied as a recheck FILTER because
-// the built-in jsonb GIN opclass (jsonb_ops) implements @>/??/?&/?| but NOT
-// the <@ containment strategy, so the jobs_queued_labels_idx GIN index cannot
-// serve it (documented here precisely).
+// selective filter is served by its index — jobs_queued_runtime_idx for the
+// runtime expression, jobs_queued_labels_arr_idx for the normalized label
+// array (migration 0041; the array GIN opclass implements <@, unlike the
+// jsonb GIN 0039 originally created) — with a bounded number of examined
+// rows. The full common/rare permutation matrix lives in
+// postgres_jobs_page_planner_it_test.go.
 
 import (
 	"context"
@@ -162,11 +162,15 @@ type explainNode struct {
 	IndexName    string        `json:"Index Name"`
 	ActualRows   float64       `json:"Actual Rows"`
 	ActualLoops  float64       `json:"Actual Loops"`
+	RowsRemoved  float64       `json:"Rows Removed by Filter"`
+	SharedHit    float64       `json:"Shared Hit Blocks"`
+	SharedRead   float64       `json:"Shared Read Blocks"`
 	Plans        []explainNode `json:"Plans"`
 }
 
 type explainRoot struct {
-	Plan explainNode `json:"Plan"`
+	Plan          explainNode `json:"Plan"`
+	ExecutionTime float64     `json:"Execution Time"`
 }
 
 func pgITExplain(t *testing.T, st *PostgresStore, query string, args ...any) explainNode {
@@ -246,16 +250,15 @@ func TestPostgresIntegrationQueuedJobsPageUnfilteredExplain(t *testing.T) {
 
 // TestPostgresIntegrationQueuedJobsPageFilteredExplain seeds 4096
 // label-ineligible (and runtime-container) rows plus ONE eligible
-// runtime-native/label-linux row and pins the bounded filtered path: the
-// selective runtime expression index serves the query, no node sequentially
-// scans jobs, every scan on jobs examines at most 2048 rows, and the page
-// returns exactly the eligible row.
+// runtime-native/label-linux row and pins the bounded filtered path: a
+// selective index serves the query, no node sequentially scans jobs, every
+// scan on jobs examines at most 2048 rows, and the page returns exactly the
+// eligible row.
 //
-// Precise limitation (asserted, not hidden): the label clause
-// (required_labels IS NULL OR required_labels <@ runnerLabels) is applied as
-// an index FILTER because jsonb_ops GIN has no <@ strategy. The bounded path
-// asserted here is therefore jobs_queued_runtime_idx; the labels GIN index is
-// left for operators that CAN use it (@>, ??, ?&, ?|).
+// Both filter dimensions are selective here, so either the runtime
+// expression index or the normalized-label array GIN may drive the plan
+// (both are bounded); the assertion requires one of them and rejects a
+// sequential scan.
 func TestPostgresIntegrationQueuedJobsPageFilteredExplain(t *testing.T) {
 	st := pgITStore(t)
 	ctx := context.Background()
@@ -288,19 +291,19 @@ func TestPostgresIntegrationQueuedJobsPageFilteredExplain(t *testing.T) {
 	if n, found := pgITFindNode(plan, func(n explainNode) bool {
 		return (n.NodeType == "Seq Scan" || n.NodeType == "Parallel Seq Scan") && n.RelationName == "jobs"
 	}); found {
-		t.Fatalf("filtered plan sequentially scans jobs (%s); the selective runtime index must serve it\nplan: %+v", n.NodeType, plan)
+		t.Fatalf("filtered plan sequentially scans jobs (%s); a selective index must serve it\nplan: %+v", n.NodeType, plan)
 	}
-	runtimeScan := false
+	filterIndexScan := false
 	pgITWalkPlan(plan, func(n explainNode) {
-		if n.IndexName == "jobs_queued_runtime_idx" {
-			runtimeScan = true
+		if n.IndexName == "jobs_queued_runtime_idx" || n.IndexName == "jobs_queued_labels_arr_idx" {
+			filterIndexScan = true
 		}
 		if n.RelationName == "jobs" && n.ActualRows > 2048 {
 			t.Fatalf("scan node %q on jobs examined %.0f rows, want <= 2048 (bounded path)", n.NodeType, n.ActualRows)
 		}
 	})
-	if !runtimeScan {
-		t.Fatalf("filtered plan does not use jobs_queued_runtime_idx\nplan: %+v", plan)
+	if !filterIndexScan {
+		t.Fatalf("filtered plan uses neither jobs_queued_runtime_idx nor jobs_queued_labels_arr_idx\nplan: %+v", plan)
 	}
 
 	page, err := st.ListQueuedJobsPage(ctx, filter, nil, 256, now)

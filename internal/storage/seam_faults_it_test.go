@@ -32,9 +32,39 @@ func pgITSkipWrites(t *testing.T, st *PostgresStore, table, event string) {
 
 // pgITDropExpressionIndexes drops every index on table whose definition
 // references column, so the column can be retyped.
+// pgITDropStatistics drops every extended-statistics object on the table.
+// ALTER COLUMN TYPE re-evaluates statistics expressions against the NEW
+// column type, so a statistic over `payload->'x'` turns a would-be scanner
+// fault into `operator does not exist: text[] -> text` and fails the FIXTURE
+// instead of the code under test. Test schemas are throwaway, so dropping
+// all statistics for the table is safe.
+func pgITDropStatistics(t *testing.T, st *PostgresStore, table string) {
+	t.Helper()
+	ctx := context.Background()
+	rows, err := st.pool.Query(ctx, `SELECT s.stxname FROM pg_statistic_ext s JOIN pg_class c ON c.oid=s.stxrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relname=$1`, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, n)
+	}
+	rows.Close()
+	for _, n := range names {
+		if _, err := st.pool.Exec(ctx, `DROP STATISTICS IF EXISTS `+n); err != nil {
+			t.Fatalf("drop statistics %s: %v", n, err)
+		}
+	}
+}
+
 func pgITDropExpressionIndexes(t *testing.T, st *PostgresStore, table, column string) {
 	t.Helper()
 	ctx := context.Background()
+	pgITDropStatistics(t, st, table)
 	rows, err := st.pool.Query(ctx, `SELECT indexname FROM pg_indexes WHERE schemaname=current_schema() AND tablename=$1 AND indexdef LIKE '%'||$2||'%'`, table, column)
 	if err != nil {
 		t.Fatal(err)
@@ -59,6 +89,7 @@ func pgITDropExpressionIndexes(t *testing.T, st *PostgresStore, table, column st
 // string destination cannot succeed.
 func pgITBreakColumnToBytea(t *testing.T, st *PostgresStore, table, column string) {
 	t.Helper()
+	pgITDropStatistics(t, st, table)
 	q := fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT`, table, column)
 	if _, err := st.pool.Exec(context.Background(), q); err != nil {
 		t.Fatalf("drop default %s.%s: %v", table, column, err)
@@ -256,8 +287,11 @@ func TestPostgresIntegrationStatementFaults(t *testing.T) {
 		st := pgITStore(t)
 		pgITSkipWrites(t, st, "schedule_occurrences", "INSERT")
 		claimed, err := st.ClaimScheduleOccurrence(ctx, "schedule-1", time.Now().UTC().Truncate(time.Second), pgITNewID(t))
-		if err != nil || !claimed {
-			t.Fatalf("skipped claim = %v, %v; want unclaimed", claimed, err)
+		// The insert is skipped, so no durable row exists. Reporting "won"
+		// without observing the row would let a later tick fire the same
+		// nominal twice: the claim must report claim-lost instead.
+		if err != nil || claimed {
+			t.Fatalf("skipped claim = %v, %v; want claim-lost", claimed, err)
 		}
 	})
 	t.Run("ReserveDownstreamLaunch/read", func(t *testing.T) {

@@ -120,6 +120,11 @@ func (s *Server) uploadArtifact(w http.ResponseWriter, r *http.Request) {
 		s.writeLeaseAuthError(w, r, authErr)
 		return
 	}
+	// Durable writes are fenced to the current registration session: a
+	// superseded process may not commit artifacts under a still-valid lease.
+	if !s.requireCurrentRunnerIncarnation(w, r, runnerID) {
+		return
+	}
 	// Static wiring gate FIRST: a DB store that cannot commit runner-produced
 	// metadata transactionally is refused before the run lookup, contract
 	// resolution, body read or staging reservation. Without this early gate a
@@ -1035,6 +1040,12 @@ func (s *Server) uploadJobCache(w http.ResponseWriter, r *http.Request) {
 	}
 	j, runnerID, ok := s.cacheLease(w, r)
 	if !ok {
+		return
+	}
+	// Durable writes are fenced to the current registration session: a
+	// superseded process may not commit cache entries under a still-valid
+	// lease.
+	if !s.requireCurrentRunnerIncarnation(w, r, runnerID) {
 		return
 	}
 	// Static wiring gate FIRST: refuse a store without transactional

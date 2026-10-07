@@ -27,6 +27,15 @@
 // failure and nothing is acknowledged. The CAS never substitutes locally
 // computed values for the backend's answer.
 //
+// When the backend answers without consuming the caller's stream (a dedup
+// hit, for example blob.FS's existing-object shortcut), the caller's stream
+// proves nothing about the stored object: the CAS then opens and hashes the
+// pre-existing object, returns it only when both digest and size match, and
+// atomically heals a mismatch from the supplied (untouched) reader. A heal
+// that cannot complete fails with ErrBackendIntegrity, so no caller — not
+// even one that only consumes the returned metadata, as provenance does —
+// can record an unverified dedup reference.
+//
 // Lifecycle: CAS writes are append/deduplicate only. Put never mutates,
 // overwrites or reuses an object: a digest names a fixed byte sequence, so
 // writing an object that already exists is an idempotent re-put of identical
@@ -303,7 +312,10 @@ func (c *CAS) PutFile(ctx context.Context, path string, digest string, size int6
 // PutKnown publishes a reader whose digest and size the caller already
 // computed (small in-memory bodies). The stream is verified against the
 // advertised digest and size while it is written — a caller that lies about
-// either fails closed — and no scratch file is created.
+// either fails closed — and no scratch file is created. When the backend
+// deduplicates (it consumes none of the stream), the pre-existing object is
+// hashed in place and healed on mismatch before the returned metadata is
+// acknowledged (see putStream).
 func (c *CAS) PutKnown(ctx context.Context, digest string, size int64, r io.Reader) (blob.Object, error) {
 	if err := validateKey(digest); err != nil {
 		return blob.Object{}, err
@@ -327,9 +339,12 @@ func (c *CAS) PutKnown(ctx context.Context, digest string, size int64, r io.Read
 //
 // A backend that returns success WITHOUT reading the stream (blob.FS
 // short-circuits to its deduplicating path when the object already exists)
-// is accepted with the same object validation: the stored bytes are then
-// proven by the caller's read-back re-hash (CAS.Open hashes while
-// streaming), which is the defense in depth every publication path keeps.
+// cannot prove the stored bytes from the accepted stream, so the CAS opens
+// the pre-existing object, hashes it, and returns success for the dedup hit
+// only when both the digest and the size match. A mismatch heals the object
+// from the caller's still-untouched reader through the backend's
+// atomic-replace path, and a heal that cannot be completed is a typed
+// integrity failure rather than an acknowledged, unverified reference.
 func (c *CAS) putStream(ctx context.Context, key string, size int64, r io.Reader) (blob.Object, error) {
 	h := sha256.New()
 	// ctx is carried into the counting reader so every byte the backend
@@ -362,16 +377,109 @@ func (c *CAS) putStream(ctx context.Context, key string, size int64, r io.Reader
 		return blob.Object{}, putErr
 	}
 	switch {
-	case cr.read == size:
-		// Verified above.
 	case cr.read == 0:
-		// The backend short-circuited: an object with this key already
-		// exists (a deduplicating backend never reads the stream then).
-		// Its stored bytes are proven by the caller's read-back re-hash.
+		// The backend consumed none of the caller's reader: it either
+		// short-circuited to a pre-existing object (the FS dedup path) or
+		// never read the stream at all. The stored bytes were therefore NOT
+		// proven by this publication, so the CAS verifies them now and
+		// heals a mismatch from the supplied (untouched) reader.
+		return c.verifyDedupHit(ctx, key, size, r, obj)
+	case cr.read == size:
+		// The stream was fully consumed and hashed, so the bytes the
+		// backend received are the advertised content (the digest check
+		// above ran).
 	default:
 		// The backend reported success after consuming only part of the
 		// stream: the published object cannot be the advertised content.
 		return blob.Object{}, fmt.Errorf("%w: read %d bytes, advertised %d", ErrSizeMismatch, cr.read, size)
+	}
+	if err := checkBackendObject(obj, key, size); err != nil {
+		return blob.Object{}, err
+	}
+	return obj, nil
+}
+
+// verifyDedupHit is the dedup branch of putStream: the backend returned
+// success without consuming the caller's reader, so the object it reports
+// already existed and its stored bytes are unverified. The stored object is
+// opened and hashed; when the digest and size match, the backend's report is
+// validated and returned. On a mismatch (same-size bitrot included) the
+// object is healed atomically from the caller's still-untouched reader and
+// the healed object is returned. A heal that cannot be completed — no
+// atomic-replace capability, or a supplied stream that does not hash to the
+// key — is a typed ErrBackendIntegrity failure that forces the caller to
+// rebuild; a bad object is never silently acknowledged, and the CAS never
+// substitutes locally computed values for a verified backend answer.
+func (c *CAS) verifyDedupHit(ctx context.Context, key string, size int64, r io.Reader, obj blob.Object) (blob.Object, error) {
+	storedErr := c.verifyStoredObject(ctx, key, size)
+	if storedErr == nil {
+		if err := checkBackendObject(obj, key, size); err != nil {
+			return blob.Object{}, err
+		}
+		return obj, nil
+	}
+	healed, healErr := c.healStoredObject(ctx, key, size, r)
+	if healErr != nil {
+		return blob.Object{}, fmt.Errorf("%w: stored object %s failed verification (%v) and could not be healed: %w",
+			ErrBackendIntegrity, key, storedErr, healErr)
+	}
+	return healed, nil
+}
+
+// verifyStoredObject opens the object at key and proves its stored bytes are
+// exactly the content the digest addresses: the CAS verifying reader hashes
+// the stream while it is read, the backend-reported size and the actual byte
+// count must both equal size, and the digest must equal key. Any
+// disagreement (a missing object included) is returned as a plain mismatch
+// for the dedup branch to heal.
+func (c *CAS) verifyStoredObject(ctx context.Context, key string, size int64) error {
+	rc, obj, err := c.Open(ctx, key)
+	if err != nil {
+		if errors.Is(err, blob.ErrNotFound) {
+			return fmt.Errorf("stored object %s is missing", key)
+		}
+		return fmt.Errorf("stored object %s cannot be opened: %w", key, err)
+	}
+	defer rc.Close()
+	if obj.Size != size {
+		return fmt.Errorf("stored object %s is %d bytes, advertised %d", key, obj.Size, size)
+	}
+	n, err := io.Copy(io.Discard, rc)
+	if err != nil {
+		return fmt.Errorf("stored object %s failed verification: %w", key, err)
+	}
+	if n != size {
+		return fmt.Errorf("stored object %s yielded %d bytes, advertised %d", key, n, size)
+	}
+	return nil
+}
+
+// healStoredObject replaces a dedup hit whose stored bytes failed verification
+// using the caller's untouched reader. The stream is counted and hashed while
+// it is written, exactly like putStream, so a reader that lies about its
+// digest or size can never replace the destination with different bad bytes;
+// the replacement itself must go through the backend's atomic-replace path
+// (blob.Replacer), which stages and verifies before the rename. The returned
+// object is the backend's validated replacement.
+func (c *CAS) healStoredObject(ctx context.Context, key string, size int64, r io.Reader) (blob.Object, error) {
+	replacer, ok := c.Blobs.(blob.Replacer)
+	if !ok {
+		return blob.Object{}, fmt.Errorf("%w: backend %T has no atomic-replace capability", ErrBackendIntegrity, c.Blobs)
+	}
+	h := sha256.New()
+	cr := &countingReader{r: r, max: size, over: ErrSizeMismatch, ctx: ctx}
+	obj, err := replacer.Replace(ctx, key, io.TeeReader(cr, h), size)
+	if errors.Is(err, ErrSizeMismatch) || errors.Is(cr.err, ErrSizeMismatch) {
+		return blob.Object{}, fmt.Errorf("%w: supplied stream is not the advertised %d bytes", ErrSizeMismatch, size)
+	}
+	if err != nil {
+		return blob.Object{}, err
+	}
+	if cr.read != size {
+		return blob.Object{}, fmt.Errorf("%w: supplied stream produced %d bytes, advertised %d", ErrSizeMismatch, cr.read, size)
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != key {
+		return blob.Object{}, fmt.Errorf("%w: supplied stream hashes to %s, not %s", ErrDigestMismatch, got, key)
 	}
 	if err := checkBackendObject(obj, key, size); err != nil {
 		return blob.Object{}, err

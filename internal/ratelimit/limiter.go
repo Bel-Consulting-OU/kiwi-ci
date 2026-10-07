@@ -170,11 +170,23 @@ func (l *Limiter) RetryAfter(key string) time.Duration {
 // request passes unthrottled.
 type Middleware struct {
 	ByClass map[string]*Limiter
+	// TrustedProxies are the CIDR ranges whose X-Forwarded-For chains are
+	// honored when resolving the canonical client IP. Empty means every peer
+	// is untrusted and RemoteAddr is authoritative.
+	TrustedProxies []*net.IPNet
+	// WebhookForge is the POST-HMAC webhook stage, keyed by the authenticated
+	// forge identity (see Key consumers in internal/server). It is a
+	// SEPARATE bucket map from the pre-authentication ClassWebhooks limiter,
+	// so invalid-HMAC floods cannot consume authenticated-forge budget and
+	// vice versa.
+	WebhookForge *Limiter
 }
 
 // NewMiddleware builds a Middleware from per-class rates (tokens/second)
 // sharing one burst size. Classes whose rate is <= 0 are left unlimited
-// unless a ClassDefault rate is configured.
+// unless a ClassDefault rate is configured. When the webhooks class is
+// configured, the post-HMAC forge limiter is built from the same rate and
+// burst.
 func NewMiddleware(rates map[string]float64, burst int) *Middleware {
 	m := &Middleware{ByClass: map[string]*Limiter{}}
 	for class, rate := range rates {
@@ -182,13 +194,24 @@ func NewMiddleware(rates map[string]float64, burst int) *Middleware {
 			m.ByClass[class] = New(rate, burst)
 		}
 	}
+	if rate := rates[ClassWebhooks]; rate > 0 {
+		m.WebhookForge = New(rate, burst)
+	}
 	return m
 }
 
 // Wrap chains the middleware around next: requests over their class budget
 // receive 429 with a Retry-After header and never reach the handler.
+//
+// Before keying, the canonical client IP is resolved (trusted proxies only)
+// and recorded in the request context, so the limiter and every downstream
+// audit consumer see the same client identity.
 func (m *Middleware) Wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, recorded := auth.ClientIPInfoFrom(r); !recorded {
+			info := CanonicalClientIP(r.RemoteAddr, ForwardedFor(r), m.TrustedProxies)
+			r = r.WithContext(auth.WithClientIPInfo(r.Context(), info))
+		}
 		class := Classify(r)
 		l := m.ByClass[class]
 		if l == nil {
@@ -254,18 +277,25 @@ func Classify(r *http.Request) string {
 	return ClassDefault
 }
 
-// Key derives the rate-limit identity for a request: the authenticated
-// principal's subject when present, otherwise — for the runner tier whose
-// credentials are authenticated by the server's tier gate before this
-// middleware runs — the authenticated bearer CREDENTIAL, otherwise the client
-// IP from RemoteAddr.
+// Key derives the rate-limit identity for a request: the server-proven
+// runner identity bound by the runner tier gate (mTLS certificate subject
+// and/or per-runner bearer credential), then the authenticated principal's
+// subject, then — for the runner tier whose credentials are authenticated by
+// the server's tier gate before this middleware runs — the authenticated
+// bearer CREDENTIAL, otherwise the canonical client IP (trusted-proxy
+// resolved; see CanonicalClientIP).
 //
 // The runner identity is deliberately never derived from the request path:
 // the path segment is attacker-controlled, so a caller could mint an
 // unlimited number of distinct buckets (and unbounded budgets) by varying
-// it. The bearer digest is one identity per credential, independent of the
-// path. Requests without a credential fall back to the client IP.
+// it. The context-bound identity is the one the auth layer PROVED, so two
+// mTLS-only runners behind one NAT get independent budgets and a forged path
+// id is limited under the caller's real identity. Requests without a proven
+// credential fall back to the canonical client IP.
 func Key(r *http.Request) string {
+	if id, ok := auth.RunnerIdentityFrom(r); ok {
+		return "runner:" + id
+	}
 	if p, ok := auth.PrincipalFrom(r); ok && p.Subject != "" {
 		return "principal:" + p.Subject
 	}
@@ -274,10 +304,7 @@ func Key(r *http.Request) string {
 			return "credential:" + auth.TokenDigest(tok)
 		}
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		host = r.RemoteAddr
-	}
+	host := auth.ClientIP(r)
 	if host == "" {
 		host = "unknown"
 	}

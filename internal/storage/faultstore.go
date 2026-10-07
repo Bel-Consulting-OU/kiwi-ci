@@ -183,6 +183,7 @@ var (
 	_ RunnerProfileLinkStore         = (*FaultyStore)(nil)
 	_ LiveProfileResolver            = (*FaultyStore)(nil)
 	_ QueuedJobPageStore             = (*FaultyStore)(nil)
+	_ QueuedJobTraversalStore        = (*FaultyStore)(nil)
 )
 
 func (f *FaultyStore) Close() error { return f.Inner.Close() }
@@ -326,6 +327,18 @@ func (f *FaultyStore) ListQueuedJobsPage(ctx context.Context, filter QueuedJobFi
 		return QueuedJobPage{}, errMissingInnerInterface("QueuedJobPageStore")
 	}
 	return inner.ListQueuedJobsPage(ctx, filter, after, limit, now)
+}
+
+// ListQueuedJobsByCreation delegates the immutable-creation-order traversal
+// read to Inner when it implements QueuedJobTraversalStore, and fails closed
+// with a diagnosable capability error otherwise. Like ListQueuedJobsPage it is
+// a READ: the FailAfter mutation counter is never consumed.
+func (f *FaultyStore) ListQueuedJobsByCreation(ctx context.Context, filter QueuedJobFilter, after *QueuedJobTraversalCursor, limit int, now time.Time) (QueuedJobTraversalPage, error) {
+	inner, ok := f.Inner.(QueuedJobTraversalStore)
+	if !ok {
+		return QueuedJobTraversalPage{}, errMissingInnerInterface("QueuedJobTraversalStore")
+	}
+	return inner.ListQueuedJobsByCreation(ctx, filter, after, limit, now)
 }
 
 func (f *FaultyStore) ListJobsByEnvironment(ctx context.Context, repoID, environment string) ([]model.Job, error) {
@@ -526,6 +539,23 @@ func (f *FaultyStore) RevokeRunnerLeases(ctx context.Context, runnerID, reason s
 		return nil, err
 	}
 	return inner.RevokeRunnerLeases(ctx, runnerID, reason)
+}
+
+// RegisterRunnerAndRevokeLeases is a mutating wrapper: an armed fault fails
+// the whole atomic registration swap before the inner store is touched, so
+// the injected failure can never leave a partial registration/revocation (the
+// fail-closed contract the server relies on).
+func (f *FaultyStore) RegisterRunnerAndRevokeLeases(ctx context.Context, runner model.Runner, reason string) ([]string, error) {
+	inner, ok := f.Inner.(RunnerRegistrationStore)
+	if !ok {
+		return nil, errMissingInnerInterface("RunnerRegistrationStore")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.fail(); err != nil {
+		return nil, err
+	}
+	return inner.RegisterRunnerAndRevokeLeases(ctx, runner, reason)
 }
 
 // DisableRunnerAndRevokeCert is a mutating wrapper: an armed fault fails the

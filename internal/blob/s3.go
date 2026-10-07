@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -45,12 +46,33 @@ func (c *byteCounter) Read(p []byte) (int, error) {
 
 // s3RequestDeadlines bound requests whose caller context carries no
 // deadline, so a stalled S3 endpoint can never hang a request forever.
+// Streamed GET bodies are deliberately NOT bounded here: a body is bounded by
+// the sliding BodyInactivityTimeout watchdog instead, so a transfer that
+// keeps making progress may run for an unbounded total time (the same
+// philosophy as the runner's streaming client and the cache store guard).
 const (
 	s3PutTimeout    = 30 * time.Minute
-	s3GetTimeout    = 2 * time.Minute
 	s3DeleteTimeout = 2 * time.Minute
-	s3ListTimeout   = 2 * time.Minute
 )
+
+// DefaultBodyInactivityTimeout is the default sliding inactivity window for a
+// streamed S3 response body (S3.BodyInactivityTimeout): when no byte arrives
+// for this long the request is aborted. Every successful read re-arms the
+// window, so the window bounds silence, never the total transfer duration.
+const DefaultBodyInactivityTimeout = 60 * time.Second
+
+// DefaultListPageTimeout is the default bound on a single ListObjectsV2 page
+// request, including reading and decoding its response body
+// (S3.ListPageTimeout). The caller's context bounds the enumeration as a
+// whole; each page gets this fresh window of its own.
+const DefaultListPageTimeout = 30 * time.Second
+
+// ErrBodyStalled reports an S3 response body aborted by the sliding
+// inactivity watchdog: no byte arrived for the configured window. The
+// returned error also wraps context.DeadlineExceeded, so callers may treat it
+// as a timeout-class failure; a caller's own context cancellation is passed
+// through unchanged instead.
+var ErrBodyStalled = errors.New("blob: s3 response body stalled")
 
 // s3ListPageSize is the bounded ListObjectsV2 page size: the store never
 // asks the endpoint for more than this many keys per request, so a listing
@@ -80,21 +102,127 @@ func withDeadline(ctx context.Context, d time.Duration) (context.Context, contex
 	return context.WithTimeout(ctx, d)
 }
 
-// bodyWithCancel ties a response body to the request context that owns it.
-// The bounded context must outlive Open: the caller streams the body after
-// Open returns, so the context may only be released when the body is closed.
-// Close closes the underlying body first (releasing the connection) and then
-// cancels the request context exactly once, making repeated closes safe.
-type bodyWithCancel struct {
-	io.ReadCloser
+// s3BodyGuard is a sliding inactivity watchdog for one streamed S3 response
+// body. It cancels the request when no byte has moved for idle, and every
+// successful read re-arms it, so a body that keeps making progress is never
+// cut by a total-duration bound while a body that stops sending is aborted in
+// bounded time. It mirrors the runner-side streaming guard and the cache
+// store guard: a single timer is armed per transfer and stopped when the body
+// is closed, leaving no timer behind.
+type s3BodyGuard struct {
 	cancel context.CancelFunc
-	once   sync.Once
+	idle   time.Duration
+
+	mu    sync.Mutex
+	timer *time.Timer
+	// last is the most recent successful progress instant.
+	last time.Time
+	// done latches the guard once it has fired or been stopped.
+	done bool
+	// fired records that the guard itself aborted the transfer, so the read
+	// error can be attributed to inactivity rather than caller cancellation.
+	fired bool
 }
 
-func (b *bodyWithCancel) Close() error {
-	err := b.ReadCloser.Close()
-	b.once.Do(b.cancel)
+// newS3BodyGuard arms the watchdog on the body's cancelable request context.
+func newS3BodyGuard(cancel context.CancelFunc, idle time.Duration) *s3BodyGuard {
+	g := &s3BodyGuard{cancel: cancel, idle: idle, last: time.Now()}
+	g.timer = time.AfterFunc(idle, g.onIdle)
+	return g
+}
+
+// onIdle fires when the inactivity timer elapses. Timer.Reset cannot revoke a
+// callback that has already been dispatched: if progress arrived after this
+// callback was scheduled, cancelling would abort an ACTIVE transfer exactly
+// at the idle boundary. The callback therefore re-checks the progress instant
+// under the lock and re-arms for the remainder of the window instead of
+// cancelling; only a window with no progress at all aborts.
+func (g *s3BodyGuard) onIdle() {
+	g.mu.Lock()
+	if g.done {
+		g.mu.Unlock()
+		return
+	}
+	if left := g.idle - time.Since(g.last); left > 0 {
+		g.timer.Reset(left)
+		g.mu.Unlock()
+		return
+	}
+	g.done = true
+	g.fired = true
+	g.mu.Unlock()
+	g.cancel()
+}
+
+// progress records a successful body read and re-arms the watchdog.
+func (g *s3BodyGuard) progress() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.done {
+		return
+	}
+	g.last = time.Now()
+	g.timer.Reset(g.idle)
+}
+
+// stop disarms the watchdog; it is idempotent and a stopped guard never fires.
+func (g *s3BodyGuard) stop() {
+	g.mu.Lock()
+	g.done = true
+	g.mu.Unlock()
+	g.timer.Stop()
+}
+
+// stalled reports whether the watchdog aborted the transfer.
+func (g *s3BodyGuard) stalled() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.fired
+}
+
+// s3GuardedBody ties a streamed response body to the request context that
+// owns it and to the inactivity watchdog. The cancelable context must outlive
+// Open: the caller streams the body after Open returns, so it may only be
+// released when the body is closed. Close closes the underlying body first
+// (releasing the connection) and then releases the watchdog and the request
+// context; the watchdog stays armed through the inner Close because a
+// verifying reader may still be draining the remainder of the stream.
+type s3GuardedBody struct {
+	io.ReadCloser
+	guard  *s3BodyGuard
+	parent context.Context
+	cancel context.CancelFunc
+}
+
+func (b *s3GuardedBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if n > 0 {
+		b.guard.progress()
+	}
+	if err != nil {
+		return n, b.mapError(err)
+	}
+	return n, nil
+}
+
+// mapError attributes an aborted read: a watchdog cancellation surfaces as
+// ErrBodyStalled wrapping context.DeadlineExceeded, while a caller's own
+// context cancellation (or any genuine transport error) is passed through.
+func (b *s3GuardedBody) mapError(err error) error {
+	if b.guard.stalled() && b.parent.Err() == nil {
+		return fmt.Errorf("%w after %s without a byte: %w", ErrBodyStalled, b.guard.idle, context.DeadlineExceeded)
+	}
 	return err
+}
+
+func (b *s3GuardedBody) Close() error {
+	// The inner Close may still move bytes (a caller draining to EOF, or a
+	// verifying reader draining a partial stream), so the watchdog and the
+	// request context stay armed until it returns: disarming first would let
+	// a peer that stops sending hang Close forever.
+	defer b.guard.stop()
+	defer b.cancel()
+	return b.ReadCloser.Close()
 }
 
 // s3Dialer is the dialer behind the default S3 transport: 10s connection
@@ -136,11 +264,42 @@ type S3 struct {
 	PathStyle       bool
 	Client          *http.Client
 
+	// BodyInactivityTimeout is the sliding inactivity window applied to a
+	// streamed Open body: when no byte arrives for this long the request is
+	// cancelled and the body read fails with an error wrapping
+	// ErrBodyStalled and context.DeadlineExceeded. Every successful read
+	// re-arms the window, so a body that keeps making progress is never cut
+	// by a total-duration bound. Zero means DefaultBodyInactivityTimeout.
+	BodyInactivityTimeout time.Duration
+
+	// ListPageTimeout bounds one ListObjectsV2 page request, including
+	// reading and decoding its response body. The caller's context still
+	// bounds the enumeration as a whole; every page gets a fresh window of
+	// its own, so a large but healthy listing can never exhaust one shared
+	// deadline. Zero means DefaultListPageTimeout.
+	ListPageTimeout time.Duration
+
 	// endpointOnce caches the endpoint resolution: endpointURL is the parsed
 	// endpoint and endpointErr is the sticky validation error.
 	endpointOnce sync.Once
 	endpointURL  *url.URL
 	endpointErr  error
+}
+
+// bodyInactivityTimeout resolves the effective GET body inactivity window.
+func (s *S3) bodyInactivityTimeout() time.Duration {
+	if s.BodyInactivityTimeout > 0 {
+		return s.BodyInactivityTimeout
+	}
+	return DefaultBodyInactivityTimeout
+}
+
+// listPageTimeout resolves the effective per-page ListObjectsV2 bound.
+func (s *S3) listPageTimeout() time.Duration {
+	if s.ListPageTimeout > 0 {
+		return s.ListPageTimeout
+	}
+	return DefaultListPageTimeout
 }
 
 func (s *S3) client() *http.Client {
@@ -470,22 +629,30 @@ func (s *S3) Put(ctx context.Context, key string, r io.Reader, size int64) (Obje
 	return Object{Key: key, SHA256: hex.EncodeToString(h.Sum(nil)), Size: size}, nil
 }
 
-// Open returns a stream for the object addressed by key. The returned reader
-// owns the request: the bounded request context stays alive while the caller
-// streams and is cancelled by the reader's Close, so Open must never cancel
-// on the success path. Every failure path cancels immediately, so a failed
-// Open never leaks a request context.
+// Open returns a stream for the object addressed by key. There is no
+// Kiwi-imposed total duration for the transfer: the caller's context bounds
+// the request, the default transport bounds the dial, TLS handshake and
+// response-header phases, and the returned body is wrapped in a sliding
+// inactivity watchdog (BodyInactivityTimeout; DefaultBodyInactivityTimeout
+// when unset) that aborts a body which stops making progress. A body that
+// keeps receiving bytes runs for exactly as long as it needs, no matter how
+// large the object or how slow the link.
+//
+// The returned reader owns the request: the derived request context stays
+// alive while the caller streams and is cancelled by the reader's Close, so
+// Open must never cancel on the success path. Every failure path cancels
+// immediately, so a failed Open never leaks a request context.
 func (s *S3) Open(ctx context.Context, key string) (io.ReadCloser, Object, error) {
 	if !keyRE.MatchString(key) {
 		return nil, Object{}, fmt.Errorf("blob: invalid key %q", key)
 	}
-	ctx, cancel := withDeadline(ctx, s3GetTimeout)
+	reqCtx, cancel := context.WithCancel(ctx)
 	rawURL, err := s.objectURL(key)
 	if err != nil {
 		cancel()
 		return nil, Object{}, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		cancel()
 		return nil, Object{}, err
@@ -507,7 +674,9 @@ func (s *S3) Open(ctx context.Context, key string) (io.ReadCloser, Object, error
 		cancel()
 		return nil, Object{}, fmt.Errorf("blob: s3 get %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
-	return &bodyWithCancel{ReadCloser: resp.Body, cancel: cancel}, Object{Key: key, SHA256: key, Size: resp.ContentLength}, nil
+	guard := newS3BodyGuard(cancel, s.bodyInactivityTimeout())
+	return &s3GuardedBody{ReadCloser: resp.Body, guard: guard, parent: ctx, cancel: cancel},
+		Object{Key: key, SHA256: key, Size: resp.ContentLength}, nil
 }
 
 func (s *S3) Delete(ctx context.Context, key string) error {
@@ -561,6 +730,9 @@ func (s *S3) listURL(continuationToken string) (string, error) {
 // objects are skipped, so the CAS GC can never mistake them for payloads.
 // The callback's error stops the walk and is returned unchanged; a truncated
 // page without a continuation token is an error rather than a silent stop.
+// The caller's context bounds the pass as a whole; each page request gets a
+// fresh ListPageTimeout window of its own (see listPage), so a healthy but
+// large enumeration is never cut by one shared deadline.
 // maxS3ListPageBytes bounds one list-page response; maxS3ListKeys bounds the
 // parsed key count independently of the body size (a defensive cap on the XML
 // content itself).
@@ -570,45 +742,76 @@ const (
 	maxS3ListPages     = 10_000
 )
 
-func (s *S3) List(ctx context.Context, fn func(Object) error) error {
-	ctx, cancel := withDeadline(ctx, s3ListTimeout)
+// listPage fetches and parses one ListObjectsV2 page. The page request and
+// its response body are bounded by a FRESH timeout derived from ctx
+// (ListPageTimeout; DefaultListPageTimeout when unset), so one slow page
+// fails page-locally instead of consuming a whole-pass budget, and the
+// caller's context still bounds the enumeration as a whole. A caller
+// cancellation is returned unchanged; a page timeout is reported with the
+// page's window in the error.
+func (s *S3) listPage(ctx context.Context, token string) (s3ListObjectsResult, error) {
+	pageCtx, cancel := context.WithTimeout(ctx, s.listPageTimeout())
 	defer cancel()
+	rawURL, err := s.listURL(token)
+	if err != nil {
+		return s3ListObjectsResult{}, err
+	}
+	req, err := http.NewRequestWithContext(pageCtx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return s3ListObjectsResult{}, err
+	}
+	s.sign(req, emptyPayloadHash, time.Now().UTC())
+	resp, err := s.client().Do(req)
+	if err != nil {
+		return s3ListObjectsResult{}, s.listPageError(ctx, err)
+	}
+	defer resp.Body.Close()
+	// Read limit+1 so an over-limit response is DETECTED rather than
+	// silently truncated into a parseable prefix.
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxS3ListPageBytes+1))
+	if readErr != nil {
+		return s3ListObjectsResult{}, s.listPageError(ctx, readErr)
+	}
+	if int64(len(body)) > maxS3ListPageBytes {
+		return s3ListObjectsResult{}, fmt.Errorf("blob: s3 list response exceeds %d bytes", int64(maxS3ListPageBytes))
+	}
+	if resp.StatusCode != http.StatusOK {
+		return s3ListObjectsResult{}, fmt.Errorf("blob: s3 list %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var page s3ListObjectsResult
+	if err := xml.Unmarshal(body, &page); err != nil {
+		return s3ListObjectsResult{}, fmt.Errorf("blob: s3 list decode: %w", err)
+	}
+	if len(page.Contents) > maxS3ListKeys {
+		return s3ListObjectsResult{}, fmt.Errorf("blob: s3 list page declares %d keys, limit is %d", len(page.Contents), maxS3ListKeys)
+	}
+	return page, nil
+}
+
+// listPageError classifies a failed page request. The caller's own context
+// cancellation is returned unchanged (the Enumerator contract), while a page
+// that hit its own fresh window is reported as a page-local timeout.
+func (s *S3) listPageError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("blob: s3 list page exceeded %s: %w", s.listPageTimeout(), err)
+	}
+	return fmt.Errorf("blob: s3 list page: %w", err)
+}
+
+func (s *S3) List(ctx context.Context, fn func(Object) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	token := ""
 	seenTokens := map[string]bool{}
 	pages := 0
 	for {
-		rawURL, err := s.listURL(token)
+		page, err := s.listPage(ctx, token)
 		if err != nil {
 			return err
-		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-		if err != nil {
-			return err
-		}
-		s.sign(req, emptyPayloadHash, time.Now().UTC())
-		resp, err := s.client().Do(req)
-		if err != nil {
-			return err
-		}
-		// Read limit+1 so an over-limit response is DETECTED rather than
-		// silently truncated into a parseable prefix.
-		body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxS3ListPageBytes+1))
-		resp.Body.Close()
-		if readErr != nil {
-			return readErr
-		}
-		if int64(len(body)) > maxS3ListPageBytes {
-			return fmt.Errorf("blob: s3 list response exceeds %d bytes", int64(maxS3ListPageBytes))
-		}
-		if resp.StatusCode != http.StatusOK {
-			return fmt.Errorf("blob: s3 list %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-		}
-		var page s3ListObjectsResult
-		if err := xml.Unmarshal(body, &page); err != nil {
-			return fmt.Errorf("blob: s3 list decode: %w", err)
-		}
-		if len(page.Contents) > maxS3ListKeys {
-			return fmt.Errorf("blob: s3 list page declares %d keys, limit is %d", len(page.Contents), maxS3ListKeys)
 		}
 		for _, entry := range page.Contents {
 			digest, ok := s3DigestFromKey(entry.Key)

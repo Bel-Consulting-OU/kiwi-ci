@@ -32,6 +32,12 @@ listen = ":8080"
 # max_cache_manifests_per_repo = 4096
 # max_cache_manifest_bytes_per_repo = 68719476736
 
+# CIDR ranges of reverse proxies in front of Kiwi. Only when the direct peer
+# is inside one of these ranges is X-Forwarded-For honored (rightmost
+# untrusted hop); otherwise the peer address is the rate-limit identity.
+# Empty means X-Forwarded-For is never trusted.
+# trusted_proxies = ["10.0.0.0/8", "192.168.0.0/16"]
+
 [database]
 # PostgreSQL connection URL; enables the durable SQL control plane.
 url = "postgres://kiwi:secret@db:5432/kiwi"
@@ -237,6 +243,17 @@ max_candidate_rows = 4096
 # (empty disables secret resolution). Only the fields of the selected broker
 # are required; a missing required field fails startup.
 broker = "static"
+
+# fallback_on lists the provider error classes that permit the broker chain to
+# advance to the next configured broker (a static broker is appended as a
+# fallback when static k=v entries are set). Absent defaults to
+# ["not_found"]. Only "not_found" and "unavailable" are accepted:
+# "unauthorized", "forbidden", "malformed" and unknown values are rejected at
+# startup, because a chain must never mask an authorization, policy or
+# security failure by delivering a later broker's secret. TLS/timeout/
+# transport failures are "unavailable" (fail closed unless explicitly opted
+# in here), and cancellation never falls back.
+# fallback_on = ["not_found"]
 
 # Vault: requires vault_addr; vault_token is optional.
 # vault_addr = "https://vault.example.com:8200"

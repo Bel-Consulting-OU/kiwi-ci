@@ -160,18 +160,22 @@ func basicStringClose(s string) (int, error) {
 }
 
 // parseScalar parses a TOML scalar of the supported kinds: quoted string
-// (basic "..." or literal '...'), bool, integer, or float. Quoted strings
-// are strict: the matching closing quote must be the FINAL byte of the
-// scalar, so `"abc"junk`, `"abc" junk`, an interior unescaped quote and a
-// lone `"` are all rejected (the old prefix/suffix check accepted
-// `"a"b"` and panicked on a single `"`). Literal strings take no escapes,
-// so an interior `'` is the same class of error.
+// (basic "..." or literal '...'), bool, integer, float, or an inline array of
+// quoted strings ("[...]"). Quoted strings are strict: the matching closing
+// quote must be the FINAL byte of the scalar, so `"abc"junk`, `"abc" junk`,
+// an interior unescaped quote and a lone `"` are all rejected (the old
+// prefix/suffix check accepted `"a"b"` and panicked on a single `"`).
+// Literal strings take no escapes, so an interior `'` is the same class of
+// error.
 func parseScalar(s string) (any, error) {
 	switch s {
 	case "true":
 		return true, nil
 	case "false":
 		return false, nil
+	}
+	if strings.HasPrefix(s, "[") {
+		return parseStringArray(s)
 	}
 	if strings.HasPrefix(s, `"`) {
 		close, err := basicStringClose(s)
@@ -204,6 +208,81 @@ func parseScalar(s string) (any, error) {
 		return i, nil
 	}
 	return nil, fmt.Errorf("invalid value %q (want quoted string, int, float or bool)", s)
+}
+
+// parseStringArray parses an inline TOML array of quoted strings, the form
+// used by list-valued keys such as secret_broker.fallback_on. Values are
+// elements only; the caller validates them. A single trailing comma and an
+// empty array are accepted; unquoted or empty elements are rejected so a
+// typo (for example fallback_on = [not_found]) cannot be silently ignored.
+func parseStringArray(s string) (any, error) {
+	if !strings.HasSuffix(s, "]") {
+		return nil, fmt.Errorf("unterminated array")
+	}
+	inner := strings.TrimSpace(s[1 : len(s)-1])
+	out := []string{}
+	if inner == "" {
+		return out, nil
+	}
+	parts, err := splitArrayElements(inner)
+	if err != nil {
+		return nil, err
+	}
+	for _, part := range parts {
+		v, err := parseScalar(part)
+		if err != nil {
+			return nil, fmt.Errorf("array element: %v", err)
+		}
+		str, ok := v.(string)
+		if !ok {
+			return nil, fmt.Errorf("array elements must be quoted strings")
+		}
+		out = append(out, str)
+	}
+	return out, nil
+}
+
+// splitArrayElements splits an inline-array body on commas outside quoted
+// strings. It is escape-aware for basic ("...") strings, accepts one trailing
+// comma, and rejects empty elements.
+func splitArrayElements(s string) ([]string, error) {
+	var parts []string
+	start := 0
+	var quote byte
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if quote == '"' && c == '\\' && i+1 < len(s) {
+			i++
+			continue
+		}
+		switch c {
+		case '"', '\'':
+			if quote == 0 {
+				quote = c
+			} else if quote == c {
+				quote = 0
+			}
+		case ',':
+			if quote == 0 {
+				parts = append(parts, strings.TrimSpace(s[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	if quote != 0 {
+		return nil, fmt.Errorf("unterminated quoted string in array")
+	}
+	parts = append(parts, strings.TrimSpace(s[start:]))
+	// A single trailing comma is allowed; drop only that empty tail.
+	if last := len(parts) - 1; parts[last] == "" {
+		parts = parts[:last]
+	}
+	for _, p := range parts {
+		if p == "" {
+			return nil, fmt.Errorf("empty array element")
+		}
+	}
+	return parts, nil
 }
 
 // unquote decodes the escapes of a TOML basic string.
@@ -283,6 +362,15 @@ func assign(dst reflect.Value, v any) error {
 			return fmt.Errorf("expected a bool, got %T", v)
 		}
 		dst.SetBool(b)
+	case reflect.Slice:
+		if dst.Type().Elem().Kind() != reflect.String {
+			return fmt.Errorf("unsupported slice element type %s", dst.Type().Elem().Kind())
+		}
+		ss, ok := v.([]string)
+		if !ok {
+			return fmt.Errorf("expected a list of strings, got %T", v)
+		}
+		dst.Set(reflect.ValueOf(ss).Convert(dst.Type()))
 	default:
 		return fmt.Errorf("unsupported field type %s", dst.Kind())
 	}

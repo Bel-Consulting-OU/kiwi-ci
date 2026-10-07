@@ -46,15 +46,15 @@ type secretsManagerResponse struct {
 func (c *SecretsManagerClient) Resolve(ctx context.Context, name string, _ SecretScope) (string, error) {
 	payload, err := json.Marshal(map[string]string{"SecretId": name})
 	if err != nil {
-		return "", fmt.Errorf("secretsmanager: marshal request: %w", err)
+		return "", classError("secretsmanager", ErrUnavailable, "marshal request", err)
 	}
 	endpoint := c.endpoint()
 	if err := validateProviderEndpoint(endpoint, true); err != nil {
-		return "", fmt.Errorf("secretsmanager: %w", err)
+		return "", classError("secretsmanager", ErrUnavailable, "invalid endpoint", err)
 	}
 	u, err := url.Parse(endpoint)
 	if err != nil {
-		return "", fmt.Errorf("secretsmanager: parse endpoint: %w", err)
+		return "", classError("secretsmanager", ErrUnavailable, "invalid endpoint", err)
 	}
 	now := time.Now().UTC()
 	amzDate := now.Format("20060102T150405Z")
@@ -83,7 +83,7 @@ func (c *SecretsManagerClient) Resolve(ctx context.Context, name string, _ Secre
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(payload)))
 	if err != nil {
-		return "", fmt.Errorf("secretsmanager: build request: %w", err)
+		return "", classError("secretsmanager", ErrUnavailable, "build request", err)
 	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -92,24 +92,30 @@ func (c *SecretsManagerClient) Resolve(ctx context.Context, name string, _ Secre
 
 	resp, err := c.client().Do(req)
 	if err != nil {
-		return "", fmt.Errorf("secretsmanager: %w", err)
+		return "", transportError("secretsmanager", "request failed", err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return "", fmt.Errorf("secretsmanager: read response: %w", err)
+		return "", transportError("secretsmanager", "read response", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("secretsmanager: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		// Secrets Manager answers most API failures (including
+		// ResourceNotFoundException and AccessDeniedException) with HTTP
+		// 400, so the sanitized error code is authoritative; only the code
+		// is ever included, never the response body.
+		code := awsErrorCode(resp, body)
+		class := awsErrorClass(code, resp.StatusCode)
+		return "", classError("secretsmanager", class, statusDetail(resp.StatusCode, code), nil)
 	}
 	var out secretsManagerResponse
 	if err := json.Unmarshal(body, &out); err != nil {
-		return "", fmt.Errorf("secretsmanager: decode response: %w", err)
+		return "", decodeError("secretsmanager", "decode response", err)
 	}
 	if out.SecretString != "" {
 		return out.SecretString, nil
 	}
-	return "", fmt.Errorf("secretsmanager: secret %q has no SecretString", name)
+	return "", classError("secretsmanager", ErrMalformedResponse, fmt.Sprintf("secret %q has no SecretString", name), nil)
 }
 
 // awsV4CanonicalRequest builds the SigV4 canonical request and returns it

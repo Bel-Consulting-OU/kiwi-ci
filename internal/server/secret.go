@@ -518,6 +518,11 @@ func (s *Server) issueSecret(w http.ResponseWriter, r *http.Request) {
 		s.writeLeaseAuthError(w, r, authErr)
 		return
 	}
+	// A superseded registration session may not retrieve secrets for the
+	// remaining lease TTL even though the lease token still validates.
+	if !s.requireCurrentRunnerIncarnation(w, r, in.RunnerID) {
+		return
+	}
 	// Defense in depth: admission already strips secrets from untrusted
 	// pipelines, and the declared allowlist is compiled at enqueue time. The
 	// commit re-checks both against the locked job.

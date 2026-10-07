@@ -130,8 +130,9 @@ func (s *PostgresStore) revokeRunnerLeasesTx(ctx context.Context, tx pgx.Tx, run
 		if err != nil {
 			return nil, nil, err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE jobs SET status=$2, error=$3, finished_at=$4, lease_runner_id=NULL, lease_token_hash=NULL, lease_expires_at=NULL, payload=$5 WHERE id=$1`,
-			j.ID, string(j.Status), nullText(j.Error), j.FinishedAt, jp); err != nil {
+		labels, regions := jobNormalizedFilterLists(j)
+		if _, err := tx.Exec(ctx, `UPDATE jobs SET status=$2, error=$3, finished_at=$4, lease_runner_id=NULL, lease_token_hash=NULL, lease_expires_at=NULL, payload=$5, required_labels=$6, placement_regions=$7 WHERE id=$1`,
+			j.ID, string(j.Status), nullText(j.Error), j.FinishedAt, jp, labels, regions); err != nil {
 			return nil, nil, err
 		}
 		// The invalidated lease releases its resource reservation in the
@@ -311,8 +312,9 @@ func (s *PostgresStore) RecoverExpiredLease(ctx context.Context, jobID string, e
 	if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE jobs SET status=$2, error=$3, finished_at=$4, lease_runner_id=NULL, lease_token_hash=NULL, lease_expires_at=NULL, payload=$5 WHERE id=$1`,
-		jobID, string(j.Status), nullText(j.Error), j.FinishedAt, jp); err != nil {
+	labels, regions := jobNormalizedFilterLists(j)
+	if _, err := tx.Exec(ctx, `UPDATE jobs SET status=$2, error=$3, finished_at=$4, lease_runner_id=NULL, lease_token_hash=NULL, lease_expires_at=NULL, payload=$5, required_labels=$6, placement_regions=$7 WHERE id=$1`,
+		jobID, string(j.Status), nullText(j.Error), j.FinishedAt, jp, labels, regions); err != nil {
 		return err
 	}
 	// The expired lease releases its resource reservation in the same

@@ -50,3 +50,14 @@ type Enumerator interface {
 type Statter interface {
 	Stat(ctx context.Context, key string) (Object, error)
 }
+
+// Replacer is the optional atomic-replace capability of a blob store. CAS
+// uses it to heal a deduplicated object whose stored bytes fail verification:
+// unlike Put, Replace must never short-circuit on an existing object, it must
+// stage the supplied stream durably and atomically replace the destination
+// (write temp + fsync + rename, or the backend's atomic-replace path), and it
+// must fail without touching the destination when the stream does not hash to
+// key or does not match size. FS implements it.
+type Replacer interface {
+	Replace(ctx context.Context, key string, r io.Reader, size int64) (Object, error)
+}

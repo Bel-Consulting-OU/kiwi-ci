@@ -63,18 +63,31 @@ const (
 	// changed shape underneath it is re-scanned from the head instead of
 	// resuming at a stale position forever.
 	queuedScanCursorTTL = 15 * time.Minute
+	// queuedScanSweepEvery bounds how many lease attempts may pass between
+	// independent TTL sweeps of the continuation-state map, so an abandoned
+	// runner's entry is reclaimed even if the runner never polls again.
+	queuedScanSweepEvery = 64
 	// DefaultReservationWait is the default reservation-head wait: zero makes
 	// a resource-blocked candidate block starving backfill immediately.
 	DefaultReservationWait = time.Duration(0)
 )
 
-// queuedScanState is one runner's continuation cursor: after names the last
-// queued candidate the previous lease attempt actually evaluated, touched is
-// when that attempt finished. It is request-local bookkeeping only; a claim
-// race between two concurrent leases for the same runner is resolved by the
-// store's atomic claim, never by this state.
+// queuedScanStateCap is the hard cardinality cap of the continuation-state
+// map. When a NEW runner's traversal position would exceed it, the entry with
+// the oldest touched instant is evicted, bounding this process's scheduler
+// bookkeeping regardless of how many runner IDs ever poll. A var (not a
+// const) so tests can shrink it.
+var queuedScanStateCap = 10000
+
+// queuedScanState is one runner's immutable-traversal continuation cursor:
+// after names the last creation-order row the previous lease attempt actually
+// evaluated, touched is when that attempt finished. It is request-local
+// bookkeeping only; a claim race between two concurrent leases for the same
+// runner is resolved by the store's atomic claim, never by this state. The
+// cursor keys on (created_at, id), which never change for a row, so a row can
+// never move from after this position to before it.
 type queuedScanState struct {
-	after   storage.QueuedJobCursor
+	after   storage.QueuedJobTraversalCursor
 	touched time.Time
 }
 
@@ -126,15 +139,20 @@ type DBScheduler struct {
 
 	// scanMu guards scan, the per-runner continuation position of the
 	// bounded queued-candidate walk: when one lease attempt exhausts its
-	// maxRows budget while the page store still has more candidates, the
-	// last EVALUATED cursor is remembered here so the next poll for the
-	// same runner resumes after it instead of re-materializing the same
-	// incompatible prefix. A cursor older than queuedScanCursorTTL is
-	// discarded. Correctness never depends on exclusive ownership: two
-	// concurrent leases may scan from the same position, and their claim
-	// race is resolved by the store's atomic lease.
+	// maxRows budget while the immutable traversal still has rows, the last
+	// EVALUATED creation-order position is remembered here so the next poll
+	// for the same runner resumes after it instead of re-materializing the
+	// same incompatible prefix. A cursor older than queuedScanCursorTTL is
+	// discarded, an independent sweep reclaims entries whose runner never
+	// returns, and a hard cardinality cap evicts the oldest entry when a new
+	// runner would exceed it. Correctness never depends on exclusive
+	// ownership: two concurrent leases may scan from the same position, and
+	// their claim race is resolved by the store's atomic lease.
 	scanMu sync.Mutex
 	scan   map[string]queuedScanState
+	// scanCalls counts lease attempts so the independent TTL sweep of scan
+	// runs periodically even when no state is mutated.
+	scanCalls atomic.Int64
 
 	// leader is true while this instance holds the leadership claim.
 	// Access is atomic: Lease and IsLeader can run concurrently from
@@ -354,25 +372,31 @@ func (s *DBScheduler) Enqueue(ctx context.Context, run model.Run, jobs map[strin
 //
 // BOUNDED CANDIDATE SCAN: one /next poll materializes at most
 // maxCandidateRows queued candidates, requested in keyset pages of at most
-// candidatePageSize from a store implementing storage.QueuedJobPageStore
-// (the durable and in-memory stores do); a store without the contract falls
-// back to the historical whole-queue ListQueuedJobs read. Pages are walked
-// in the aged order (aged priority DESC, created_at ASC, id ASC — see
-// orderQueuedJobs), the same order the page store returns, so bounding the
-// scan never changes the fairness policy.
+// candidatePageSize from a store implementing storage.QueuedJobPageStore AND
+// storage.QueuedJobTraversalStore (the durable and in-memory stores do); a
+// store without those contracts falls back to the historical whole-queue
+// ListQueuedJobs read. The head page is walked in the aged order (aged
+// priority DESC, created_at ASC, id ASC — see orderQueuedJobs), the same
+// order the page store returns, so the head window keeps the fairness policy
+// exactly as before.
 //
 // The read carries the effective runner's coarse eligibility pushdown
 // (storage.QueuedJobFilter: runtimes, labels, region, capacity and the
 // job-scoped-cgroup envelope relaxation), so candidates the shared lease
 // predicate would reject are skipped by the store instead of being
 // materialized. Every lease attempt starts with a HEAD WINDOW page (newly
-// enqueued/high-priority candidates are always seen), then resumes from a
-// fresh per-runner continuation cursor when the previous attempt exhausted
-// its maxRows budget mid-queue — so a long prefix of candidates that pass
-// the coarse filter but fail the Go gates (deadlines, dependencies,
-// environment/policy concurrency) cannot pin the scan to the same rows
-// forever. Cursors older than queuedScanCursorTTL are discarded, and a claim
-// or an exhausted queue clears the cursor.
+// enqueued/high-priority candidates are always seen), then continues the
+// remaining budget with a ROUND-ROBIN SWEEP over the immutable creation order
+// (created_at ASC, id ASC), resuming from a fresh per-runner traversal cursor
+// and wrapping to the head when the sweep is exhausted. A long prefix of
+// candidates that pass the coarse filter but fail the Go gates (deadlines,
+// dependencies, environment/policy concurrency) therefore cannot pin the
+// scan to the same rows forever: creation order has no mutable key, so a row
+// promoted by PromoteQueuedJobBoosts moves only within the head window's aged
+// order (where it is re-read every attempt), never across the traversal
+// cursor. Cursors older than queuedScanCursorTTL are discarded, an
+// independent sweep reclaims cursors whose runner never returns, the state
+// map is capped, and a claim or an exhausted traversal clears the cursor.
 //
 // RESERVATION POLICY (anti-backfill): the first resource-blocked candidate
 // in aged order that is still eligible on every other gate becomes the
@@ -455,9 +479,17 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 	// enforced-policy, dependencies) still decides every candidate.
 	filter := runnerQueuedJobFilter(eff)
 	scanned := 0
+	// The independent scan-state sweep runs every queuedScanSweepEvery lease
+	// attempts even when the state map is never mutated, so abandoned
+	// runners are reclaimed on a busy leader without waiting for any of
+	// them to return.
+	if n := s.scanCalls.Add(1); n%queuedScanSweepEvery == 0 {
+		s.sweepScanState(now)
+	}
 	pageStore, hasPages := s.Store.(storage.QueuedJobPageStore)
-	if hasPages {
-		res, err := s.leasePaged(ctx, pageStore, filter, walk, runnerID, pageSize, maxRows, now)
+	traversalStore, hasTraversal := s.Store.(storage.QueuedJobTraversalStore)
+	if hasPages && hasTraversal {
+		res, err := s.leasePaged(ctx, pageStore, traversalStore, filter, walk, runnerID, pageSize, maxRows, now)
 		if err != nil {
 			return nil, "", time.Time{}, err
 		}
@@ -465,13 +497,12 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 			return res.job, res.raw, res.expires, nil
 		}
 	} else {
-		// Historical fallback for stores without the paged candidate
-		// contract: materialize the whole queue, apply the SAME coarse
-		// matcher the page store applies, and walk it in the same aged
-		// order, still bounded by maxCandidateRows. The per-runner
-		// continuation cursor is not applied here: this path is a legacy
-		// store contract, and the whole-queue read already bounds the
-		// candidate set.
+		// Historical fallback for stores without BOTH candidate contracts:
+		// materialize the whole queue, apply the SAME coarse matcher the
+		// page store applies, and walk it in the same aged order, still
+		// bounded by maxCandidateRows. The per-runner continuation cursor is
+		// not applied here: this path is a legacy store contract, and the
+		// whole-queue read already bounds the candidate set.
 		queued, err := s.Store.ListQueuedJobs(ctx)
 		if err != nil {
 			return nil, "", time.Time{}, err
@@ -500,23 +531,32 @@ func (s *DBScheduler) Lease(ctx context.Context, runnerID string, now time.Time)
 	return nil, "", time.Time{}, ErrNoJobs
 }
 
-// leasePaged runs the bounded paged candidate walk of ONE lease attempt over
-// a storage.QueuedJobPageStore:
+// leasePaged runs the bounded candidate walk of ONE lease attempt over a
+// store implementing BOTH storage.QueuedJobPageStore and
+// storage.QueuedJobTraversalStore:
 //
-//  1. HEAD WINDOW: one page at the head (after=nil) is fetched and walked
-//     first, so newly enqueued or highest-aged candidates are always seen
-//     promptly, even while the runner is resuming deeper in the queue.
-//  2. CONTINUATION: while budget remains, pages are fetched from a FRESH
-//     per-runner cursor when one exists, otherwise strictly after the head
-//     window's Last. Every fetched page is walked in full, so the cursor
-//     only ever advances past rows this attempt actually evaluated.
-//  3. STATE: a claim clears the cursor; exhaustion (!HasMore) clears it; a
-//     maxRows exhaustion with HasMore stores the last evaluated position so
-//     the next poll for the same runner resumes instead of re-materializing
-//     the same prefix. An interactive reservation head that leaves every
-//     candidate unclaimed simply stores (or keeps) the position the same
-//     way, so the next poll continues rather than restarting.
-func (s *DBScheduler) leasePaged(ctx context.Context, pageStore storage.QueuedJobPageStore, filter storage.QueuedJobFilter, walk *leaseCandidateWalk, runnerID string, pageSize, maxRows int, now time.Time) (leaseWalkResult, error) {
+//  1. HEAD WINDOW: one page at the head (after=nil) is fetched in the aged
+//     order and walked first, so newly enqueued or highest-aged candidates
+//     are always seen promptly, even while the runner is resuming deeper in
+//     the queue. This is the only aged-order read; the reservation head is
+//     detected here exactly as before.
+//  2. ROUND-ROBIN SWEEP: while budget remains, pages are fetched in the
+//     IMMUTABLE creation order (created_at ASC, id ASC) from a fresh
+//     per-runner traversal cursor, wrapping to the beginning when the sweep
+//     reaches the end. Creation order cannot be moved by
+//     PromoteQueuedJobBoosts, so a promoted row that crosses an old aged
+//     cursor boundary is still visited by the sweep (and any row that rises
+//     into the aged head window is seen there). Every fetched page is walked
+//     in full, so the cursor only ever advances past rows this attempt
+//     actually evaluated.
+//  3. STATE: a claim clears the cursor; a full sweep with no claim clears it;
+//     a budget exhaustion mid-sweep stores the last evaluated position so the
+//     next poll for the same runner resumes instead of re-materializing the
+//     same prefix. When the head window alone consumes the whole budget
+//     (maxRows <= pageSize) the request still walks one traversal page, so
+//     the round-robin always advances; the request stays bounded by
+//     maxRows + pageSize.
+func (s *DBScheduler) leasePaged(ctx context.Context, pageStore storage.QueuedJobPageStore, traversalStore storage.QueuedJobTraversalStore, filter storage.QueuedJobFilter, walk *leaseCandidateWalk, runnerID string, pageSize, maxRows int, now time.Time) (leaseWalkResult, error) {
 	headLimit := pageSize
 	if maxRows < headLimit {
 		headLimit = maxRows
@@ -537,45 +577,70 @@ func (s *DBScheduler) leasePaged(ctx context.Context, pageStore storage.QueuedJo
 		}
 		return res, nil
 	}
-	last, hasMore := head.Last, head.HasMore
-	if len(head.Jobs) == 0 {
-		hasMore = false
-	}
-	after, hasAfter := head.Last, hasMore
+	// Round-robin sweep over the immutable creation order. The stored
+	// cursor (if any) is this runner's position in that order; nil starts at
+	// the oldest queued row.
+	var cursor *storage.QueuedJobTraversalCursor
 	if stored, ok := s.loadScanCursor(runnerID, now); ok {
-		after, hasAfter = stored, true
+		c := stored
+		cursor = &c
 	}
-	for hasAfter && scanned < maxRows {
+	remaining := maxRows - scanned
+	if remaining <= 0 {
+		// The head window consumed the entire budget (maxRows <= pageSize):
+		// walk at least one traversal page so the round-robin advances
+		// instead of re-walking the same aged head forever.
+		remaining = pageSize
+	}
+	var last storage.QueuedJobTraversalCursor
+	progress := false
+	for remaining > 0 {
 		pageLimit := pageSize
-		if remaining := maxRows - scanned; remaining < pageLimit {
+		if remaining < pageLimit {
 			pageLimit = remaining
 		}
-		page, err := pageStore.ListQueuedJobsPage(ctx, filter, &after, pageLimit, now)
+		page, err := traversalStore.ListQueuedJobsByCreation(ctx, filter, cursor, pageLimit, now)
 		if err != nil {
 			return leaseWalkResult{}, err
 		}
 		if len(page.Jobs) == 0 {
-			hasMore = false
-			break
+			if cursor == nil {
+				// Nothing queued from the head: the sweep is exhausted.
+				break
+			}
+			// The stored position is past the last queued row: wrap to the
+			// beginning and keep sweeping within this request.
+			cursor = nil
+			continue
 		}
-		orderQueuedJobs(page.Jobs, now)
 		scanned += len(page.Jobs)
+		remaining -= len(page.Jobs)
 		if res := walk.walkPage(page.Jobs); res.claimed || res.err != nil {
 			if res.claimed {
 				s.clearScanCursor(runnerID)
 			}
 			return res, nil
 		}
-		last, hasMore = page.Last, page.HasMore
-		if !hasMore {
+		if page.HasMore {
+			last = page.Last
+			progress = true
+			c := page.Last
+			cursor = &c
+			continue
+		}
+		// End of the traversal reached without a claim.
+		if cursor == nil {
+			// The sweep began (or wrapped) at the head and covered every
+			// queued row: a full pass with nothing claimable. Restart from
+			// the head next poll.
+			progress = false
 			break
 		}
-		after = page.Last
+		// We began behind the head: wrap and sweep the prefix within the
+		// remaining budget.
+		cursor = nil
 	}
-	if hasMore && scanned >= maxRows {
-		// Budget exhausted with candidates still unscanned: remember the
-		// last position the walk actually evaluated, so the next poll
-		// resumes behind it instead of re-scanning the same prefix.
+	if cursor != nil && progress {
 		s.saveScanCursor(runnerID, last, now)
 	} else {
 		s.clearScanCursor(runnerID)
@@ -597,43 +662,93 @@ func (w *leaseCandidateWalk) walkPage(candidates []model.Job) leaseWalkResult {
 	return leaseWalkResult{}
 }
 
-// loadScanCursor returns the runner's fresh continuation cursor. A cursor at
-// or past queuedScanCursorTTL is discarded, so a queue that changed shape
-// underneath a stale position is re-scanned from the head.
-func (s *DBScheduler) loadScanCursor(runnerID string, now time.Time) (storage.QueuedJobCursor, bool) {
+// loadScanCursor returns the runner's fresh immutable-traversal cursor. A
+// cursor at or past queuedScanCursorTTL is discarded, so a queue that changed
+// shape underneath a stale position is re-scanned from the head.
+func (s *DBScheduler) loadScanCursor(runnerID string, now time.Time) (storage.QueuedJobTraversalCursor, bool) {
 	s.scanMu.Lock()
 	defer s.scanMu.Unlock()
 	st, ok := s.scan[runnerID]
 	if !ok {
-		return storage.QueuedJobCursor{}, false
+		return storage.QueuedJobTraversalCursor{}, false
 	}
 	if now.Sub(st.touched) > queuedScanCursorTTL {
 		delete(s.scan, runnerID)
-		return storage.QueuedJobCursor{}, false
+		return storage.QueuedJobTraversalCursor{}, false
 	}
 	return st.after, true
 }
 
-// saveScanCursor records the runner's continuation position. Concurrent
-// leases for one runner may overwrite each other; the last writer wins and
-// the worst case is one redundant re-scan, never a skipped claim (the store's
-// atomic claim is the race boundary).
-func (s *DBScheduler) saveScanCursor(runnerID string, after storage.QueuedJobCursor, now time.Time) {
+// saveScanCursor records the runner's immutable-traversal continuation
+// position. Concurrent leases for one runner may overwrite each other; the
+// last writer wins and the worst case is one redundant re-scan, never a
+// skipped claim (the store's atomic claim is the race boundary). The
+// mutation also sweeps stale entries and enforces the hard cardinality cap,
+// evicting the oldest-touched entry when a new runner would exceed it.
+func (s *DBScheduler) saveScanCursor(runnerID string, after storage.QueuedJobTraversalCursor, now time.Time) {
 	s.scanMu.Lock()
 	defer s.scanMu.Unlock()
 	if s.scan == nil {
 		s.scan = map[string]queuedScanState{}
 	}
+	s.sweepScanStateLocked(now)
+	if _, exists := s.scan[runnerID]; !exists && len(s.scan) >= queuedScanStateCap {
+		s.evictOldestScanStateLocked()
+	}
 	s.scan[runnerID] = queuedScanState{after: after, touched: now}
 }
 
-// clearScanCursor drops the runner's continuation position (a claim, an
-// exhausted queue, or any state that would otherwise be re-scanned next
+// clearScanCursor drops the runner's continuation position (a claim, a full
+// traversal sweep, or any state that would otherwise be re-scanned next
 // poll).
 func (s *DBScheduler) clearScanCursor(runnerID string) {
 	s.scanMu.Lock()
 	defer s.scanMu.Unlock()
 	delete(s.scan, runnerID)
+}
+
+// DropScanState removes the runner's immutable-traversal continuation
+// position, if any. The server calls it when a runner is disabled or drained
+// so a runner that returns later (re-enabled or re-registered) starts its
+// round-robin sweep from the head instead of resuming an abandoned position.
+func (s *DBScheduler) DropScanState(runnerID string) {
+	s.clearScanCursor(runnerID)
+}
+
+// sweepScanState reclaims every continuation entry whose runner has not
+// touched it within queuedScanCursorTTL. It runs independently of any
+// runner's return (periodically from Lease and on every state mutation), so
+// an abandoned runner cannot pin memory indefinitely.
+func (s *DBScheduler) sweepScanState(now time.Time) {
+	s.scanMu.Lock()
+	defer s.scanMu.Unlock()
+	s.sweepScanStateLocked(now)
+}
+
+// sweepScanStateLocked is sweepScanState under the held mutex.
+func (s *DBScheduler) sweepScanStateLocked(now time.Time) {
+	for id, st := range s.scan {
+		if now.Sub(st.touched) > queuedScanCursorTTL {
+			delete(s.scan, id)
+		}
+	}
+}
+
+// evictOldestScanStateLocked drops the entry with the oldest touched instant,
+// bounding the map at queuedScanStateCap even when every runner keeps
+// polling. The caller holds scanMu and must have ensured the map is non-empty
+// and at (or above) the cap.
+func (s *DBScheduler) evictOldestScanStateLocked() {
+	oldestID := ""
+	var oldest time.Time
+	for id, st := range s.scan {
+		if oldestID == "" || st.touched.Before(oldest) {
+			oldestID, oldest = id, st.touched
+		}
+	}
+	if oldestID != "" {
+		delete(s.scan, oldestID)
+	}
 }
 
 // runnerQueuedJobFilter derives the storage.QueuedJobFilter for one effective

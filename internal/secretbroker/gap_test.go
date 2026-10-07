@@ -400,7 +400,8 @@ func TestGCPErrorMatrix(t *testing.T) {
 		t.Fatalf("secret read failure = %v", err)
 	}
 
-	// Resolve: non-200 status.
+	// Resolve: non-200 status. The response body ("denied") must be
+	// classified as Forbidden and must NOT be echoed into the error.
 	statusTripper := routeTripper{fn: func(req *http.Request) (*http.Response, error) {
 		if strings.Contains(req.URL.Host, "oauth") {
 			return canned(http.StatusOK, `{"access_token":"tok"}`), nil
@@ -408,8 +409,10 @@ func TestGCPErrorMatrix(t *testing.T) {
 		return canned(http.StatusForbidden, "denied"), nil
 	}}
 	c = &GCPClient{ClientEmail: "sa@x", PrivateKeyPEM: pem, TokenURL: "https://oauth.test/token", SecretManagerURL: "https://sm.test", HTTPClient: &http.Client{Transport: statusTripper}}
-	if _, err := c.Resolve(ctx, "x", SecretScope{}); err == nil || !strings.Contains(err.Error(), "denied") {
-		t.Fatalf("secret status = %v", err)
+	if _, err := c.Resolve(ctx, "x", SecretScope{}); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("secret status = %v, want ErrForbidden", err)
+	} else if strings.Contains(err.Error(), "denied") {
+		t.Fatalf("provider body leaked into error: %v", err)
 	}
 
 	// Resolve: decode failure, empty payload, and bad base64 payload.
@@ -533,8 +536,10 @@ func TestVaultResolveErrorMatrix(t *testing.T) {
 	c = &VaultClient{Address: "https://vault.test", HTTPClient: &http.Client{Transport: routeTripper{fn: func(*http.Request) (*http.Response, error) {
 		return canned(http.StatusOK, `{"errors":["permission denied","bad token"]}`), nil
 	}}}}
-	if _, err := c.Resolve(ctx, "x", SecretScope{}); err == nil || !strings.Contains(err.Error(), "permission denied") {
-		t.Fatalf("error list = %v", err)
+	if _, err := c.Resolve(ctx, "x", SecretScope{}); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("error list = %v, want ErrForbidden", err)
+	} else if strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("provider body leaked into error: %v", err)
 	}
 }
 
@@ -587,7 +592,7 @@ func TestOpenEnvelopeMalformedEphemeralKey(t *testing.T) {
 
 // TestChainBrokerSkipsNil proves a nil broker in the chain is skipped.
 func TestChainBrokerSkipsNil(t *testing.T) {
-	chain := ChainBroker{nil, StaticBroker{"a": "1"}}
+	chain := ChainBroker{Brokers: []Broker{nil, StaticBroker{"a": "1"}}}
 	v, err := chain.Resolve(context.Background(), "a", SecretScope{})
 	if err != nil || v != "1" {
 		t.Fatalf("chain = (%q, %v)", v, err)

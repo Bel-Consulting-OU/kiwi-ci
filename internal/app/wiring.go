@@ -148,9 +148,16 @@ func applyQuotaConfig(srv *server.Server, cfg *config.Config) {
 
 // buildSecretBroker constructs the secret broker chain from the
 // secret_broker section: the selected provider broker plus (when
-// configured) the static broker as a fallback. It returns nil when no
-// broker is configured (the secrets endpoint stays disabled).
+// configured) the static broker as a fallback. The chain advances to the
+// static fallback ONLY for the error classes named by fallback_on (absent
+// means ["not_found"]); an authorization, policy or malformed-response
+// failure fails closed and the later broker is never consulted. It returns
+// nil when no broker is configured (the secrets endpoint stays disabled).
 func buildSecretBroker(cfg config.SecretBrokerConfig) (secretbroker.Broker, error) {
+	policy, err := secretbroker.ParseFallbackOn(cfg.FallbackOn)
+	if err != nil {
+		return nil, fmt.Errorf("secret broker: %w", err)
+	}
 	var primary secretbroker.Broker
 	switch cfg.Broker {
 	case "":
@@ -192,7 +199,7 @@ func buildSecretBroker(cfg config.SecretBrokerConfig) (secretbroker.Broker, erro
 		return nil, fmt.Errorf("secret broker: unknown provider %q", cfg.Broker)
 	}
 	static := parseStaticPairs(cfg.Static)
-	var chain secretbroker.ChainBroker
+	var chain []secretbroker.Broker
 	if primary != nil {
 		chain = append(chain, primary)
 	}
@@ -205,7 +212,7 @@ func buildSecretBroker(cfg config.SecretBrokerConfig) (secretbroker.Broker, erro
 	case 1:
 		return chain[0], nil
 	default:
-		return chain, nil
+		return secretbroker.ChainBroker{Brokers: chain, FallbackOn: policy}, nil
 	}
 }
 

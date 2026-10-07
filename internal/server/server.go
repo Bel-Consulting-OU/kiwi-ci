@@ -1358,14 +1358,25 @@ func (s *Server) auth(next http.Handler) http.Handler {
 				return
 			}
 			mtls := s.RunnerCA != nil && s.RequireRunnerClientCerts
+			// provenRunnerID is the identity the runner tier gate actually
+			// authenticated (per-runner bearer and/or verified mTLS peer
+			// certificate). It is bound to the request context below so the
+			// rate limiter keys the authenticated runner — never the
+			// attacker-controlled path — and mTLS-only runners behind one
+			// NAT/proxy do not share one IP bucket.
+			provenRunnerID := ""
 			switch {
 			case perRunnerConfigured:
 				// Per-runner credentials exist: the shared token is rejected
 				// here (it can never impersonate a specific runner ID).
-				if _, ok, berr := s.runnerBearerID(r); berr != nil {
+				id, ok, berr := s.runnerBearerID(r)
+				if berr != nil {
 					s.serverError(w, r, http.StatusServiceUnavailable, berr, "runner authentication store unavailable")
 					return
-				} else if !ok && !mtls {
+				}
+				if ok {
+					provenRunnerID = id
+				} else if !mtls {
 					http.Error(w, "unauthorized", http.StatusUnauthorized)
 					return
 				}
@@ -1392,6 +1403,14 @@ func (s *Server) auth(next http.Handler) http.Handler {
 					http.Error(w, "runner client certificate required", http.StatusUnauthorized)
 					return
 				}
+				if provenRunnerID == "" {
+					if peerID, perr := s.peerRunnerID(r); perr == nil {
+						provenRunnerID = peerID
+					}
+				}
+			}
+			if provenRunnerID != "" {
+				r = r.WithContext(auth.WithRunnerIdentity(r.Context(), provenRunnerID))
 			}
 			next.ServeHTTP(w, r)
 			return
@@ -2902,6 +2921,89 @@ func (s *Server) writeRunnerProfileDB(ctx context.Context, runner, old model.Run
 	return nil
 }
 
+// registrationRevocationReason is the audit/rejection reason recorded when a
+// fresh registration supersedes the runner's previous incarnation.
+const registrationRevocationReason = "runner re-registered; superseded incarnation revoked"
+
+// registerRunnerWithRevocation performs the registration write together with
+// the predecessor incarnation's lease revocation.
+//
+// When the store provides the transactional RunnerRegistrationStore
+// capability (PostgresStore), the incarnation swap and the full revocation
+// (requeue per infrastructure-retry budget, release resource reservations
+// and capacity slots, clear lease columns, move quota counters and runner
+// counters, recompute dependents/runs, write audit) commit in ONE
+// schema-fenced transaction. Otherwise the guarded profile write remains the
+// commit point and the revocation is applied afterwards through
+// RevokeRunnerLeases, with the incarnation fence (heartbeat/next/complete
+// plus the sensitive durable-write endpoints) as the fail-closed backstop.
+func (s *Server) registerRunnerWithRevocation(ctx context.Context, runner, old model.Runner, create bool) ([]string, error) {
+	if rs, ok := s.DB.(storage.RunnerRegistrationStore); ok {
+		revoked, err := rs.RegisterRunnerAndRevokeLeases(ctx, runner, registrationRevocationReason)
+		if err != nil {
+			return nil, err
+		}
+		if create {
+			if hs, ok := s.DB.(storage.RunnerHeartbeatStore); ok {
+				_ = hs.TouchRunnerLastSeen(ctx, runner.ID)
+			}
+		}
+		return revoked, nil
+	}
+	if err := s.writeRunnerProfileDB(ctx, runner, old, create); err != nil {
+		return nil, err
+	}
+	if rs, ok := s.DB.(storage.RecoveryStore); ok {
+		revoked, err := rs.RevokeRunnerLeases(ctx, runner.ID, registrationRevocationReason)
+		if err != nil {
+			// The profile write already committed; the registration stands
+			// and the incarnation fence blocks the superseded process from
+			// the sensitive endpoints. A failed best-effort revoke is
+			// surfaced for operators instead of failing the ACK the store
+			// cannot undo.
+			s.logError("register: predecessor lease revocation failed", "runner", runner.ID, "error", err.Error())
+			return nil, nil
+		}
+		return revoked, nil
+	}
+	return nil, nil
+}
+
+// revokeRunnerLeasesLocked invalidates every running lease held by runnerID
+// in the single-process (memory/fs) state, mirroring the DB transaction's
+// requeue-or-cancel decision, lease clearing, capacity-slot release and
+// failure accounting. It MUST run under s.mu. The caller recomputes run
+// aggregation afterwards (scheduleStateLocked).
+func (s *Server) revokeRunnerLeasesLocked(runnerID, reason string, now time.Time) []string {
+	revoked := []string{}
+	for id, j := range s.jobs {
+		if j.Status != model.StatusRunning || j.LeaseRunnerID != runnerID {
+			continue
+		}
+		requeue := j.Attempts <= j.MaxInfraRetries
+		if requeue {
+			j.Status = model.StatusQueued
+			j.Error = reason + "; retrying"
+		} else {
+			j.Status = model.StatusCancelled
+			j.Error = reason
+			j.FinishedAt = &now
+		}
+		j.LeaseRunnerID = ""
+		j.LeaseTokenHash = nil
+		j.LeaseExpiresAt = nil
+		s.jobs[id] = j
+		s.releaseRunnerLocked(runnerID, id, model.StatusFailure)
+		action := "job.runner_disabled_cancelled"
+		if requeue {
+			action = "job.runner_disabled_requeued"
+		}
+		s.auditLocked(action, "admin", j.RunID, j.ID, reason, map[string]string{"job": j.Key, "runner": runnerID})
+		revoked = append(revoked, id)
+	}
+	return revoked
+}
+
 func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	var in model.Runner
 	if !decode(w, r, &in) {
@@ -3027,6 +3129,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 			s.internalError(w, r, gerr, "")
 			return
 		}
+		createRunner := errors.Is(gerr, storage.ErrNotFound)
 		// Re-registration must not clear admin state: a disabled runner
 		// stays disabled and a draining runner keeps draining until an
 		// admin re-enables it.
@@ -3052,12 +3155,26 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		// this caller.
 		in.ActiveJobs, in.CurrentJob, in.Busy = nil, "", false
 		in.Completed, in.Failed = 0, 0
-		if err := s.writeRunnerProfileDB(r.Context(), in, old, true); err != nil {
-			s.internalError(w, r, err, "")
+		// The registration swap and the predecessor incarnation's lease
+		// revocation commit together (atomically on stores that support the
+		// transactional registration contract), so the superseded process
+		// loses its capacity and its durable-write credentials with the
+		// incarnation swap.
+		revoked, rerr := s.registerRunnerWithRevocation(r.Context(), in, old, createRunner)
+		if rerr != nil {
+			s.internalError(w, r, rerr, "")
 			return
 		}
 		// Echo the lease-owned fields a guarded store preserved so the
 		// registration ACK describes the current row exactly as before.
+		// Leases revoked by the swap are no longer active, so they are
+		// dropped from the echo.
+		for _, revokedID := range revoked {
+			old.ActiveJobs = removeString(old.ActiveJobs, revokedID)
+			if old.CurrentJob == revokedID {
+				old.CurrentJob = ""
+			}
+		}
 		in.ActiveJobs = append([]string{}, old.ActiveJobs...)
 		if len(in.ActiveJobs) == 0 && old.CurrentJob != "" {
 			in.ActiveJobs = []string{old.CurrentJob}
@@ -3084,12 +3201,16 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		in.Registered = now
 	} else {
 		in.Registered = old.Registered
-		in.Completed = old.Completed
-		in.Failed = old.Failed
 	}
 	if in.Capacity < 1 && !s.RequireProfiles {
 		in.Capacity = 1
 	}
+	// Re-registration revokes the predecessor incarnation's leases BEFORE
+	// the new session is installed: the superseded process loses its
+	// capacity slots, reservations and lease credentials as part of the
+	// incarnation swap (the DB counterpart is registerRunnerWithRevocation).
+	s.revokeRunnerLeasesLocked(in.ID, registrationRevocationReason, now)
+	old = s.runners[in.ID]
 	incarnation, ierr := newID()
 	if ierr != nil {
 		s.mu.Unlock()
@@ -3107,12 +3228,14 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	if len(in.ActiveJobs) > 0 {
 		in.CurrentJob = in.ActiveJobs[0]
 	}
+	in.Completed, in.Failed = old.Completed, old.Failed
 	s.runners[in.ID] = in
 	s.auditLocked("runner.register", in.Name, "", "", "runner registered", nil)
 	// Persist failure keeps the in-memory registration and answers 200;
 	// /readiness 503 + degraded is the compensating control, and the runner
 	// re-registers once the store heals.
 	s.persistCheckedLocked("runner.register")
+	s.scheduleStateLocked()
 	s.mu.Unlock()
 	s.recordRunnerRegistration(in.ID, in.ProtocolMax)
 	writeJSON(w, http.StatusOK, newRegisterResponse(in, s.RequireProfiles || hasProfile))
@@ -3265,6 +3388,12 @@ func (s *Server) runnerDrain(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		ri.Draining = true
+		// A drained runner takes no new work: drop its traversal
+		// continuation position so a later re-enable starts its round-robin
+		// sweep from the head instead of resuming an abandoned position.
+		if s.Sched != nil {
+			s.Sched.DropScanState(id)
+		}
 		writeJSON(w, http.StatusOK, ri)
 		return
 	}
@@ -3347,6 +3476,12 @@ func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
 		// The durable revocation is committed; mirror it locally so this
 		// replica rejects the certificate immediately.
 		s.mirrorRunnerCertRevoked(ri)
+		// A disabled runner takes no new work: drop its traversal
+		// continuation position so a re-registered runner starts from the
+		// head.
+		if s.Sched != nil {
+			s.Sched.DropScanState(id)
+		}
 		writeJSON(w, http.StatusOK, ri)
 		return
 	}
@@ -3637,6 +3772,22 @@ func (s *Server) runnerIncarnationCurrent(ctx context.Context, runnerID, incarna
 		return false
 	}
 	return cur.Incarnation == "" || cur.Incarnation == incarnation
+}
+
+// requireCurrentRunnerIncarnation is the shared gate for the sensitive
+// runner endpoints: it renders the same refusal shape as heartbeat/next/
+// complete (409 with the superseded-session body) when the presented
+// incarnation is not the latest registration for the runner that owns the
+// lease. Endpoints call it after the lease/token authorization resolved the
+// owning runner, so OIDC issuance, secret delivery and artifact/snapshot/
+// cache uploads cannot be driven by a superseded process for the remaining
+// lease TTL.
+func (s *Server) requireCurrentRunnerIncarnation(w http.ResponseWriter, r *http.Request, runnerID string) bool {
+	if s.runnerIncarnationCurrent(r.Context(), runnerID, r.Header.Get(RunnerIncarnationHeader)) {
+		return true
+	}
+	http.Error(w, "runner session superseded by a newer registration", http.StatusConflict)
+	return false
 }
 
 // checkSchemaCompatibility is the fail-closed compatibility gate for DB
@@ -4064,7 +4215,26 @@ func (s *Server) nextDB(w http.ResponseWriter, r *http.Request, id string) {
 	// The bounded lease-scan policy is re-applied here too, so config loaded
 	// after SwitchToDB takes effect on the next poll.
 	s.Sched.SetLeaseScanLimits(s.LeaseCandidatePageSize, s.LeaseMaxCandidateRows, s.LeaseReservationWait)
-	j, rawToken, exp, err := s.Sched.Lease(ctx, id, time.Now().UTC())
+	// The lease tick uses the DATABASE clock (storage.ClockStore.Now), never
+	// the serving replica's application clock: the scheduler's queue-deadline
+	// and aging decisions must agree with the clock the durable rows were
+	// written under, so a skewed replica cannot lease a row past its queue
+	// deadline (the claim re-asserts it in SQL) or misjudge aged priority.
+	// A missing capability or a failed read fails the lease request instead
+	// of silently falling back to time.Now().
+	dbClock, ok := s.DB.(storage.ClockStore)
+	if !ok {
+		s.logError("next: store lacks the database clock capability; refusing lease")
+		http.Error(w, "database clock unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	leaseNow, err := dbClock.Now(ctx)
+	if err != nil {
+		s.logError("next: database clock read failed; refusing lease", "error", err.Error())
+		http.Error(w, "database clock unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	j, rawToken, exp, err := s.Sched.Lease(ctx, id, leaseNow.UTC())
 	switch {
 	case errors.Is(err, scheduler.ErrNotLeader):
 		http.Error(w, "scheduler standby", http.StatusServiceUnavailable)
