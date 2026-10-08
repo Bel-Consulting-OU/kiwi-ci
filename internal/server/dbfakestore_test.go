@@ -3465,29 +3465,36 @@ func (f *dbFakeStore) ExpireDownstreamReservations(ctx context.Context, olderTha
 	return n, nil
 }
 
-func (f *dbFakeStore) GetGeneratedFragment(ctx context.Context, parentJobID, fragmentID string) (storage.GeneratedFragmentReceipt, bool, error) {
+func (f *dbFakeStore) GetGeneratedFragment(ctx context.Context, parentJobID, mutationSlot string) (storage.GeneratedFragmentReceipt, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	rec, ok := f.fragments[fragmentReceiptKey(parentJobID, fragmentID)]
+	if mutationSlot == "" {
+		return storage.GeneratedFragmentReceipt{}, false, fmt.Errorf("storage: empty mutation slot")
+	}
+	rec, ok := f.fragments[fragmentReceiptKey(parentJobID, mutationSlot)]
 	return rec, ok, nil
 }
 
 // fragmentReceiptKey mirrors the canonical generated_fragments mutation key
-// (parent job, fragment id): the lease generation authorizes an upload but
-// never defines the mutation.
-func fragmentReceiptKey(parentJobID, fragmentID string) string {
-	return parentJobID + ":" + fragmentID
+// (parent job, mutation slot): the lease generation authorizes an upload but
+// never defines the mutation, and the fragment digest is stored in the
+// receipt so a different digest for the slot is a conflict, not a new key.
+func fragmentReceiptKey(parentJobID, mutationSlot string) string {
+	return parentJobID + ":" + mutationSlot
 }
 
 // InsertGeneratedFragmentTx mirrors the SQL transaction under f.mu: the
 // storage-owned lease predicate runs FIRST at the fake store's clock under
-// the lock (authorization always precedes the receipt replay, so a stale
+// the lock (authorization always precedes the receipt resolution, so a stale
 // generation or token can never observe the stored children), then a
-// committed receipt for the canonical (parent, fragment id) mutation key is
-// returned with replayed=true and nothing is inserted; otherwise the
-// verifier runs with the run's job count read under that lock and the
-// fragment + receipt commit atomically.
+// committed receipt for the canonical (parent, mutation slot) key is
+// resolved — the SAME fragment digest replays with replayed=true and nothing
+// is inserted, a DIFFERENT digest is refused with
+// storage.ErrGeneratedMutationConflict; otherwise the verifier runs with the
+// run's job count read under that lock and the fragment + receipt commit
+// atomically.
 func (f *dbFakeStore) InsertGeneratedFragmentTx(ctx context.Context, req storage.GeneratedFragmentRequest, verify storage.GeneratedJobVerifier) (storage.GeneratedFragmentReceipt, bool, error) {
+	slot := storage.GeneratedFragmentSlot(req.MutationSlot)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	parent, ok := f.jobs[req.ParentJobID]
@@ -3498,8 +3505,16 @@ func (f *dbFakeStore) InsertGeneratedFragmentTx(ctx context.Context, req storage
 	if err := storage.ValidateGeneratedParentLease(parent, req, commitNow); err != nil {
 		return storage.GeneratedFragmentReceipt{}, false, err
 	}
-	key := fragmentReceiptKey(req.ParentJobID, req.FragmentID)
+	key := fragmentReceiptKey(req.ParentJobID, slot)
 	if rec, ok := f.fragments[key]; ok {
+		if rec.FragmentID != req.FragmentID {
+			return storage.GeneratedFragmentReceipt{}, false, &storage.GeneratedMutationConflictError{
+				ParentJobID:         req.ParentJobID,
+				MutationSlot:        slot,
+				ExistingFragmentID:  rec.FragmentID,
+				SubmittedFragmentID: req.FragmentID,
+			}
+		}
 		return rec, true, nil
 	}
 	count := 0
@@ -3522,6 +3537,7 @@ func (f *dbFakeStore) InsertGeneratedFragmentTx(ctx context.Context, req storage
 	rec := storage.GeneratedFragmentReceipt{
 		ParentJobID:     req.ParentJobID,
 		LeaseGeneration: req.LeaseGeneration,
+		MutationSlot:    slot,
 		FragmentID:      req.FragmentID,
 		Children:        append([]storage.GeneratedFragmentChild(nil), req.Children...),
 		CreatedAt:       commitNow,

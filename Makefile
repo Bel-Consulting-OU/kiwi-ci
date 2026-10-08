@@ -29,7 +29,7 @@ test-integration: integration
 # against a throwaway database; every test creates and drops its own schema.
 integration:
 	@test -n "$$KIWI_TEST_POSTGRES_URL" || { echo "integration: set KIWI_TEST_POSTGRES_URL (e.g. postgres://postgres:pass@localhost:5432/kiwi?sslmode=disable)"; exit 1; }
-	go test -count=1 -timeout=45m -run Integration ./internal/storage ./internal/scheduler ./internal/server ./internal/app
+	go test -count=1 -timeout=90m -run Integration ./internal/storage ./internal/scheduler ./internal/server ./internal/app
 
 test-adversarial:
 	go test -run 'Adversarial|Security|Property|Fault|Symlink|Traversal|Tamper|Reject|Evil|Bomb' -shuffle=on ./...
@@ -76,7 +76,7 @@ coverage-report:
 # per-package report and the coverage floor.
 coverage-ci:
 	go test -timeout=45m -coverprofile=coverage.out -covermode=atomic ./...
-	go test -count=1 -timeout=45m -run Integration -covermode=atomic -coverprofile=integration-coverage.out -coverpkg=./... ./internal/storage ./internal/scheduler ./internal/server ./internal/app
+	go test -count=1 -timeout=90m -run Integration -covermode=atomic -coverprofile=integration-coverage.out -coverpkg=./... ./internal/storage ./internal/scheduler ./internal/server ./internal/app
 	./scripts/ci-coverage-selftest.sh coverage.out integration-coverage.out
 	./scripts/merge-coverage.sh merged-coverage.out coverage.out integration-coverage.out
 	./scripts/coverage-report.sh merged-coverage.out

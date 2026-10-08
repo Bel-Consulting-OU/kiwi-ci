@@ -272,10 +272,20 @@ func TestDynamicGenerateDBMode(t *testing.T) {
 		t.Fatalf("child not inserted through DynamicStore: %+v", child)
 	}
 	_ = runnerID
-	// The parent's lease must still be valid for a second fragment.
-	w = doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", fragmentBody(t, `{"jobs":{"child-b":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo b"}]}},"deps":{}}`), leaseHeaders(task, runnerID))
-	if w.Code != http.StatusCreated {
-		t.Fatalf("db second fragment = %d: %s", w.Code, w.Body.String())
+	// The parent's lease must still be valid for a replay of the admitted
+	// fragment. A DIFFERENT fragment would be the nondeterministic-retry
+	// conflict (409), covered by TestDynamicFragmentDifferentIDConflicts.
+	body := fragmentBody(t, frag)
+	w = doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", body, leaseHeaders(task, runnerID))
+	if w.Code != http.StatusOK {
+		t.Fatalf("db replay = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	var replay generatedResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &replay); err != nil {
+		t.Fatal(err)
+	}
+	if !replay.Replayed || len(replay.JobIDs) != len(res.JobIDs) {
+		t.Fatalf("db replay = %+v, first = %+v", replay, res)
 	}
 }
 

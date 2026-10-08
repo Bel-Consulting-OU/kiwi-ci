@@ -1,10 +1,7 @@
 package runner
 
 import (
-	"encoding/json"
-	"fmt"
-	"reflect"
-
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/execution"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
@@ -17,10 +14,11 @@ import (
 // pipeline.VerifyCompiledJobBinding verifier — the same code the exact replay
 // path runs — so a payload the runner accepts can never be rejected (or
 // silently differ) on replay, and vice versa. What stays runner-local is the
-// TRUST policy: the effective capabilities and the untrusted floor. The
-// returned caps are the effective policy capabilities to re-check admission
-// against; policyOK is false when the payload carries no policy (legacy
-// compiler) and the caller keeps only the baseline admission check.
+// TRUST policy seam (payloadLocalBindingCheck); the capability decode and the
+// untrusted floor are the shared execution.EffectivePolicyCapabilities, which
+// exact replay and the artifact provenance path run too. policyOK is false
+// when the payload carries no policy (legacy compiler) and the caller keeps
+// only the baseline admission check.
 //
 // Any mismatch refuses execution: the runner never runs bytes the control
 // plane did not compile deterministically.
@@ -43,72 +41,30 @@ func verifyCompiledPayload(spec *pipeline.Spec, key string, p *model.CompiledJob
 	if err != nil {
 		return cj, caps, false, err
 	}
-	if p.EffectivePolicy == nil {
-		return cj, caps, false, nil
-	}
-	policyRaw, err := json.Marshal(p.EffectivePolicy)
+	caps, policyOK, err = execution.EffectivePolicyCapabilities(p, trusted)
 	if err != nil {
-		return cj, caps, false, fmt.Errorf("compiled payload: encode effective policy: %w", err)
+		return cj, caps, false, err
 	}
-	if err := json.Unmarshal(policyRaw, &caps); err != nil {
-		return cj, caps, false, fmt.Errorf("compiled payload: decode effective policy: %w", err)
-	}
-	if !trusted {
-		// The untrusted hard floor must hold: an effective policy that is
-		// not already a subset of the floor is a mismatch, not something
-		// the runner silently narrows.
-		eff := caps.Effective(false)
-		if !reflect.DeepEqual(eff, caps) {
-			return cj, caps, false, fmt.Errorf("compiled payload policy exceeds the untrusted capability floor")
-		}
-		caps = eff
-	}
-	return cj, caps, true, nil
+	return cj, caps, policyOK, nil
 }
 
-// effectivePolicySandbox is the runner-side extension of the compiled
-// payload's effective policy: policy.Capabilities carries the capability
-// intersection, and the daemon-level sandbox requirements (rootless,
-// read_only_rootfs, non_root) ride the same policy JSON as additive fields
-// emitted by the control plane's policy compilation. Absent fields decode
-// as false, so legacy payloads that carry no sandbox requirements are
-// no-ops.
-type effectivePolicySandbox struct {
-	Rootless       bool `json:"rootless"`
-	ReadOnlyRootFS bool `json:"read_only_rootfs"`
-	// NonRoot demands the job run as an unprivileged user; the executor's
-	// container backend enforces it (rootful: --user=65534:65534; rootless:
-	// userns-mapped container UID 0, documented in pipeline.Sandbox) and
-	// refuses runtimes that cannot enforce it.
-	NonRoot bool `json:"non_root"`
-}
+// effectivePolicySandbox and the payloadSandboxRequirements/applyEffectiveSandbox
+// helpers are thin runner-side aliases of the shared execution package, kept so
+// the runner keeps its package-local seam surface; the implementation (and the
+// exact decode semantics the distributed runner and replay share) lives in
+// internal/execution.
+type effectivePolicySandbox = execution.PolicySandbox
 
 // payloadSandboxRequirements decodes the sandbox requirements the effective
 // policy demands. A nil payload or a payload without an effective policy
 // yields no requirements (the local legacy compile path is authoritative
 // for those).
 func payloadSandboxRequirements(p *model.CompiledJobPayload) (effectivePolicySandbox, error) {
-	var out effectivePolicySandbox
-	if p == nil || p.EffectivePolicy == nil {
-		return out, nil
-	}
-	raw, err := json.Marshal(p.EffectivePolicy)
-	if err != nil {
-		return out, fmt.Errorf("encode effective policy: %w", err)
-	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return out, fmt.Errorf("decode effective policy: %w", err)
-	}
-	return out, nil
+	return execution.PayloadSandboxRequirements(p)
 }
 
 // applyEffectiveSandbox copies the effective policy's sandbox requirements
-// into the compiled job before execution. Requirements can only strengthen:
-// a job that did not request rootless gains the requirement when the
-// effective policy demands it, and an explicit job-level request is never
-// weakened.
+// into the compiled job before execution. Requirements can only strengthen.
 func applyEffectiveSandbox(cj *pipeline.CompiledJob, req effectivePolicySandbox) {
-	cj.Job.Sandbox.Rootless = cj.Job.Sandbox.Rootless || req.Rootless
-	cj.Job.Sandbox.ReadOnlyRootFS = cj.Job.Sandbox.ReadOnlyRootFS || req.ReadOnlyRootFS
-	cj.Job.Sandbox.NonRoot = cj.Job.Sandbox.NonRoot || req.NonRoot
+	execution.ApplyEffectiveSandbox(cj, req)
 }

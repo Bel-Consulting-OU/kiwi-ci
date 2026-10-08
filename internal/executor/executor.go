@@ -137,6 +137,14 @@ type Options struct {
 	// any status other than skipped/blocked) under the host temp dir.
 	// Snapshot failures are logged as warnings and never change job status.
 	CaptureSnapshot bool
+	// PreJobCheckpoint, when set, is invoked exactly once per executed job,
+	// AFTER every restore (cache/downloads; the distributed runner's checkout
+	// ran before RunCompiledJob) has completed and BEFORE any service or step
+	// can mutate the workspace. The distributed runner wires it to capture a
+	// pre_job workspace snapshot for exact replay. A checkpoint error is a
+	// warning only: like the post-job capture, snapshot evidence never fails
+	// the job.
+	PreJobCheckpoint func(ctx context.Context) error
 	// WorkspaceMaxBytes rejects a job before execution when the filesystem
 	// containing the workspace reports fewer free bytes than the quota, so
 	// an oversized workspace never half-runs. Zero disables the check.
@@ -616,6 +624,15 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			res.Status = model.StatusFailure
 			res.Error = err.Error()
 			return finish(res)
+		}
+	}
+	// Pre-execution checkpoint: exactly once per attempt, after every
+	// restore above and before any service container or step can touch the
+	// workspace. The hook is evidence capture, so a failure is a warning
+	// mirroring the post-job capture path and never changes the job status.
+	if e.Opt.PreJobCheckpoint != nil {
+		if err := e.Opt.PreJobCheckpoint(ctx); err != nil {
+			e.log(cj.ID, "snapshot", "pre-job checkpoint warning: "+err.Error())
 		}
 	}
 	// Sandbox requirements must never be silently unenforced: native and tart

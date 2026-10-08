@@ -15,9 +15,23 @@ import (
 
 // executionEventsResponse is the GET /api/v1/events body: the ascending page
 // plus the cursor a follow-up call must send as ?after.
+//
+// Canonical is true only in DB mode, where the stream is the authoritative
+// commit-ordered PostgreSQL feed; fs/memory mode reports false because the
+// journal is best-effort (a failed fs append consumes a cursor but loses the
+// record), so consumers must treat it as a non-canonical mirror.
+//
+// LatestCursor is the latest committed cursor: MAX(seq) in DB mode, the
+// durable journal watermark in fs mode. A consumer can snapshot state, read
+// latest_cursor, then poll after=latest_cursor and miss no event in between.
+// Events are currently retained indefinitely (no windowed retention exists
+// yet), so there is no 410 cursor-expired path; a cursor below the oldest
+// retained event is impossible today.
 type executionEventsResponse struct {
-	Events     []model.ExecutionEvent `json:"events"`
-	NextCursor string                 `json:"next_cursor"`
+	Events       []model.ExecutionEvent `json:"events"`
+	NextCursor   string                 `json:"next_cursor"`
+	Canonical    bool                   `json:"canonical"`
+	LatestCursor string                 `json:"latest_cursor"`
 }
 
 // Execution event stream tuning, mirroring logs_stream.go.
@@ -111,9 +125,10 @@ func (s *Server) appendJobEventLocked(j model.Job, from, to model.Status, actor 
 }
 
 // listEvents serves GET /api/v1/events: the canonical ascending event page
-// plus its next cursor. The route is admin tier (same as /api/v1/audit:
-// auth.ActionFor does not map it, so classifyRoute sends it to the blanket
-// admin gate).
+// plus its next cursor, the store's latest committed cursor (bootstrap
+// reference) and the canonical flag (true only in DB mode). The route is
+// admin tier (same as /api/v1/audit: auth.ActionFor does not map it, so
+// classifyRoute sends it to the blanket admin gate).
 func (s *Server) listEvents(w http.ResponseWriter, r *http.Request) {
 	if !s.executionEventsSupported(w) {
 		return
@@ -129,7 +144,37 @@ func (s *Server) listEvents(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, r, err, "")
 		return
 	}
-	writeJSON(w, http.StatusOK, executionEventsResponse{Events: events, NextCursor: strconv.FormatInt(cursor, 10)})
+	latest, err := s.latestExecutionEventSeq(r.Context(), cursor)
+	if err != nil {
+		s.internalError(w, r, err, "")
+		return
+	}
+	writeJSON(w, http.StatusOK, executionEventsResponse{
+		Events:       events,
+		NextCursor:   strconv.FormatInt(cursor, 10),
+		Canonical:    s.DB != nil,
+		LatestCursor: strconv.FormatInt(latest, 10),
+	})
+}
+
+// latestExecutionEventSeq resolves the latest committed cursor for the list
+// response: the optional ExecutionEventCursorStore read when the configured
+// store implements it (PostgreSQL MAX(seq), fs journal watermark), and the
+// page cursor as the best-effort fallback for a store without the read or a
+// server without a persistent store. The fallback is never above the true
+// watermark for the stores this server builds (both implement the read), and
+// the canonical flag tells consumers which mode they are on.
+func (s *Server) latestExecutionEventSeq(ctx context.Context, fallback int64) (int64, error) {
+	if s.DB != nil {
+		if cs, ok := s.DB.(storage.ExecutionEventCursorStore); ok {
+			return cs.LatestExecutionEventSeq(ctx)
+		}
+		return fallback, nil
+	}
+	if s.store == nil {
+		return fallback, nil
+	}
+	return s.store.LatestExecutionEventSeq(ctx)
 }
 
 // executionEventsSupported reports whether the configured store can serve the

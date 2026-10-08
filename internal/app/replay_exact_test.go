@@ -14,14 +14,25 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/execution"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executor"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
 )
 
 // recordedExport builds the control plane's exact-replay export body for one
 // job of text with coherent digests; mutate, when non-nil, tampers the
 // payload after the digests are computed (simulating a corrupt record).
 func recordedExport(t *testing.T, text, key string, mutate func(*model.CompiledJobPayload)) string {
+	t.Helper()
+	return recordedExportWithPersisted(t, text, key, mutate, map[string]any{"trusted": true})
+}
+
+// recordedExportWithPersisted is recordedExport with an explicit persisted
+// job state (trust, resource requests, legacy network) so tests can exercise
+// the shared materializer's trust/resource overlays.
+func recordedExportWithPersisted(t *testing.T, text, key string, mutate func(*model.CompiledJobPayload), persisted map[string]any) string {
 	t.Helper()
 	spec, err := pipeline.Parse([]byte(text))
 	if err != nil {
@@ -60,6 +71,7 @@ func recordedExport(t *testing.T, text, key string, mutate func(*model.CompiledJ
 		"key":                  key,
 		"pipeline":             text,
 		"compiled_job_payload": payload,
+		"persisted_job":        persisted,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -131,7 +143,7 @@ func TestReplayExactIgnoresLocalPipelineFile(t *testing.T) {
 	historical := "version: 1\njobs:\n  build:\n    steps:\n      - run: echo historical\n"
 	env := newExactReplayEnv(t,
 		recordedExport(t, historical, "build", nil),
-		[][]model.SnapshotRecord{exactPage(model.SnapshotRecord{ID: "snap1", JobKey: "build", LeaseGeneration: 1, CreatedAt: time.Now().UTC()})},
+		[][]model.SnapshotRecord{exactPage(model.SnapshotRecord{ID: "snap1", JobKey: "build", LeaseGeneration: 1, Phase: model.SnapshotPhasePreJob, CreatedAt: time.Now().UTC()})},
 		nil,
 		map[string][]byte{"snap1": snapshotArchive(t)},
 	)
@@ -156,7 +168,7 @@ func TestReplayExactRefusesMismatchedPayload(t *testing.T) {
 		recordedExport(t, historical, "build", func(p *model.CompiledJobPayload) {
 			p.PipelineDigest = strings.Repeat("0", 64)
 		}),
-		[][]model.SnapshotRecord{exactPage(model.SnapshotRecord{ID: "snap1", JobKey: "build", LeaseGeneration: 1, CreatedAt: time.Now().UTC()})},
+		[][]model.SnapshotRecord{exactPage(model.SnapshotRecord{ID: "snap1", JobKey: "build", LeaseGeneration: 1, Phase: model.SnapshotPhasePreJob, CreatedAt: time.Now().UTC()})},
 		nil,
 		map[string][]byte{"snap1": snapshotArchive(t)},
 	)
@@ -178,8 +190,8 @@ func TestReplayExactSelectsRequestedAttempt(t *testing.T) {
 	env := newExactReplayEnv(t,
 		recordedExport(t, historical, "build", nil),
 		[][]model.SnapshotRecord{exactPage(
-			model.SnapshotRecord{ID: "snap-old", JobKey: "build", LeaseGeneration: 1, CreatedAt: now.Add(-time.Hour)},
-			model.SnapshotRecord{ID: "snap-new", JobKey: "build", LeaseGeneration: 2, CreatedAt: now},
+			model.SnapshotRecord{ID: "snap-old", JobKey: "build", LeaseGeneration: 1, Phase: model.SnapshotPhasePreJob, CreatedAt: now.Add(-time.Hour)},
+			model.SnapshotRecord{ID: "snap-new", JobKey: "build", LeaseGeneration: 2, Phase: model.SnapshotPhasePreJob, CreatedAt: now},
 		)},
 		nil,
 		map[string][]byte{"snap-old": snapshotArchive(t), "snap-new": snapshotArchive(t)},
@@ -205,7 +217,7 @@ func TestReplayExactRefusesMissingAttempt(t *testing.T) {
 	historical := "version: 1\njobs:\n  build:\n    steps:\n      - run: echo historical\n"
 	env := newExactReplayEnv(t,
 		recordedExport(t, historical, "build", nil),
-		[][]model.SnapshotRecord{exactPage(model.SnapshotRecord{ID: "snap1", JobKey: "build", LeaseGeneration: 1, CreatedAt: time.Now().UTC()})},
+		[][]model.SnapshotRecord{exactPage(model.SnapshotRecord{ID: "snap1", JobKey: "build", LeaseGeneration: 1, Phase: model.SnapshotPhasePreJob, CreatedAt: time.Now().UTC()})},
 		nil,
 		map[string][]byte{"snap1": snapshotArchive(t)},
 	)
@@ -227,8 +239,8 @@ func TestReplayExactPaginatesSnapshotList(t *testing.T) {
 	env := newExactReplayEnv(t,
 		recordedExport(t, historical, "build", nil),
 		[][]model.SnapshotRecord{
-			exactPage(model.SnapshotRecord{ID: "snap1", JobKey: "build", LeaseGeneration: 1, CreatedAt: now.Add(-time.Hour)}),
-			exactPage(model.SnapshotRecord{ID: "snap2", JobKey: "build", LeaseGeneration: 2, CreatedAt: now}),
+			exactPage(model.SnapshotRecord{ID: "snap1", JobKey: "build", LeaseGeneration: 1, Phase: model.SnapshotPhasePreJob, CreatedAt: now.Add(-time.Hour)}),
+			exactPage(model.SnapshotRecord{ID: "snap2", JobKey: "build", LeaseGeneration: 2, Phase: model.SnapshotPhasePreJob, CreatedAt: now}),
 		},
 		[]string{"cur1"},
 		map[string][]byte{"snap1": snapshotArchive(t), "snap2": snapshotArchive(t)},
@@ -257,7 +269,7 @@ func TestReplayDebugRerunUsesLocalPipelineAndWarns(t *testing.T) {
 	historical := "version: 1\njobs:\n  build:\n    steps:\n      - run: echo recorded\n"
 	env := newExactReplayEnv(t,
 		recordedExport(t, historical, "build", nil),
-		[][]model.SnapshotRecord{exactPage(model.SnapshotRecord{ID: "snap1", JobKey: "build", LeaseGeneration: 1, CreatedAt: time.Now().UTC()})},
+		[][]model.SnapshotRecord{exactPage(model.SnapshotRecord{ID: "snap1", JobKey: "build", LeaseGeneration: 1, Phase: model.SnapshotPhasePreJob, CreatedAt: time.Now().UTC()})},
 		nil,
 		map[string][]byte{"snap1": snapshotArchive(t)},
 	)
@@ -277,5 +289,136 @@ func TestReplayDebugRerunUsesLocalPipelineAndWarns(t *testing.T) {
 	}
 	if !strings.Contains(string(warned), "CURRENT pipeline file") || !strings.Contains(string(warned), "may differ") {
 		t.Fatalf("missing debug-rerun warning: %q", string(warned))
+	}
+}
+
+// captureReplayOptions installs the replay options seam for one test and
+// returns an accessor for the last derived executor options.
+func captureReplayOptions(t *testing.T) func() (executor.Options, bool) {
+	t.Helper()
+	orig := replayOptionsSeam
+	var got executor.Options
+	var seen bool
+	replayOptionsSeam = func(o executor.Options) {
+		got, seen = o, true
+	}
+	t.Cleanup(func() { replayOptionsSeam = orig })
+	return func() (executor.Options, bool) { return got, seen }
+}
+
+// TestReplayExactPrefersPreJobSnapshot: when an attempt has BOTH a pre_job
+// checkpoint and a post_job outcome snapshot, exact replay must select the
+// pre_job record (the only state that predates the attempt's mutations).
+func TestReplayExactPrefersPreJobSnapshot(t *testing.T) {
+	historical := "version: 1\njobs:\n  build:\n    steps:\n      - run: echo historical\n"
+	now := time.Now().UTC()
+	env := newExactReplayEnv(t,
+		recordedExport(t, historical, "build", nil),
+		[][]model.SnapshotRecord{exactPage(
+			model.SnapshotRecord{ID: "snap-pre", JobKey: "build", LeaseGeneration: 1, Phase: model.SnapshotPhasePreJob, CreatedAt: now},
+			model.SnapshotRecord{ID: "snap-post", JobKey: "build", LeaseGeneration: 1, Phase: model.SnapshotPhasePostJob, CreatedAt: now.Add(time.Second)},
+		)},
+		nil,
+		map[string][]byte{"snap-pre": snapshotArchive(t), "snap-post": snapshotArchive(t)},
+	)
+	if err := Replay(context.Background(), []string{"--server", env.srv.URL, "run1", "build"}); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if len(env.downloads) != 1 || env.downloads[0] != "snap-pre" {
+		t.Fatalf("downloaded %v, want the pre_job snapshot", env.downloads)
+	}
+	if err := Replay(context.Background(), []string{"--server", env.srv.URL, "--attempt", "1", "run1", "build"}); err != nil {
+		t.Fatalf("replay attempt 1: %v", err)
+	}
+	if len(env.downloads) != 2 || env.downloads[1] != "snap-pre" {
+		t.Fatalf("downloaded %v, want snap-pre for the requested attempt", env.downloads)
+	}
+}
+
+// TestReplayExactRefusesPostJobOnlyAndEscapeHatch: an attempt whose only
+// snapshot is the post-execution outcome must be REFUSED with an actionable
+// error naming the problem, and --allow-post-job-snapshot must select it with
+// a printed warning that execution starts from post-execution state.
+func TestReplayExactRefusesPostJobOnlyAndEscapeHatch(t *testing.T) {
+	historical := "version: 1\njobs:\n  build:\n    steps:\n      - run: echo historical\n"
+	env := newExactReplayEnv(t,
+		recordedExport(t, historical, "build", nil),
+		[][]model.SnapshotRecord{exactPage(
+			model.SnapshotRecord{ID: "snap-post", JobKey: "build", LeaseGeneration: 1, Phase: model.SnapshotPhasePostJob, CreatedAt: time.Now().UTC()},
+		)},
+		nil,
+		map[string][]byte{"snap-post": snapshotArchive(t)},
+	)
+	err := Replay(context.Background(), []string{"--server", env.srv.URL, "run1", "build"})
+	if err == nil || !strings.Contains(err.Error(), "pre_job") || !strings.Contains(err.Error(), "--allow-post-job-snapshot") {
+		t.Fatalf("post-job-only refusal = %v, want the actionable pre_job/escape-hatch error", err)
+	}
+	if len(env.downloads) != 0 {
+		t.Fatalf("downloaded %v despite the refusal", env.downloads)
+	}
+
+	origStderr := os.Stderr
+	pipeR, pipeW, perr := os.Pipe()
+	if perr != nil {
+		t.Fatal(perr)
+	}
+	os.Stderr = pipeW
+	replayErr := Replay(context.Background(), []string{"--server", env.srv.URL, "--allow-post-job-snapshot", "run1", "build"})
+	_ = pipeW.Close()
+	os.Stderr = origStderr
+	warned, _ := io.ReadAll(pipeR)
+	if replayErr != nil {
+		t.Fatalf("escape-hatch replay: %v", replayErr)
+	}
+	if len(env.downloads) != 1 || env.downloads[0] != "snap-post" {
+		t.Fatalf("downloaded %v, want snap-post under the escape hatch", env.downloads)
+	}
+	if !strings.Contains(string(warned), "POST-execution") {
+		t.Fatalf("missing post-execution warning: %q", string(warned))
+	}
+}
+
+// TestReplayExactEnforcesUntrustedFloor: an untrusted recorded job must be
+// replayed under the untrusted network/sandbox/resource floor even when the
+// persisted fields pretend otherwise (network=internet). The recorded
+// effective policy is the authority; the persisted network field is ignored
+// whenever a verified payload policy exists, and the untrusted floor toggles
+// the immutable-image requirement and the mandatory workspace bound.
+func TestReplayExactEnforcesUntrustedFloor(t *testing.T) {
+	historical := "version: 1\njobs:\n  build:\n    steps:\n      - run: echo historical\n"
+	untrusted := recordedExportWithPersisted(t, historical, "build",
+		func(p *model.CompiledJobPayload) {
+			b, merr := json.Marshal(policy.DefaultUntrustedCapabilities())
+			if merr != nil {
+				t.Fatal(merr)
+			}
+			p.EffectivePolicy = json.RawMessage(b)
+		},
+		map[string]any{"trusted": false, "network": "internet"})
+	env := newExactReplayEnv(t,
+		untrusted,
+		[][]model.SnapshotRecord{exactPage(
+			model.SnapshotRecord{ID: "snap-pre", JobKey: "build", LeaseGeneration: 1, Phase: model.SnapshotPhasePreJob, CreatedAt: time.Now().UTC()},
+		)},
+		nil,
+		map[string][]byte{"snap-pre": snapshotArchive(t)},
+	)
+	gotOptions := captureReplayOptions(t)
+	// The untrusted floor demands non-root, which the native runtime cannot
+	// enforce: the replay must finish with failures instead of silently
+	// running the job under weaker conditions.
+	replayErr := Replay(context.Background(), []string{"--server", env.srv.URL, "run1", "build"})
+	if replayErr == nil || !strings.Contains(replayErr.Error(), "failures") {
+		t.Fatalf("untrusted replay = %v, want the sandbox-floor refusal", replayErr)
+	}
+	opts, ok := gotOptions()
+	if !ok {
+		t.Fatal("replay options seam never fired")
+	}
+	if !opts.Untrusted || !opts.RequireImmutableImages {
+		t.Fatalf("replay options = untrusted %t immutable %t, want the untrusted floor", opts.Untrusted, opts.RequireImmutableImages)
+	}
+	if opts.WorkspaceMaxBytes != execution.DefaultUntrustedWorkspaceMaxBytes {
+		t.Fatalf("WorkspaceMaxBytes = %d, want the untrusted default %d", opts.WorkspaceMaxBytes, execution.DefaultUntrustedWorkspaceMaxBytes)
 	}
 }

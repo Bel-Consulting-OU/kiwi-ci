@@ -23,15 +23,20 @@ import (
 //     describe (PostgreSQL: AFTER INSERT/UPDATE triggers on jobs and runs),
 //     so a rolled-back transition never leaves an event behind.
 //
-//     Concurrency note: sequence values are allocated as statements execute,
-//     so an in-flight transaction that already holds seq 5 can commit after
-//     a reader has seen seq 6. Events are never reordered or duplicated, but
-//     a reader that advances its cursor past 5 will not see it afterwards.
-//     Consumers that must not miss a delayed event should, on a suspicious
-//     gap, re-read from a cursor they already passed (for example the last
-//     cursor observed before an idle gap) instead of assuming the stream is
-//     complete. The SSE endpoint re-polls its last advanced cursor, so a
-//     reconnect after a gap resumes from the client's own `after` value.
+//     Commit-ordered cursor: seq is allocated from a single-row locked
+//     cursor (migration 0046, execution_event_cursor) held until commit, so
+//     a later event transaction blocks until the earlier one commits or
+//     rolls back. Allocation order is therefore exactly the visible order:
+//     a reader can never observe seq 6 while seq 5 is still in flight, and a
+//     rollback also rolls back its allocation (no holes). The old BIGSERIAL
+//     allocation could publish out of order and permanently lose an event
+//     behind an advanced cursor; that history is impossible now.
+//
+//     Events are currently retained indefinitely: there is no windowed
+//     retention and therefore no 410 cursor-expired path. Consumers can
+//     snapshot state, read the latest committed cursor (see
+//     ExecutionEventCursorStore / the API's latest_cursor), and then poll
+//     after=latest without a bootstrap gap.
 //
 //   - AppendExecutionEvent persists one manually constructed event. It
 //     exists for the filesystem/memory modes and tests; PostgreSQL
@@ -39,6 +44,16 @@ import (
 type ExecutionEventStore interface {
 	ListExecutionEvents(ctx context.Context, afterSeq int64, limit int, runID string) ([]model.ExecutionEvent, int64, error)
 	AppendExecutionEvent(ctx context.Context, e model.ExecutionEvent) error
+}
+
+// ExecutionEventCursorStore is the optional companion contract for reading
+// the stream's latest committed cursor: MAX(seq) in PostgreSQL, the durable
+// journal watermark for the filesystem repository. The list response's
+// latest_cursor lets a consumer snapshot state, read the cursor, then poll
+// after=latest without a bootstrap gap (events are currently retained
+// indefinitely, so there is no windowed-retention 410 path).
+type ExecutionEventCursorStore interface {
+	LatestExecutionEventSeq(ctx context.Context) (int64, error)
 }
 
 // Execution event page bounds, mirroring the audit/runs page conventions:
@@ -82,13 +97,15 @@ func ExecutionEventType(scope string, from, to model.Status) string {
 }
 
 // ExecutionEventTerminalStatuses are the statuses whose event payload may
-// carry run timings (started_at/finished_at). The PostgreSQL trigger embeds
-// the same set.
+// carry run timings (started_at/finished_at). The PostgreSQL trigger
+// function embeds the same set, including blocked (terminal in the model),
+// and a unit test pins the parity with model.Status.Terminal().
 var ExecutionEventTerminalStatuses = []model.Status{
 	model.StatusSuccess,
 	model.StatusFailure,
 	model.StatusCancelled,
 	model.StatusSkipped,
+	model.StatusBlocked,
 }
 
 // ExecutionEventTimingPayload returns the timing entries (started_at,
@@ -161,7 +178,11 @@ func (s *PostgresStore) ListExecutionEvents(ctx context.Context, afterSeq int64,
 // the manual escape hatch (tests, operator tooling): production DB-mode
 // events are appended by the migration 0045 triggers in the same
 // transaction as the state change, so no production writer calls this. The
-// insert goes through the schema-compatible fence because it is a raw write.
+// insert goes through the schema-compatible fence (raw write) and allocates
+// its seq from the SAME commit-ordered cursor the migration 0046 trigger
+// function uses: the cursor row lock is held to commit, so this append and a
+// concurrent trigger append can never publish out of allocation order and a
+// rollback cannot leave a hole.
 func (s *PostgresStore) AppendExecutionEvent(ctx context.Context, e model.ExecutionEvent) error {
 	if e.Type == "" {
 		return errors.New("storage: execution event type is required")
@@ -183,10 +204,33 @@ func (s *PostgresStore) AppendExecutionEvent(ctx context.Context, e model.Execut
 		t := e.CreatedAt.UTC()
 		createdAt = &t
 	}
-	_, err := s.execSchemaFenced(ctx, `
-		INSERT INTO execution_events (schema_version, run_id, job_id, attempt, event_type, from_status, to_status, actor, payload, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, COALESCE($10, clock_timestamp()))`,
-		schemaVersion, nullText(e.RunID), nullText(e.JobID), e.Attempt, e.Type,
-		nullText(e.FromStatus), nullText(e.ToStatus), nullText(e.Actor), payload, createdAt)
-	return err
+	tx, err := s.beginSchemaCompatibleTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var seq int64
+	if err := tx.QueryRow(ctx, `UPDATE execution_event_cursor SET value = value + 1 RETURNING value`).Scan(&seq); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO execution_events (seq, schema_version, run_id, job_id, attempt, event_type, from_status, to_status, actor, payload, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11, clock_timestamp()))`,
+		seq, schemaVersion, nullText(e.RunID), nullText(e.JobID), e.Attempt, e.Type,
+		nullText(e.FromStatus), nullText(e.ToStatus), nullText(e.Actor), payload, createdAt); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// LatestExecutionEventSeq returns MAX(seq) of the committed stream (0 when
+// empty): the latest committed cursor, so a consumer can snapshot state,
+// read this cursor, and poll after=latest without a bootstrap gap. It is a
+// read-only raw SELECT and carries no schema fence.
+func (s *PostgresStore) LatestExecutionEventSeq(ctx context.Context) (int64, error) {
+	var max int64
+	if err := s.pool.QueryRow(ctx, `SELECT COALESCE(MAX(seq), 0) FROM execution_events`).Scan(&max); err != nil {
+		return 0, err
+	}
+	return max, nil
 }

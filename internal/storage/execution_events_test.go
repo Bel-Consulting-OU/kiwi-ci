@@ -159,3 +159,33 @@ func TestExecutionEventTimingPayload(t *testing.T) {
 		t.Fatal("nil timings must produce no payload keys")
 	}
 }
+
+// TestExecutionEventTerminalStatusesIncludeBlocked pins the terminal-timing
+// enumeration: blocked is terminal in the model and must be treated exactly
+// like success/failure/cancelled/skipped, so the list stays in exact parity
+// with model.Status.Terminal(). The PostgreSQL trigger function embeds the
+// same set (migration 0046), so the two can never drift.
+func TestExecutionEventTerminalStatusesIncludeBlocked(t *testing.T) {
+	listed := map[model.Status]bool{}
+	for _, s := range ExecutionEventTerminalStatuses {
+		listed[s] = true
+	}
+	if !listed[model.StatusBlocked] {
+		t.Fatal("ExecutionEventTerminalStatuses omits blocked")
+	}
+	all := []model.Status{
+		model.StatusQueued,
+		model.StatusRunning,
+		model.StatusWaitingApproval,
+		model.StatusBlocked,
+		model.StatusSuccess,
+		model.StatusFailure,
+		model.StatusCancelled,
+		model.StatusSkipped,
+	}
+	for _, s := range all {
+		if got := listed[s]; got != s.Terminal() {
+			t.Errorf("terminal parity for %s: listed=%v Terminal()=%v", s, got, s.Terminal())
+		}
+	}
+}

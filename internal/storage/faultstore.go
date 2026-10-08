@@ -1431,12 +1431,12 @@ func (f *FaultyStore) InsertGeneratedFragmentTx(ctx context.Context, req Generat
 	return inner.InsertGeneratedFragmentTx(ctx, req, verify)
 }
 
-func (f *FaultyStore) GetGeneratedFragment(ctx context.Context, parentJobID, fragmentID string) (GeneratedFragmentReceipt, bool, error) {
+func (f *FaultyStore) GetGeneratedFragment(ctx context.Context, parentJobID, mutationSlot string) (GeneratedFragmentReceipt, bool, error) {
 	inner, ok := f.Inner.(GeneratedFragmentStore)
 	if !ok {
 		return GeneratedFragmentReceipt{}, false, errMissingInnerInterface("GeneratedFragmentStore")
 	}
-	return inner.GetGeneratedFragment(ctx, parentJobID, fragmentID)
+	return inner.GetGeneratedFragment(ctx, parentJobID, mutationSlot)
 }
 
 func (f *FaultyStore) PutCacheManifest(ctx context.Context, rec CacheManifestRecord) error {
@@ -2142,11 +2142,13 @@ type outboxMeta struct {
 }
 
 // fragmentKey is the in-memory generated-fragments mutation key: the
-// canonical (parent job, fragment id) identity. The lease generation
+// canonical (parent job, mutation slot) identity. The lease generation
 // authorizes an upload but never defines it, so an infrastructure retry of
-// the same logical parent under a new generation still replays.
-func fragmentKey(parentJobID, fragmentID string) string {
-	return parentJobID + ":" + fragmentID
+// the same logical parent under a new generation still replays; a different
+// fragment digest in the same slot is a nondeterministic retry and is
+// refused by the insertion instead of keyed separately.
+func fragmentKey(parentJobID, mutationSlot string) string {
+	return parentJobID + ":" + mutationSlot
 }
 
 func newMemStore() *memStore {
@@ -5518,24 +5520,33 @@ func (m *memStore) QuotaCounts(ctx context.Context, repoKey, teamKey string) (in
 }
 
 // GetGeneratedFragment returns the idempotency receipt of an admitted
-// fragment by its canonical mutation key (parent job, fragment id),
-// regardless of the lease generation that admitted it.
-func (m *memStore) GetGeneratedFragment(ctx context.Context, parentJobID, fragmentID string) (GeneratedFragmentReceipt, bool, error) {
+// fragment by its canonical mutation key (parent job, mutation slot),
+// regardless of the lease generation that admitted it. The receipt carries
+// the fragment digest that won the slot; a caller comparing it with a
+// submitted digest detects a nondeterministic retry.
+func (m *memStore) GetGeneratedFragment(ctx context.Context, parentJobID, mutationSlot string) (GeneratedFragmentReceipt, bool, error) {
+	if mutationSlot == "" {
+		return GeneratedFragmentReceipt{}, false, fmt.Errorf("storage: empty mutation slot")
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	rec, ok := m.fragments[fragmentKey(parentJobID, fragmentID)]
+	rec, ok := m.fragments[fragmentKey(parentJobID, mutationSlot)]
 	return rec, ok, nil
 }
 
 // InsertGeneratedFragmentTx mirrors the SQL transaction under m.mu: the
 // parent lease predicate is validated FOR THE CURRENT REQUEST first, then a
-// committed receipt for the canonical (parent, fragment id) mutation key is
-// returned with replayed=true and nothing is inserted; otherwise the parent
-// is re-validated (via the verifier, with the run's job count read under the
-// same lock), the whole fragment is staged, and the receipt commits with the
-// jobs. The lease generation authorizes the mutation but never defines it: a
-// retry under a new generation of the same logical parent still replays.
+// committed receipt for the canonical (parent, mutation slot) key is
+// resolved — the SAME fragment digest replays with replayed=true and nothing
+// is inserted, a DIFFERENT digest is refused with
+// ErrGeneratedMutationConflict; otherwise the parent is re-validated (via
+// the verifier, with the run's job count read under the same lock), the
+// whole fragment is staged, and the receipt commits with the jobs. The lease
+// generation authorizes the mutation but never defines it: a retry under a
+// new generation of the same logical parent still replays an identical
+// fragment.
 func (m *memStore) InsertGeneratedFragmentTx(ctx context.Context, req GeneratedFragmentRequest, verify GeneratedJobVerifier) (GeneratedFragmentReceipt, bool, error) {
+	slot := GeneratedFragmentSlot(req.MutationSlot)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	parent, ok := m.jobs[req.ParentJobID]
@@ -5551,7 +5562,15 @@ func (m *memStore) InsertGeneratedFragmentTx(ctx context.Context, req GeneratedF
 	if err := ValidateGeneratedParentLease(parent, req, commitNow); err != nil {
 		return GeneratedFragmentReceipt{}, false, err
 	}
-	if rec, ok := m.fragments[fragmentKey(req.ParentJobID, req.FragmentID)]; ok {
+	if rec, ok := m.fragments[fragmentKey(req.ParentJobID, slot)]; ok {
+		if rec.FragmentID != req.FragmentID {
+			return GeneratedFragmentReceipt{}, false, &GeneratedMutationConflictError{
+				ParentJobID:         req.ParentJobID,
+				MutationSlot:        slot,
+				ExistingFragmentID:  rec.FragmentID,
+				SubmittedFragmentID: req.FragmentID,
+			}
+		}
 		return rec, true, nil
 	}
 	count := 0
@@ -5600,11 +5619,12 @@ func (m *memStore) InsertGeneratedFragmentTx(ctx context.Context, req GeneratedF
 	rec := GeneratedFragmentReceipt{
 		ParentJobID:     req.ParentJobID,
 		LeaseGeneration: req.LeaseGeneration,
+		MutationSlot:    slot,
 		FragmentID:      req.FragmentID,
 		Children:        append([]GeneratedFragmentChild(nil), req.Children...),
 		CreatedAt:       commitNow,
 	}
-	m.fragments[fragmentKey(req.ParentJobID, req.FragmentID)] = rec
+	m.fragments[fragmentKey(req.ParentJobID, slot)] = rec
 	return rec, false, nil
 }
 

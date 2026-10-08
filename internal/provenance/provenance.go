@@ -55,15 +55,24 @@ type Statement struct {
 	// CapsuleDigest is the canonical, versioned digest of the PERSISTED
 	// CompiledJobPayload (see CapsuleDigest): the exact admitted computation
 	// the evidence binds.
-	CapsuleDigest         string          `json:"capsuleDigest,omitempty"`
-	Runtime               string          `json:"runtime,omitempty"`
-	ImageDigest           string          `json:"imageDigest,omitempty"`
-	Issuer                string          `json:"issuer,omitempty"`
-	Materials             []MaterialEntry `json:"materials,omitempty"`
-	EffectivePolicyDigest string          `json:"effectivePolicyDigest,omitempty"`
-	StartTime             *time.Time      `json:"startTime,omitempty"`
-	EndTime               *time.Time      `json:"endTime,omitempty"`
-	ArtifactSize          int64           `json:"artifactSize,omitempty"`
+	CapsuleDigest string `json:"capsuleDigest,omitempty"`
+	// ExecutionCapsuleDigest is the canonical, versioned digest of the
+	// materialized EFFECTIVE EXECUTION (see
+	// execution.MaterializedCapsuleDigest): the compilation record PLUS the
+	// persisted trust/resource/network/sandbox overlay that actually ran.
+	// It is omitted when the materialization cannot be derived (no persisted
+	// payload); a v1 capsule digest that is present but v2 that is absent
+	// means the runtime overlay could not be recomputed, not that there was
+	// none.
+	ExecutionCapsuleDigest string          `json:"executionCapsuleDigest,omitempty"`
+	Runtime                string          `json:"runtime,omitempty"`
+	ImageDigest            string          `json:"imageDigest,omitempty"`
+	Issuer                 string          `json:"issuer,omitempty"`
+	Materials              []MaterialEntry `json:"materials,omitempty"`
+	EffectivePolicyDigest  string          `json:"effectivePolicyDigest,omitempty"`
+	StartTime              *time.Time      `json:"startTime,omitempty"`
+	EndTime                *time.Time      `json:"endTime,omitempty"`
+	ArtifactSize           int64           `json:"artifactSize,omitempty"`
 	// ArtifactPublishedAt records when the artifact bytes were published. It
 	// is explicitly NOT the build completion time: FinishedOn is only set
 	// from a real terminal job timestamp.
@@ -142,6 +151,11 @@ type ArtifactInput struct {
 	// CompiledJobPayload the computation was admitted under (see
 	// CapsuleDigest). Empty when no payload exists.
 	CapsuleDigest string
+	// ExecutionCapsuleDigest is the canonical digest of the materialized
+	// effective execution (see execution.MaterializedCapsuleDigest), derived
+	// from the persisted job + payload + effective policy. Empty when the
+	// materialization cannot be derived (missing payload).
+	ExecutionCapsuleDigest string
 	// ArtifactPublishedAt is when the artifact bytes were published. It is
 	// emitted on the statement (never as FinishedOn).
 	ArtifactPublishedAt time.Time
@@ -182,6 +196,7 @@ func ArtifactStatement(in ArtifactInput) Statement {
 		PredicateType:          PredicateType,
 		AttemptID:              in.AttemptID,
 		CapsuleDigest:          in.CapsuleDigest,
+		ExecutionCapsuleDigest: in.ExecutionCapsuleDigest,
 		PipelineDigest:         in.PipelineDigest,
 		CompilerVersion:        in.CompilerVersion,
 		RunnerIdentity:         in.RunnerIdentity,
@@ -323,7 +338,10 @@ type VerifyOptions struct {
 	// CapsuleDigest, when non-empty, must equal the statement's canonical
 	// compiled-payload capsule digest.
 	CapsuleDigest string
-	TrustedKey    ed25519.PublicKey
+	// ExecutionCapsuleDigest, when non-empty, must equal the statement's
+	// materialized effective-execution capsule digest.
+	ExecutionCapsuleDigest string
+	TrustedKey             ed25519.PublicKey
 }
 
 // VerifyWith parses, verifies and constraint-checks a serialized DSSE
@@ -402,6 +420,7 @@ func VerifyWith(envelope []byte, jwksOrKey func(kid string) (ed25519.PublicKey, 
 		{opts.Digest, st.Subject[0].Digest["sha256"], "subject digest"},
 		{opts.AttemptID, st.AttemptID, "attempt id"},
 		{opts.CapsuleDigest, st.CapsuleDigest, "capsule digest"},
+		{opts.ExecutionCapsuleDigest, st.ExecutionCapsuleDigest, "execution capsule digest"},
 	} {
 		if c.want != "" && c.got != c.want {
 			return Statement{}, fmt.Errorf("provenance: %s mismatch: want %q, got %q", c.label, c.want, c.got)

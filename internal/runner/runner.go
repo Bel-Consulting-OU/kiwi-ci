@@ -30,6 +30,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/artifact"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cache"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executil"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/execution"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executor"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/logging"
@@ -1059,18 +1060,11 @@ func (r *Runner) onDisabled(err error) error {
 }
 
 // workspaceMaxBytesForResources converts a job's declared resources.disk
-// request into the workspace bound handed to the executor. The unit is bytes:
-// pipeline.ByteSize is the pipeline decoder's canonical byte count ("2Gi" is
-// 2<<30 because the binary suffixes Ki/Gi/Ti are 1024-based; a plain integer
-// is bytes), so the value only needs widening to int64, never re-parsing. An
-// undeclared disk (zero) yields zero, the documented default: no workspace
-// bound is derived and pipelines without a disk declaration keep their
-// previous behavior.
+// request into the workspace bound handed to the executor. It is the shared
+// execution.WorkspaceMaxBytesForResources derivation (see there for the unit
+// contract); the runner keeps the local name as its package seam.
 func workspaceMaxBytesForResources(res pipeline.Resources) int64 {
-	if res.Disk <= 0 {
-		return 0
-	}
-	return int64(res.Disk)
+	return execution.WorkspaceMaxBytesForResources(res)
 }
 
 // workspaceQuotaLimitForTask derives the hard workspace bound execute installs
@@ -1393,9 +1387,15 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// effective network also comes from the payload (the compiled job's
 	// sandbox/network intersected with the effective policy ceiling), never
 	// from the legacy job.Network reinterpretation.
+	//
+	// The post-verification materialization (effective network, persisted
+	// resource overlay, effective sandbox requirements, trust floor, workspace
+	// bound) is the ONE shared execution.MaterializeEffectiveExecution used by
+	// exact replay and the artifact provenance path, so every consumer derives
+	// identical restrictions.
 	var cj pipeline.CompiledJob
+	var caps policy.Capabilities
 	if t.Job.CompiledJobPayload != nil {
-		var caps policy.Capabilities
 		var policyOK bool
 		cj, caps, policyOK, err = verifyCompiledPayload(spec, t.Job.Key, t.Job.CompiledJobPayload, t.Job.Trusted)
 		if err != nil {
@@ -1407,18 +1407,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 				r.complete(parent, t, model.StatusFailure, fmt.Errorf("compiled payload policy admission: %w", err), nil)
 				return
 			}
-			if err := applyEffectiveNetwork(&cj, caps); err != nil {
-				r.complete(parent, t, model.StatusFailure, fmt.Errorf("compiled payload network admission: %w", err), nil)
-				return
-			}
 		}
-		// The signed payload records the spec-deterministic compile; the
-		// server fills untrusted zero-declared requests with its configured
-		// ceilings only in the PERSISTED relational fields (the payload
-		// cannot carry them: the runner cannot reproduce operator
-		// configuration). Re-apply the persisted values so execution bounds
-		// and the scheduler's reservations agree.
-		applyPersistedResourceRequests(&cj, t.Job)
 	} else {
 		g, gerr := pipeline.Compile(spec)
 		if gerr != nil {
@@ -1431,20 +1420,13 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 			r.complete(parent, t, model.StatusFailure, fmt.Errorf("compiled job %q not found", t.Job.Key), nil)
 			return
 		}
-		// Legacy path: the control plane did not attach a compilation
-		// record, so the job-level network field is authoritative.
-		cj.Job.Network = t.Job.Network
 	}
-	// Copy the effective policy's sandbox requirements onto the compiled
-	// job before execution: the executor derives daemon-level promises
-	// (rootless, read-only rootfs) from cj.Job.Sandbox alone, and the
-	// verified payload is the only authoritative policy record.
-	effSandbox, serr := payloadSandboxRequirements(t.Job.CompiledJobPayload)
-	if serr != nil {
-		r.complete(parent, t, model.StatusFailure, fmt.Errorf("compiled payload sandbox requirements: %w", serr), nil)
+	eff, merr := execution.MaterializeEffectiveExecution(cj, t.Job.CompiledJobPayload, t.Job, caps)
+	if merr != nil {
+		r.complete(parent, t, model.StatusFailure, merr, nil)
 		return
 	}
-	applyEffectiveSandbox(&cj, effSandbox)
+	cj = eff.CompiledJob
 	// Capability intersection enforcement: when the profile declared a
 	// capability ceiling, a job whose runtime capability this host did not
 	// discover is refused up front (never silently executed by a backend
@@ -1600,7 +1582,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// require image references pinned by digest. The untrusted floor is
 	// unconditional here: nothing may override RequireImmutableImages for
 	// an untrusted job.
-	opts := executor.Options{Workspace: tmp, RunID: t.Job.RunID, RunnerID: r.ID, InstanceID: r.instanceID, Event: t.Job.Event, Branch: branchFromRef(t.Job.Ref), ChangedFiles: resolvedChangedFiles, SecretProvider: provider, Logs: logging.Func(func(job, step, line string) { sink.WriteLine(job, step, line) }), Cache: cacheStore, Artifacts: artifactStore, ArtifactReporter: reporter, DependencyStatus: t.Job.DependencyStatus, NeedsOutputs: t.Job.NeedsOutputs, CacheNamespace: cacheNamespace(t.Job), RequireImmutableImages: !t.Job.Trusted, LifecycleContext: parent, OnCgroupCreated: func(parent string) error { return r.ledgerSetCgroup(ledgerID, parent) }, RequireJobCgroup: t.JobCgroup}
+	opts := executor.Options{Workspace: tmp, RunID: t.Job.RunID, RunnerID: r.ID, InstanceID: r.instanceID, Event: t.Job.Event, Branch: branchFromRef(t.Job.Ref), ChangedFiles: resolvedChangedFiles, SecretProvider: provider, Logs: logging.Func(func(job, step, line string) { sink.WriteLine(job, step, line) }), Cache: cacheStore, Artifacts: artifactStore, ArtifactReporter: reporter, DependencyStatus: t.Job.DependencyStatus, NeedsOutputs: t.Job.NeedsOutputs, CacheNamespace: cacheNamespace(t.Job), LifecycleContext: parent, OnCgroupCreated: func(parent string) error { return r.ledgerSetCgroup(ledgerID, parent) }, RequireJobCgroup: t.JobCgroup}
 	if artifactStore != nil {
 		// Capture is bounded by the job context while it is alive (so a job
 		// that exceeds its declared lifetime stops publishing) and by the
@@ -1612,25 +1594,14 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 			Reserve:  r.artifactCaptureReserve(),
 		}
 	}
-	// The declared resources.disk is the job's workspace bound: it feeds the
-	// executor's pre-execution free-space check and the container backend's
-	// step-boundary workspace check, and it is what the snapshot capture
-	// derives its local archive cap from (see uploadJobSnapshot). The
-	// authoritative source is the persisted t.Job.DiskRequest (what the
-	// scheduler reserved); the compiled job's declaration is the fallback
-	// for legacy control planes that did not persist resource requests.
-	// Untrusted jobs without a declaration get the mandatory executor default
-	// budget instead of zero, so an undeclared disk can never mean
-	// "unbounded" for a job the runner does not trust. Trusted jobs without a
-	// declaration keep the documented zero (unbounded) behavior.
-	declaredDisk := workspaceMaxBytesForResources(cj.Job.Resources)
-	if t.Job.DiskRequest > 0 {
-		declaredDisk = t.Job.DiskRequest
-	}
-	workspaceMaxBytes := executor.WorkspaceBoundBytes(declaredDisk, untrusted, executor.DefaultUntrustedWorkspaceMaxBytes)
-	opts.WorkspaceMaxBytes = workspaceMaxBytes
+	// The materialized effective execution (network, resources, sandbox
+	// requirements, untrusted floor, immutable-image requirement and workspace
+	// bound) is mapped onto the executor options through the ONE shared
+	// mapping exact replay uses, so a replayed job can never run under weaker
+	// restrictions. The workspace bound is the same value the snapshot
+	// capture derives its archive cap from below.
+	opts = executor.OptionsFromExecution(opts, eff)
 	opts.WorkspaceAvailabilityChecked = availabilityChecked
-	opts.Untrusted = untrusted
 	// Production untrusted policy: the step-boundary resources.disk check is
 	// not a security boundary, so an untrusted job whose workspace cannot get
 	// a hard OS-level bound (project quota) fails closed. The escape hatch is
@@ -1640,6 +1611,25 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// in depth and never re-probes when execute reported one.
 	opts.RequireUntrustedDiskQuota = requireDiskQuota
 	opts.WorkspaceQuota = workspaceQuota
+	// Pre-execution checkpoint (exact-replay evidence): when snapshot capture
+	// is enabled, the executor captures and uploads a pre_job workspace
+	// snapshot after checkout/cache/dependency restoration and before any
+	// service or step runs, under the active lease. The checkpoint runs
+	// exactly once per attempt; a failure is a warning (the executor logs it
+	// and never fails the job), bounded by the same finalization grace as the
+	// post-job capture so a wedged control plane cannot pin the runner slot.
+	if r.Cfg.CaptureSnapshots {
+		opts.PreJobCheckpoint = func(cctx context.Context) error {
+			ckctx, cancel := context.WithTimeout(cctx, r.finalizeTimeout())
+			defer cancel()
+			start := time.Now()
+			if err := r.uploadJobSnapshotPhase(ckctx, t, tmp, eff.WorkspaceMaxBytes, model.SnapshotPhasePreJob); err != nil {
+				return err
+			}
+			r.Metrics.Observe("kiwi_runner_snapshot_duration_seconds", time.Since(start).Seconds())
+			return nil
+		}
+	}
 
 	opts.OnCleanupDebt = func(d executor.CleanupDebt) {
 		jobDebt.Store(true)
@@ -1735,7 +1725,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// on captures every outcome).
 	if r.Cfg.CaptureSnapshots && snapshotRequested(cj.Job.Snapshot, res.Status) {
 		snapStart := time.Now()
-		if err := r.uploadJobSnapshot(finalizeCtx, t, tmp, workspaceMaxBytes); err != nil {
+		if err := r.uploadJobSnapshot(finalizeCtx, t, tmp, eff.WorkspaceMaxBytes); err != nil {
 			sink.WriteLine(cj.ID, "snapshot", "upload warning: "+err.Error())
 		} else {
 			r.Metrics.Observe("kiwi_runner_snapshot_duration_seconds", time.Since(snapStart).Seconds())
@@ -1865,7 +1855,8 @@ func checkShardAssignment(cj pipeline.CompiledJob) error {
 // exceeds the ceiling is refused; a default request (no explicit egress
 // declaration) inherits the ceiling. The result is written into the
 // compiled job's sandbox.network, which the executor backend derives
-// isolation from.
+// isolation from. It is the shared execution.ApplyEffectiveNetwork (exact
+// replay runs the identical intersection).
 // applyPersistedResourceRequests overlays the persisted relational request
 // fields onto the verified compiled job. The payload records the
 // spec-deterministic compile (untrusted zero-declared requests are NOT
@@ -1873,76 +1864,22 @@ func checkShardAssignment(cj pipeline.CompiledJob) error {
 // cannot reproduce); the persisted fields carry the values the scheduler
 // reserved, so execution bounds and reservations stay identical.
 func applyPersistedResourceRequests(cj *pipeline.CompiledJob, j model.Job) {
-	if j.CPURequest > 0 {
-		cj.Job.Resources.CPU = j.CPURequest
-	}
-	if j.MemoryRequest > 0 {
-		cj.Job.Resources.Memory = pipeline.ByteSize(j.MemoryRequest)
-	}
-	if j.DiskRequest > 0 {
-		cj.Job.Resources.Disk = pipeline.ByteSize(j.DiskRequest)
-	}
-	if j.PIDsRequest > 0 {
-		cj.Job.Resources.PIDs = j.PIDsRequest
-	}
+	execution.ApplyPersistedResourceRequests(cj, j)
 }
 
 func applyEffectiveNetwork(cj *pipeline.CompiledJob, caps policy.Capabilities) error {
-	requested := requestedNetworkPolicy(cj.Job)
-	ceiling := caps.Network
-	if ceiling == pipeline.NetworkPolicyDefault {
-		ceiling = pipeline.NetworkPolicyInternet
-	}
-	if requested != pipeline.NetworkPolicyDefault && networkPolicyStrength(requested) > networkPolicyStrength(ceiling) {
-		return fmt.Errorf("job requests network %s which exceeds the compiled policy ceiling %s", networkPolicyName(requested), networkPolicyName(ceiling))
-	}
-	effective := pipeline.NetworkPolicyDefault
-	if networkPolicyStrength(requested) < networkPolicyStrength(ceiling) {
-		effective = requested
-	} else if ceiling != pipeline.NetworkPolicyInternet {
-		effective = ceiling
-	}
-	if effective != pipeline.NetworkPolicyDefault {
-		cj.Job.Sandbox.Network = effective
-	}
-	return nil
+	return execution.ApplyEffectiveNetwork(cj, caps)
 }
 
-// requestedNetworkPolicy mirrors the policy engine's derivation of the
-// network a job requests: an explicit sandbox.network declaration,
-// NetworkPolicyNone for network "none", and NetworkPolicyDefault otherwise.
-func requestedNetworkPolicy(j pipeline.Job) pipeline.NetworkPolicy {
-	if j.Network == "none" {
-		return pipeline.NetworkPolicyNone
-	}
-	return j.Sandbox.Network
-}
-
-// networkPolicyStrength orders network policies for least-privilege
-// comparison: None < ServicesOnly < Internet, with Default compared as
-// Internet.
+// networkPolicyStrength and networkPolicyName are the runner-side seams over
+// the shared execution ordering/rendering (pinned by runner tests; exact
+// replay and the capsule digest use the same functions).
 func networkPolicyStrength(p pipeline.NetworkPolicy) int {
-	switch p {
-	case pipeline.NetworkPolicyNone:
-		return 0
-	case pipeline.NetworkPolicyServicesOnly:
-		return 1
-	default:
-		return 2
-	}
+	return execution.NetworkPolicyStrength(p)
 }
 
 func networkPolicyName(p pipeline.NetworkPolicy) string {
-	switch p {
-	case pipeline.NetworkPolicyNone:
-		return "none"
-	case pipeline.NetworkPolicyServicesOnly:
-		return "services-only"
-	case pipeline.NetworkPolicyInternet:
-		return "internet"
-	default:
-		return "default"
-	}
+	return execution.NetworkPolicyName(p)
 }
 
 // checkoutTask provisions the job workspace: the default git checkout or

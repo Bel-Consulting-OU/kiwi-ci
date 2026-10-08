@@ -18,7 +18,10 @@ import (
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/blob"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cas"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/execution"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/provenance"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
@@ -243,6 +246,87 @@ func TestArtifactUploadProvenanceCarriesFullIdentity(t *testing.T) {
 	}
 }
 
+// TestArtifactUploadProvenanceCarriesExecutionCapsuleDigest proves the signed
+// statement carries the v2 execution capsule digest, recomputed from the
+// persisted job + payload + effective policy through the shared materializer
+// (it differs from the v1 compilation capsule because the trusted/v2 digests
+// bind different records).
+func TestArtifactUploadProvenanceCarriesExecutionCapsuleDigest(t *testing.T) {
+	s, f, _, hdrs := artifactIdentityFixture(t)
+	text := "version: 1\njobs:\n  build:\n    runtime: container\n    image: alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc\n    resources:\n      disk: 1Gi\n    steps:\n      - run: echo hi\n"
+	spec, err := pipeline.Parse([]byte(text))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pd, err := pipeline.PipelineDigest(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := pipeline.Compile(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cj := g.Jobs["build"]
+	cjJSON, err := json.Marshal(cj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(cjJSON)
+	policyJSON, err := json.Marshal(policy.DefaultTrustedCapabilities())
+	if err != nil {
+		t.Fatal(err)
+	}
+	compiled := &model.CompiledJobPayload{
+		SchemaVersion: 1, CompilerVersion: "test",
+		PipelineDigest: pd, JobDigest: hex.EncodeToString(sum[:]),
+		EffectiveJob: json.RawMessage(cjJSON), EffectivePolicy: json.RawMessage(policyJSON),
+	}
+	f.mu.Lock()
+	j := f.jobs["job-a"]
+	j.Pipeline = text
+	j.CompiledJobPayload = compiled
+	j.DiskRequest = 2 << 30
+	f.jobs["job-a"] = j
+	f.mu.Unlock()
+
+	w := fcUploadBlobArtifact(t, s, hdrs, "payload")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("upload = %d, want 201: %s", w.Code, w.Body.String())
+	}
+	var rec model.ArtifactRecord
+	if err := json.Unmarshal(w.Body.Bytes(), &rec); err != nil {
+		t.Fatal(err)
+	}
+	st, payloadBytes := provenanceStatementForUpload(t, s, rec)
+	if st.ExecutionCapsuleDigest == "" {
+		t.Fatal("executionCapsuleDigest missing from the signed statement")
+	}
+	if !strings.Contains(string(payloadBytes), "executionCapsuleDigest") {
+		t.Fatalf("signed payload omits executionCapsuleDigest: %s", payloadBytes)
+	}
+	if st.ExecutionCapsuleDigest == st.CapsuleDigest {
+		t.Fatal("v2 execution capsule digest equals the v1 compilation capsule digest")
+	}
+	caps, _, err := execution.EffectivePolicyCapabilities(compiled, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eff, err := execution.MaterializeEffectiveExecution(cj, compiled, j, caps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := execution.MaterializedCapsuleDigest(eff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.ExecutionCapsuleDigest != want {
+		t.Fatalf("executionCapsuleDigest = %q, want %q", st.ExecutionCapsuleDigest, want)
+	}
+	if eff.DeclaredDiskBytes != 2<<30 || eff.WorkspaceMaxBytes != 2<<30 {
+		t.Fatalf("materialized disk = %d/%d, want the persisted 2Gi", eff.DeclaredDiskBytes, eff.WorkspaceMaxBytes)
+	}
+}
+
 // TestArtifactProvenanceWithoutCapsulePayloadStillUploads proves the explicit
 // degraded binding: a job without a persisted CompiledJobPayload still
 // uploads (201) and the statement simply omits the capsule/pipeline fields
@@ -258,11 +342,11 @@ func TestArtifactProvenanceWithoutCapsulePayloadStillUploads(t *testing.T) {
 		t.Fatal(err)
 	}
 	st, payloadBytes := provenanceStatementForUpload(t, s, rec)
-	if st.CapsuleDigest != "" || st.PipelineDigest != "" || st.CompilerVersion != "" || st.EffectivePolicyDigest != "" {
-		t.Fatalf("capsule fields fabricated without a payload: %q/%q/%q/%q", st.CapsuleDigest, st.PipelineDigest, st.CompilerVersion, st.EffectivePolicyDigest)
+	if st.CapsuleDigest != "" || st.ExecutionCapsuleDigest != "" || st.PipelineDigest != "" || st.CompilerVersion != "" || st.EffectivePolicyDigest != "" {
+		t.Fatalf("capsule fields fabricated without a payload: %q/%q/%q/%q/%q", st.CapsuleDigest, st.ExecutionCapsuleDigest, st.PipelineDigest, st.CompilerVersion, st.EffectivePolicyDigest)
 	}
-	if strings.Contains(string(payloadBytes), "capsuleDigest") {
-		t.Fatalf("signed payload carries capsuleDigest without a payload: %s", payloadBytes)
+	if strings.Contains(string(payloadBytes), "capsuleDigest") || strings.Contains(string(payloadBytes), "executionCapsuleDigest") {
+		t.Fatalf("signed payload carries capsule digests without a payload: %s", payloadBytes)
 	}
 	// The rest of the identity is still bound.
 	if st.AttemptID != "job-a:5" || st.Predicate.RunDetails.Metadata.InvocationID != "run-c/job-a:5" {

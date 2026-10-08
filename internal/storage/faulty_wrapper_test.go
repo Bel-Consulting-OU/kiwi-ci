@@ -344,7 +344,7 @@ func faultyWrapperCases() map[string]wrapperCase {
 			return err
 		}},
 		"GetGeneratedFragment": {seed: fragment, call: func(f *FaultyStore) error {
-			_, _, err := f.GetGeneratedFragment(ctx(), testJob.ID, "frag")
+			_, _, err := f.GetGeneratedFragment(ctx(), testJob.ID, GeneratedFragmentMutationSlotDefault)
 			return err
 		}},
 		"PutCacheManifest": {mutates: true, call: func(f *FaultyStore) error {

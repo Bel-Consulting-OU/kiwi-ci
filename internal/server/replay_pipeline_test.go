@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"testing"
 
@@ -122,6 +123,13 @@ func assertExportedPipeline(t *testing.T, w *httptest.ResponseRecorder, j model.
 	}
 	if got.LeaseGeneration != j.LeaseGeneration || got.Attempts != j.Attempts {
 		t.Fatalf("export attempt identity = gen %d attempts %d, want %d/%d", got.LeaseGeneration, got.Attempts, j.LeaseGeneration, j.Attempts)
+	}
+	// The persisted execution state the replay materializer consumes must be
+	// exported exactly; without it exact replay cannot derive the effective
+	// network/sandbox/resource restrictions.
+	wantPersisted := persistedJobForExport(j)
+	if !reflect.DeepEqual(got.PersistedJob, wantPersisted) {
+		t.Fatalf("export persisted job = %+v, want %+v", got.PersistedJob, wantPersisted)
 	}
 	if j.CompiledJobPayload != nil {
 		if got.CompiledJobPayload == nil || got.CompiledJobPayload.PipelineDigest != j.CompiledJobPayload.PipelineDigest {

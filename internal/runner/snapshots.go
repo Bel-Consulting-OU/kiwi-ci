@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/safefs"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/snapshot"
@@ -64,8 +65,9 @@ func snapshotArchiveMaxBytes(workspaceMaxBytes int64) int64 {
 }
 
 // uploadJobSnapshot archives the job workspace with snapshot.Create and
-// POSTs it to /api/v1/jobs/{id}/snapshots under the active lease. The
-// caller treats any error as a warning: snapshot uploads never fail a job.
+// POSTs it to /api/v1/jobs/{id}/snapshots under the active lease with the
+// post_job phase. The caller treats any error as a warning: snapshot uploads
+// never fail a job.
 //
 // The archive is STREAMED directly into the request body through an io.Pipe:
 // the tar.gz bytes are produced by snapshot.Create and consumed by the HTTP
@@ -83,6 +85,15 @@ func snapshotArchiveMaxBytes(workspaceMaxBytes int64) int64 {
 // workspaceMaxBytes is the job's declared disk bound (zero when none was
 // declared).
 func (r *Runner) uploadJobSnapshot(ctx context.Context, t server.Task, workspace string, workspaceMaxBytes int64) error {
+	return r.uploadJobSnapshotPhase(ctx, t, workspace, workspaceMaxBytes, model.SnapshotPhasePostJob)
+}
+
+// uploadJobSnapshotPhase is uploadJobSnapshot with an explicit snapshot
+// phase: post_job for the capture taken during finalization, pre_job for the
+// pre-execution checkpoint the executor invokes after restoration. The phase
+// rides the X-Kiwi-Snapshot-Phase header; older control planes default a
+// missing header to post_job.
+func (r *Runner) uploadJobSnapshotPhase(ctx context.Context, t server.Task, workspace string, workspaceMaxBytes int64, phase string) error {
 	limit := snapshotArchiveMaxBytes(workspaceMaxBytes)
 	pr, pw := io.Pipe()
 	// capture carries snapshot.Create's result from its goroutine. The writer
@@ -121,6 +132,7 @@ func (r *Runner) uploadJobSnapshot(ctx context.Context, t server.Task, workspace
 	req.Header.Set("X-Kiwi-Runner-ID", r.ID)
 	req.Header.Set("X-Kiwi-Lease-Token", t.LeaseToken)
 	req.Header.Set("X-Kiwi-Lease-Generation", fmt.Sprint(t.LeaseGeneration))
+	req.Header.Set("X-Kiwi-Snapshot-Phase", phase)
 	resp, err := r.streamClient().Do(req)
 	if err != nil {
 		// Abort a capture that may still be writing, then surface the

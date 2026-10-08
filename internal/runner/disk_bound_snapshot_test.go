@@ -336,10 +336,12 @@ func TestExecuteDiskBoundAndSnapshotCapEndToEnd(t *testing.T) {
 	// Streaming cannot retract the request that is already in flight when the
 	// cap trips, so the attempt reaches the control plane — but only as an
 	// aborted body the upload handler cannot turn into a snapshot (the fake
-	// counts requests, not accepted archives). The invariant is that at most
-	// one attempt is made and the job warning names the local cap.
-	if snapshots > 1 {
-		t.Fatalf("over-cap snapshot attempts = %d, want at most 1", snapshots)
+	// counts requests, not accepted archives). The pre_job checkpoint and
+	// the post_job capture are the two attempts; the invariant is that at
+	// most one attempt is made per phase and the job warning names the local
+	// cap.
+	if snapshots > 2 {
+		t.Fatalf("over-cap snapshot attempts = %d, want at most 2 (pre_job + post_job)", snapshots)
 	}
 	entries, rerr := os.ReadDir(tmpRoot)
 	if rerr != nil {

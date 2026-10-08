@@ -13,6 +13,7 @@ import (
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 const fcOneChildFragment = `{"jobs":{"child-a":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo child"}]}},"deps":{}}`
@@ -356,7 +357,7 @@ func TestFlowDynamicDBTxReplay(t *testing.T) {
 func TestFlowDynamicReceiptWithoutStore(t *testing.T) {
 	s, f, _ := fcDynamicDBFixture(t)
 	s.DB = fcPlainStore{f}
-	if _, found, err := s.generatedFragmentReceipt(context.Background(), "p", "f"); err != nil || found {
+	if _, found, err := s.generatedFragmentReceipt(context.Background(), "p", storage.GeneratedFragmentMutationSlotDefault, "f"); err != nil || found {
 		t.Fatalf("receipt without store = %v %v", found, err)
 	}
 }

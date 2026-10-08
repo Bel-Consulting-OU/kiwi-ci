@@ -351,26 +351,116 @@ func TestGeneratedFragmentReplaysAcrossInfrastructureRetry(t *testing.T) {
 		t.Fatalf("receipt rows = %d, want 1", receipts)
 	}
 
-	// A CHANGED fragment under gen2 is a new mutation: new children.
+	// A CHANGED fragment under gen2 is a nondeterministic generator retry for
+	// the SAME logical emission (the parent's mutation slot is already
+	// committed with a different digest): it must FAIL CLOSED — no second
+	// child graph, no receipt — the deploy-eu/deploy-us history.
 	gen2b, changedIDs := fragITThreeChildFragment(t, gen2, runID)
 	gen2b.FragmentID = "frag-changed"
 	changed, replayed, err := st.InsertGeneratedFragmentTx(ctx, gen2b, nil)
-	if err != nil || replayed {
-		t.Fatalf("changed fragment = %+v replayed=%v err=%v", changed, replayed, err)
+	if !errors.Is(err, ErrGeneratedMutationConflict) {
+		t.Fatalf("changed fragment = %+v replayed=%v err=%v, want ErrGeneratedMutationConflict", changed, replayed, err)
+	}
+	var conflictErr *GeneratedMutationConflictError
+	if !errors.As(err, &conflictErr) {
+		t.Fatalf("changed fragment error type = %v", err)
+	}
+	if conflictErr.ExistingFragmentID != gen1.FragmentID || conflictErr.SubmittedFragmentID != "frag-changed" || conflictErr.MutationSlot != GeneratedFragmentMutationSlotDefault {
+		t.Fatalf("conflict error = %+v", conflictErr)
 	}
 	afterChanged := fragITRunJobIDs(t, st, runID)
-	if len(afterChanged) != len(before)+3 {
-		t.Fatalf("changed fragment job count = %d, want %d", len(afterChanged), len(before)+3)
+	if len(afterChanged) != len(before) {
+		t.Fatalf("conflicting fragment job count = %d, want %d", len(afterChanged), len(before))
 	}
 	for _, id := range changedIDs {
-		if !afterChanged[id] {
-			t.Fatalf("changed-fragment child %s missing", id)
+		if afterChanged[id] {
+			t.Fatalf("conflicting-fragment child %s was inserted", id)
 		}
 	}
 	for _, c := range first.Children {
 		if !afterChanged[c.ID] {
 			t.Fatalf("original child %s disappeared", c.ID)
 		}
+	}
+	// The committed receipt survives the conflict and still replays.
+	replay, replayed, err = st.InsertGeneratedFragmentTx(ctx, gen2, nil)
+	if err != nil || !replayed {
+		t.Fatalf("replay after conflict = %+v replayed=%v err=%v", replay, replayed, err)
+	}
+	for i := range first.Children {
+		if replay.Children[i].ID != first.Children[i].ID {
+			t.Fatalf("post-conflict replay children differ: %+v vs %+v", replay.Children, first.Children)
+		}
+	}
+}
+
+// TestGeneratedFragmentNondeterministicRetryConflict is the finding-4
+// regression on real PostgreSQL: a generator retry that re-emits a DIFFERENT
+// fragment digest under the same logical parent (same mutation slot, new
+// lease generation) is refused with ErrGeneratedMutationConflict, inserts no
+// job rows, leaves the first children intact, and keeps the run job count
+// unchanged.
+func TestGeneratedFragmentNondeterministicRetryConflict(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	runID, jobID, runner1, parent1 := fragITLeasedRetryJob(t, st, 200*time.Millisecond)
+	gen1 := GeneratedFragmentRequest{ParentJobID: jobID, RunnerID: runner1, LeaseGeneration: parent1.LeaseGeneration, LeaseTokenHash: parent1.LeaseTokenHash}
+	gen1, firstIDs := fragITThreeChildFragment(t, gen1, runID)
+	gen1.FragmentID = "frag-committed"
+	first, replayed, err := st.InsertGeneratedFragmentTx(ctx, gen1, nil)
+	if err != nil || replayed {
+		t.Fatalf("gen1 fragment = %+v replayed=%v err=%v", first, replayed, err)
+	}
+	before := fragITRunJobIDs(t, st, runID)
+
+	// Infrastructure retry under gen2: the generator is nondeterministic and
+	// emits a different fragment for the same logical emission (different
+	// child keys, hence a different digest).
+	token2 := []byte("frag-conflict-token-gen2")
+	runner2 := pgITNewID(t)
+	gen2num := fragITReclaimGeneration(t, st, jobID, parent1.LeaseGeneration, runner2, token2)
+	gen2 := GeneratedFragmentRequest{ParentJobID: jobID, RunnerID: runner2, LeaseGeneration: gen2num, LeaseTokenHash: token2}
+	gen2.Jobs = map[string]model.Job{}
+	gen2.Children = nil
+	conflictIDs := make([]string, 0, 2)
+	for _, key := range []string{"deploy-eu", "deploy-us"} {
+		id := pgITNewID(t)
+		gen2.Jobs[id] = pgITJob(runID, id, pgITRepo)
+		gen2.Children = append(gen2.Children, GeneratedFragmentChild{Key: key, ID: id})
+		conflictIDs = append(conflictIDs, id)
+	}
+	gen2.FragmentID = "frag-nondeterministic"
+	rec, replayed, err := st.InsertGeneratedFragmentTx(ctx, gen2, nil)
+	if !errors.Is(err, ErrGeneratedMutationConflict) {
+		t.Fatalf("nondeterministic retry = %+v replayed=%v err=%v, want ErrGeneratedMutationConflict", rec, replayed, err)
+	}
+	var conflictErr *GeneratedMutationConflictError
+	if !errors.As(err, &conflictErr) {
+		t.Fatalf("conflict error type = %v", err)
+	}
+	if conflictErr.ExistingFragmentID != "frag-committed" || conflictErr.SubmittedFragmentID != "frag-nondeterministic" {
+		t.Fatalf("conflict error ids = %+v", conflictErr)
+	}
+	after := fragITRunJobIDs(t, st, runID)
+	if len(after) != len(before) {
+		t.Fatalf("conflict changed the run job count: before=%d after=%d", len(before), len(after))
+	}
+	for _, id := range conflictIDs {
+		if after[id] {
+			t.Fatalf("conflicting child %s was inserted", id)
+		}
+	}
+	for _, id := range firstIDs {
+		if !after[id] {
+			t.Fatalf("first child %s disappeared after the conflict", id)
+		}
+	}
+	var receipts int
+	if err := st.pool.QueryRow(ctx, `SELECT COUNT(*) FROM generated_fragments WHERE parent_job_id=$1 AND mutation_slot=$2`, jobID, GeneratedFragmentMutationSlotDefault).Scan(&receipts); err != nil {
+		t.Fatalf("count receipts: %v", err)
+	}
+	if receipts != 1 {
+		t.Fatalf("slot receipts = %d, want exactly 1", receipts)
 	}
 }
 
@@ -415,8 +505,8 @@ func TestGeneratedFragmentStaleGenerationCannotReplay(t *testing.T) {
 	}
 
 	// The receipt itself survived; the current generation replays it.
-	got, ok, err := st.GetGeneratedFragment(ctx, jobID, gen1.FragmentID)
-	if err != nil || !ok || len(got.Children) != 3 {
+	got, ok, err := st.GetGeneratedFragment(ctx, jobID, GeneratedFragmentMutationSlotDefault)
+	if err != nil || !ok || len(got.Children) != 3 || got.FragmentID != gen1.FragmentID {
 		t.Fatalf("receipt read = %+v ok=%v err=%v", got, ok, err)
 	}
 	current := GeneratedFragmentRequest{ParentJobID: jobID, RunnerID: runner1, LeaseGeneration: gen2num, LeaseTokenHash: token2}

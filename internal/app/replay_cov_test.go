@@ -80,18 +80,18 @@ func TestReplayErrorPaths(t *testing.T) {
 		t.Fatal("mismatched job snapshot accepted")
 	}
 	// Download fails.
-	downloadFail := replayServer(t, `[{"id":"snap1","job_key":"build","created_at":"2026-09-14T00:00:00Z"}]`, http.StatusOK, http.StatusInternalServerError, nil)
+	downloadFail := replayServer(t, `[{"id":"snap1","job_key":"build","phase":"pre_job","created_at":"2026-09-14T00:00:00Z"}]`, http.StatusOK, http.StatusInternalServerError, nil)
 	if err := Replay(context.Background(), []string{"--server", downloadFail.URL, "--pipeline", pipelinePath, "--debug-rerun", "run1", "build"}); err == nil {
 		t.Fatal("snapshot download failure accepted")
 	}
 	// The downloaded archive is not a valid snapshot.
 	archive := snapshotArchive(t)
-	garbage := replayServer(t, `[{"id":"snap1","job_key":"build","created_at":"2026-09-14T00:00:00Z"}]`, http.StatusOK, http.StatusOK, []byte("not-a-archive"))
+	garbage := replayServer(t, `[{"id":"snap1","job_key":"build","phase":"pre_job","created_at":"2026-09-14T00:00:00Z"}]`, http.StatusOK, http.StatusOK, []byte("not-a-archive"))
 	if err := Replay(context.Background(), []string{"--server", garbage.URL, "--pipeline", pipelinePath, "--debug-rerun", "run1", "build"}); err == nil {
 		t.Fatal("garbage snapshot accepted")
 	}
 	// The pipeline file is missing.
-	good := replayServer(t, `[{"id":"snap1","job_key":"build","created_at":"2026-09-14T00:00:00Z"}]`, http.StatusOK, http.StatusOK, archive)
+	good := replayServer(t, `[{"id":"snap1","job_key":"build","phase":"pre_job","created_at":"2026-09-14T00:00:00Z"}]`, http.StatusOK, http.StatusOK, archive)
 	if err := Replay(context.Background(), []string{"--server", good.URL, "--pipeline", filepath.Join(t.TempDir(), "nope.yaml"), "--debug-rerun", "run1", "build"}); err == nil {
 		t.Fatal("missing pipeline accepted")
 	}
@@ -116,7 +116,7 @@ func TestReplayErrorPaths(t *testing.T) {
 
 func TestReplaySuccessAndFailureResults(t *testing.T) {
 	archive := snapshotArchive(t)
-	srv := replayServer(t, `[{"id":"snap1","job_key":"build","created_at":"2026-09-14T00:00:00Z"}]`, http.StatusOK, http.StatusOK, archive)
+	srv := replayServer(t, `[{"id":"snap1","job_key":"build","phase":"pre_job","created_at":"2026-09-14T00:00:00Z"}]`, http.StatusOK, http.StatusOK, archive)
 	// A passing job replays cleanly (with the optional step selector).
 	okPipeline := writePipeline(t, t.TempDir(), "version: 1\njobs:\n  build:\n    steps:\n      - name: greet\n        run: echo replay-ok\n")
 	if err := Replay(context.Background(), []string{"--server", srv.URL, "--pipeline", okPipeline, "--debug-rerun", "run1", "build"}); err != nil {
@@ -144,7 +144,7 @@ func TestReplaySuccessAndFailureResults(t *testing.T) {
 		}
 		switch {
 		case r.URL.Path == "/api/v1/runs/run1/snapshots":
-			_, _ = w.Write([]byte(`[{"id":"snap1","job_key":"build","created_at":"2026-09-14T00:00:00Z"}]`))
+			_, _ = w.Write([]byte(`[{"id":"snap1","job_key":"build","phase":"pre_job","created_at":"2026-09-14T00:00:00Z"}]`))
 		default:
 			_, _ = w.Write(archive)
 		}

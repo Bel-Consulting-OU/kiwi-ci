@@ -1188,7 +1188,7 @@ func TestPostgresIntegrationGeneratedJobsAndFragments(t *testing.T) {
 		t.Fatalf("generated job with unknown run must fail the FK: %v", err)
 	}
 
-	if _, ok, err := st.GetGeneratedFragment(ctx, parentID, "frag"); err != nil || ok {
+	if _, ok, err := st.GetGeneratedFragment(ctx, parentID, GeneratedFragmentMutationSlotDefault); err != nil || ok {
 		t.Fatalf("missing fragment = %v, %v", ok, err)
 	}
 	// The fragment transaction owns the lease predicate, so the parent must
@@ -1219,8 +1219,8 @@ func TestPostgresIntegrationGeneratedJobsAndFragments(t *testing.T) {
 	if err != nil || !replayed || again.FragmentID != receipt.FragmentID {
 		t.Fatalf("fragment replay = %+v, %v, %v", again, replayed, err)
 	}
-	got, ok, err := st.GetGeneratedFragment(ctx, parentID, "frag-1")
-	if err != nil || !ok || got.ParentJobID != parentID {
+	got, ok, err := st.GetGeneratedFragment(ctx, parentID, GeneratedFragmentMutationSlotDefault)
+	if err != nil || !ok || got.ParentJobID != parentID || got.FragmentID != "frag-1" {
 		t.Fatalf("GetGeneratedFragment = %+v, %v, %v", got, ok, err)
 	}
 	// The verifier runs inside the transaction and its error rolls back.
@@ -1231,11 +1231,12 @@ func TestPostgresIntegrationGeneratedJobsAndFragments(t *testing.T) {
 		return nil
 	}
 	rejChild := pgITNewID(t)
-	rejReq := GeneratedFragmentRequest{ParentJobID: parentID, RunnerID: fragRunnerID, LeaseGeneration: 1, LeaseTokenHash: fragTokenHash, FragmentID: "rejected", Jobs: map[string]model.Job{rejChild: pgITJob(runID, rejChild, pgITRepo)}}
+	rejReq := GeneratedFragmentRequest{ParentJobID: parentID, RunnerID: fragRunnerID, LeaseGeneration: 1, LeaseTokenHash: fragTokenHash, MutationSlot: "rejected", FragmentID: "rejected", Jobs: map[string]model.Job{rejChild: pgITJob(runID, rejChild, pgITRepo)}}
 	if _, _, err := st.InsertGeneratedFragmentTx(ctx, rejReq, verifier); err != nil {
 		t.Fatalf("verifier pass: %v", err)
 	}
 	rejectedChild := pgITNewID(t)
+	rejReq.MutationSlot = "rejected-2"
 	rejReq.FragmentID = "rejected-2"
 	rejReq.Jobs = map[string]model.Job{rejectedChild: pgITJob(runID, rejectedChild, pgITRepo)}
 	failVerifier := func(parent model.Job, runJobCount int, _ time.Time) error { return errors.New("rejected by verifier") }
@@ -1255,7 +1256,22 @@ func TestPostgresIntegrationGeneratedJobsAndFragments(t *testing.T) {
 		t.Fatal("empty fragment id must fail")
 	}
 	if _, _, err := st.GetGeneratedFragment(ctx, parentID, ""); err == nil {
-		t.Fatal("empty fragment id lookup must fail")
+		t.Fatal("empty mutation slot lookup must fail")
+	}
+	// A different digest for the SAME slot is a conflict, not a new graph.
+	conflictChild := pgITNewID(t)
+	conflictReq := GeneratedFragmentRequest{ParentJobID: parentID, RunnerID: fragRunnerID, LeaseGeneration: 1, LeaseTokenHash: fragTokenHash, FragmentID: "frag-1-conflict", Jobs: map[string]model.Job{conflictChild: pgITJob(runID, conflictChild, pgITRepo)}}
+	if _, _, err := st.InsertGeneratedFragmentTx(ctx, conflictReq, nil); !errors.Is(err, ErrGeneratedMutationConflict) {
+		t.Fatalf("different digest in the default slot = %v, want ErrGeneratedMutationConflict", err)
+	}
+	var conflictErr *GeneratedMutationConflictError
+	if _, _, err := st.InsertGeneratedFragmentTx(ctx, conflictReq, nil); !errors.As(err, &conflictErr) {
+		t.Fatalf("conflict error type = %v", err)
+	} else if conflictErr.ExistingFragmentID != "frag-1" || conflictErr.SubmittedFragmentID != "frag-1-conflict" {
+		t.Fatalf("conflict ids = %+v, want frag-1 vs frag-1-conflict", conflictErr)
+	}
+	if _, err := st.GetJob(ctx, conflictChild); !errors.Is(err, ErrNotFound) {
+		t.Fatal("conflicting fragment must not insert jobs")
 	}
 	if _, _, err := st.InsertGeneratedFragmentTx(ctx, GeneratedFragmentRequest{ParentJobID: parentID, Jobs: map[string]model.Job{"bad": {ID: "bad"}}}, nil); err == nil {
 		t.Fatal("invalid fragment job id must fail")
@@ -1268,6 +1284,7 @@ func TestPostgresIntegrationGeneratedJobsAndFragments(t *testing.T) {
 		RunnerID:        fragRunnerID,
 		LeaseGeneration: 1,
 		LeaseTokenHash:  fragTokenHash,
+		MutationSlot:    "with-contract",
 		FragmentID:      "with-contract",
 		Jobs:            map[string]model.Job{contractChild: pgITJob(runID, contractChild, pgITRepo)},
 		Contracts:       map[string]map[string]ArtifactContract{contractChild: testContracts},
@@ -1283,13 +1300,14 @@ func TestPostgresIntegrationGeneratedJobsAndFragments(t *testing.T) {
 		RunnerID:        fragRunnerID,
 		LeaseGeneration: 1,
 		LeaseTokenHash:  fragTokenHash,
+		MutationSlot:    "unknown-contract",
 		FragmentID:      "unknown-contract",
 		Jobs:            map[string]model.Job{},
 		Contracts:       map[string]map[string]ArtifactContract{pgITNewID(t): testContracts},
 	}, nil); err != nil {
 		t.Fatalf("unknown contract job id is a no-op update: %v", err)
 	}
-	if _, _, err := st.InsertGeneratedFragmentTx(ctx, GeneratedFragmentRequest{ParentJobID: parentID, FragmentID: "bad-contract", Jobs: map[string]model.Job{}, Contracts: map[string]map[string]ArtifactContract{"bad": {}}}, nil); err == nil {
+	if _, _, err := st.InsertGeneratedFragmentTx(ctx, GeneratedFragmentRequest{ParentJobID: parentID, MutationSlot: "bad-contract", FragmentID: "bad-contract", Jobs: map[string]model.Job{}, Contracts: map[string]map[string]ArtifactContract{"bad": {}}}, nil); err == nil {
 		t.Fatal("invalid contract job id must fail")
 	}
 }

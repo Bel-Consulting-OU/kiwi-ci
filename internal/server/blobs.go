@@ -24,8 +24,11 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/blob"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cache"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cas"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/execution"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/fsutil"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/provenance"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
@@ -876,8 +879,50 @@ func artifactProvenanceInput(j model.Job, run model.Run, rec model.ArtifactRecor
 		if d, err := provenance.CapsuleDigest(p); err == nil {
 			in.CapsuleDigest = d
 		}
+		// The execution capsule digest binds the FINAL effective execution
+		// (trust/resource/network/sandbox overlays), recomputed from the
+		// PERSISTED job + payload + effective policy through the same shared
+		// materializer the runner and exact replay use. It requires no runner
+		// environment; when the persisted records cannot be re-verified the
+		// field is omitted (never fabricated) and the upload still succeeds.
+		in.ExecutionCapsuleDigest = executionCapsuleDigestForJob(j)
 	}
 	return in
+}
+
+// executionCapsuleDigestForJob derives the v2 execution capsule digest for a
+// persisted job, or "" when it cannot be materialized (missing/mismatched
+// payload, missing policy decode, unparseable pipeline). Omission is always
+// preferred over fabrication and never fails the upload.
+func executionCapsuleDigestForJob(j model.Job) string {
+	p := j.CompiledJobPayload
+	if p == nil || strings.TrimSpace(j.Pipeline) == "" {
+		return ""
+	}
+	spec, err := pipeline.Parse([]byte(j.Pipeline))
+	if err != nil {
+		return ""
+	}
+	cj, err := pipeline.VerifyCompiledJobBinding(spec, j.Key, p)
+	if err != nil {
+		return ""
+	}
+	caps, policyOK, err := execution.EffectivePolicyCapabilities(p, j.Trusted)
+	if err != nil {
+		return ""
+	}
+	if !policyOK {
+		caps = policy.Capabilities{}
+	}
+	eff, err := execution.MaterializeEffectiveExecution(cj, p, j, caps)
+	if err != nil {
+		return ""
+	}
+	d, err := execution.MaterializedCapsuleDigest(eff)
+	if err != nil {
+		return ""
+	}
+	return d
 }
 
 // effectivePolicyDigest returns the sha256 of the canonical JSON of the

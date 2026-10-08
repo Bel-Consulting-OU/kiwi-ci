@@ -619,8 +619,10 @@ func TestFinalExecuteSnapshotUploadWarning(t *testing.T) {
 	r := testRunnerFor(t, ts, Config{CaptureSnapshots: true})
 	r.Cfg.CheckoutFn = func(context.Context, model.Job, string) error { return nil }
 	r.execute(context.Background(), basicTask(payloadPipeline))
-	if rsrv.snapshots != 1 {
-		t.Fatalf("snapshot uploads = %d", rsrv.snapshots)
+	// One pre_job checkpoint upload and one post_job outcome upload: both
+	// reach the (failing) endpoint, and both are warnings only.
+	if rsrv.snapshots != 2 {
+		t.Fatalf("snapshot uploads = %d, want pre_job + post_job", rsrv.snapshots)
 	}
 	if !strings.Contains(rsrv.joinedLogs(), "snapshot: upload warning:") {
 		t.Fatalf("snapshot warning missing: %q", rsrv.joinedLogs())

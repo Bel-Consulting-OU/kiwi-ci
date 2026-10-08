@@ -190,13 +190,15 @@ type Server struct {
 	completionReceiptsCacheOK     bool
 	completionReceiptsCacheExpiry time.Time
 	// generatedFragments is the generated-fragment idempotency receipt table
-	// keyed by the canonical mutation identity (parent job + fragment id; the
-	// lease generation authorizes an upload but never defines it). In DB mode
-	// the durable generated_fragments table is authoritative; in fs mode the
-	// table rides the state snapshot, written in the SAME atomic snapshot as
-	// the child jobs it describes, so a restart restores it and a resubmitted
-	// fragment replays the SAME child IDs instead of re-admitting a duplicate
-	// graph. Guarded by s.mu.
+	// keyed by the canonical mutation identity (parent job + mutation slot;
+	// the lease generation authorizes an upload but never defines it, and the
+	// fragment digest is stored in the receipt so a different digest for the
+	// slot is a conflict, not a second graph). In DB mode the durable
+	// generated_fragments table is authoritative; in fs mode the table rides
+	// the state snapshot, written in the SAME atomic snapshot as the child
+	// jobs it describes, so a restart restores it and a resubmitted fragment
+	// replays the SAME child IDs instead of re-admitting a duplicate graph.
+	// Guarded by s.mu.
 	generatedFragments map[string]storage.GeneratedFragmentReceipt
 	leaseKey           []byte
 	logSeq             int64

@@ -56,6 +56,20 @@ type generatedResponse struct {
 	Replayed    bool     `json:"replayed,omitempty"`
 }
 
+// generatedMutationConflictResponse is the 409 body of a nondeterministic
+// generator retry: the parent job's mutation slot already committed a
+// DIFFERENT fragment digest, and appending a second child graph is refused.
+// It deliberately carries no child IDs: the conflict must not leak the
+// committed receipt beyond the explicit replay response.
+type generatedMutationConflictResponse struct {
+	Reason  string `json:"reason"`
+	Message string `json:"message"`
+}
+
+// generatedMutationConflictReason is the stable machine-readable reason of
+// the 409 conflict response.
+const generatedMutationConflictReason = "GENERATED_MUTATION_CONFLICT"
+
 // generateJobs implements POST /api/v1/jobs/{id}/generated. The caller must
 // hold the parent job's active lease; every generated child is admitted
 // under the parent's effective capabilities (children can only inherit or
@@ -81,6 +95,17 @@ func (s *Server) generateJobs(w http.ResponseWriter, r *http.Request) {
 		var adm *admissionError
 		if errors.As(aerr, &adm) {
 			http.Error(w, adm.Error(), adm.Status)
+			return
+		}
+		// A nondeterministic generator retry submitted a different fragment
+		// digest for a mutation slot that already committed: refuse to
+		// append a second child graph with a stable, machine-readable 409.
+		var conflict *storage.GeneratedMutationConflictError
+		if errors.As(aerr, &conflict) {
+			writeJSON(w, http.StatusConflict, generatedMutationConflictResponse{
+				Reason:  generatedMutationConflictReason,
+				Message: "a nondeterministic generator retry cannot append a second child graph to the same parent job; the committed fragment differs from the submitted fragment",
+			})
 			return
 		}
 		// A failed snapshot write is a server-side durability failure, not a
@@ -244,11 +269,14 @@ func replayGeneratedResponse(parent model.Job, depth int, rec storage.GeneratedF
 // the deterministic fragment_id (sha256 hex of the canonical {jobs, deps});
 // the server recomputes it and rejects a missing or mismatching id with 400.
 // A fragment already admitted under the same canonical mutation key (parent
-// job, fragment id) is answered idempotently with the originally created
-// children. The lease generation AUTHORIZES the mutation (the caller has
-// already validated the active lease before this function runs) but never
-// defines it: an infrastructure retry of the same logical parent under a new
-// generation re-submits the identical fragment and replays the SAME children.
+// job, mutation slot) with the SAME digest is answered idempotently with the
+// originally created children; a DIFFERENT digest for that slot is refused
+// with *storage.GeneratedMutationConflictError (mapped to 409 by the
+// handler): a nondeterministic generator retry cannot append a second child
+// graph. The lease generation AUTHORIZES the mutation (the caller has already
+// validated the active lease before this function runs) but never defines it:
+// an infrastructure retry of the same logical parent under a new generation
+// re-submits the identical fragment and replays the SAME children.
 func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job, in generatedFragment) (*generatedResponse, error) {
 	fragmentID, err := in.Digest()
 	if err != nil {
@@ -261,13 +289,20 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 		return nil, fmt.Errorf("generated fragment_id does not match the fragment digest")
 	}
 	childDepth := parent.DynamicDepth + 1
-	// Replay fast path: a committed receipt returns the original children
-	// without re-running admission (a replay must survive policy edits and a
-	// changed compiler exactly as the original admission did). The caller
-	// (the generateJobs handler) has already validated the CURRENT live lease
+	// The logical mutation slot is server-side state, never client-supplied:
+	// today's endpoint has exactly one generated output per parent job, so
+	// the constant default slot is the identity. The documented future
+	// generalization is (parent, mutation key, digest) with an explicit key.
+	mutationSlot := storage.GeneratedFragmentMutationSlotDefault
+	// Replay fast path: a committed receipt for the same slot with the SAME
+	// digest returns the original children without re-running admission (a
+	// replay must survive policy edits and a changed compiler exactly as the
+	// original admission did); a receipt with a DIFFERENT digest is the
+	// nondeterministic-retry conflict and fails closed. The caller (the
+	// generateJobs handler) has already validated the CURRENT live lease
 	// through authorizeRunnerLease, so a stale generation or token never
 	// reaches this lookup.
-	if rec, found, rerr := s.generatedFragmentReceipt(ctx, parent.ID, fragmentID); rerr != nil {
+	if rec, found, rerr := s.generatedFragmentReceipt(ctx, parent.ID, mutationSlot, fragmentID); rerr != nil {
 		return nil, rerr
 	} else if found {
 		return replayGeneratedResponse(parent, childDepth, rec), nil
@@ -517,6 +552,7 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 			LeaseGeneration: parent.LeaseGeneration,
 			LeaseTokenHash:  parent.LeaseTokenHash,
 			Depth:           childDepth,
+			MutationSlot:    mutationSlot,
 			FragmentID:      fragmentID,
 			Jobs:            created,
 			Deps:            deps,
@@ -562,10 +598,19 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 	// Replay AFTER authorization and BEFORE the graph/cap checks, mirroring
 	// the SQL transaction: an identical fragment always replays the original
 	// children, even if the run has since grown past a limit the original
-	// admission satisfied. A stale generation never reaches this lookup (the
-	// lease predicate above rejected it).
-	if rec, found := s.memoryGeneratedFragment(parent.ID, fragmentID); found {
+	// admission satisfied, while a different digest in the same slot is the
+	// nondeterministic-retry conflict and inserts nothing. A stale generation
+	// never reaches this lookup (the lease predicate above rejected it).
+	if rec, found := s.memoryGeneratedFragment(parent.ID, mutationSlot); found {
 		s.mu.Unlock()
+		if rec.FragmentID != fragmentID {
+			return nil, &storage.GeneratedMutationConflictError{
+				ParentJobID:         parent.ID,
+				MutationSlot:        mutationSlot,
+				ExistingFragmentID:  rec.FragmentID,
+				SubmittedFragmentID: fragmentID,
+			}
+		}
 		return replayGeneratedResponse(parent, childDepth, rec), nil
 	}
 	if verr := verifyGeneratedFragmentGraph(parent, current, childDepth, runJobCount, len(created)); verr != nil {
@@ -585,11 +630,13 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 	// restart restores the receipt alongside its children: a resubmitted
 	// identical fragment replays the SAME child IDs instead of re-admitting a
 	// duplicate graph with fresh random IDs. The key is the canonical
-	// mutation identity (parent, fragment id); the generation only authorized
-	// this admission.
-	s.generatedFragments[generatedFragmentKey(parent.ID, fragmentID)] = storage.GeneratedFragmentReceipt{
+	// mutation identity (parent, mutation slot, with the fragment digest
+	// stored in the receipt for the conflict rule); the generation only
+	// authorized this admission.
+	s.generatedFragments[generatedFragmentKey(parent.ID, mutationSlot)] = storage.GeneratedFragmentReceipt{
 		ParentJobID:     parent.ID,
 		LeaseGeneration: parent.LeaseGeneration,
+		MutationSlot:    mutationSlot,
 		FragmentID:      fragmentID,
 		Children:        children,
 		CreatedAt:       commitNow,
@@ -607,25 +654,43 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 }
 
 // generatedFragmentKey is the canonical mutation key of the generated-fragment
-// receipts: parent job ID + ":" + fragment ID. Parent job IDs are 32 hex
-// chars and fragment IDs are 64 hex chars, so the ':'-concatenation is
-// unambiguous. The lease generation is deliberately NOT part of the key: it
-// authorizes an upload but does not define it, so an infrastructure retry of
-// the same logical parent under a new generation replays the original
-// children. Mirrors fragmentKey in internal/storage/faultstore.go and the
-// generated_fragments_mutation_idx unique index (migration 0043).
-func generatedFragmentKey(parentJobID, fragmentID string) string {
-	return parentJobID + ":" + fragmentID
+// receipts: parent job ID + ":" + mutation slot. Parent job IDs are 32 hex
+// chars, so the ':'-concatenation is unambiguous for any slot. The lease
+// generation is deliberately NOT part of the key: it authorizes an upload but
+// does not define it, so an infrastructure retry of the same logical parent
+// under a new generation replays the original children. The fragment digest
+// is NOT part of the key either: it is stored in the receipt so a different
+// digest for the same slot is detected as a conflict instead of keyed
+// separately. Mirrors fragmentKey in internal/storage/faultstore.go and the
+// generated_fragments_slot_idx unique index (migration 0047).
+func generatedFragmentKey(parentJobID, mutationSlot string) string {
+	return parentJobID + ":" + mutationSlot
 }
 
-// generatedFragmentReceipt resolves the idempotency receipt of a fragment:
-// from the durable store in DB mode (when it implements the receipt store),
-// from the in-memory map otherwise. The caller must have authorized the
-// CURRENT lease first; the receipt read itself carries no lease authority.
-func (s *Server) generatedFragmentReceipt(ctx context.Context, parentJobID, fragmentID string) (storage.GeneratedFragmentReceipt, bool, error) {
+// generatedFragmentReceipt resolves the idempotency receipt of a fragment
+// slot: from the durable store in DB mode (when it implements the receipt
+// store), from the in-memory map otherwise. A receipt whose stored fragment
+// digest differs from fragmentID is a nondeterministic-retry conflict and is
+// returned as *storage.GeneratedMutationConflictError (found stays false:
+// there is no replay response for a conflict). The caller must have
+// authorized the CURRENT lease first; the receipt read itself carries no
+// lease authority.
+func (s *Server) generatedFragmentReceipt(ctx context.Context, parentJobID, mutationSlot, fragmentID string) (storage.GeneratedFragmentReceipt, bool, error) {
 	if s.DB != nil {
 		if gs, ok := s.DB.(storage.GeneratedFragmentStore); ok {
-			return gs.GetGeneratedFragment(ctx, parentJobID, fragmentID)
+			rec, found, err := gs.GetGeneratedFragment(ctx, parentJobID, mutationSlot)
+			if err != nil || !found {
+				return rec, found, err
+			}
+			if rec.FragmentID != fragmentID {
+				return storage.GeneratedFragmentReceipt{}, false, &storage.GeneratedMutationConflictError{
+					ParentJobID:         parentJobID,
+					MutationSlot:        mutationSlot,
+					ExistingFragmentID:  rec.FragmentID,
+					SubmittedFragmentID: fragmentID,
+				}
+			}
+			return rec, true, nil
 		}
 		// Stores without the receipt read still dedupe inside
 		// InsertGeneratedFragmentTx; the fast path is simply skipped.
@@ -633,14 +698,25 @@ func (s *Server) generatedFragmentReceipt(ctx context.Context, parentJobID, frag
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rec, ok := s.memoryGeneratedFragment(parentJobID, fragmentID)
-	return rec, ok, nil
+	rec, ok := s.memoryGeneratedFragment(parentJobID, mutationSlot)
+	if !ok {
+		return storage.GeneratedFragmentReceipt{}, false, nil
+	}
+	if rec.FragmentID != fragmentID {
+		return storage.GeneratedFragmentReceipt{}, false, &storage.GeneratedMutationConflictError{
+			ParentJobID:         parentJobID,
+			MutationSlot:        mutationSlot,
+			ExistingFragmentID:  rec.FragmentID,
+			SubmittedFragmentID: fragmentID,
+		}
+	}
+	return rec, true, nil
 }
 
-// memoryGeneratedFragment reads the in-memory receipt map. The caller holds
-// s.mu.
-func (s *Server) memoryGeneratedFragment(parentJobID, fragmentID string) (storage.GeneratedFragmentReceipt, bool) {
-	rec, ok := s.generatedFragments[generatedFragmentKey(parentJobID, fragmentID)]
+// memoryGeneratedFragment reads the in-memory receipt map by (parent,
+// mutation slot). The caller holds s.mu.
+func (s *Server) memoryGeneratedFragment(parentJobID, mutationSlot string) (storage.GeneratedFragmentReceipt, bool) {
+	rec, ok := s.generatedFragments[generatedFragmentKey(parentJobID, mutationSlot)]
 	return rec, ok
 }
 
@@ -648,8 +724,13 @@ func (s *Server) memoryGeneratedFragment(parentJobID, fragmentID string) (storag
 // receipt table from the persisted snapshot. Receipts are validated against
 // the restored job map: a receipt whose parent or any child is missing (a
 // corrupt or hand-edited snapshot) is dropped instead of replaying phantom
-// child IDs. The canonical key is recomputed from the receipt fields, never
-// trusted from the snapshot map key. The caller holds s.mu.
+// child IDs. The canonical key is recomputed from the receipt fields (parent
+// + mutation slot, with a pre-0047 receipt's empty slot read as the default),
+// never trusted from the snapshot map key. A snapshot that carries the
+// pre-slot duplicate history for one (parent, slot) — two receipts under
+// different fragment digests — deterministically keeps the NEWEST receipt and
+// drops the older, mirroring the database quarantine in migration 0047. The
+// caller holds s.mu.
 func (s *Server) restoreGeneratedFragmentsLocked(in map[string]storage.GeneratedFragmentReceipt) {
 	if len(in) == 0 {
 		return
@@ -675,7 +756,17 @@ func (s *Server) restoreGeneratedFragmentsLocked(in map[string]storage.Generated
 		if !valid {
 			continue
 		}
-		s.generatedFragments[generatedFragmentKey(rec.ParentJobID, rec.FragmentID)] = rec
+		slot := storage.GeneratedFragmentSlot(rec.MutationSlot)
+		rec.MutationSlot = slot
+		key := generatedFragmentKey(rec.ParentJobID, slot)
+		if existing, ok := s.generatedFragments[key]; ok && existing.FragmentID != rec.FragmentID {
+			// Newest wins, with the digest as a deterministic tie-break.
+			if existing.CreatedAt.After(rec.CreatedAt) ||
+				(existing.CreatedAt.Equal(rec.CreatedAt) && existing.FragmentID > rec.FragmentID) {
+				continue
+			}
+		}
+		s.generatedFragments[key] = rec
 	}
 }
 

@@ -104,6 +104,7 @@ var rawReadAllowlist = map[string]bool{
 	"GetSchedule":              true,
 	"GetJobContracts":          true,
 	"GetGeneratedFragment":     true,
+	"LatestExecutionEventSeq":  true, // SELECT MAX(seq) read only
 	"GetDownstreamLink":        true,
 	"RecentUsage":              true,
 	"QuotaCounts":              true,

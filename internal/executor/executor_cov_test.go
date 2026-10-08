@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,16 +20,23 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secrets"
 )
 
-// covSink records every emitted line.
+// covSink records every emitted line. The mutex is required because the
+// native backend streams stdout and stderr from separate goroutines and the
+// executor logs a pre-job checkpoint warning between them.
 type covSink struct {
+	mu    sync.Mutex
 	lines []string
 }
 
 func (s *covSink) WriteLine(job, step, line string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.lines = append(s.lines, step+": "+line)
 }
 
 func (s *covSink) has(sub string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, l := range s.lines {
 		if strings.Contains(l, sub) {
 			return true

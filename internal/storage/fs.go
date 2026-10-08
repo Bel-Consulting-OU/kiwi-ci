@@ -128,11 +128,12 @@ type Snapshot struct {
 	RunIdempotency map[string]IdempotencyReceipt `json:"run_idempotency,omitempty"`
 	// GeneratedFragments persists the fs-mode generated-fragment idempotency
 	// receipts (the generated_fragments equivalents), keyed by the canonical
-	// mutation identity parent job + fragment id (see generatedFragmentKey in
-	// the server). The receipt is written in the SAME atomic snapshot as the
-	// child jobs it describes, so after a restart a resubmitted fragment
-	// replays the SAME child IDs instead of re-admitting a duplicate graph.
-	// The lease generation authorizes the upload but is not part of the key.
+	// mutation identity parent job + mutation slot (see generatedFragmentKey
+	// in the server). The receipt is written in the SAME atomic snapshot as
+	// the child jobs it describes, so after a restart a resubmitted fragment
+	// replays the SAME child IDs instead of re-admitting a duplicate graph,
+	// and a DIFFERENT fragment digest for the same slot fails closed. The
+	// lease generation authorizes the upload but is not part of the key.
 	// Additive; older snapshots load with a nil map, which the server treats
 	// as empty.
 	GeneratedFragments map[string]GeneratedFragmentReceipt `json:"generated_fragments,omitempty"`
@@ -814,6 +815,26 @@ func (r *Repository) ListExecutionEvents(ctx context.Context, afterSeq int64, li
 		return nil, afterSeq, err
 	}
 	return r.ReadExecutionEvents(afterSeq, limit, runID)
+}
+
+// LatestExecutionEventSeq implements ExecutionEventCursorStore for the
+// filesystem journal: the in-memory watermark, initialized once from the
+// durable journal. It is the fs-mode "latest committable cursor" the events
+// list reports as latest_cursor: fs append and mutation share the server
+// lock, so a consumer can snapshot state, read this watermark, then poll
+// after=watermark without a bootstrap gap. Best-effort/non-canonical
+// (canonical=false in the response): a concurrent writer may have advanced
+// the file since the last read.
+func (r *Repository) LatestExecutionEventSeq(ctx context.Context) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.initExecutionEventSeqLocked(); err != nil {
+		return 0, err
+	}
+	return r.executionEventSeq, nil
 }
 
 // ReadExecutionEvents streams the journal in append order and returns the

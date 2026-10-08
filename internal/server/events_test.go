@@ -54,6 +54,12 @@ func (f *eventsFakeStore) ListExecutionEvents(_ context.Context, after int64, li
 	return out, cursor, nil
 }
 
+func (f *eventsFakeStore) LatestExecutionEventSeq(_ context.Context) (int64, error) {
+	f.eventsMu.Lock()
+	defer f.eventsMu.Unlock()
+	return int64(len(f.events)), nil
+}
+
 func decodeEventsResponse(t *testing.T, body []byte) executionEventsResponse {
 	t.Helper()
 	var resp executionEventsResponse
@@ -99,6 +105,14 @@ func TestEventsEndpointAdminOnlyAndPagination(t *testing.T) {
 	resp := decodeEventsResponse(t, w.Body.Bytes())
 	if len(resp.Events) != 3 || resp.NextCursor != "3" {
 		t.Fatalf("events = %d next_cursor %q, want 3/3", len(resp.Events), resp.NextCursor)
+	}
+	// fs mode is explicitly non-canonical, and latest_cursor is the journal
+	// watermark (the bootstrap reference).
+	if resp.Canonical {
+		t.Fatalf("fs events response claims canonical: %s", w.Body.String())
+	}
+	if resp.LatestCursor != "3" {
+		t.Fatalf("fs latest_cursor = %q, want 3", resp.LatestCursor)
 	}
 	for i, e := range resp.Events {
 		if e.Seq != int64(i+1) || e.SchemaVersion != 1 {
@@ -160,6 +174,29 @@ func TestEventsEndpointDBMode(t *testing.T) {
 	resp := decodeEventsResponse(t, w.Body.Bytes())
 	if len(resp.Events) != 1 || resp.Events[0].Type != "run.running" || resp.NextCursor != "1" {
 		t.Fatalf("db events = %+v next %q", resp.Events, resp.NextCursor)
+	}
+	// DB mode is canonical, and latest_cursor comes from the store's
+	// MAX(seq) read: snapshot state, read latest_cursor, poll after=latest.
+	if !resp.Canonical {
+		t.Fatalf("db events response not canonical: %s", w.Body.String())
+	}
+	if resp.LatestCursor != "1" {
+		t.Fatalf("db latest_cursor = %q, want 1", resp.LatestCursor)
+	}
+	// Bootstrap contract: after=latest_cursor returns nothing until a new
+	// event commits, then returns exactly the new event.
+	if w := doJSON(t, s2, http.MethodGet, "/api/v1/events?after="+resp.LatestCursor, "admin-tok", ""); w.Code != http.StatusOK {
+		t.Fatalf("after=latest = %d: %s", w.Code, w.Body.String())
+	} else if page := decodeEventsResponse(t, w.Body.Bytes()); len(page.Events) != 0 {
+		t.Fatalf("after=latest returned %d events", len(page.Events))
+	}
+	if err := f.AppendExecutionEvent(context.Background(), model.ExecutionEvent{RunID: "r1", Type: "run.succeeded", ToStatus: "success"}); err != nil {
+		t.Fatal(err)
+	}
+	w = doJSON(t, s2, http.MethodGet, "/api/v1/events?after="+resp.LatestCursor, "admin-tok", "")
+	page := decodeEventsResponse(t, w.Body.Bytes())
+	if len(page.Events) != 1 || page.Events[0].Type != "run.succeeded" || page.LatestCursor != "2" {
+		t.Fatalf("after=latest bootstrap = %+v latest %q", page.Events, page.LatestCursor)
 	}
 }
 

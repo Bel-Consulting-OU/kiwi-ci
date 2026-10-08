@@ -348,3 +348,307 @@ func TestIntegrationExecutionEventsRunFilterAndLimitBounds(t *testing.T) {
 		t.Fatalf("empty page = %d cursor %d err %v", len(page), cur, err)
 	}
 }
+
+// pgITWaitForLockWait blocks until the backend pid waits on a heavyweight
+// lock (the transaction-scoped cursor row lock T1 holds), so the test proves
+// T2 is actually blocked instead of guessing with a sleep.
+func pgITWaitForLockWait(t *testing.T, st *PostgresStore, pid int) {
+	t.Helper()
+	ctx := context.Background()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var waitType string
+		err := st.pool.QueryRow(ctx, `SELECT COALESCE(wait_event_type, '') FROM pg_stat_activity WHERE pid=$1`, pid).Scan(&waitType)
+		if err != nil {
+			t.Fatalf("read pg_stat_activity for pid %d: %v", pid, err)
+		}
+		if waitType == "Lock" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("backend %d never waited on the cursor row lock", pid)
+}
+
+// pgITAssertExecutionEventSeqContiguous asserts the committed stream has no
+// holes in its seq allocation: every committed seq from 1..max is present.
+func pgITAssertExecutionEventSeqContiguous(t *testing.T, st *PostgresStore) {
+	t.Helper()
+	ctx := context.Background()
+	rows, err := st.pool.Query(ctx, `SELECT seq FROM execution_events ORDER BY seq`)
+	if err != nil {
+		t.Fatalf("read seq stream: %v", err)
+	}
+	defer rows.Close()
+	want := int64(1)
+	for rows.Next() {
+		var seq int64
+		if err := rows.Scan(&seq); err != nil {
+			t.Fatalf("scan seq: %v", err)
+		}
+		if seq != want {
+			t.Fatalf("execution event seq hole: got %d, want %d", seq, want)
+		}
+		want++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("seq stream rows: %v", err)
+	}
+	if want == 1 {
+		t.Fatal("no committed execution events")
+	}
+}
+
+// pgITInsertTwoJobRun seeds one queued run with two jobs and returns the
+// committed baseline cursor (the enqueue events are already visible).
+func pgITInsertTwoJobRun(t *testing.T, st *PostgresStore) (runID, jobA, jobB string, baseline int64) {
+	t.Helper()
+	ctx := context.Background()
+	runID, jobA, jobB = pgITNewID(t), pgITNewID(t), pgITNewID(t)
+	if err := st.InsertCompiledRun(ctx, InsertCompiledRunRequest{
+		Run: model.Run{ID: runID, Repo: pgITRepo, Status: model.StatusQueued, CreatedAt: time.Now().UTC()},
+		Jobs: map[string]model.Job{
+			jobA: pgITJob(runID, jobA, pgITRepo),
+			jobB: pgITJob(runID, jobB, pgITRepo),
+		},
+	}); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	baseline, err := st.LatestExecutionEventSeq(ctx)
+	if err != nil {
+		t.Fatalf("baseline latest seq: %v", err)
+	}
+	pgITAssertExecutionEventSeqContiguous(t, st)
+	return runID, jobA, jobB, baseline
+}
+
+// pgITBlockedEvent returns the run's job.blocked event for jobID.
+func pgITBlockedEvent(t *testing.T, st *PostgresStore, runID, jobID string) model.ExecutionEvent {
+	t.Helper()
+	events := pgITExecutionEvents(t, st, runID)
+	for _, e := range events {
+		if e.Type == "job.blocked" && e.JobID == jobID {
+			return e
+		}
+	}
+	t.Fatalf("no job.blocked event for %s in %+v", jobID, events)
+	return model.ExecutionEvent{}
+}
+
+// TestPostgresIntegrationExecutionEventsCursorCommitOrdered is the BLOCKER-1
+// regression on real PostgreSQL: seq must be allocated in commit order, so a
+// consumer can never observe a higher seq while a lower allocation is still
+// in flight (the BIGSERIAL loss history).
+//
+// T1 updates job A in an open transaction (the trigger allocates the next
+// cursor and holds it); T2's update of job B must BLOCK on the same cursor
+// row until T1 commits. No A/B event is visible while T1 is open, and no
+// consumer can see a seq above the baseline. After T1 commits, T2 proceeds
+// and commits: A precedes B adjacent, the stream has no holes, and a read
+// after=0 then after=A.seq returns B exactly once.
+func TestPostgresIntegrationExecutionEventsCursorCommitOrdered(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	runID, jobA, jobB, baseline := pgITInsertTwoJobRun(t, st)
+
+	// T1: allocate the next seq for job A, uncommitted.
+	tx1, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin T1: %v", err)
+	}
+	defer tx1.Rollback(ctx)
+	if _, err := tx1.Exec(ctx, `UPDATE jobs SET status='blocked', error='t1' WHERE id=$1`, jobA); err != nil {
+		t.Fatalf("T1 update job A: %v", err)
+	}
+
+	// T2: update job B. It must block on the cursor row T1 holds.
+	t2pid := make(chan int, 1)
+	t2done := make(chan error, 1)
+	go func() {
+		tx2, err := st.pool.Begin(ctx)
+		if err != nil {
+			t2done <- err
+			return
+		}
+		defer tx2.Rollback(ctx)
+		var pid int
+		if err := tx2.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+			t2done <- err
+			return
+		}
+		t2pid <- pid
+		if _, err := tx2.Exec(ctx, `UPDATE jobs SET status='blocked', error='t2' WHERE id=$1`, jobB); err != nil {
+			t2done <- err
+			return
+		}
+		t2done <- tx2.Commit(ctx)
+	}()
+	pid := <-t2pid
+	pgITWaitForLockWait(t, st, pid)
+
+	// While T1 is in flight and T2 blocked: neither event is visible, the
+	// latest committed cursor is still the baseline, and no higher seq can
+	// be observed (T2 cannot commit before T1 releases the cursor).
+	if got, err := st.LatestExecutionEventSeq(ctx); err != nil || got != baseline {
+		t.Fatalf("latest seq during in-flight allocation = %d, %v; want baseline %d", got, err, baseline)
+	}
+	for _, e := range pgITExecutionEvents(t, st, runID) {
+		if e.JobID == jobA || e.JobID == jobB {
+			if e.Type == "job.blocked" {
+				t.Fatalf("uncommitted blocked event visible: %+v", e)
+			}
+		}
+	}
+
+	// Commit T1: T2 unblocks (its UPDATE proceeds) and commits.
+	if err := tx1.Commit(ctx); err != nil {
+		t.Fatalf("commit T1: %v", err)
+	}
+	if err := <-t2done; err != nil {
+		t.Fatalf("commit T2: %v", err)
+	}
+	evA := pgITBlockedEvent(t, st, runID, jobA)
+	evB := pgITBlockedEvent(t, st, runID, jobB)
+	if evA.Seq != baseline+1 || evB.Seq != evA.Seq+1 {
+		t.Fatalf("commit-ordered seqs = A:%d B:%d, want A=%d and B=A+1", evA.Seq, evB.Seq, baseline+1)
+	}
+	pgITAssertExecutionEventSeqContiguous(t, st)
+
+	// Cursor walk over the committed stream: after=0 sees A (and B), then
+	// after=A.seq returns B exactly once. A consumer that advanced its
+	// cursor while T1 was in flight (impossible to pass baseline then) is
+	// replayed the events it could have missed.
+	page1, cursor1, err := st.ListExecutionEvents(ctx, 0, MaxExecutionEventLimit, runID)
+	if err != nil {
+		t.Fatalf("read after=0: %v", err)
+	}
+	if len(page1) == 0 || page1[len(page1)-1].Seq != evB.Seq || cursor1 != evB.Seq {
+		t.Fatalf("after=0 page = %d events cursor %d, want through B(%d)", len(page1), cursor1, evB.Seq)
+	}
+	page2, cursor2, err := st.ListExecutionEvents(ctx, evA.Seq, MaxExecutionEventLimit, runID)
+	if err != nil {
+		t.Fatalf("read after=A: %v", err)
+	}
+	if len(page2) != 1 || page2[0].Seq != evB.Seq || page2[0].JobID != jobB || cursor2 != evB.Seq {
+		t.Fatalf("after=A page = %+v cursor %d, want exactly B(%d)", page2, cursor2, evB.Seq)
+	}
+	// The same pagination from the pre-commit baseline cursor sees the two
+	// events exactly once each: no lost event behind an advanced cursor.
+	fromBaseline, _, err := st.ListExecutionEvents(ctx, baseline, MaxExecutionEventLimit, runID)
+	if err != nil {
+		t.Fatalf("read after=baseline: %v", err)
+	}
+	seenA, seenB := 0, 0
+	for _, e := range fromBaseline {
+		if e.Seq == evA.Seq {
+			seenA++
+		}
+		if e.Seq == evB.Seq {
+			seenB++
+		}
+	}
+	if seenA != 1 || seenB != 1 {
+		t.Fatalf("baseline walk saw A %d times, B %d times, want once each", seenA, seenB)
+	}
+}
+
+// TestPostgresIntegrationExecutionEventsCursorRollbackNoHole proves the
+// rollback half of the cursor contract: a transaction that allocated a seq
+// and rolled back does not burn it, so the next committing transaction uses
+// exactly the next visible seq (no hole). A separate scratch database keeps
+// the assertion "starts at 1 with no gap" meaningful for the whole stream.
+func TestPostgresIntegrationExecutionEventsCursorRollbackNoHole(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	runID, jobA, jobB, baseline := pgITInsertTwoJobRun(t, st)
+
+	// T1 allocates the next seq for job A, then rolls back.
+	tx1, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin T1: %v", err)
+	}
+	if _, err := tx1.Exec(ctx, `UPDATE jobs SET status='blocked', error='t1' WHERE id=$1`, jobA); err != nil {
+		t.Fatalf("T1 update job A: %v", err)
+	}
+
+	// T2 must block until the rollback releases the cursor row.
+	t2pid := make(chan int, 1)
+	t2done := make(chan error, 1)
+	go func() {
+		tx2, err := st.pool.Begin(ctx)
+		if err != nil {
+			t2done <- err
+			return
+		}
+		defer tx2.Rollback(ctx)
+		var pid int
+		if err := tx2.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+			t2done <- err
+			return
+		}
+		t2pid <- pid
+		if _, err := tx2.Exec(ctx, `UPDATE jobs SET status='blocked', error='t2' WHERE id=$1`, jobB); err != nil {
+			t2done <- err
+			return
+		}
+		t2done <- tx2.Commit(ctx)
+	}()
+	pid := <-t2pid
+	pgITWaitForLockWait(t, st, pid)
+
+	if err := tx1.Rollback(ctx); err != nil {
+		t.Fatalf("rollback T1: %v", err)
+	}
+	if err := <-t2done; err != nil {
+		t.Fatalf("commit T2 after rollback: %v", err)
+	}
+
+	// The rolled-back allocation is NOT burned: B takes baseline+1 and the
+	// stream has no gap where A's allocation was. A itself never committed.
+	evB := pgITBlockedEvent(t, st, runID, jobB)
+	if evB.Seq != baseline+1 {
+		t.Fatalf("committed seq after rollback = %d, want %d (rolled-back allocation must not be burned)", evB.Seq, baseline+1)
+	}
+	for _, e := range pgITExecutionEvents(t, st, runID) {
+		if e.JobID == jobA && e.Type == "job.blocked" {
+			t.Fatalf("rolled-back transition left event %+v", e)
+		}
+	}
+	if j, _ := st.GetJob(ctx, jobA); j.Status != model.StatusQueued {
+		t.Fatalf("rolled-back job A status = %s, want queued", j.Status)
+	}
+	pgITAssertExecutionEventSeqContiguous(t, st)
+}
+
+// TestIntegrationExecutionEventsManualAppendUsesCursor proves the manual
+// AppendExecutionEvent allocates through the same commit-ordered cursor as
+// the triggers: it interleaves with trigger appends in strict seq order and
+// leaves no holes.
+func TestIntegrationExecutionEventsManualAppendUsesCursor(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	runID, jobA, _, baseline := pgITInsertTwoJobRun(t, st)
+	if err := st.AppendExecutionEvent(ctx, model.ExecutionEvent{RunID: runID, JobID: jobA, Attempt: 7, Type: "job.note", Payload: map[string]string{"k": "v"}}); err != nil {
+		t.Fatalf("manual append: %v", err)
+	}
+	if _, err := st.pool.Exec(ctx, `UPDATE jobs SET status='blocked' WHERE id=$1`, jobA); err != nil {
+		t.Fatalf("trigger append: %v", err)
+	}
+	events := pgITExecutionEvents(t, st, runID)
+	var note, blocked model.ExecutionEvent
+	for _, e := range events {
+		switch e.Type {
+		case "job.note":
+			note = e
+		case "job.blocked":
+			blocked = e
+		}
+	}
+	if note.Seq != baseline+1 || blocked.Seq != note.Seq+1 {
+		t.Fatalf("manual/trigger seqs = note:%d blocked:%d, want %d then %d", note.Seq, blocked.Seq, baseline+1, baseline+2)
+	}
+	if note.Payload["k"] != "v" || note.Attempt != 7 {
+		t.Fatalf("manual append payload = %+v", note)
+	}
+	pgITAssertExecutionEventSeqContiguous(t, st)
+}

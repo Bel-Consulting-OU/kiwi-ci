@@ -12,6 +12,7 @@ import (
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/policy"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 // trustedGenerateServerDB builds a DB-mode server whose policy grants
@@ -134,19 +135,40 @@ func TestDynamicFragmentReplayIdempotent(t *testing.T) {
 	}
 }
 
-// TestDynamicFragmentDifferentIDInserts: a different fragment under the same
-// parent and lease generation is a new insert, not a replay.
-func TestDynamicFragmentDifferentIDInserts(t *testing.T) {
+// TestDynamicFragmentDifferentIDConflicts: after one fragment for a parent
+// job is committed in its mutation slot, a DIFFERENT fragment digest under
+// the same parent is a nondeterministic generator retry: the server answers
+// 409 with reason GENERATED_MUTATION_CONFLICT, inserts nothing, and exactly
+// the first fragment's child set stays visible. The committed receipt still
+// replays.
+func TestDynamicFragmentDifferentIDConflicts(t *testing.T) {
 	f := newDBFakeStore()
 	s := trustedGenerateServerDB(t, f)
 	runnerID, task := leaseRunJob(t, s)
-	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", fragmentBody(t, replayFragmentA), leaseHeaders(task, runnerID))
+	path := "/api/v1/jobs/" + task.Job.ID + "/generated"
+	w := doJSONHeaders(t, s, http.MethodPost, path, "token", fragmentBody(t, replayFragmentA), leaseHeaders(task, runnerID))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("first = %d: %s", w.Code, w.Body.String())
 	}
-	w = doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/generated", "token", fragmentBody(t, replayFragmentB), leaseHeaders(task, runnerID))
-	if w.Code != http.StatusCreated {
-		t.Fatalf("different fragment = %d, want 201: %s", w.Code, w.Body.String())
+	var first generatedResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &first); err != nil {
+		t.Fatal(err)
+	}
+	w = doJSONHeaders(t, s, http.MethodPost, path, "token", fragmentBody(t, replayFragmentB), leaseHeaders(task, runnerID))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("different fragment = %d, want 409: %s", w.Code, w.Body.String())
+	}
+	var conflict generatedMutationConflictResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &conflict); err != nil {
+		t.Fatalf("conflict body is not JSON: %v: %s", err, w.Body.String())
+	}
+	if conflict.Reason != generatedMutationConflictReason || conflict.Message == "" {
+		t.Fatalf("conflict body = %+v", conflict)
+	}
+	for _, id := range first.JobIDs {
+		if strings.Contains(w.Body.String(), id) {
+			t.Fatalf("conflict response leaked committed child %s: %s", id, w.Body.String())
+		}
 	}
 	f.mu.Lock()
 	n := 0
@@ -156,8 +178,20 @@ func TestDynamicFragmentDifferentIDInserts(t *testing.T) {
 		}
 	}
 	f.mu.Unlock()
-	if n != 2 {
-		t.Fatalf("children = %d, want 2 (one per fragment id)", n)
+	if n != 1 {
+		t.Fatalf("children = %d, want 1 (exactly the first fragment's child)", n)
+	}
+	// The committed slot receipt is intact: the original fragment replays.
+	w = doJSONHeaders(t, s, http.MethodPost, path, "token", fragmentBody(t, replayFragmentA), leaseHeaders(task, runnerID))
+	if w.Code != http.StatusOK {
+		t.Fatalf("original replay after conflict = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	var replay generatedResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &replay); err != nil {
+		t.Fatal(err)
+	}
+	if !replay.Replayed || len(replay.JobIDs) != len(first.JobIDs) {
+		t.Fatalf("original replay = %+v, first = %+v", replay, first)
 	}
 }
 
@@ -321,10 +355,12 @@ func runFragmentParityCase(t *testing.T, tc fragmentParityCase, db bool) string 
 // testLeaseWindow returns a positive window used to age a lease.
 func testLeaseWindow() time.Duration { return time.Minute }
 
-// TestGeneratedFragmentConcurrentCapRaceParity: two concurrent fragments
-// whose combined size straddles the run cap race the insertion in both
-// modes. Exactly one wins, the other is rejected, and the run never exceeds
-// the cap.
+// TestGeneratedFragmentConcurrentCapRaceParity: two concurrent fragments of
+// two DIFFERENT parents in the SAME run whose combined size straddles the run
+// cap race the insertion in both modes. Distinct parents keep their mutation
+// slots independent (same-parent differing digests are refused earlier as
+// conflicts), so the per-run cap is the only limiter. Exactly one wins, the
+// other is rejected, and the run never exceeds the cap.
 func TestGeneratedFragmentConcurrentCapRaceParity(t *testing.T) {
 	run := func(t *testing.T, db bool) {
 		var (
@@ -341,28 +377,48 @@ func TestGeneratedFragmentConcurrentCapRaceParity(t *testing.T) {
 			s, _ = trustedGenerateServer(t)
 			runnerID, task = leaseRunJob(t, s)
 		}
-		// Slack of exactly one fragment: both pre-checks pass, the
-		// insertion-time cap check must admit exactly one.
-		fragSize := 2
-		fillRunTo(t, s, f, task.Job.RunID, maxJobsPerRun-fragSize)
 		parent, err := s.jobForLease(context.Background(), task.Job.ID)
 		if err != nil {
 			t.Fatal(err)
 		}
 		_ = runnerID
+		// A second parent job in the SAME run under the same lease identity:
+		// its own mutation slot, so both fragments can reach the cap check.
+		second, err := newID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		parent2 := parent
+		parent2.ID = second
+		parent2.Key = parent.Key + "-second"
+		if f != nil {
+			f.mu.Lock()
+			f.jobs[parent2.ID] = parent2
+			f.mu.Unlock()
+		} else {
+			s.mu.Lock()
+			s.jobs[parent2.ID] = parent2
+			s.mu.Unlock()
+		}
+		// Slack of exactly one fragment: both pre-checks pass, the
+		// insertion-time cap check must admit exactly one.
+		fragSize := 2
+		fillRunTo(t, s, f, task.Job.RunID, maxJobsPerRun-fragSize)
 		type outcome struct {
 			ok  bool
 			err string
 		}
 		outcomes := make(chan outcome, 2)
 		var wg sync.WaitGroup
+		parents := []model.Job{parent, parent2}
 		for i := 0; i < 2; i++ {
 			body := fmt.Sprintf(`{"jobs":{"c%d-a":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo a"}]},"c%d-b":{"runtime":"container","image":"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","steps":[{"run":"echo b"}]}},"deps":{}}`, i, i)
 			frag := parseFragment(t, body)
+			p := parents[i]
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				_, err := s.processGeneratedFragment(context.Background(), parent, frag)
+				_, err := s.processGeneratedFragment(context.Background(), p, frag)
 				outcomes <- outcome{ok: err == nil, err: errString(err)}
 			}()
 		}
@@ -541,8 +597,9 @@ func generatedFragmentSetup(t *testing.T, db bool) (*Server, *dbFakeStore, strin
 // TestGeneratedFragmentReplaysAcrossInfrastructureRetry is the P1 regression:
 // parent gen1 admits fragment F (children A/B/C); an infrastructure retry
 // requeues the same logical parent and claims gen2; re-submitting the
-// identical F must replay A/B/C with no new rows and a replayed response, and
-// a CHANGED fragment under gen2 must still insert new children.
+// identical F must replay A/B/C with no new rows and a replayed response,
+// and a CHANGED fragment under gen2 is a nondeterministic generator retry:
+// 409 with no new children (exactly one child set ever).
 func TestGeneratedFragmentReplaysAcrossInfrastructureRetry(t *testing.T) {
 	for _, db := range []bool{false, true} {
 		name := "memory"
@@ -597,31 +654,144 @@ func TestGeneratedFragmentReplaysAcrossInfrastructureRetry(t *testing.T) {
 				t.Fatalf("retry inserted %d new children (before=%d after=%d)", after-before, before, after)
 			}
 
-			// A CHANGED fragment under the same new generation is a new
-			// mutation: new children.
+			// A CHANGED fragment under the new generation is a
+			// nondeterministic generator retry for the SAME logical
+			// emission: 409 with no new children (much less a second
+			// graph). This is the deploy-eu/deploy-us history: gen1 F1
+			// commits, gen2 F2 conflicts, exactly one child set remains.
 			changedBody := fragmentBody(t, replayFragmentB)
 			w = doJSONHeaders(t, s, http.MethodPost, path, "token", changedBody, retryLeaseHeaders(runnerID, retryToken, retryGen))
-			if w.Code != http.StatusCreated {
-				t.Fatalf("changed fragment = %d, want 201: %s", w.Code, w.Body.String())
+			if w.Code != http.StatusConflict {
+				t.Fatalf("changed fragment = %d, want 409: %s", w.Code, w.Body.String())
 			}
-			var changed generatedResponse
-			if err := json.Unmarshal(w.Body.Bytes(), &changed); err != nil {
-				t.Fatal(err)
+			var conflict generatedMutationConflictResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &conflict); err != nil {
+				t.Fatalf("conflict body is not JSON: %v: %s", err, w.Body.String())
 			}
-			if changed.Replayed {
-				t.Fatalf("changed fragment replayed: %s", w.Body.String())
+			if conflict.Reason != generatedMutationConflictReason {
+				t.Fatalf("conflict reason = %q, want %q", conflict.Reason, generatedMutationConflictReason)
 			}
-			for _, id := range changed.JobIDs {
-				for _, prev := range first.JobIDs {
-					if id == prev {
-						t.Fatalf("changed fragment reused original child %s", id)
-					}
-				}
+			if after := runJobCount(s, f, task.Job.RunID); after != before {
+				t.Fatalf("changed fragment job count = %d, want unchanged %d", after, before)
 			}
-			if after := runJobCount(s, f, task.Job.RunID); after != before+1 {
-				t.Fatalf("changed fragment job count = %d, want %d", after, before+1)
+			// The original receipt still replays after the conflict.
+			w = doJSONHeaders(t, s, http.MethodPost, path, "token", body, retryLeaseHeaders(runnerID, retryToken, retryGen))
+			if w.Code != http.StatusOK {
+				t.Fatalf("replay after conflict = %d, want 200: %s", w.Code, w.Body.String())
 			}
 		})
+	}
+}
+
+// TestGeneratedFragmentNondeterministicRetryConflict is the finding-4
+// regression in memory mode: a generator retry that emits a DIFFERENT digest
+// for the same logical emission (same parent job, same mutation slot, new
+// lease generation) is refused with 409 GENERATED_MUTATION_CONFLICT, inserts
+// nothing, leaves the first children intact, and keeps the run job count
+// unchanged. The PostgreSQL twin lives in
+// TestGeneratedFragmentNondeterministicRetryConflict (storage IT).
+func TestGeneratedFragmentNondeterministicRetryConflict(t *testing.T) {
+	s, _ := trustedGenerateServer(t)
+	runnerID, task := leaseRunJob(t, s)
+	path := "/api/v1/jobs/" + task.Job.ID + "/generated"
+	body := fragmentBody(t, retryFragmentABC)
+	w := doJSONHeaders(t, s, http.MethodPost, path, "token", body, leaseHeaders(task, runnerID))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("first upload = %d: %s", w.Code, w.Body.String())
+	}
+	var first generatedResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &first); err != nil {
+		t.Fatal(err)
+	}
+	before := runJobCount(s, nil, task.Job.RunID)
+
+	// Infrastructure retry: the same logical parent is re-leased under a new
+	// generation, and the generator re-emits a DIFFERENT fragment.
+	const retryToken = "nondeterministic-retry-token"
+	retryGen := task.LeaseGeneration + 1
+	rebindParentLeaseForRetry(t, s, nil, task.Job.ID, runnerID, retryToken, retryGen)
+	w = doJSONHeaders(t, s, http.MethodPost, path, "token", fragmentBody(t, replayFragmentB), retryLeaseHeaders(runnerID, retryToken, retryGen))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("nondeterministic retry = %d, want 409: %s", w.Code, w.Body.String())
+	}
+	var conflict generatedMutationConflictResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &conflict); err != nil {
+		t.Fatalf("conflict body is not JSON: %v: %s", err, w.Body.String())
+	}
+	if conflict.Reason != generatedMutationConflictReason {
+		t.Fatalf("conflict reason = %q, want %q", conflict.Reason, generatedMutationConflictReason)
+	}
+	for _, id := range first.JobIDs {
+		if strings.Contains(w.Body.String(), id) {
+			t.Fatalf("conflict response leaked committed child %s: %s", id, w.Body.String())
+		}
+	}
+	if after := runJobCount(s, nil, task.Job.RunID); after != before {
+		t.Fatalf("nondeterministic retry changed the job count: %d -> %d", before, after)
+	}
+	s.mu.Lock()
+	for _, id := range first.JobIDs {
+		if _, ok := s.jobs[id]; !ok {
+			s.mu.Unlock()
+			t.Fatalf("first child %s disappeared after the conflict", id)
+		}
+	}
+	s.mu.Unlock()
+	// The committed receipt still replays the original children.
+	w = doJSONHeaders(t, s, http.MethodPost, path, "token", body, retryLeaseHeaders(runnerID, retryToken, retryGen))
+	if w.Code != http.StatusOK {
+		t.Fatalf("replay after conflict = %d, want 200: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestRestoreGeneratedFragmentsSlotConflictKeepsNewest: a pre-0047 fs
+// snapshot can carry the nondeterministic-retry history — two receipts for
+// one parent under different fragment digests and an empty MutationSlot.
+// The restore collapses them deterministically to the newest receipt under
+// the default slot, mirroring the database quarantine in migration 0047.
+func TestRestoreGeneratedFragmentsSlotConflictKeepsNewest(t *testing.T) {
+	s, _ := trustedGenerateServer(t)
+	_, task := leaseRunJob(t, s)
+	s.mu.Lock()
+	parent := s.jobs[task.Job.ID]
+	olderChild, err := newID()
+	if err != nil {
+		s.mu.Unlock()
+		t.Fatal(err)
+	}
+	newerChild, err := newID()
+	if err != nil {
+		s.mu.Unlock()
+		t.Fatal(err)
+	}
+	s.jobs[olderChild] = model.Job{ID: olderChild, RunID: parent.RunID, Status: model.StatusQueued}
+	s.jobs[newerChild] = model.Job{ID: newerChild, RunID: parent.RunID, Status: model.StatusQueued}
+	older := time.Now().UTC().Add(-time.Hour)
+	newer := time.Now().UTC()
+	s.restoreGeneratedFragmentsLocked(map[string]storage.GeneratedFragmentReceipt{
+		// Legacy keys were parent+fragment; the loader recomputes the key.
+		parent.ID + ":old": {
+			ParentJobID: parent.ID, FragmentID: strings.Repeat("a", 64),
+			Children: []storage.GeneratedFragmentChild{{Key: "child", ID: olderChild}}, CreatedAt: older,
+		},
+		parent.ID + ":new": {
+			ParentJobID: parent.ID, FragmentID: strings.Repeat("b", 64),
+			Children: []storage.GeneratedFragmentChild{{Key: "child", ID: newerChild}}, CreatedAt: newer,
+		},
+	})
+	rec, ok := s.memoryGeneratedFragment(parent.ID, storage.GeneratedFragmentMutationSlotDefault)
+	s.mu.Unlock()
+	if !ok {
+		t.Fatal("restore dropped the newest receipt")
+	}
+	if rec.FragmentID != strings.Repeat("b", 64) || len(rec.Children) != 1 || rec.Children[0].ID != newerChild {
+		t.Fatalf("restored receipt = %+v, want the newest digest/child", rec)
+	}
+	if rec.MutationSlot != storage.GeneratedFragmentMutationSlotDefault {
+		t.Fatalf("restored receipt slot = %q", rec.MutationSlot)
+	}
+	if _, ok := s.generatedFragments[generatedFragmentKey(parent.ID, storage.GeneratedFragmentMutationSlotDefault)]; !ok {
+		t.Fatal("restored receipt is not keyed by parent+slot")
 	}
 }
 

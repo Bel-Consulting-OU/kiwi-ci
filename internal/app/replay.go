@@ -12,6 +12,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/execution"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executor"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/logging"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
@@ -23,7 +24,8 @@ import (
 // recordedJobPipeline mirrors the control plane's exact-replay export
 // (GET /api/v1/runs/{run}/jobs/{job}/pipeline): the persisted canonical
 // pipeline text and the enqueue-time compiled job payload the runner
-// verified, plus the job's attempt identity.
+// verified, plus the job's attempt identity and the persisted execution state
+// (trust, resource requests, service envelope) the shared materializer needs.
 type recordedJobPipeline struct {
 	RunID              string                    `json:"run_id"`
 	JobID              string                    `json:"id"`
@@ -33,7 +35,38 @@ type recordedJobPipeline struct {
 	Attempts           int                       `json:"attempts,omitempty"`
 	Pipeline           string                    `json:"pipeline"`
 	CompiledJobPayload *model.CompiledJobPayload `json:"compiled_job_payload,omitempty"`
+	PersistedJob       *recordedPersistedJob     `json:"persisted_job,omitempty"`
 }
+
+// recordedPersistedJob is the persisted execution state the materializer
+// consumes; it mirrors the control plane's exportedPersistedJob DTO.
+type recordedPersistedJob struct {
+	Trusted                bool                   `json:"trusted"`
+	Network                string                 `json:"network,omitempty"`
+	CPURequest             float64                `json:"cpu_request,omitempty"`
+	MemoryRequest          int64                  `json:"memory_request,omitempty"`
+	DiskRequest            int64                  `json:"disk_request,omitempty"`
+	PIDsRequest            int                    `json:"pids_request,omitempty"`
+	ServiceEnvelopeRequest model.ResourceCapacity `json:"service_envelope_request,omitempty"`
+}
+
+// persistedJob converts the exported state to the model.Job shape the
+// materializer consumes.
+func (r recordedPersistedJob) persistedJob() model.Job {
+	return model.Job{
+		Trusted:                r.Trusted,
+		Network:                r.Network,
+		CPURequest:             r.CPURequest,
+		MemoryRequest:          r.MemoryRequest,
+		DiskRequest:            r.DiskRequest,
+		PIDsRequest:            r.PIDsRequest,
+		ServiceEnvelopeRequest: r.ServiceEnvelopeRequest,
+	}
+}
+
+// replayOptionsSeam observes the effective executor.Options a replay derived
+// (test-only; production leaves it nil).
+var replayOptionsSeam func(executor.Options)
 
 // Replay reconstructs the workspace state a run's job executed in and
 // re-runs that job locally.
@@ -53,7 +86,7 @@ type recordedJobPipeline struct {
 //
 // Secrets are freshly authorized from the local provider — never captured.
 //
-// Usage: kiwi replay RUN JOB [STEP] --server URL --token TOKEN [--attempt N] [--debug-rerun] [--pipeline FILE]
+// Usage: kiwi replay RUN JOB [STEP] --server URL --token TOKEN [--attempt N] [--debug-rerun] [--allow-post-job-snapshot] [--pipeline FILE]
 func Replay(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("replay", flag.ContinueOnError)
 	server := fs.String("server", os.Getenv("KIWI_SERVER"), "control plane URL")
@@ -61,12 +94,13 @@ func Replay(ctx context.Context, args []string) error {
 	pipelineFile := fs.String("pipeline", ".kiwi/pipeline.yaml", "pipeline file for --debug-rerun")
 	attempt := fs.Int64("attempt", 0, "lease generation (attempt) of the snapshot to replay; default: newest generation for the job")
 	debugRerun := fs.Bool("debug-rerun", false, "run against the CURRENT local pipeline file instead of the recorded pipeline (execution semantics may differ)")
+	allowPostJob := fs.Bool("allow-post-job-snapshot", false, "replay from the post-execution (post_job) snapshot when the attempt has no pre-execution checkpoint (execution starts from post-execution workspace state)")
 	rest, err := parseFlagsAndPositionals(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(rest) != 2 && len(rest) != 3 {
-		return fmt.Errorf("usage: kiwi replay RUN JOB [STEP] --server URL --token TOKEN [--attempt N] [--debug-rerun] [--pipeline FILE]")
+		return fmt.Errorf("usage: kiwi replay RUN JOB [STEP] --server URL --token TOKEN [--attempt N] [--debug-rerun] [--allow-post-job-snapshot] [--pipeline FILE]")
 	}
 	if *server == "" {
 		return fmt.Errorf("--server (or KIWI_SERVER) is required")
@@ -114,6 +148,11 @@ func Replay(ctx context.Context, args []string) error {
 	// local-file behavior and warns about it.
 	var spec *pipeline.Spec
 	var matchJob pipeline.CompiledJob
+	// materialized is the effective execution of the recorded job (exact mode
+	// only): the trust/resource/network/sandbox overlays the distributed
+	// runner executed under. Replay maps it onto executor.Options so a hostile
+	// record can never be replayed under weaker restrictions.
+	var materialized *execution.EffectiveExecution
 	snapshotKey := jobKey
 	if *debugRerun {
 		fmt.Fprintf(os.Stderr, "warning: --debug-rerun executes %s from your CURRENT pipeline file; execution semantics may differ from the recorded run\n", *pipelineFile)
@@ -169,7 +208,25 @@ func Replay(ctx context.Context, args []string) error {
 		if !found {
 			return fmt.Errorf("job %q not found in the recorded pipeline", rec.Key)
 		}
-		matchJob = verified
+		// Materialize the effective execution from the recorded verified job
+		// plus the persisted job fields: the same pure derivation the
+		// distributed runner ran, so the replay enforces the recorded
+		// network/sandbox/resource restrictions even if a hostile record
+		// tries to present more permissive persisted fields.
+		if rec.PersistedJob == nil {
+			return fmt.Errorf("recorded job %q in run %s has no persisted execution state (trust/resources); the control plane is too old for exact replay: use --debug-rerun to run against your current pipeline", rec.Key, runID)
+		}
+		persisted := rec.PersistedJob.persistedJob()
+		caps, _, cerr := execution.EffectivePolicyCapabilities(rec.CompiledJobPayload, persisted.Trusted)
+		if cerr != nil {
+			return fmt.Errorf("recorded effective policy for job %q in run %s is invalid: %w; use --debug-rerun to run against your current pipeline", rec.Key, runID, cerr)
+		}
+		eff, merr := execution.MaterializeEffectiveExecution(verified, rec.CompiledJobPayload, persisted, caps)
+		if merr != nil {
+			return fmt.Errorf("recorded effective execution for job %q in run %s is invalid: %w; use --debug-rerun to run against your current pipeline", rec.Key, runID, merr)
+		}
+		materialized = &eff
+		matchJob = eff.CompiledJob
 		snapshotKey = rec.Key
 	}
 
@@ -177,11 +234,14 @@ func Replay(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("list snapshots: %w", err)
 	}
-	match, err := selectReplaySnapshot(recs, snapshotKey, *attempt, runID)
+	match, err := selectReplaySnapshot(recs, snapshotKey, *attempt, runID, *allowPostJob)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("using snapshot %s (lease generation %d)\n", match.ID, match.LeaseGeneration)
+	if snapshotPhaseOf(match) == model.SnapshotPhasePostJob {
+		fmt.Fprintf(os.Stderr, "warning: --allow-post-job-snapshot selected the POST-execution snapshot %s; execution starts from the state the recorded attempt left behind, not from a pre-execution checkpoint\n", match.ID)
+	}
+	fmt.Printf("using %s snapshot %s (lease generation %d)\n", snapshotPhaseOf(match), match.ID, match.LeaseGeneration)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, *server+"/api/v1/runs/"+url.PathEscape(runID)+"/snapshots/"+url.PathEscape(match.ID), nil)
 	if err != nil {
@@ -213,13 +273,29 @@ func Replay(ctx context.Context, args []string) error {
 	logs := &logging.Console{Writer: os.Stdout, Masker: masker}
 	provider := secrets.Chain{secrets.EnvProvider{Prefix: "KIWI_SECRET_"}, secrets.MacKeychainProvider{Service: "kiwi-ci"}}
 	opts := executor.Options{
-		Workspace:              ws,
-		RunID:                  runIDLocal,
-		OnlyStep:               stepID,
-		RequireImmutableImages: true,
-		InheritEnv:             false,
-		SecretProvider:         provider,
-		Logs:                   logs,
+		Workspace:      ws,
+		RunID:          runIDLocal,
+		OnlyStep:       stepID,
+		InheritEnv:     false,
+		SecretProvider: provider,
+		Logs:           logs,
+	}
+	if materialized != nil {
+		// Exact replay: enforce the recorded effective execution (untrusted
+		// floor, workspace bound, immutable images) through the ONE shared
+		// mapping the distributed runner uses. Deliberate local-only
+		// differences: the ephemeral local workspace, no artifact/cache
+		// upload, the step selector, and no OS-level workspace quota (the
+		// host capability and its operator escape hatch are runner-local).
+		opts = executor.OptionsFromExecution(opts, *materialized)
+	} else {
+		// --debug-rerun executes the local file with historical local
+		// semantics; no recorded effective execution exists to derive from.
+		opts.RequireImmutableImages = true
+	}
+	// Test seam: observe the final options (production leaves it nil).
+	if replayOptionsSeam != nil {
+		replayOptionsSeam(opts)
 	}
 	e := &executor.Executor{Opt: opts, Masker: masker}
 	result := e.RunCompiledJob(ctx, spec, matchJob)
@@ -274,15 +350,60 @@ func listReplaySnapshots(ctx context.Context, client *http.Client, auth func(*ht
 	}
 }
 
-// selectReplaySnapshot picks the snapshot record to restore for jobKey. With
+// snapshotPhaseOf returns the effective phase of a snapshot record. Legacy
+// records (persisted before the phase field existed) carry an empty phase and
+// were outcome captures, so they mean post_job.
+func snapshotPhaseOf(rec model.SnapshotRecord) string {
+	if rec.Phase == "" {
+		return model.SnapshotPhasePostJob
+	}
+	return rec.Phase
+}
+
+// selectReplaySnapshot picks the snapshot record to restore for jobKey.
+//
+// Replay MUST start from the pre-execution checkpoint (phase pre_job): the
+// post-execution snapshot already contains the attempt's mutations, so
+// executing from it would silently run against post-execution state. With
 // attempt > 0 only records uploaded under that lease generation match — a
 // missing attempt is an error, never a silent fallback to another attempt.
 // Without an attempt the newest generation wins (legacy records without a
 // generation compare by upload time).
-func selectReplaySnapshot(recs []model.SnapshotRecord, jobKey string, attempt int64, runID string) (model.SnapshotRecord, error) {
+//
+// When the requested attempt has no pre_job record, the caller may opt into
+// the post_job record with allowPostJob (the --allow-post-job-snapshot escape
+// hatch); the record is returned so the caller can warn that execution starts
+// from post-execution state. Without the escape hatch the refusal names the
+// problem and the flag.
+func selectReplaySnapshot(recs []model.SnapshotRecord, jobKey string, attempt int64, runID string, allowPostJob bool) (model.SnapshotRecord, error) {
+	if match := pickReplaySnapshot(recs, jobKey, attempt, model.SnapshotPhasePreJob); match.ID != "" {
+		return match, nil
+	}
+	post := pickReplaySnapshot(recs, jobKey, attempt, model.SnapshotPhasePostJob)
+	if post.ID != "" {
+		if allowPostJob {
+			return post, nil
+		}
+		where := "for job " + fmt.Sprintf("%q", jobKey)
+		if attempt > 0 {
+			where = fmt.Sprintf("for job %q at lease generation %d", jobKey, attempt)
+		}
+		return model.SnapshotRecord{}, fmt.Errorf("no pre-execution (pre_job) workspace snapshot %s in run %s: the recorded attempt has only a post-execution snapshot, and replaying it would start from the state the attempt already mutated; re-run with --allow-post-job-snapshot to accept post-execution state, or re-run the job with a runner that captures pre_job snapshots", where, runID)
+	}
+	if attempt > 0 {
+		return model.SnapshotRecord{}, fmt.Errorf("no workspace snapshot for job %q at lease generation %d in run %s", jobKey, attempt, runID)
+	}
+	return model.SnapshotRecord{}, fmt.Errorf("no workspace snapshot for job %q in run %s", jobKey, runID)
+}
+
+// pickReplaySnapshot returns the newest record for jobKey whose effective
+// phase equals phase (legacy empty phases are post_job), honoring the attempt
+// selection rules: a positive attempt matches exactly that lease generation;
+// zero selects across generations (newest generation, then newest upload).
+func pickReplaySnapshot(recs []model.SnapshotRecord, jobKey string, attempt int64, phase string) model.SnapshotRecord {
 	var match model.SnapshotRecord
 	for _, rec := range recs {
-		if rec.JobKey != jobKey {
+		if rec.JobKey != jobKey || snapshotPhaseOf(rec) != phase {
 			continue
 		}
 		if attempt > 0 {
@@ -299,11 +420,5 @@ func selectReplaySnapshot(recs []model.SnapshotRecord, jobKey string, attempt in
 			match = rec
 		}
 	}
-	if match.ID == "" {
-		if attempt > 0 {
-			return match, fmt.Errorf("no workspace snapshot for job %q at lease generation %d in run %s", jobKey, attempt, runID)
-		}
-		return match, fmt.Errorf("no workspace snapshot for job %q in run %s", jobKey, runID)
-	}
-	return match, nil
+	return match
 }

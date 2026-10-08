@@ -735,19 +735,70 @@ type GeneratedFragmentChild struct {
 	ID  string `json:"id"`
 }
 
+// GeneratedFragmentMutationSlotDefault is the logical mutation slot of
+// today's generated-fragment endpoint: exactly one generated output per
+// parent job. The slot is the store-side constant, never client-supplied
+// yet (a future generation may carry an explicit mutation key generalized to
+// (parent, mutation_key, digest); see GeneratedFragmentRequest.MutationSlot).
+const GeneratedFragmentMutationSlotDefault = "generated"
+
+// GeneratedFragmentSlot returns the effective mutation slot of a fragment
+// request or receipt: the explicit slot when set, the single-output default
+// otherwise. An empty slot occurs only for direct storage callers and for
+// receipts persisted before the slot existed (migration 0047), never on the
+// server endpoint path.
+func GeneratedFragmentSlot(slot string) string {
+	if slot == "" {
+		return GeneratedFragmentMutationSlotDefault
+	}
+	return slot
+}
+
+// ErrGeneratedMutationConflict marks a fragment upload whose mutation slot is
+// already committed with a DIFFERENT fragment digest: the retry is a
+// nondeterministic re-emission, and appending its graph would duplicate the
+// logical generator output. Callers compare with errors.Is and read the two
+// fragment ids from *GeneratedMutationConflictError.
+var ErrGeneratedMutationConflict = errors.New("storage: generated fragment mutation conflict")
+
+// GeneratedMutationConflictError carries the committed fragment digest and
+// the submitted one for a refused mutation-slot conflict. The handler maps it
+// to HTTP 409 (reason GENERATED_MUTATION_CONFLICT) instead of appending a
+// second child graph. No child IDs are carried: the conflict response must
+// not leak the committed receipt beyond the explicit replay path.
+type GeneratedMutationConflictError struct {
+	ParentJobID         string
+	MutationSlot        string
+	ExistingFragmentID  string
+	SubmittedFragmentID string
+}
+
+func (e *GeneratedMutationConflictError) Error() string {
+	return fmt.Sprintf("storage: generated fragment mutation conflict for parent %s slot %q: committed fragment %s differs from submitted fragment %s; a nondeterministic generator retry cannot append a second graph",
+		e.ParentJobID, e.MutationSlot, e.ExistingFragmentID, e.SubmittedFragmentID)
+}
+
+// Unwrap makes errors.Is(err, ErrGeneratedMutationConflict) true.
+func (e *GeneratedMutationConflictError) Unwrap() error { return ErrGeneratedMutationConflict }
+
 // GeneratedFragmentReceipt is the durable idempotency receipt of one
-// generated fragment upload: the canonical mutation key (parent job,
-// fragment digest) maps to the children created for it, in canonical
-// (sorted-key) order, so a replay reconstructs the original response
-// exactly. The lease generation is NOT part of the mutation identity: it
-// authorizes the upload (the presenting lease must still be current) but an
-// infrastructure retry of the same logical parent under a new generation
-// re-submits the identical fragment and must replay THESE children instead
-// of inserting a duplicate graph. LeaseGeneration records the generation
-// that authorized the original admission.
+// generated fragment upload: the canonical generation-free mutation identity
+// (parent job, mutation slot) maps to the fragment digest that admitted it
+// and to the children created for it, in canonical (sorted-key) order, so a
+// replay reconstructs the original response exactly. The lease generation is
+// NOT part of the mutation identity: it authorizes the upload (the presenting
+// lease must still be current) but an infrastructure retry of the same
+// logical parent under a new generation re-submits the identical fragment and
+// must replay THESE children instead of inserting a duplicate graph.
+// FragmentID is the digest that won the slot: a submission with a different
+// digest for the same slot is refused (ErrGeneratedMutationConflict) rather
+// than admitted as a second logical output. LeaseGeneration records the
+// generation that authorized the original admission. MutationSlot carries
+// the slot (empty in pre-0047 persisted receipts, read as the default).
 type GeneratedFragmentReceipt struct {
 	ParentJobID     string                   `json:"parent_job_id"`
 	LeaseGeneration int64                    `json:"lease_generation"`
+	MutationSlot    string                   `json:"mutation_slot,omitempty"`
 	FragmentID      string                   `json:"fragment_id"`
 	Children        []GeneratedFragmentChild `json:"children"`
 	CreatedAt       time.Time                `json:"created_at"`
@@ -760,17 +811,30 @@ type GeneratedFragmentReceipt struct {
 // presented; the store verifies them and the lease expiry against the locked
 // parent row at the storage clock, BEFORE any receipt replay. The generation
 // AUTHORIZES the mutation but never defines it: the receipt identity is
-// (ParentJobID, FragmentID), so a retry under a new generation of the same
-// logical parent replays the original children. The verification closure and
-// the receipt are evaluated inside the same transaction as the insertion.
-// Children lists the created child key/ID pairs in canonical (sorted
-// fragment key) order, matching the response the admitting server reported.
+// (ParentJobID, MutationSlot), so a retry under a new generation of the same
+// logical parent replays the original children when it submits the SAME
+// fragment digest, and fails closed with ErrGeneratedMutationConflict when a
+// nondeterministic generator emits a different digest for the same slot. The
+// verification closure and the receipt are evaluated inside the same
+// transaction as the insertion. Children lists the created child key/ID
+// pairs in canonical (sorted fragment key) order, matching the response the
+// admitting server reported.
+//
+// MutationSlot is the logical mutation identity. Today's endpoint has exactly
+// one generated output per parent job, so the server always fills the
+// constant GeneratedFragmentMutationSlotDefault; it is never client-supplied
+// yet. The documented future generalization is (ParentJobID, MutationSlot,
+// FragmentID) with a client-supplied mutation key, at which point a slot may
+// legitimately hold several distinct graphs; until then a differing digest in
+// one slot is a conflict. An empty MutationSlot is read as the default by
+// every store.
 type GeneratedFragmentRequest struct {
 	ParentJobID     string
 	RunnerID        string
 	LeaseGeneration int64
 	LeaseTokenHash  []byte
 	Depth           int
+	MutationSlot    string
 	FragmentID      string
 	Jobs            map[string]model.Job
 	Deps            map[string][]string
@@ -808,13 +872,15 @@ func ValidateGeneratedParentLease(parent model.Job, req GeneratedFragmentRequest
 }
 
 // GeneratedFragmentStore reads the idempotency receipt of a previously
-// admitted fragment by its canonical mutation key (parent job, fragment id)
-// so a replayed upload returns the same children without re-inserting
-// anything, regardless of which lease generation admitted it. Callers must
-// have authorized the CURRENT lease before consulting the receipt; the
-// receipt read itself carries no lease authority.
+// admitted fragment by its canonical mutation key (parent job, mutation
+// slot) so a replayed upload returns the same children without re-inserting
+// anything, regardless of which lease generation admitted it, and a
+// different fragment digest under the same slot is diagnosed as
+// ErrGeneratedMutationConflict by the caller. Callers must have authorized
+// the CURRENT lease before consulting the receipt; the receipt read itself
+// carries no lease authority.
 type GeneratedFragmentStore interface {
-	GetGeneratedFragment(ctx context.Context, parentJobID, fragmentID string) (GeneratedFragmentReceipt, bool, error)
+	GetGeneratedFragment(ctx context.Context, parentJobID, mutationSlot string) (GeneratedFragmentReceipt, bool, error)
 }
 
 // DynamicStoreTx is the transactional dynamic-fragment contract. The
@@ -822,8 +888,10 @@ type GeneratedFragmentStore interface {
 // same transaction as the fragment insertion, AFTER the storage layer has
 // validated the complete parent lease predicate of the CURRENT request, so a
 // stale lease or an over-cap run rejects the fragment atomically and a
-// replayed fragment (same canonical mutation key parent+fragment id) returns
-// the ORIGINAL receipt with replayed=true and inserts nothing. The
+// replayed fragment (same canonical mutation key parent+mutation slot with
+// the same fragment digest) returns the ORIGINAL receipt with replayed=true
+// and inserts nothing, while a DIFFERENT digest in the same slot fails
+// closed with ErrGeneratedMutationConflict before any row is written. The
 // fragment's artifact contracts commit in the SAME transaction as the jobs —
 // a generated job with a required artifact has its contract row visible
 // before any completion can run.

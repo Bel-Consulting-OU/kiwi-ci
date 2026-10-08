@@ -612,6 +612,15 @@ type SnapshotEntry struct {
 	SHA256 string `json:"sha256"`
 }
 
+// Snapshot phase values. A snapshot is captured either BEFORE a job attempt
+// executes (pre_job: the pre-execution checkpoint, the state a replay must
+// start from) or AFTER it finished (post_job: the outcome workspace, which
+// already contains the attempt's mutations).
+const (
+	SnapshotPhasePreJob  = "pre_job"
+	SnapshotPhasePostJob = "post_job"
+)
+
 // SnapshotRecord is the server-side record of an uploaded workspace
 // snapshot: the archive location, its digest, and the entry manifest.
 type SnapshotRecord struct {
@@ -626,6 +635,12 @@ type SnapshotRecord struct {
 	RootSHA256 string          `json:"root_sha256"`
 	Entries    []SnapshotEntry `json:"entries,omitempty"`
 	CreatedAt  time.Time       `json:"created_at"`
+	// Phase records when the snapshot was captured relative to the attempt's
+	// execution: SnapshotPhasePreJob or SnapshotPhasePostJob. Legacy records
+	// persisted before the field existed carry the empty string and mean
+	// SnapshotPhasePostJob (they were outcome captures); exact replay refuses
+	// to use such a record unless --allow-post-job-snapshot is passed.
+	Phase string `json:"phase,omitempty"`
 	// LeaseGeneration is the lease generation (attempt identity) the
 	// snapshot was uploaded under: the addressable "snapshot from attempt
 	// N" of a retried job (model.AttemptID pairs it with JobID). Zero for

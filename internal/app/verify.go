@@ -24,8 +24,8 @@ import (
 // server's Ed25519 signature (or the pinned --trusted-key), then binds the
 // attestation subject digest to the bytes that were actually downloaded.
 // Non-empty --repository/--commit/--ref/--job/--builder/--issuer/--attempt/
-// --capsule-digest flags are enforced as statement constraints via
-// provenance.VerifyWith.
+// --capsule-digest/--execution-capsule-digest flags are enforced as statement
+// constraints via provenance.VerifyWith.
 func VerifyArtifact(args []string) error {
 	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
 	serverURL := fs.String("server", "http://127.0.0.1:8080", "Kiwi server URL")
@@ -38,6 +38,7 @@ func VerifyArtifact(args []string) error {
 	issuer := fs.String("issuer", "", "required provenance issuer (constraint)")
 	attempt := fs.String("attempt", "", "required provenance attempt ID (constraint, <jobID>:<leaseGeneration>)")
 	capsuleDigest := fs.String("capsule-digest", "", "required provenance capsule digest (constraint, sha256 of the persisted compiled job payload)")
+	executionCapsuleDigest := fs.String("execution-capsule-digest", "", "required provenance execution capsule digest (constraint, sha256 of the materialized effective execution)")
 	trustedKey := fs.String("trusted-key", "", "path to a PEM Ed25519 public key that pins the verification key")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -82,14 +83,15 @@ func VerifyArtifact(args []string) error {
 		return err
 	}
 	opts := provenance.VerifyOptions{
-		Repository:    *repository,
-		Commit:        *commit,
-		Ref:           *ref,
-		Job:           *job,
-		Builder:       *builder,
-		Issuer:        *issuer,
-		AttemptID:     *attempt,
-		CapsuleDigest: *capsuleDigest,
+		Repository:             *repository,
+		Commit:                 *commit,
+		Ref:                    *ref,
+		Job:                    *job,
+		Builder:                *builder,
+		Issuer:                 *issuer,
+		AttemptID:              *attempt,
+		CapsuleDigest:          *capsuleDigest,
+		ExecutionCapsuleDigest: *executionCapsuleDigest,
 	}
 	var resolver func(kid string) (ed25519.PublicKey, bool)
 	if *trustedKey != "" {

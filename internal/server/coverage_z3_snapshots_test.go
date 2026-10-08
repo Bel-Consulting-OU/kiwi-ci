@@ -338,7 +338,7 @@ func TestFlowSnapshotDBLateCapabilityGates(t *testing.T) {
 		j := f.jobs["job-a"]
 		r := httptest.NewRequest(http.MethodPost, "/api/v1/jobs/job-a/snapshots", strings.NewReader(string(archive)))
 		w := httptest.NewRecorder()
-		s.uploadSnapshotDB(w, r, j, "runner-a", 5)
+		s.uploadSnapshotDB(w, r, j, "runner-a", 5, model.SnapshotPhasePostJob)
 		f.mu.Lock()
 		records := len(f.snapshots)
 		f.mu.Unlock()

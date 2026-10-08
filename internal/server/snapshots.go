@@ -32,6 +32,23 @@ import (
 // it at the shared constant.
 var snapshotUploadMaxBytes = snapshot.MaxArchiveBytes
 
+// parseSnapshotPhase validates the X-Kiwi-Snapshot-Phase upload header. An
+// absent value defaults to post_job (older runners capture outcome
+// snapshots); pre_job and post_job are the only accepted values, and
+// anything else is a 400 before the body is read.
+func parseSnapshotPhase(raw string) (string, error) {
+	switch strings.TrimSpace(raw) {
+	case "":
+		return model.SnapshotPhasePostJob, nil
+	case model.SnapshotPhasePreJob:
+		return model.SnapshotPhasePreJob, nil
+	case model.SnapshotPhasePostJob:
+		return model.SnapshotPhasePostJob, nil
+	default:
+		return "", fmt.Errorf("invalid snapshot phase %q (want %s or %s)", raw, model.SnapshotPhasePreJob, model.SnapshotPhasePostJob)
+	}
+}
+
 // DefaultSnapshotMaxPerJob bounds how many snapshot records one (run, job)
 // pair may retain. Each record pins its archive blob in CAS until the record
 // is deleted (the reference-aware GC treats records as live references), so
@@ -220,6 +237,15 @@ func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
 	if !s.requireCurrentRunnerIncarnation(w, r, runnerID) {
 		return
 	}
+	// Snapshot phase: pre_job (the executor's pre-execution checkpoint) or
+	// post_job (the finalization capture). A missing header means post_job so
+	// runners that predate the phase field keep their outcome-capture
+	// semantics; anything else is rejected before a byte is read.
+	phase, phaseErr := parseSnapshotPhase(r.Header.Get("X-Kiwi-Snapshot-Phase"))
+	if phaseErr != nil {
+		http.Error(w, phaseErr.Error(), http.StatusBadRequest)
+		return
+	}
 	// Static wiring gate FIRST: a DB store without transactional lease-commit
 	// support is refused before the count preflight, before a body byte is read
 	// and before any staging reservation is taken, instead of failing after
@@ -261,7 +287,7 @@ func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "snapshot storage requires a CAS blob store in DB mode", http.StatusServiceUnavailable)
 			return
 		}
-		s.uploadSnapshotDB(w, r, j, runnerID, gen)
+		s.uploadSnapshotDB(w, r, j, runnerID, gen, phase)
 		return
 	}
 	if s.store == nil {
@@ -348,6 +374,7 @@ func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
 		Version:         m.Version,
 		RootSHA256:      m.RootSHA256,
 		CreatedAt:       time.Now().UTC(),
+		Phase:           phase,
 		LeaseGeneration: gen,
 		Attempts:        j.Attempts,
 	}
@@ -483,7 +510,7 @@ func validateSnapshotFiles(rec model.SnapshotRecord) error {
 // because a failed metadata persist must not remove a digest another
 // record may reference. The record's Path is the cas:<digest> reference,
 // so any replica resolves the archive by digest.
-func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j model.Job, runnerID string, gen int64) {
+func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j model.Job, runnerID string, gen int64, phase string) {
 	ctx := r.Context()
 	stagingBudget := s.StagingBudget()
 	if stagingBudget == nil {
@@ -613,6 +640,7 @@ func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j mode
 		Version:         m.Version,
 		RootSHA256:      m.RootSHA256,
 		CreatedAt:       time.Now().UTC(),
+		Phase:           phase,
 		LeaseGeneration: gen,
 		Attempts:        j.Attempts,
 	}
@@ -1029,6 +1057,37 @@ type runJobPipeline struct {
 	Attempts           int                       `json:"attempts,omitempty"`
 	Pipeline           string                    `json:"pipeline"`
 	CompiledJobPayload *model.CompiledJobPayload `json:"compiled_job_payload,omitempty"`
+	// PersistedJob carries the persisted execution state the replay
+	// materializer needs (trust, persisted resource requests, legacy network
+	// and the service envelope) so replay derives the same effective
+	// execution the distributed runner executed under.
+	PersistedJob exportedPersistedJob `json:"persisted_job"`
+}
+
+// exportedPersistedJob is the exact-replay subset of model.Job the shared
+// execution materializer consumes.
+type exportedPersistedJob struct {
+	Trusted                bool                   `json:"trusted"`
+	Network                string                 `json:"network,omitempty"`
+	CPURequest             float64                `json:"cpu_request,omitempty"`
+	MemoryRequest          int64                  `json:"memory_request,omitempty"`
+	DiskRequest            int64                  `json:"disk_request,omitempty"`
+	PIDsRequest            int                    `json:"pids_request,omitempty"`
+	ServiceEnvelopeRequest model.ResourceCapacity `json:"service_envelope_request,omitempty"`
+}
+
+// persistedJobForExport copies the materializer-relevant persisted fields of
+// a job into the export DTO.
+func persistedJobForExport(j model.Job) exportedPersistedJob {
+	return exportedPersistedJob{
+		Trusted:                j.Trusted,
+		Network:                j.Network,
+		CPURequest:             j.CPURequest,
+		MemoryRequest:          j.MemoryRequest,
+		DiskRequest:            j.DiskRequest,
+		PIDsRequest:            j.PIDsRequest,
+		ServiceEnvelopeRequest: j.ServiceEnvelopeRequest,
+	}
 }
 
 // jobInRun resolves a job addressed by ID, key or base key within one run.
@@ -1114,6 +1173,7 @@ func (s *Server) exportRunJobPipeline(w http.ResponseWriter, r *http.Request) {
 		Attempts:           j.Attempts,
 		Pipeline:           j.Pipeline,
 		CompiledJobPayload: j.CompiledJobPayload,
+		PersistedJob:       persistedJobForExport(j),
 	})
 }
 

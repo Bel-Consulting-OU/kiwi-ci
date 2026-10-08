@@ -4814,36 +4814,39 @@ func (s *PostgresStore) InsertGeneratedJobs(ctx context.Context, parentJobID str
 }
 
 // GetGeneratedFragment reads one fragment idempotency receipt by its
-// canonical mutation key (parent job, fragment id). found=false means the
-// fragment was never admitted under this parent, regardless of the lease
-// generation that admitted it. The caller must have authorized the CURRENT
-// lease before consulting the receipt: the generation authorizes the
-// mutation but never defines it, and this read carries no lease authority.
-func (s *PostgresStore) GetGeneratedFragment(ctx context.Context, parentJobID, fragmentID string) (GeneratedFragmentReceipt, bool, error) {
+// canonical mutation key (parent job, mutation slot). found=false means the
+// slot was never committed under this parent, regardless of the lease
+// generation that admitted it; a found receipt carries the fragment digest
+// that won the slot, which the caller compares with the submitted digest to
+// detect a nondeterministic retry (ErrGeneratedMutationConflict). The caller
+// must have authorized the CURRENT lease before consulting the receipt: the
+// generation authorizes the mutation but never defines it, and this read
+// carries no lease authority.
+func (s *PostgresStore) GetGeneratedFragment(ctx context.Context, parentJobID, mutationSlot string) (GeneratedFragmentReceipt, bool, error) {
 	if err := ValidateJobID(parentJobID); err != nil {
 		return GeneratedFragmentReceipt{}, false, err
 	}
-	if fragmentID == "" {
-		return GeneratedFragmentReceipt{}, false, error(fmt.Errorf("storage: empty fragment id"))
+	if mutationSlot == "" {
+		return GeneratedFragmentReceipt{}, false, error(fmt.Errorf("storage: empty mutation slot"))
 	}
 	var (
 		raw        []byte
+		fragmentID string
 		generation int64
 		ts         time.Time
 	)
-	// The (parent_job_id, fragment_id) unique index allows exactly one row;
-	// the newest created_at is selected defensively for a database upgraded
-	// from a pre-0043 schema where a pair could in theory occur more than
-	// once.
-	err := s.pool.QueryRow(ctx, `SELECT children, lease_generation, created_at FROM generated_fragments WHERE parent_job_id=$1 AND fragment_id=$2 ORDER BY created_at DESC LIMIT 1`,
-		parentJobID, fragmentID).Scan(&raw, &generation, &ts)
+	// The (parent_job_id, mutation_slot) unique index (migration 0047) allows
+	// exactly one row; the newest created_at is selected defensively for a
+	// database whose post-migration quarantine left an unexpected duplicate.
+	err := s.pool.QueryRow(ctx, `SELECT children, fragment_id, lease_generation, created_at FROM generated_fragments WHERE parent_job_id=$1 AND mutation_slot=$2 ORDER BY created_at DESC LIMIT 1`,
+		parentJobID, mutationSlot).Scan(&raw, &fragmentID, &generation, &ts)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return GeneratedFragmentReceipt{}, false, nil
 	}
 	if err != nil {
 		return GeneratedFragmentReceipt{}, false, err
 	}
-	rec := GeneratedFragmentReceipt{ParentJobID: parentJobID, LeaseGeneration: generation, FragmentID: fragmentID, CreatedAt: ts}
+	rec := GeneratedFragmentReceipt{ParentJobID: parentJobID, LeaseGeneration: generation, MutationSlot: mutationSlot, FragmentID: fragmentID, CreatedAt: ts}
 	if err := json.Unmarshal(raw, &rec.Children); err != nil {
 		return GeneratedFragmentReceipt{}, false, err
 	}
@@ -4857,11 +4860,15 @@ func (s *PostgresStore) GetGeneratedFragment(ctx context.Context, parentJobID, f
 //     after the lock, then ValidateGeneratedParentLease re-checks {running,
 //     runner, generation, token, expiry} against that locked state for the
 //     CURRENT request;
-//  2. only AFTER the lease is authorized, a committed receipt for the same
-//     canonical mutation key (parent, fragment id) is returned with
-//     replayed=true and nothing is inserted (the lost-response replay path,
-//     including an infrastructure retry under a NEW generation: the
-//     generation authorizes but never defines the mutation);
+//  2. only AFTER the lease is authorized, the committed receipt for the
+//     canonical mutation key (parent, mutation slot) is resolved: the SAME
+//     fragment digest replays the original children with replayed=true and
+//     nothing is inserted (the lost-response path, including an
+//     infrastructure retry under a NEW generation: the generation authorizes
+//     but never defines the mutation), while a DIFFERENT digest in the same
+//     slot is refused with ErrGeneratedMutationConflict before any row is
+//     written — a nondeterministic generator retry cannot append a second
+//     child graph;
 //  3. the run's current job count is read inside the transaction and the
 //     verifier re-checks graph invariants and the max-jobs-per-run bound
 //     against that fresh state;
@@ -4872,8 +4879,8 @@ func (s *PostgresStore) GetGeneratedFragment(ctx context.Context, parentJobID, f
 //     receipt).
 //
 // A concurrent duplicate insert that loses the receipt race rolls its own
-// job rows back and returns the winner's receipt, so exactly one fragment is
-// ever visible.
+// job rows back and applies the same replay/conflict rule to the winner, so
+// exactly one fragment is ever visible per slot.
 func (s *PostgresStore) InsertGeneratedFragmentTx(ctx context.Context, req GeneratedFragmentRequest, verify GeneratedJobVerifier) (GeneratedFragmentReceipt, bool, error) {
 	if err := ValidateJobID(req.ParentJobID); err != nil {
 		return GeneratedFragmentReceipt{}, false, err
@@ -4881,6 +4888,7 @@ func (s *PostgresStore) InsertGeneratedFragmentTx(ctx context.Context, req Gener
 	if req.FragmentID == "" {
 		return GeneratedFragmentReceipt{}, false, fmt.Errorf("storage: empty fragment id")
 	}
+	slot := GeneratedFragmentSlot(req.MutationSlot)
 	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return GeneratedFragmentReceipt{}, false, err
@@ -4916,26 +4924,17 @@ func (s *PostgresStore) InsertGeneratedFragmentTx(ctx context.Context, req Gener
 	if err := ValidateGeneratedParentLease(parent, req, commitNow); err != nil {
 		return GeneratedFragmentReceipt{}, false, err
 	}
-	// Replay path inside the transaction, after authorization. A committed
-	// receipt for the SAME (parent, fragment id) mutation key returns the
-	// original children and inserts nothing, whatever lease generation
-	// admitted them.
-	var (
-		raw           []byte
-		replayGen     int64
-		replayCreated time.Time
-	)
-	err = tx.QueryRow(ctx, `SELECT children, lease_generation, created_at FROM generated_fragments WHERE parent_job_id=$1 AND fragment_id=$2 ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,
-		req.ParentJobID, req.FragmentID).Scan(&raw, &replayGen, &replayCreated)
-	if err == nil {
-		rec := GeneratedFragmentReceipt{ParentJobID: req.ParentJobID, LeaseGeneration: replayGen, FragmentID: req.FragmentID, CreatedAt: replayCreated}
-		if err := json.Unmarshal(raw, &rec.Children); err != nil {
-			return GeneratedFragmentReceipt{}, false, err
-		}
-		return rec, true, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
+	// Slot resolution inside the transaction, after authorization. A
+	// committed receipt for the SAME (parent, mutation slot) key returns the
+	// original children when the submitted digest matches, and fails closed
+	// with ErrGeneratedMutationConflict when it does not, whatever lease
+	// generation admitted the original.
+	rec, found, err := s.lookupGeneratedFragmentTx(ctx, tx, req.ParentJobID, slot, req.FragmentID, true)
+	if err != nil {
 		return GeneratedFragmentReceipt{}, false, err
+	}
+	if found {
+		return rec, true, nil
 	}
 	var runJobCount int
 	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM jobs WHERE run_id=$1`, parent.RunID).Scan(&runJobCount); err != nil {
@@ -4978,34 +4977,67 @@ func (s *PostgresStore) InsertGeneratedFragmentTx(ctx context.Context, req Gener
 	if err != nil {
 		return GeneratedFragmentReceipt{}, false, err
 	}
-	ct, err := tx.Exec(ctx, `INSERT INTO generated_fragments (parent_job_id, lease_generation, fragment_id, children, created_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (parent_job_id, fragment_id) DO NOTHING`,
-		req.ParentJobID, req.LeaseGeneration, req.FragmentID, cb, commitNow)
+	ct, err := tx.Exec(ctx, `INSERT INTO generated_fragments (parent_job_id, lease_generation, mutation_slot, fragment_id, children, created_at) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (parent_job_id, mutation_slot) DO NOTHING`,
+		req.ParentJobID, req.LeaseGeneration, slot, req.FragmentID, cb, commitNow)
 	if err != nil {
 		return GeneratedFragmentReceipt{}, false, err
 	}
 	if ct.RowsAffected() == 0 {
 		// A concurrent duplicate committed first: discard this transaction's
-		// job rows and return the winner's receipt for the canonical
-		// mutation key (newest created_at).
-		var (
-			winner        []byte
-			winnerGen     int64
-			winnerCreated time.Time
-		)
-		if err := tx.QueryRow(ctx, `SELECT children, lease_generation, created_at FROM generated_fragments WHERE parent_job_id=$1 AND fragment_id=$2 ORDER BY created_at DESC LIMIT 1`,
-			req.ParentJobID, req.FragmentID).Scan(&winner, &winnerGen, &winnerCreated); err != nil {
-			return GeneratedFragmentReceipt{}, false, err
+		// job rows and apply the replay/conflict rule to the winner's receipt
+		// for the canonical mutation key.
+		winner, found, werr := s.lookupGeneratedFragmentTx(ctx, tx, req.ParentJobID, slot, req.FragmentID, false)
+		if werr != nil {
+			return GeneratedFragmentReceipt{}, false, werr
 		}
-		rec := GeneratedFragmentReceipt{ParentJobID: req.ParentJobID, LeaseGeneration: winnerGen, FragmentID: req.FragmentID, CreatedAt: winnerCreated}
-		if err := json.Unmarshal(winner, &rec.Children); err != nil {
-			return GeneratedFragmentReceipt{}, false, err
+		if !found {
+			return GeneratedFragmentReceipt{}, false, fmt.Errorf("storage: generated fragment slot %q lost its winner row", slot)
 		}
-		return rec, true, nil
+		return winner, true, nil
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return GeneratedFragmentReceipt{}, false, err
 	}
-	return GeneratedFragmentReceipt{ParentJobID: req.ParentJobID, LeaseGeneration: req.LeaseGeneration, FragmentID: req.FragmentID, Children: children, CreatedAt: commitNow}, false, nil
+	return GeneratedFragmentReceipt{ParentJobID: req.ParentJobID, LeaseGeneration: req.LeaseGeneration, MutationSlot: slot, FragmentID: req.FragmentID, Children: children, CreatedAt: commitNow}, false, nil
+}
+
+// lookupGeneratedFragmentTx resolves the (parent, slot) receipt inside the
+// fragment transaction. It returns ErrGeneratedMutationConflict when a row
+// exists whose fragment digest differs from submittedFragmentID, so both the
+// pre-insert probe and the post-conflict winner read share one rule. lock
+// takes the row lock (pre-insert probe); the winner read after a lost insert
+// race does not need it because the winning row is already committed.
+func (s *PostgresStore) lookupGeneratedFragmentTx(ctx context.Context, tx pgx.Tx, parentJobID, slot, submittedFragmentID string, lock bool) (GeneratedFragmentReceipt, bool, error) {
+	query := `SELECT children, fragment_id, lease_generation, created_at FROM generated_fragments WHERE parent_job_id=$1 AND mutation_slot=$2 ORDER BY created_at DESC LIMIT 1`
+	if lock {
+		query += ` FOR UPDATE`
+	}
+	var (
+		raw        []byte
+		fragmentID string
+		generation int64
+		createdAt  time.Time
+	)
+	err := tx.QueryRow(ctx, query, parentJobID, slot).Scan(&raw, &fragmentID, &generation, &createdAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return GeneratedFragmentReceipt{}, false, nil
+	}
+	if err != nil {
+		return GeneratedFragmentReceipt{}, false, err
+	}
+	if fragmentID != submittedFragmentID {
+		return GeneratedFragmentReceipt{}, false, &GeneratedMutationConflictError{
+			ParentJobID:         parentJobID,
+			MutationSlot:        slot,
+			ExistingFragmentID:  fragmentID,
+			SubmittedFragmentID: submittedFragmentID,
+		}
+	}
+	rec := GeneratedFragmentReceipt{ParentJobID: parentJobID, LeaseGeneration: generation, MutationSlot: slot, FragmentID: fragmentID, CreatedAt: createdAt}
+	if err := json.Unmarshal(raw, &rec.Children); err != nil {
+		return GeneratedFragmentReceipt{}, false, err
+	}
+	return rec, true, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -5831,6 +5863,66 @@ var migrationIdentityColumns = []string{
 	`ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS applied_at timestamptz NOT NULL DEFAULT now()`,
 }
 
+// migrationPreflights are idempotent repair statements that must run INSIDE
+// a migration's own transaction, BEFORE the migration's SQL, keyed by
+// version. They exist for the rare migration whose DDL fails exactly on the
+// databases the migration was meant to fix, which cannot be repaired by
+// editing the immutable migration file.
+//
+// Version 43 is the canonical case: its UNIQUE (parent_job_id, fragment_id)
+// index fails on a database that actually hit the pre-0043 duplicate-receipt
+// bug (the same parent+fragment twice under different generations/children),
+// which is exactly the database the fix must upgrade. The preflight creates
+// the evidence table generated_fragments_conflicts and quarantines the older
+// duplicate receipts into it with reason 'duplicate semantic receipt
+// (pre-0043 upgrade)' before deleting exactly those rows, so the index
+// creation succeeds and no duplicate is ever deleted silently: the full row
+// (generation, children JSON, created_at) is preserved in the conflicts
+// table, and child job rows are untouched. Ranking keeps the newest receipt
+// per (parent_job_id, fragment_id) by (created_at DESC, lease_generation
+// DESC); the delete joins on the 0010 primary key, so it removes exactly the
+// quarantined rows. Fresh databases and databases without duplicates are
+// no-ops.
+//
+// A database that recorded 43 before this preflight existed is handled by
+// migration 0047, which creates the same conflicts table if missing and
+// applies the slot-level quarantine.
+var migrationPreflights = map[int][]string{
+	43: {
+		`CREATE TABLE IF NOT EXISTS generated_fragments_conflicts (
+			parent_job_id TEXT NOT NULL,
+			lease_generation BIGINT NOT NULL,
+			fragment_id TEXT NOT NULL,
+			children JSONB NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL,
+			reason TEXT NOT NULL,
+			quarantined_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+		)`,
+		`INSERT INTO generated_fragments_conflicts (parent_job_id, lease_generation, fragment_id, children, created_at, reason)
+		SELECT parent_job_id, lease_generation, fragment_id, children, created_at,
+		       'duplicate semantic receipt (pre-0043 upgrade)'
+		FROM (
+			SELECT parent_job_id, lease_generation, fragment_id, children, created_at,
+			       ROW_NUMBER() OVER (PARTITION BY parent_job_id, fragment_id ORDER BY created_at DESC, lease_generation DESC) AS rn
+			FROM generated_fragments
+		) ranked
+		WHERE rn > 1`,
+		`DELETE FROM generated_fragments gf
+		USING (
+			SELECT parent_job_id, lease_generation, fragment_id
+			FROM (
+				SELECT parent_job_id, lease_generation, fragment_id,
+				       ROW_NUMBER() OVER (PARTITION BY parent_job_id, fragment_id ORDER BY created_at DESC, lease_generation DESC) AS rn
+				FROM generated_fragments
+			) ranked
+			WHERE rn > 1
+		) dup
+		WHERE gf.parent_job_id = dup.parent_job_id
+		  AND gf.lease_generation = dup.lease_generation
+		  AND gf.fragment_id = dup.fragment_id`,
+	},
+}
+
 func (s *PostgresStore) applyMigration(ctx context.Context, m migrations.Migration) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -5894,6 +5986,14 @@ func (s *PostgresStore) applyMigration(ctx context.Context, m migrations.Migrati
 			}
 		}
 		return tx.Commit(ctx)
+	}
+	// Idempotent preflight repair, in the SAME transaction as the migration:
+	// a failure rolls both back and the version stays unrecorded, so a retry
+	// sees the same repaired starting state. See migrationPreflights.
+	for _, stmt := range migrationPreflights[m.Version] {
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("migration %d preflight: %w", m.Version, err)
+		}
 	}
 	for _, stmt := range m.Statements {
 		if _, err := tx.Exec(ctx, stmt); err != nil {
