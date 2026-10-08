@@ -313,18 +313,19 @@ func TestFlowEffectsEnqueueCompletionEffects(t *testing.T) {
 	if err := s.enqueueCompletionEffects(context.Background(), model.Job{ID: "j"}, model.Run{ID: "r"}); err != nil {
 		t.Fatalf("memory effect enqueue = %v", err)
 	}
-	// Split design: TWO deterministic intents per completion — the internal
-	// completion_reconcile row (unbounded retries) and the external
-	// forge_delivery row (bounded retries + dead-letter).
+	// Split design: THREE deterministic intents per completion — the internal
+	// completion_reconcile row (unbounded retries), the external
+	// forge_delivery row (bounded retries + dead-letter) and the internal
+	// execution_attest row (unbounded retries).
 	pending := s.outbox.Pending()
-	if len(pending) != 2 {
-		t.Fatalf("queued effects = %d, want reconcile + forge_delivery", len(pending))
+	if len(pending) != 3 {
+		t.Fatalf("queued effects = %d, want reconcile + forge_delivery + execution_attest", len(pending))
 	}
 	kinds := map[string]bool{}
 	for _, it := range pending {
 		kinds[it.Kind] = true
 	}
-	if !kinds[storage.OutboxKindCompletionReconcile] || !kinds[storage.OutboxKindForgeDelivery] {
+	if !kinds[storage.OutboxKindCompletionReconcile] || !kinds[storage.OutboxKindForgeDelivery] || !kinds[storage.OutboxKindExecutionAttest] {
 		t.Fatalf("queued kinds = %v", kinds)
 	}
 	// DB append failure surfaces.

@@ -147,7 +147,7 @@ func TestPostgresIntegrationTriggeredSQLErrors(t *testing.T) {
 		"audit_events/CompleteJob": {"audit_events", func(t *testing.T, st *PostgresStore, ids *boomerIds) {
 			leaseJob(t, st, ids, 1)
 			receipt := model.CompletionReceipt{JobID: ids.job, Generation: 1, RunnerID: ids.runner}
-			if err := st.CompleteJob(ctx, ids.job, 1, ids.runner, model.StatusSuccess, "", nil, receipt); err == nil {
+			if err := st.CompleteJob(ctx, ids.job, 1, ids.runner, model.StatusSuccess, "", nil, receipt, nil); err == nil {
 				t.Fatal("expected the completion audit insert to fail")
 			}
 		}},
@@ -170,7 +170,7 @@ func TestPostgresIntegrationTriggeredSQLErrors(t *testing.T) {
 		"outbox/completionEffects": {"outbox", func(t *testing.T, st *PostgresStore, ids *boomerIds) {
 			leaseJob(t, st, ids, 1)
 			receipt := model.CompletionReceipt{JobID: ids.job, Generation: 1, RunnerID: ids.runner}
-			if err := st.CompleteJob(ctx, ids.job, 1, ids.runner, model.StatusSuccess, "", nil, receipt); err == nil {
+			if err := st.CompleteJob(ctx, ids.job, 1, ids.runner, model.StatusSuccess, "", nil, receipt, nil); err == nil {
 				t.Fatal("expected the completion outbox insert to fail")
 			}
 		}},
@@ -232,7 +232,7 @@ func TestPostgresIntegrationTriggeredSQLErrors(t *testing.T) {
 		"runs/recomputeRun": {"runs", func(t *testing.T, st *PostgresStore, ids *boomerIds) {
 			leaseJob(t, st, ids, 1)
 			receipt := model.CompletionReceipt{JobID: ids.job, Generation: 1, RunnerID: ids.runner}
-			if err := st.CompleteJob(ctx, ids.job, 1, ids.runner, model.StatusSuccess, "", nil, receipt); err == nil {
+			if err := st.CompleteJob(ctx, ids.job, 1, ids.runner, model.StatusSuccess, "", nil, receipt, nil); err == nil {
 				t.Fatal("expected the run recompute update to fail")
 			}
 		}},
@@ -248,7 +248,7 @@ func TestPostgresIntegrationTriggeredSQLErrors(t *testing.T) {
 		}},
 		"jobs/CompleteJob": {"jobs", func(t *testing.T, st *PostgresStore, ids *boomerIds) {
 			receipt := model.CompletionReceipt{JobID: ids.job, Generation: 1, RunnerID: ids.runner}
-			if err := st.CompleteJob(ctx, ids.job, 1, ids.runner, model.StatusSuccess, "", nil, receipt); err == nil {
+			if err := st.CompleteJob(ctx, ids.job, 1, ids.runner, model.StatusSuccess, "", nil, receipt, nil); err == nil {
 				t.Fatal("expected the job completion update to fail")
 			}
 		}},
@@ -265,7 +265,7 @@ func TestPostgresIntegrationTriggeredSQLErrors(t *testing.T) {
 		}},
 		"jobs/recomputeDependent": {"jobs", func(t *testing.T, st *PostgresStore, ids *boomerIds) {
 			receipt := model.CompletionReceipt{JobID: ids.job, Generation: 1, RunnerID: ids.runner}
-			if err := st.CompleteJob(ctx, ids.job, 1, ids.runner, model.StatusSuccess, "", nil, receipt); err == nil {
+			if err := st.CompleteJob(ctx, ids.job, 1, ids.runner, model.StatusSuccess, "", nil, receipt, nil); err == nil {
 				t.Fatal("expected the dependent recompute update to fail")
 			}
 		}},
@@ -293,7 +293,7 @@ func TestPostgresIntegrationTriggeredSQLErrors(t *testing.T) {
 		}},
 		"runners/completeRunner": {"runners", func(t *testing.T, st *PostgresStore, ids *boomerIds) {
 			receipt := model.CompletionReceipt{JobID: ids.job, Generation: 1, RunnerID: ids.runner}
-			if err := st.CompleteJob(ctx, ids.job, 1, ids.runner, model.StatusSuccess, "", nil, receipt); err == nil {
+			if err := st.CompleteJob(ctx, ids.job, 1, ids.runner, model.StatusSuccess, "", nil, receipt, nil); err == nil {
 				t.Fatal("expected the runner counter update to fail")
 			}
 		}},
@@ -344,7 +344,7 @@ func TestPostgresIntegrationTriggeredSQLErrors(t *testing.T) {
 		"completion_receipts/CompleteJob": {"completion_receipts", func(t *testing.T, st *PostgresStore, ids *boomerIds) {
 			leaseJob(t, st, ids, 1)
 			r := model.CompletionReceipt{JobID: ids.job, Generation: 1, RunnerID: ids.runner}
-			if err := st.CompleteJob(ctx, ids.job, 1, ids.runner, model.StatusSuccess, "", nil, r); err == nil {
+			if err := st.CompleteJob(ctx, ids.job, 1, ids.runner, model.StatusSuccess, "", nil, r, nil); err == nil {
 				t.Fatal("expected the completion receipt insert to fail")
 			}
 		}},

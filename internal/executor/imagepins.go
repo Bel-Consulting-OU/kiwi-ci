@@ -3,6 +3,7 @@ package executor
 import (
 	"fmt"
 	"regexp"
+	"strings"
 )
 
 // imageName is the distribution/reference name grammar shared by docker and
@@ -46,4 +47,20 @@ func digestPinned(ref string) bool {
 // pinned by a strict digest when RequireImmutableImages is on.
 func unpinnedImageError(kind, ref string) error {
 	return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("%s %q is not pinned by a well-formed @sha256:<64-hex> digest (require_immutable_images)", kind, ref)}
+}
+
+// pinnedDigest returns the "sha256:<hex>" digest a digest-pinned reference
+// carries. The reference is validated by the anchored digestPinned grammar
+// first, so the returned suffix is always a well-formed digest. It lets
+// observed-runtime capture record the digest a pinned reference proves even
+// when a daemon inspect is unavailable.
+func pinnedDigest(ref string) (string, bool) {
+	if !digestPinned(ref) {
+		return "", false
+	}
+	i := strings.LastIndex(ref, "@")
+	if i < 0 {
+		return "", false
+	}
+	return ref[i+1:], true
 }

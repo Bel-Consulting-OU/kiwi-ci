@@ -296,12 +296,25 @@ func (p Principal) repoEntryGrant(grant RepoGrant) (RepositoryPermission, RepoEn
 // (ParseStoredRepoID), so a legacy canonical key written before typed
 // identity ("github.com/o/r", or the dotless "gitlab/acme/widget") addresses
 // the same identity it was derived from; an unusable key matches nothing.
+// The resolution itself is shared with the capability grant matcher through
+// resolveRepoGrantEntries, so permission and capability grants can never
+// disagree about what a repository key addresses.
+func (p Principal) repoEntryGrantMode(grant RepoGrant, legacyBareFallback bool) (RepositoryPermission, RepoEntryResult) {
+	return resolveRepoGrantEntries(p.Repositories, func(a, b RepositoryPermission) bool { return a == b }, grant, legacyBareFallback)
+}
+
+// resolveRepoGrantEntries is the single typed repository-grant resolution
+// behind both the RepositoryPermission matcher (repoEntryGrantMode) and the
+// capability matcher (repoCapabilityEntryGrantMode). It resolves one typed
+// grant against a map of repository keys to entry values; equal reports
+// whether two entry values are the same grant set (RepositoryPermission is
+// directly comparable, capability sets compare as sets).
 //
 // Resolution is DETERMINISTIC and fails closed:
 //
 //   - an identity lookup first considers canonical identity keys with the
-//     same (canonical host, full name); when several DIFFERENT permission
-//     sets collide there, the result is RepoConflict;
+//     same (canonical host, full name); when several DIFFERENT entry values
+//     collide there, the result is RepoConflict;
 //   - on a canonical miss it considers EXPLICIT bare keys with the same full
 //     name (a bare grant addresses every forge presenting the name), with the
 //     same conflict rule;
@@ -314,25 +327,26 @@ func (p Principal) repoEntryGrant(grant RepoGrant) (RepositoryPermission, RepoEn
 //
 // Only RepoNoEntry — a repository the map genuinely does not mention — leaves
 // the decision to the global roles.
-func (p Principal) repoEntryGrantMode(grant RepoGrant, legacyBareFallback bool) (RepositoryPermission, RepoEntryResult) {
+func resolveRepoGrantEntries[T any](entries map[string]T, equal func(a, b T) bool, grant RepoGrant, legacyBareFallback bool) (T, RepoEntryResult) {
+	var zero T
 	if grant.Kind() == RepoGrantInvalid {
-		return RepositoryPermission{}, RepoNoEntry
+		return zero, RepoNoEntry
 	}
-	identities := map[string]RepositoryPermission{}
+	identities := map[string]T{}
 	identityFull := map[string]map[string]bool{}
-	aliases := map[string]RepositoryPermission{}
+	aliases := map[string]T{}
 	identityConflict := map[string]bool{}
 	aliasConflict := map[string]bool{}
-	record := func(m map[string]RepositoryPermission, conflicts map[string]bool, key string, perm RepositoryPermission) {
+	record := func(m map[string]T, conflicts map[string]bool, key string, perm T) {
 		if prev, ok := m[key]; ok {
-			if prev != perm {
+			if !equal(prev, perm) {
 				conflicts[key] = true
 			}
 			return
 		}
 		m[key] = perm
 	}
-	for key, perm := range p.Repositories {
+	for key, perm := range entries {
 		keyGrant, err := ParseStoredRepoID(key)
 		if err != nil {
 			// Unusable key: it can never match a repository.
@@ -350,47 +364,47 @@ func (p Principal) repoEntryGrantMode(grant RepoGrant, legacyBareFallback bool) 
 		}
 		identityFull[id.FullName][id.ID()] = true
 	}
-	resolve := func(m map[string]RepositoryPermission, conflicts map[string]bool, key string) (RepositoryPermission, RepoEntryResult) {
+	resolve := func(m map[string]T, conflicts map[string]bool, key string) (T, RepoEntryResult) {
 		if conflicts[key] {
-			return RepositoryPermission{}, RepoConflict
+			return zero, RepoConflict
 		}
 		if perm, ok := m[key]; ok {
 			return perm, RepoFound
 		}
-		return RepositoryPermission{}, RepoNoEntry
+		return zero, RepoNoEntry
 	}
 	// resolveAliasToIdentity mirrors the historical bare→canonical fallback:
 	// among the canonical keys sharing the bare full name, exactly one
-	// distinct permission set resolves (and several distinct sets, or a
+	// distinct entry value resolves (and several distinct values, or a
 	// conflicting identity, fail closed).
-	resolveAliasToIdentity := func(fullName string) (RepositoryPermission, RepoEntryResult) {
+	resolveAliasToIdentity := func(fullName string) (T, RepoEntryResult) {
 		ids := identityFull[fullName]
 		if len(ids) == 0 {
-			return RepositoryPermission{}, RepoNoEntry
+			return zero, RepoNoEntry
 		}
-		var match RepositoryPermission
+		var match T
 		found, ambiguous := false, false
 		for idKey := range ids {
 			perm, res := resolve(identities, identityConflict, idKey)
 			if res == RepoConflict {
-				return RepositoryPermission{}, RepoConflict
+				return zero, RepoConflict
 			}
 			if res != RepoFound {
 				continue
 			}
 			if !found {
 				match, found = perm, true
-			} else if perm != match {
+			} else if !equal(perm, match) {
 				ambiguous = true
 			}
 		}
 		if ambiguous {
-			return RepositoryPermission{}, RepoConflict
+			return zero, RepoConflict
 		}
 		if found {
 			return match, RepoFound
 		}
-		return RepositoryPermission{}, RepoNoEntry
+		return zero, RepoNoEntry
 	}
 	if grant.IsAlias() {
 		a, _ := grant.Alias()
@@ -398,7 +412,7 @@ func (p Principal) repoEntryGrantMode(grant RepoGrant, legacyBareFallback bool) 
 			return perm, res
 		}
 		if !legacyBareFallback {
-			return RepositoryPermission{}, RepoNoEntry
+			return zero, RepoNoEntry
 		}
 		return resolveAliasToIdentity(a.FullName)
 	}

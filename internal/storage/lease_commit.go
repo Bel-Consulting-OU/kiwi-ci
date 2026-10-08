@@ -397,6 +397,11 @@ func (s *PostgresStore) InsertSnapshotForLease(ctx context.Context, jobID, runne
 		rec.ID, rec.RunID, nullText(rec.JobID), rec.CreatedAt, payload); err != nil {
 		return err
 	}
+	// checkpoint.published shares the record's transaction: a failed append
+	// rolls the snapshot back.
+	if err := appendExecutionEventTx(ctx, tx, ExecutionEventCheckpointPublished(rec, generation, runnerID)); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 
@@ -442,6 +447,12 @@ func (s *PostgresStore) InsertArtifactOnceForLease(ctx context.Context, jobID, r
 		return model.ArtifactRecord{}, false, err
 	}
 	if ct.RowsAffected() == 1 {
+		// artifact.published is part of the insert transaction: a failed
+		// append rolls the artifact back (a duplicate upload never reaches
+		// this branch, so it emits nothing).
+		if err := appendExecutionEventTx(ctx, tx, ExecutionEventArtifactPublished(a, generation, runnerID)); err != nil {
+			return model.ArtifactRecord{}, false, err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return model.ArtifactRecord{}, false, err
 		}
@@ -571,6 +582,7 @@ func (m *memStore) InsertSnapshotForLease(ctx context.Context, jobID, runnerID s
 		}
 	}
 	m.snapshots = append(m.snapshots, rec)
+	m.appendExecutionEventLocked(ExecutionEventCheckpointPublished(rec, generation, runnerID))
 	return nil
 }
 
@@ -600,6 +612,7 @@ func (m *memStore) InsertArtifactOnceForLease(ctx context.Context, jobID, runner
 		return existing, false, nil
 	}
 	m.artifacts = append(m.artifacts, a)
+	m.appendExecutionEventLocked(ExecutionEventArtifactPublished(a, generation, runnerID))
 	return a, true, nil
 }
 

@@ -18,11 +18,11 @@ type completionConflictStore struct {
 	err error
 }
 
-func (s *completionConflictStore) CompleteJob(ctx context.Context, jobID string, generation int64, runnerID string, status model.Status, errMsg string, outputs map[string]string, receipt model.CompletionReceipt) error {
+func (s *completionConflictStore) CompleteJob(ctx context.Context, jobID string, generation int64, runnerID string, status model.Status, errMsg string, outputs map[string]string, receipt model.CompletionReceipt, observed *model.ObservedRuntime) error {
 	if s.err != nil {
 		return s.err
 	}
-	return s.dbFakeStore.CompleteJob(ctx, jobID, generation, runnerID, status, errMsg, outputs, receipt)
+	return s.dbFakeStore.CompleteJob(ctx, jobID, generation, runnerID, status, errMsg, outputs, receipt, observed)
 }
 
 // TestCompleteDBMapsCompletionConflictTo409 pins the completion-error -> HTTP

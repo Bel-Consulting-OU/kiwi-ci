@@ -83,7 +83,7 @@ func TestMemStoreServiceEnvelopeReservation(t *testing.T) {
 		t.Fatalf("plain claim while services hold capacity = %v, want ErrResourceCapacity", err)
 	}
 	receipt := model.CompletionReceipt{JobID: svcJob, Generation: 1, RunnerID: runnerID}
-	if err := m.CompleteJob(ctx, svcJob, 1, runnerID, model.StatusSuccess, "", nil, receipt); err != nil {
+	if err := m.CompleteJob(ctx, svcJob, 1, runnerID, model.StatusSuccess, "", nil, receipt, nil); err != nil {
 		t.Fatalf("complete service job: %v", err)
 	}
 	if got, err := m.RunnerReservedResources(ctx, runnerID); err != nil || got != (model.ResourceCapacity{}) {

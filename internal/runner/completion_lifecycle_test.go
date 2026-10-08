@@ -75,7 +75,7 @@ func TestCompletionAbortsOnRunnerShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	start := time.Now()
-	r.complete(ctx, basicTask(payloadPipeline), model.StatusCancelled, nil, nil)
+	r.complete(ctx, basicTask(payloadPipeline), model.StatusCancelled, nil, nil, nil)
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("complete with a canceled runner context took %v (grace %v); shutdown cancellation was ignored", elapsed, completionGrace)
 	}

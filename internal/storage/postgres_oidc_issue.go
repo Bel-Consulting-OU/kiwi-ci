@@ -512,6 +512,12 @@ func (s *PostgresStore) CommitOIDCIssuance(ctx context.Context, req OIDCIssuance
 		ev.ID, ev.Action, nullText(ev.Actor), nullText(ev.RunID), nullText(ev.JobID), nullText(ev.Message), meta, ev.CreatedAt); err != nil {
 		return OIDCIssuanceResult{}, err
 	}
+	// oidc.issued shares the audit's transaction: a failed append rolls the
+	// issuance back so the token is never returned without its stream
+	// evidence. Only the audience, kid and claim KEY names travel.
+	if err := appendExecutionEventTx(ctx, tx, ExecutionEventOIDCIssued(req, runID)); err != nil {
+		return OIDCIssuanceResult{}, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return OIDCIssuanceResult{}, err
 	}

@@ -81,6 +81,10 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 	rep.JobID = j.ID
 	rep.JobKey = j.Key
 	rep.CreatedAt = time.Now().UTC()
+	// The attempt identity comes from the verified lease (the DB store
+	// restamps it authoritatively inside its fence; the fs/memory path keeps
+	// this value so a read can attribute the report to the attempt).
+	rep.LeaseGeneration = j.LeaseGeneration
 	// DB mode ignores the application instant: the lease-fenced delivery
 	// transaction overwrites rep.CreatedAt with a clock_timestamp() sampled
 	// after the job row lock, because the canonical (created_at,id) ordering

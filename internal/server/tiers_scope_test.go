@@ -131,8 +131,6 @@ var expectedRouteTiers = map[string]routeTier{
 	"GET /api/v1/runs/{id}/logs/stream":              tierRBAC,
 	"GET /api/v1/runs/{id}/artifacts":                tierRBAC,
 	"GET /api/v1/runs/{id}/tests":                    tierRBAC,
-	"GET /api/v1/runs/{id}/snapshots":                tierRBAC,
-	"GET /api/v1/runs/{id}/snapshots/{sid}":          tierRBAC,
 	"GET /api/v1/runs/{id}/deployments":              tierRBAC,
 	"GET /api/v1/test-intelligence":                  tierRBAC,
 	"GET /api/v1/artifacts/{id}":                     tierRBAC,
@@ -156,22 +154,26 @@ var expectedRouteTiers = map[string]routeTier{
 	// gate (like drain), never the RBAC table.
 	"PUT /api/v1/runner-profiles/{id}/runner/{runnerID}":    tierAdmin,
 	"DELETE /api/v1/runner-profiles/{id}/runner/{runnerID}": tierAdmin,
-	// The recorded pipeline/payload export (exact replay) is an admin
-	// operation: deliberately unmapped by auth.ActionFor so it falls
-	// through to the blanket admin gate (and the handler re-asserts
-	// requireRunAdmin for store principals), never the RBAC table. The
-	// payload is exactly what the runner executed.
-	"GET /api/v1/runs/{id}/jobs/{job}/pipeline": tierAdmin,
+	// Capability: admin OR a controller principal carrying the addressed
+	// capability. The recorded pipeline/payload export (exact replay) is
+	// evidence material, so it consumes evidence:read (run-scoped). The
+	// snapshot surface consumes checkpoints:read (run-scoped) and the audit
+	// trail consumes evidence:read GLOBALLY (the trail spans repositories).
+	// The event endpoints consume execution.events:read: the unscoped cursor
+	// read needs it globally, a run_id-scoped read accepts the repo-scoped
+	// capability or plain read access to that run's repository.
+	"GET /api/v1/runs/{id}/jobs/{job}/pipeline": tierCapability,
+	"GET /api/v1/runs/{id}/snapshots":           tierCapability,
+	"GET /api/v1/runs/{id}/snapshots/{sid}":     tierCapability,
+	"GET /api/v1/jobs/{id}/attestation":         tierCapability,
+	"GET /api/v1/audit":                         tierCapability,
+	"GET /api/v1/events":                        tierCapability,
+	"GET /api/v1/events/stream":                 tierCapability,
 	// Admin: blanket admin gate.
 	"GET /metrics":                       tierAdmin,
 	"POST /api/v1/jobs/{id}/deployments": tierAdmin,
 	"POST /api/v1/drain":                 tierAdmin,
 	"GET /api/v1/drain":                  tierAdmin,
-	"GET /api/v1/audit":                  tierAdmin,
-	// The canonical execution event stream is admin tier like audit: the
-	// cursor-pull list endpoint and the SSE wrapper over the same cursor.
-	"GET /api/v1/events":        tierAdmin,
-	"GET /api/v1/events/stream": tierAdmin,
 }
 
 func tierName(t routeTier) string {
@@ -184,6 +186,8 @@ func tierName(t routeTier) string {
 		return "runner"
 	case tierRBAC:
 		return "rbac"
+	case tierCapability:
+		return "capability"
 	default:
 		return "admin"
 	}
@@ -238,14 +242,27 @@ func TestHandlerRouteTableFullyClassified(t *testing.T) {
 			if _, _, handled := auth.ActionFor(rt.Method, rt.Path); !handled {
 				t.Errorf("%s classified rbac but ActionFor is unhandled", rt.Pattern)
 			}
+			if _, ok := capabilityRouteFor(rt.Method, rt.Path); ok {
+				t.Errorf("%s classified rbac but the capability table claims it", rt.Pattern)
+			}
+		case tierCapability:
+			if _, ok := capabilityRouteFor(rt.Method, rt.Path); !ok {
+				t.Errorf("%s classified capability but the capability table has no entry", rt.Pattern)
+			}
+			if publicPath(req) || runnerPath(rt.Method, rt.Path) {
+				t.Errorf("%s fell through to capability despite another classifier claiming it", rt.Pattern)
+			}
 		case tierAdmin:
 			// Admin is the explicit fall-through by design; it must never
-			// be reachable through the public or runner tables.
+			// be reachable through the public, runner or capability tables.
 			if publicPath(req) || runnerPath(rt.Method, rt.Path) {
 				t.Errorf("%s fell through to admin despite another classifier claiming it", rt.Pattern)
 			}
 			if _, _, handled := auth.ActionFor(rt.Method, rt.Path); handled {
 				t.Errorf("%s fell through to admin despite an RBAC mapping", rt.Pattern)
+			}
+			if _, ok := capabilityRouteFor(rt.Method, rt.Path); ok {
+				t.Errorf("%s fell through to admin despite a capability mapping", rt.Pattern)
 			}
 		}
 	}
@@ -326,12 +343,12 @@ func TestRunnerTierRejectsStorePrincipals(t *testing.T) {
 }
 
 // TestRunnerCredentialsCannotReachRBACOrAdminRoutes is the mirror probe:
-// the runner bearer must never satisfy the RBAC or admin gates.
+// the runner bearer must never satisfy the RBAC, capability or admin gates.
 func TestRunnerCredentialsCannotReachRBACOrAdminRoutes(t *testing.T) {
 	s, _ := routeTestServer(t)
 	h := s.Handler()
 	for pattern, tier := range expectedRouteTiers {
-		if tier != tierRBAC && tier != tierAdmin {
+		if tier != tierRBAC && tier != tierCapability && tier != tierAdmin {
 			continue
 		}
 		method, path, _ := strings.Cut(pattern, " ")
@@ -466,7 +483,7 @@ func TestClassifyRouteNeverPanicsOnHostilePaths(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, p, nil)
 		got := classifyRoute(req)
 		switch got {
-		case tierPublic, tierEnroll, tierRunner, tierRBAC, tierAdmin:
+		case tierPublic, tierEnroll, tierRunner, tierRBAC, tierCapability, tierAdmin:
 		default:
 			t.Fatalf("path %q produced invalid tier %d", p, got)
 		}
@@ -481,6 +498,87 @@ func TestClassifyRouteNeverPanicsOnHostilePaths(t *testing.T) {
 		// slashes) unless runnerPath agrees.
 		if got == tierRunner && !runnerPath(http.MethodPost, p) {
 			t.Fatalf("path %q classified runner but runnerPath disagrees", p)
+		}
+		// Capability-tier classification must always come from the explicit
+		// table (never from path-shape guessing).
+		if got == tierCapability {
+			if _, ok := capabilityRouteFor(http.MethodPost, p); !ok {
+				t.Fatalf("path %q classified capability but the table disagrees", p)
+			}
+		}
+	}
+}
+
+// TestCapabilityRouteTableExactInventory pins the controller capability route
+// table as an exhaustive contract: every entry, its capability and its scope
+// are explicit, so wiring a new capability to a route (or changing the scope
+// of an existing one) fails this test until it is reviewed here.
+func TestCapabilityRouteTableExactInventory(t *testing.T) {
+	want := []struct {
+		pattern    string
+		capability auth.Capability
+		scope      capabilityScope
+		readFallbk bool
+	}{
+		{"/api/v1/events", auth.CapExecutionEventsRead, capabilityScopeRun, true},
+		{"/api/v1/events/stream", auth.CapExecutionEventsRead, capabilityScopeRun, true},
+		{"/api/v1/audit", auth.CapEvidenceRead, capabilityScopeGlobal, false},
+		{"/api/v1/runs/{id}/snapshots", auth.CapCheckpointsRead, capabilityScopeRun, false},
+		{"/api/v1/runs/{id}/snapshots/{sid}", auth.CapCheckpointsRead, capabilityScopeRun, false},
+		{"/api/v1/runs/{id}/jobs/{job}/pipeline", auth.CapEvidenceRead, capabilityScopeRun, false},
+		{"/api/v1/jobs/{id}/attestation", auth.CapEvidenceRead, capabilityScopeRun, false},
+	}
+	if len(capabilityRoutes) != len(want) {
+		t.Fatalf("capability route table has %d entries, want %d", len(capabilityRoutes), len(want))
+	}
+	for i, w := range want {
+		got := capabilityRoutes[i]
+		if got.method != http.MethodGet || got.pattern != w.pattern || got.capability != w.capability || got.scope != w.scope || got.readFallback != w.readFallbk {
+			t.Errorf("capabilityRoutes[%d] = %+v, want GET %s cap=%s scope=%d readFallback=%v", i, got, w.pattern, w.capability, w.scope, w.readFallbk)
+		}
+	}
+	// Reserved slot: graph.mutations:write is declared but deliberately wires
+	// no route yet.
+	for _, rt := range capabilityRoutes {
+		if rt.capability == auth.CapGraphMutationsWrite {
+			t.Fatalf("graph.mutations:write must stay reserved (no route wired), found %s %s", rt.method, rt.pattern)
+		}
+	}
+	// Every capability route pattern must be a registered route.
+	registered := map[string]bool{}
+	for _, rt := range registeredRoutePatterns(t) {
+		registered[rt.Method+" "+rt.Path] = true
+	}
+	for _, rt := range capabilityRoutes {
+		if !registered[rt.method+" "+rt.pattern] {
+			t.Errorf("capability route %s %s is not registered on the mux", rt.method, rt.pattern)
+		}
+	}
+	// Route lookup is segment-exact: a placeholder never matches an empty
+	// segment, a literal must match exactly, and an extra segment fails.
+	for _, probe := range []struct {
+		method, path string
+		want         bool
+	}{
+		{http.MethodGet, "/api/v1/events", true},
+		{http.MethodGet, "/api/v1/events/", true},
+		{http.MethodPost, "/api/v1/events", false},
+		{http.MethodGet, "/api/v1/events/stream", true},
+		{http.MethodGet, "/api/v1/events/stream/extra", false},
+		{http.MethodGet, "/api/v1/events/other", false},
+		{http.MethodGet, "/api/v1/audit", true},
+		{http.MethodGet, "/api/v1/runs/probe/snapshots", true},
+		{http.MethodGet, "/api/v1/runs//snapshots", false},
+		{http.MethodGet, "/api/v1/runs/probe/snapshots/probe", true},
+		{http.MethodGet, "/api/v1/runs/probe/snapshots/probe/extra", false},
+		{http.MethodGet, "/api/v1/runs/probe/jobs/job/pipeline", true},
+		{http.MethodGet, "/api/v1/runs/probe/jobs//pipeline", false},
+		{http.MethodGet, "/api/v1/jobs/probe/attestation", true},
+		{http.MethodGet, "/api/v1/jobs//attestation", false},
+		{http.MethodGet, "/api/v1/jobs/probe/attestation/extra", false},
+	} {
+		if _, ok := capabilityRouteFor(probe.method, probe.path); ok != probe.want {
+			t.Errorf("capabilityRouteFor(%s %s) = %v, want %v", probe.method, probe.path, ok, probe.want)
 		}
 	}
 }

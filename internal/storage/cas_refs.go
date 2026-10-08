@@ -32,6 +32,11 @@ type CASReferenceStore interface {
 	// durable pending-sidecar rows (the upload window between a sidecar
 	// upload and its artifact payload).
 	ListAllPendingSidecarDigests(ctx context.Context) ([]string, error)
+	// ListAllExecutionAttestationEnvelopeRefs returns every non-empty
+	// envelope reference of the execution_attestations rows (the final
+	// execution attestations). A "cas:"-prefixed ref names a CAS object the
+	// collector must never delete.
+	ListAllExecutionAttestationEnvelopeRefs(ctx context.Context) ([]string, error)
 }
 
 var _ CASReferenceStore = (*PostgresStore)(nil)

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
 // doJSONHeaders serves one request with extra headers (e.g. X-Kiwi-* lease
@@ -79,6 +80,22 @@ func leaseHeaders(task Task, runnerID string) map[string]string {
 		"X-Kiwi-Runner-ID":        runnerID,
 		"X-Kiwi-Lease-Token":      task.LeaseToken,
 		"X-Kiwi-Lease-Generation": fmt.Sprint(task.LeaseGeneration),
+	}
+}
+
+// TestBuildJobContractsMapsProvenancePolicy proves the pipeline artifact's
+// provenance policy is carried into the durable contract (and an empty policy
+// stays empty = best_effort).
+func TestBuildJobContractsMapsProvenancePolicy(t *testing.T) {
+	out := buildJobContracts(pipeline.CompiledJob{Job: pipeline.Job{Artifacts: []pipeline.Artifact{
+		{Name: "bin", Paths: []string{"out"}, Required: true, Provenance: " required "},
+		{Name: "doc", Paths: []string{"doc"}},
+	}}})
+	if out["bin"].Provenance != "required" || !out["bin"].Required {
+		t.Fatalf("required contract = %+v", out["bin"])
+	}
+	if out["doc"].Provenance != "" {
+		t.Fatalf("default contract provenance = %q, want empty (best_effort)", out["doc"].Provenance)
 	}
 }
 

@@ -120,7 +120,7 @@ func TestIntegrationResourceCapacityHealsAfterOldReplicaCompletionPostgres(t *te
 
 	// A completion served by THIS binary still releases its row exactly once
 	// (the release path is unchanged by the self-healing read).
-	if err := st.CompleteJob(ctx, job3, 1, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: job3, Generation: 1, RunnerID: runnerID}); err != nil {
+	if err := st.CompleteJob(ctx, job3, 1, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: job3, Generation: 1, RunnerID: runnerID}, nil); err != nil {
 		t.Fatalf("complete job3: %v", err)
 	}
 	pgITAssertReservations(t, st, runnerID, fourGiB, 1)

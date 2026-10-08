@@ -41,12 +41,12 @@ func TestPostgresIntegrationCompletionReceiptTTLPrune(t *testing.T) {
 		t.Fatalf("lease: %v", err)
 	}
 	receipt := model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID, ResultHash: "hash-ttl"}
-	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, receipt); err != nil {
+	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, receipt, nil); err != nil {
 		t.Fatalf("CompleteJob: %v", err)
 	}
 
 	// A fresh receipt dedupes: the exact replay is acknowledged.
-	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, receipt); err != nil {
+	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, receipt, nil); err != nil {
 		t.Fatalf("fresh replay: %v", err)
 	}
 
@@ -70,7 +70,7 @@ func TestPostgresIntegrationCompletionReceiptTTLPrune(t *testing.T) {
 	// being acknowledged and reconciled. (The store reports the cleared
 	// lease_runner_id as a generation mismatch or a lease conflict; the
 	// server maps both to 409, which is the replay contract under test.)
-	err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, receipt)
+	err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, receipt, nil)
 	if err == nil {
 		t.Fatal("aged replay must be rejected")
 	}

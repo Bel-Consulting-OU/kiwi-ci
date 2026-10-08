@@ -43,11 +43,11 @@ func (s *idcovReceiptScriptStore) GetJob(ctx context.Context, id string) (model.
 	return s.dbFakeStore.GetJob(ctx, id)
 }
 
-func (s *idcovReceiptScriptStore) CompleteJob(ctx context.Context, jobID string, generation int64, runnerID string, status model.Status, errMsg string, outputs map[string]string, receipt model.CompletionReceipt) error {
+func (s *idcovReceiptScriptStore) CompleteJob(ctx context.Context, jobID string, generation int64, runnerID string, status model.Status, errMsg string, outputs map[string]string, receipt model.CompletionReceipt, observed *model.ObservedRuntime) error {
 	if s.completeErr != nil {
 		return s.completeErr
 	}
-	return s.dbFakeStore.CompleteJob(ctx, jobID, generation, runnerID, status, errMsg, outputs, receipt)
+	return s.dbFakeStore.CompleteJob(ctx, jobID, generation, runnerID, status, errMsg, outputs, receipt, observed)
 }
 
 func (s *idcovReceiptScriptStore) HasCompletionReceipt(ctx context.Context, jobID string, generation int64, runnerID string) (model.CompletionReceipt, bool, error) {

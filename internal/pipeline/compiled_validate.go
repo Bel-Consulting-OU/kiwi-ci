@@ -252,6 +252,11 @@ func ValidateCompiledJob(cj CompiledJob) error {
 		default:
 			return fmt.Errorf("%s artifact %q has invalid sbom format %q (want spdx-json or cyclonedx-json)", where, a.Name, a.SBOM)
 		}
+		switch strings.TrimSpace(a.Provenance) {
+		case "", "best_effort", "required":
+		default:
+			return fmt.Errorf("%s artifact %q has invalid provenance policy %q (want best_effort or required)", where, a.Name, a.Provenance)
+		}
 		if a.Sigstore != nil && a.Sigstore.Required && (strings.TrimSpace(a.Sigstore.Issuer) == "" || strings.TrimSpace(a.Sigstore.Identity) == "") {
 			return fmt.Errorf("%s artifact %q: sigstore.required demands both issuer and identity", where, a.Name)
 		}

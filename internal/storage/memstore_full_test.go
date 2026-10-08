@@ -186,18 +186,18 @@ func TestMemStoreCompleteJobBranches(t *testing.T) {
 	}
 
 	m := newLeased(t)
-	if err := m.CompleteJob(ctx, memJobID, -1, memRunnerID, model.StatusSuccess, "", nil, receipt()); err == nil {
+	if err := m.CompleteJob(ctx, memJobID, -1, memRunnerID, model.StatusSuccess, "", nil, receipt(), nil); err == nil {
 		t.Fatal("negative generation must fail")
 	}
 	badReceipt := receipt()
 	badReceipt.RunnerID = "99999999999999999999999999999999"
-	if err := m.CompleteJob(ctx, memJobID, 3, memRunnerID, model.StatusSuccess, "", nil, badReceipt); err == nil {
+	if err := m.CompleteJob(ctx, memJobID, 3, memRunnerID, model.StatusSuccess, "", nil, badReceipt, nil); err == nil {
 		t.Fatal("mismatched receipt must fail")
 	}
-	if err := m.CompleteJob(ctx, "ffffffffffffffffffffffffffffffff", 3, memRunnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: "ffffffffffffffffffffffffffffffff", Generation: 3, RunnerID: memRunnerID}); !errors.Is(err, ErrNotFound) {
+	if err := m.CompleteJob(ctx, "ffffffffffffffffffffffffffffffff", 3, memRunnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: "ffffffffffffffffffffffffffffffff", Generation: 3, RunnerID: memRunnerID}, nil); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing job = %v", err)
 	}
-	if err := m.CompleteJob(ctx, memJobID, 4, memRunnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: memJobID, Generation: 4, RunnerID: memRunnerID}); !errors.Is(err, ErrGenerationMismatch) {
+	if err := m.CompleteJob(ctx, memJobID, 4, memRunnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: memJobID, Generation: 4, RunnerID: memRunnerID}, nil); !errors.Is(err, ErrGenerationMismatch) {
 		t.Fatalf("stale generation = %v, want ErrGenerationMismatch", err)
 	}
 
@@ -206,7 +206,7 @@ func TestMemStoreCompleteJobBranches(t *testing.T) {
 	if err := m.InsertJobContracts(ctx, memJobID, map[string]ArtifactContract{"bin": {Name: "bin", Required: true}}); err != nil {
 		t.Fatalf("contracts: %v", err)
 	}
-	if err := m.CompleteJob(ctx, memJobID, 3, memRunnerID, model.StatusSuccess, "", nil, receipt()); !errors.Is(err, ErrRequiredArtifactMissing) {
+	if err := m.CompleteJob(ctx, memJobID, 3, memRunnerID, model.StatusSuccess, "", nil, receipt(), nil); !errors.Is(err, ErrRequiredArtifactMissing) {
 		t.Fatalf("missing required artifact = %v", err)
 	}
 	if err := m.InsertArtifact(ctx, model.ArtifactRecord{ID: memArtifactID, RunID: memRunID, JobID: memJobID, Name: "bin", LeaseGeneration: 3}); err != nil {
@@ -219,15 +219,15 @@ func TestMemStoreCompleteJobBranches(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("contracts: %v", err)
 	}
-	if err := m.CompleteJob(ctx, memJobID, 3, memRunnerID, model.StatusSuccess, "err", map[string]string{"k": "v"}, receipt()); err != nil {
+	if err := m.CompleteJob(ctx, memJobID, 3, memRunnerID, model.StatusSuccess, "err", map[string]string{"k": "v"}, receipt(), nil); err != nil {
 		t.Fatalf("completion: %v", err)
 	}
 	// Replay of the same receipt is idempotent.
-	if err := m.CompleteJob(ctx, memJobID, 3, memRunnerID, model.StatusSuccess, "", nil, receipt()); err != nil {
+	if err := m.CompleteJob(ctx, memJobID, 3, memRunnerID, model.StatusSuccess, "", nil, receipt(), nil); err != nil {
 		t.Fatalf("replayed completion = %v", err)
 	}
 	// A different receipt for the now-terminal job is a generation mismatch.
-	if err := m.CompleteJob(ctx, memJobID, 3, memRunnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: memJobID, Generation: 3, RunnerID: "99999999999999999999999999999999"}); err == nil {
+	if err := m.CompleteJob(ctx, memJobID, 3, memRunnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: memJobID, Generation: 3, RunnerID: "99999999999999999999999999999999"}, nil); err == nil {
 		t.Fatal("identity-mismatched replay must fail")
 	}
 	got, _ := m.GetJob(ctx, memJobID)
@@ -235,16 +235,17 @@ func TestMemStoreCompleteJobBranches(t *testing.T) {
 		t.Fatalf("completed job = %+v", got)
 	}
 	pending, err := m.OutboxPending(ctx)
-	// Split design: exactly two intents per completion — the internal
-	// completion_reconcile row and the external forge_delivery row.
-	if err != nil || len(pending) != 2 {
+	// Split design: exactly three intents per completion — the internal
+	// completion_reconcile row, the external forge_delivery row and the
+	// internal execution_attest row.
+	if err != nil || len(pending) != 3 {
 		t.Fatalf("completion outbox = %v, %v", pending, err)
 	}
 	kinds := map[string]bool{}
 	for _, it := range pending {
 		kinds[it.Kind] = true
 	}
-	if !kinds[OutboxKindCompletionReconcile] || !kinds[OutboxKindForgeDelivery] {
+	if !kinds[OutboxKindCompletionReconcile] || !kinds[OutboxKindForgeDelivery] || !kinds[OutboxKindExecutionAttest] {
 		t.Fatalf("completion outbox kinds = %v", kinds)
 	}
 
@@ -254,7 +255,7 @@ func TestMemStoreCompleteJobBranches(t *testing.T) {
 	if err := m2.UpsertRunner(ctx, r); err != nil {
 		t.Fatalf("runner: %v", err)
 	}
-	if err := m2.CompleteJob(ctx, memJobID, 3, memRunnerID, model.StatusFailure, "boom", nil, receipt()); err != nil {
+	if err := m2.CompleteJob(ctx, memJobID, 3, memRunnerID, model.StatusFailure, "boom", nil, receipt(), nil); err != nil {
 		t.Fatalf("failure completion: %v", err)
 	}
 	gotRunner, _ := m2.GetRunner(ctx, memRunnerID)

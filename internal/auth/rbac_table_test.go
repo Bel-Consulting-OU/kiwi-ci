@@ -36,11 +36,12 @@ func TestActionForMapping(t *testing.T) {
 		{"GET", "/api/v1/runs/r1/logs/stream", ActionRead, true},
 		{"GET", "/api/v1/runs/r1/tests", ActionRead, true},
 		{"GET", "/api/v1/runs/r1/deployments", ActionRead, true},
-		// The whole snapshot surface is admin tier (L4-A): a record
-		// carries the workspace file inventory (names, modes, sizes,
-		// SHA-256) plus the manifest root and archive digests, so the
-		// listing is as sensitive as the archive download and no
-		// repository read/artifact_read grant may obtain it.
+		// The snapshot routes still resolve to ActionAdmin here: the admin
+		// action satisfies them. The server classifies them as capability
+		// routes (checkpoints:read) BEFORE consulting this table, and the
+		// handlers accept ActionAdmin OR the capability, so a repository
+		// read/artifact_read grant still obtains nothing (see
+		// TestSnapshotRoutesAreAdminTierForEveryRepositoryGrant).
 		{"GET", "/api/v1/runs/r1/snapshots", ActionAdmin, true},
 		{"GET", "/api/v1/runs/r1/snapshots/s1", ActionAdmin, true},
 		{"GET", "/api/v1/runs/r1/artifacts", ActionArtifactRead, true},
@@ -97,7 +98,10 @@ func TestActionForMapping(t *testing.T) {
 // no repository-scoped grant — not even one carrying every repository
 // permission — can satisfy it. Only the global admin role does, so a
 // repository-read principal can never obtain the workspace manifest
-// (filenames, modes, sizes, SHA-256) or the archive.
+// (filenames, modes, sizes, SHA-256) or the archive. Controller access is a
+// SEPARATE grant channel (the checkpoints:read capability, authorized by
+// AuthorizeCapability against the run's repository), deliberately not a
+// RepositoryPermission bit.
 func TestSnapshotRoutesAreAdminTierForEveryRepositoryGrant(t *testing.T) {
 	allRepoPerms := RepositoryPermission{
 		Read: true, Run: true, TrustedRun: true, Approve: true,

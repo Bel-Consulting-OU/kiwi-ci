@@ -421,6 +421,10 @@ func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
 	persistErr := s.persistLocked()
 	if persistErr != nil {
 		delete(s.snapshots, id)
+	} else {
+		// checkpoint.published is appended after the durable record, next to
+		// the mutation it describes (best-effort in fs mode).
+		s.appendExecutionEventLocked(storage.ExecutionEventCheckpointPublished(rec, gen, runnerID))
 	}
 	s.mu.Unlock()
 	if persistErr != nil {
@@ -710,7 +714,7 @@ func verifyStoredSnapshot(ctx context.Context, c *cas.CAS, digest string, wantSi
 // does not touch the global server mutex. Production leaves it a no-op.
 var snapshotListMemoryLock = func() {}
 
-// requireRunAdmin enforces the admin action for the workspace snapshot
+// requireRunAdmin enforces the ADMIN action for the workspace snapshot
 // surface — the record/manifest LISTING and the archive DOWNLOAD, both of
 // which describe or carry the private workspace — scoped by the run's
 // canonical policy identity (repoIDForRun). The repository resolution keeps
@@ -718,24 +722,28 @@ var snapshotListMemoryLock = func() {}
 // auth.Authorize makes ActionAdmin unsatisfiable by any repository grant:
 // only the global admin role (or the admin token, which carries no principal)
 // passes. A non-admin authenticated principal is answered 403 by
-// requireAction.
+// requireAction. The snapshot HANDLERS now enforce requireRunCapability
+// (auth.ActionAdmin OR the checkpoints:read controller capability); this
+// helper remains the admin-only half and its exact decision is pinned by
+// TestRequireRunAdminResolvesRunCanonicalRepo.
 func (s *Server) requireRunAdmin(w http.ResponseWriter, r *http.Request, run model.Run) bool {
 	return s.requireAction(w, r, auth.ActionAdmin, repoIDForRun(run), false)
 }
 
 // listSnapshots is GET /api/v1/runs/{id}/snapshots: the snapshot records of
-// the run's jobs, ADMIN tier — the same tier as the archive download.
+// the run's jobs, CAPABILITY tier (checkpoints:read).
 //
-// TIER DECISION (L4-A): a record is not innocuous metadata. It carries every
-// SnapshotEntry (workspace file name, mode, size, SHA-256), the manifest root
-// digest and the archive digest — an inventory of the private workspace the
-// archive holds (checkout, generated and secret-derived files). The download
-// is already admin tier, so the collection that describes exactly that
-// archive is admin tier too: requireRunAdmin resolves auth.ActionAdmin
-// against the run's canonical repository identity (repoIDForRun) and no
-// repository grant (not even artifact_read) satisfies it. The server-local
-// archive path is still stripped (redactSnapshot); the admin caller sees the
-// digests and entries the archive itself contains.
+// TIER DECISION (L4-A + controller capabilities): a record is not innocuous
+// metadata. It carries every SnapshotEntry (workspace file name, mode, size,
+// SHA-256), the manifest root digest and the archive digest — an inventory of
+// the private workspace the archive holds (checkout, generated and
+// secret-derived files). The download is the same class, so both are gated by
+// requireRunCapability: admin (auth.ActionAdmin, resolved against the run's
+// canonical repository identity via repoIDForRun) OR the run-scoped
+// checkpoints:read controller capability. No repository read grant satisfies
+// it: a principal with plain read access and no capability is answered 403.
+// The server-local archive path is still stripped (redactSnapshot); the
+// authorized caller sees the digests and entries the archive itself contains.
 //
 // The response is keyset-paginated (bounded limit + opaque cursor,
 // created_at ASC, id ASC) so neither manifests nor metadata can be requested
@@ -767,7 +775,7 @@ func (s *Server) listSnapshots(w http.ResponseWriter, r *http.Request) {
 			s.internalError(w, r, err, "")
 			return
 		}
-		if !s.requireRunAdmin(w, r, run) {
+		if !s.requireRunCapability(w, r, auth.CapCheckpointsRead, run.ID) {
 			return
 		}
 		page, err = listSnapshotsPageFromStore(r.Context(), s.DB, runID, cursor, limit)
@@ -790,7 +798,7 @@ func (s *Server) listSnapshots(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		if !s.requireRunAdmin(w, r, run) {
+		if !s.requireRunCapability(w, r, auth.CapCheckpointsRead, run.ID) {
 			return
 		}
 		page = storage.PageSnapshots(recs, runID, cursor.createdAt, cursor.id, limit)
@@ -902,16 +910,16 @@ func (s *Server) snapshotRecordsForRunLocked(runID string) []model.SnapshotRecor
 }
 
 // downloadSnapshot is GET /api/v1/runs/{id}/snapshots/{sid}: streams one
-// uploaded workspace snapshot archive for replay/debugging (admin tier). The
-// archive is the full private workspace (checkout, generated and
-// secret-derived files), so the download demands the admin action
-// (requireRunAdmin, auth.ActionAdmin) — a repository read or artifact_read
-// grant is not enough — while the route map in auth.ActionFor classifies
-// exactly this path as ActionAdmin. The decision is scoped to the run's
-// canonical repository identity (repoIDForRun) and the record must belong to
-// the addressed run. DB mode resolves the record through SnapshotStore and
-// the bytes from CAS by digest (any replica); memory mode streams the
-// node-local archive.
+// uploaded workspace snapshot archive for replay/debugging (capability tier).
+// The archive is the full private workspace (checkout, generated and
+// secret-derived files), so the download demands auth.ActionAdmin OR the
+// run-scoped checkpoints:read controller capability (requireRunCapability) —
+// a repository read or artifact_read grant is not enough — while the route
+// map in auth.ActionFor classifies exactly this path as ActionAdmin. The
+// decision is scoped to the run's canonical repository identity
+// (repoIDForRun) and the record must belong to the addressed run. DB mode
+// resolves the record through SnapshotStore and the bytes from CAS by digest
+// (any replica); memory mode streams the node-local archive.
 func (s *Server) downloadSnapshot(w http.ResponseWriter, r *http.Request) {
 	if s.DB != nil {
 		s.downloadSnapshotDB(w, r)
@@ -934,7 +942,7 @@ func (s *Server) downloadSnapshot(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if !s.requireRunAdmin(w, r, run) {
+	if !s.requireRunCapability(w, r, auth.CapCheckpointsRead, run.ID) {
 		return
 	}
 	f, err := os.Open(rec.Path)
@@ -958,10 +966,10 @@ func (s *Server) downloadSnapshot(w http.ResponseWriter, r *http.Request) {
 // the SnapshotStore through the single-record GetSnapshot (run_id, id) lookup
 // — never by listing every record of the run and scanning the slice — and
 // the archive bytes from CAS by digest, so a fresh replica with the same
-// store+CAS serves the download. Like the memory path it is admin tier —
-// requireRunAdmin resolves the run's canonical repository before the admin
-// decision — and records with a node-local Path (legacy) fall back to the
-// local file.
+// store+CAS serves the download. Like the memory path it is capability tier —
+// requireRunCapability resolves the run's canonical repository before the
+// ActionAdmin-or-checkpoints:read decision — and records with a node-local
+// Path (legacy) fall back to the local file.
 func (s *Server) downloadSnapshotDB(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	runID := r.PathValue("id")
@@ -975,7 +983,7 @@ func (s *Server) downloadSnapshotDB(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, r, err, "")
 		return
 	}
-	if !s.requireRunAdmin(w, r, run) {
+	if !s.requireRunCapability(w, r, auth.CapCheckpointsRead, run.ID) {
 		return
 	}
 	ss, ok := s.DB.(storage.SnapshotStore)
@@ -1044,10 +1052,12 @@ func redactSnapshot(rec model.SnapshotRecord) model.SnapshotRecord {
 
 // runJobPipeline is the exact-replay export of one persisted job: the
 // canonical pipeline text the job was compiled from plus its enqueue-time
-// compilation record. It is admin tier because the payload carries the full
-// effective job (steps, env, images) and the pipeline text may embed
+// compilation record. It is capability tier because the payload carries the
+// full effective job (steps, env, images) and the pipeline text may embed
 // workspace-relative build detail; the public /api/v1/runs/{id}/jobs DTO
-// keeps the pipeline redacted.
+// keeps the pipeline redacted. The route consumes evidence:read (see
+// capabilityRoutes): the export is replay-material evidence, the same
+// capability class as the audit trail.
 type runJobPipeline struct {
 	RunID              string                    `json:"run_id"`
 	JobID              string                    `json:"id"`
@@ -1135,12 +1145,12 @@ func (s *Server) jobInRun(ctx context.Context, runID, ref string) (model.Job, bo
 // exact-replay export of the persisted canonical pipeline text and the
 // enqueue-time compiled job payload the runner verified at execution time.
 // The {job} segment is a job ID or its key/base key within the run. The route
-// demands the same admin action as the snapshot reads (requireRunAdmin,
-// auth.ActionAdmin, scoped to the run's canonical repository identity): the
-// payload is the exact bytes the runner executed and the pipeline text is
-// not part of any public job DTO. A missing payload is returned as-is (the
-// caller refuses exact replay); the endpoint never recompiles or invents a
-// record.
+// demands auth.ActionAdmin OR the run-scoped evidence:read controller
+// capability (requireRunCapability, scoped to the run's canonical repository
+// identity): the payload is the exact bytes the runner executed and the
+// pipeline text is not part of any public job DTO. A missing payload is
+// returned as-is (the caller refuses exact replay); the endpoint never
+// recompiles or invents a record.
 func (s *Server) exportRunJobPipeline(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
 	run, err := s.runForAuth(r.Context(), runID)
@@ -1152,7 +1162,7 @@ func (s *Server) exportRunJobPipeline(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, r, err, "")
 		return
 	}
-	if !s.requireRunAdmin(w, r, run) {
+	if !s.requireRunCapability(w, r, auth.CapEvidenceRead, run.ID) {
 		return
 	}
 	j, ok, err := s.jobInRun(r.Context(), runID, r.PathValue("job"))

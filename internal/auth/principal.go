@@ -37,11 +37,25 @@ type RepositoryPermission struct {
 }
 
 // Principal is the authenticated identity bound to a request. Roles are
-// global capabilities; Repositories holds per-repo overrides.
+// global capabilities; Repositories holds per-repo overrides. Capabilities
+// and RepositoryCapabilities hold the fine-grained controller grants (see
+// Capability): the global list covers every repository, the repository map
+// holds per-repository grant sets resolved with the same canonical/alias
+// matcher as Repositories.
 type Principal struct {
 	Subject      string                          `json:"subject"`
 	Roles        []Role                          `json:"roles,omitempty"`
 	Repositories map[string]RepositoryPermission `json:"repositories,omitempty"`
+	// Capabilities are the controller capabilities granted on EVERY
+	// repository. They are additive to RepositoryCapabilities (a repo entry
+	// can only add capabilities, never remove a globally held one).
+	Capabilities []Capability `json:"capabilities,omitempty"`
+	// RepositoryCapabilities maps a repository grant key (the same schema as
+	// Repositories: explicit r1:/a1: forms or the unambiguous bare spellings,
+	// validated by ParseRepoGrantConfig) to the capabilities granted for the
+	// repositories it addresses. Canonically equivalent keys carrying
+	// different capability sets conflict and fail closed.
+	RepositoryCapabilities map[string][]Capability `json:"repository_capabilities,omitempty"`
 }
 
 // Has reports whether the principal holds the given role.

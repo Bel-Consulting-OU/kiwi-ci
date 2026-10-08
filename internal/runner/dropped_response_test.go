@@ -937,7 +937,7 @@ func TestRestartLeaseAcquireToCompletionAccountsUsageOnce(t *testing.T) {
 	tampered.LeaseGeneration++
 	tampered.LeaseToken = "forged-lease"
 	r := testRunnerFor(t, ts, Config{})
-	r.complete(context.Background(), tampered, model.StatusSuccess, nil, nil)
+	r.complete(context.Background(), tampered, model.StatusSuccess, nil, nil, nil)
 	attempts = cp.completionAttempts()
 	if len(attempts) != 3 || attempts[2].Outcome != "rejected-stale-lease" {
 		t.Fatalf("forged completion = %+v, want rejected-stale-lease", attempts)

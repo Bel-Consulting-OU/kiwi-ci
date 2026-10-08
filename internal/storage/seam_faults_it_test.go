@@ -234,7 +234,7 @@ func TestPostgresIntegrationStatementFaults(t *testing.T) {
 		pgITEnqueueOne(t, st, pgITNewID(t), jobID, pgITRepo)
 		pgITSeedRunner(t, st, runnerID, 1, 0, 0)
 		pgITBreakColumnToArray(t, st, "jobs", "key")
-		err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID})
+		err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID}, nil)
 		if err == nil {
 			t.Fatal("completion with a mistyped run_id column succeeded")
 		}
@@ -251,7 +251,7 @@ func TestPostgresIntegrationStatementFaults(t *testing.T) {
 		pgITBreakColumn(t, st, "completion_receipts", "runner_id")
 		// Generation 2 makes the live job look stale, so the helper probes
 		// the receipts table and must surface its failure.
-		err := st.CompleteJob(ctx, jobID, 2, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: jobID, Generation: 2, RunnerID: runnerID})
+		err := st.CompleteJob(ctx, jobID, 2, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: jobID, Generation: 2, RunnerID: runnerID}, nil)
 		if err == nil {
 			t.Fatal("completion with a mistyped receipts column succeeded")
 		}

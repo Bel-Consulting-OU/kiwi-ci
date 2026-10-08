@@ -59,7 +59,7 @@ func TestPostgresClosedPoolErrorPaths(t *testing.T) {
 		}},
 		{"HeartbeatLease", func() error { return st.HeartbeatLease(ctx, jobID, runnerID, 1, now) }},
 		{"CompleteJob", func() error {
-			return st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID})
+			return st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID}, nil)
 		}},
 		{"CancelRunJobs", func() error { _, err := st.CancelRunJobs(ctx, runID, "reason"); return err }},
 		{"UpsertRunner", func() error { return st.UpsertRunner(ctx, runner) }},

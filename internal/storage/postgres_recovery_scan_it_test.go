@@ -17,9 +17,11 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
-// pgITRecoveryJob builds a minimal job with a valid run FK target.
+// pgITRecoveryJob builds a minimal job with a valid run FK target. The Key is
+// derived from the job id so multiple fixture jobs of one run stay distinct
+// under the run-scoped logical identity index (migration 0048).
 func pgITRecoveryJob(runID, jobID string, status model.Status) model.Job {
-	return model.Job{ID: jobID, RunID: runID, Key: "build", Status: status, CreatedAt: time.Now().UTC()}
+	return model.Job{ID: jobID, RunID: runID, Key: "build-" + jobID, Status: status, CreatedAt: time.Now().UTC()}
 }
 
 // pgITRecoveryPage collects one full id-ordered page walk (pages of 2) and
@@ -77,24 +79,29 @@ func TestPostgresIntegrationRecoveryScanDiscoveryPagesDeterministically(t *testi
 	legacyFallback := pgITNewID(t)
 
 	seed := []model.Job{
-		{ID: runningExpired, RunID: runID, Key: "build", Status: model.StatusRunning, CreatedAt: now, LeaseExpiresAt: &expired},
-		{ID: runningLive, RunID: runID, Key: "build", Status: model.StatusRunning, CreatedAt: now, LeaseExpiresAt: &live},
-		{ID: runningNoExpiry, RunID: runID, Key: "build", Status: model.StatusRunning, CreatedAt: now},
-		{ID: terminalExpired, RunID: runID, Key: "build", Status: model.StatusFailure, CreatedAt: now, LeaseExpiresAt: &expired},
-		{ID: queuedPast, RunID: runID, Key: "build", Status: model.StatusQueued, CreatedAt: now, QueueDeadline: &past},
-		{ID: queuedFuture, RunID: runID, Key: "build", Status: model.StatusQueued, CreatedAt: now, QueueDeadline: &future},
-		{ID: waitingPast, RunID: runID, Key: "build", Status: model.StatusWaitingApproval, CreatedAt: now, QueueDeadline: &past},
-		{ID: cancelledPast, RunID: runID, Key: "build", Status: model.StatusCancelled, CreatedAt: now, QueueDeadline: &past},
+		{ID: runningExpired, RunID: runID, Status: model.StatusRunning, CreatedAt: now, LeaseExpiresAt: &expired},
+		{ID: runningLive, RunID: runID, Status: model.StatusRunning, CreatedAt: now, LeaseExpiresAt: &live},
+		{ID: runningNoExpiry, RunID: runID, Status: model.StatusRunning, CreatedAt: now},
+		{ID: terminalExpired, RunID: runID, Status: model.StatusFailure, CreatedAt: now, LeaseExpiresAt: &expired},
+		{ID: queuedPast, RunID: runID, Status: model.StatusQueued, CreatedAt: now, QueueDeadline: &past},
+		{ID: queuedFuture, RunID: runID, Status: model.StatusQueued, CreatedAt: now, QueueDeadline: &future},
+		{ID: waitingPast, RunID: runID, Status: model.StatusWaitingApproval, CreatedAt: now, QueueDeadline: &past},
+		{ID: cancelledPast, RunID: runID, Status: model.StatusCancelled, CreatedAt: now, QueueDeadline: &past},
 		{
 			// Pre-QueueDeadline persist: the deadline lives only in the
 			// compiled payload, so the queue_deadline column stays NULL and
 			// the query's payload fallback must find it.
-			ID: legacyFallback, RunID: runID, Key: "build", Status: model.StatusQueued,
+			ID: legacyFallback, RunID: runID, Status: model.StatusQueued,
 			CreatedAt: now.Add(-2 * time.Hour),
 			CompiledJobPayload: &model.CompiledJobPayload{
 				EffectiveJob: json.RawMessage(`{"job":{"queue_timeout":"5m"}}`),
 			},
 		},
+	}
+	// Run-scoped logical identity: every fixture job of the run needs its own
+	// Key (migration 0048), like the compiled graph it stands in for.
+	for i := range seed {
+		seed[i].Key = "build-" + seed[i].ID
 	}
 	for _, j := range seed {
 		if err := st.InsertJob(ctx, j); err != nil {
@@ -235,12 +242,12 @@ func TestPostgresIntegrationRecoveryQueueDeadlineMigration(t *testing.T) {
 		t.Fatalf("insert run at v20: %v", err)
 	}
 	backfilled := pgITNewID(t)
-	if _, err := st.pool.Exec(ctx, `INSERT INTO jobs (id, run_id, key, status, created_at, payload) VALUES ($1, $2, 'build', 'queued', now() - interval '1 hour', $3::jsonb)`,
+	if _, err := st.pool.Exec(ctx, `INSERT INTO jobs (id, run_id, key, status, created_at, payload) VALUES ($1, $2, 'build-' || $1, 'queued', now() - interval '1 hour', $3::jsonb)`,
 		backfilled, runID, `{"queue_deadline":"2000-01-01T00:00:00Z"}`); err != nil {
 		t.Fatalf("insert backfill row: %v", err)
 	}
 	guarded := pgITNewID(t)
-	if _, err := st.pool.Exec(ctx, `INSERT INTO jobs (id, run_id, key, status, created_at, payload) VALUES ($1, $2, 'build', 'queued', now() - interval '1 hour', $3::jsonb)`,
+	if _, err := st.pool.Exec(ctx, `INSERT INTO jobs (id, run_id, key, status, created_at, payload) VALUES ($1, $2, 'build-' || $1, 'queued', now() - interval '1 hour', $3::jsonb)`,
 		guarded, runID, `{"queue_deadline":123}`); err != nil {
 		t.Fatalf("insert malformed-deadline row: %v", err)
 	}

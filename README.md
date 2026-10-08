@@ -171,7 +171,7 @@ kiwi runner [--server URL --token TOKEN] | kiwi runner list|drain|disable|enable
 kiwi dispatch | kiwi runs | kiwi jobs | kiwi logs [--follow]
 kiwi cancel | kiwi approve | kiwi rerun | kiwi artifacts
 kiwi replay RUN JOB [STEP]   (exact replay from the recorded pipeline + snapshot; --attempt N, --debug-rerun)
-kiwi verify [--trusted-key PATH] ARTIFACT_ID
+kiwi verify [--trusted-key PATH] ARTIFACT_ID   (or --attestation JOB_ID for the final execution attestation)
 kiwi schedules list|trigger
 kiwi outbox dead-letters list|requeue|delete
 kiwi policy check [-f FILE] [--trusted]

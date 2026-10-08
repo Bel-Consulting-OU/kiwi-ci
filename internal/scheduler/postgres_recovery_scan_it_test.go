@@ -208,7 +208,7 @@ func TestPostgresIntegrationSchedulerRecoverExpiredPagingAndFailureIsolation(t *
 		queuedIDs = append(queuedIDs, fmt.Sprintf("%032x", i+100))
 	}
 	for _, id := range runningIDs {
-		if err := st.InsertJob(ctx, model.Job{ID: id, RunID: runID, Key: "build", RepoURL: pgITSchedRepo,
+		if err := st.InsertJob(ctx, model.Job{ID: id, RunID: runID, Key: "build-" + id, RepoURL: pgITSchedRepo,
 			Status: model.StatusRunning, CreatedAt: now, Attempts: 1, MaxInfraRetries: 0,
 			LeaseRunnerID: "runner", LeaseGeneration: 1, LeaseExpiresAt: &expired}); err != nil {
 			t.Fatalf("insert running candidate %s: %v", id, err)
@@ -216,21 +216,23 @@ func TestPostgresIntegrationSchedulerRecoverExpiredPagingAndFailureIsolation(t *
 	}
 	for _, id := range queuedIDs {
 		dl := expired
-		if err := st.InsertJob(ctx, model.Job{ID: id, RunID: runID, Key: "build", RepoURL: pgITSchedRepo,
+		if err := st.InsertJob(ctx, model.Job{ID: id, RunID: runID, Key: "build-" + id, RepoURL: pgITSchedRepo,
 			Status: model.StatusQueued, CreatedAt: now, QueueDeadline: &dl}); err != nil {
 			t.Fatalf("insert queue candidate %s: %v", id, err)
 		}
 	}
 	// Raw inserts: the canonical path validates ids, this candidate must not.
+	// The key is still derived from the id, so every fixture row of the run
+	// keeps its own run-scoped logical identity.
 	for _, row := range []struct {
 		id, status string
 	}{
 		{failingRunning, "running"},
 		{failingQueued, "queued"},
 	} {
-		payload, _ := json.Marshal(model.Job{ID: row.id, RunID: runID, Key: "build", Status: model.Status(row.status), CreatedAt: now})
+		payload, _ := json.Marshal(model.Job{ID: row.id, RunID: runID, Key: "build-" + row.id, Status: model.Status(row.status), CreatedAt: now})
 		if _, err := raw.Exec(ctx, `INSERT INTO jobs (id, run_id, key, status, attempts, lease_runner_id, lease_generation, lease_expires_at, created_at, queue_deadline, payload)
-			VALUES ($1, $2, 'build', $3, 1, NULL, 0, $4, $5, $4, $6::jsonb)`, row.id, runID, row.status, expired, now, string(payload)); err != nil {
+			VALUES ($1, $2, 'build-' || $1, $3, 1, NULL, 0, $4, $5, $4, $6::jsonb)`, row.id, runID, row.status, expired, now, string(payload)); err != nil {
 			t.Fatalf("insert failing candidate %q: %v", row.id, err)
 		}
 	}
@@ -249,7 +251,7 @@ func TestPostgresIntegrationSchedulerRecoverExpiredPagingAndFailureIsolation(t *
 		{corruptQueued, "queued", expired},
 	} {
 		if _, err := raw.Exec(ctx, `INSERT INTO jobs (id, run_id, key, status, attempts, lease_runner_id, lease_generation, lease_expires_at, created_at, queue_deadline, payload)
-			VALUES ($1, $2, 'build', $3, 1, 'runner-x', 1, $4, $5, $4, '"scalar"'::jsonb)`, row.id, runID, row.status, row.deadline, now); err != nil {
+			VALUES ($1, $2, 'build-' || $1, $3, 1, 'runner-x', 1, $4, $5, $4, '"scalar"'::jsonb)`, row.id, runID, row.status, row.deadline, now); err != nil {
 			t.Fatalf("insert corrupt candidate %q: %v", row.id, err)
 		}
 	}

@@ -361,7 +361,7 @@ func TestMemStoreQuotaReservationLifecycle(t *testing.T) {
 		t.Fatalf("after lease = %d/%d, want 1/0", running, queued)
 	}
 	// Complete releases the running slot.
-	if err := m.CompleteJob(ctx(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaae", 1, testRunner.ID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaae", Generation: 1, RunnerID: testRunner.ID}); err != nil {
+	if err := m.CompleteJob(ctx(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaae", 1, testRunner.ID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaae", Generation: 1, RunnerID: testRunner.ID}, nil); err != nil {
 		t.Fatal(err)
 	}
 	running, queued, _ = m.QuotaCounts(ctx(), repoID, "")

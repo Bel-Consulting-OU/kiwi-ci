@@ -94,9 +94,22 @@ type Run struct {
 // carries the pipeline text so a restarted control plane and its runners can
 // recompile deterministically without an external store.
 type Job struct {
-	ID      string `json:"id"`
-	RunID   string `json:"run_id"`
-	Key     string `json:"key"`
+	ID    string `json:"id"`
+	RunID string `json:"run_id"`
+	// Key is the RUN-SCOPED logical node identity: the compiled job id with
+	// its matrix/shard suffix (e.g. build[os=linux]) and unique within one
+	// run, so matrix variants stay distinct. Uniqueness is enforced on
+	// (run_id, key) — the jobs_run_key_idx unique index where the database
+	// was clean when migration 0048 ran, and always by the generated-fragment
+	// admission checks (storage.CheckGeneratedJobKeyConflicts), which fail
+	// closed with *storage.GeneratedJobKeyConflictError. Never key identity
+	// on BaseKey.
+	Key string `json:"key"`
+	// BaseKey is the DECLARED pipeline job key the compiled variant came from
+	// (pipeline.CompiledJob.BaseID). It is grouping/display only and
+	// INTENTIONALLY repeats across matrix/shard variants of one job, so it is
+	// deliberately NOT unique within a run: address a specific node by Key
+	// (or ID), never by BaseKey.
 	BaseKey string `json:"base_key,omitempty"`
 	// RepoID is the immutable canonical repository identity, copied from the
 	// run at job creation (never re-derived from the possibly changed clone
@@ -272,6 +285,79 @@ type Job struct {
 	// independently of every repository allowlist or policy grant, so an
 	// allow-everything ACL cannot admit unprovable work. Additive.
 	RepoIdentityQuarantined bool `json:"repo_identity_quarantined,omitempty"`
+	// ObservedRuntime is the executor-captured runtime identity of the
+	// attempt that completed this job (see ObservedRuntime). It is persisted
+	// by the completion transaction from the runner's completion payload;
+	// nil for jobs completed by runners that captured nothing. Additive.
+	ObservedRuntime *ObservedRuntime `json:"observed_runtime,omitempty"`
+	// UsageLeaseGeneration is the lease generation whose completion recorded
+	// this job's usage (usage_recorded/cost/energy_wh). It binds the durable
+	// usage accounting to the exact attempt that incurred it. 0 for records
+	// persisted before the field existed. Additive.
+	UsageLeaseGeneration int64 `json:"usage_lease_generation,omitempty"`
+	// AttemptRunnerID is the runner identity that COMPLETED the job's current
+	// attempt, persisted by the completion transaction before the lease
+	// fields are cleared (LeaseRunnerID is owned by the live lease and must
+	// not survive it). It is the durable runner identity the final execution
+	// attestation binds; additive and empty for records completed before the
+	// field existed.
+	AttemptRunnerID string `json:"attempt_runner_id,omitempty"`
+}
+
+// ExecutionAttestationRecord is the durable index row of one signed final
+// execution attestation. The signed DSSE envelope itself lives in the CAS
+// (EnvelopeRef "cas:<sha256>") or, in fs dev mode, in a durable sidecar file
+// whose path EnvelopeRef records. The primary key is (JobID, Generation): one
+// attempt has exactly one attestation, so an idempotent replay can never
+// append a second row or a second event.
+type ExecutionAttestationRecord struct {
+	JobID      string `json:"job_id"`
+	Generation int64  `json:"generation"`
+	RunID      string `json:"run_id"`
+	Status     string `json:"status"`
+	// StatementSHA256 is the SHA-256 of the canonical statement JSON the
+	// envelope payload carries (the signed bytes before DSSE wrapping).
+	StatementSHA256 string `json:"statement_sha256"`
+	// EnvelopeRef locates the signed envelope: "cas:<sha256>" in CAS mode or
+	// the durable sidecar file path in fs mode.
+	EnvelopeRef string    `json:"envelope_ref"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// AttestationKey derives the canonical map key of one execution attestation
+// record: "<jobID>:<generation>" (model.AttemptID), matching the row's
+// primary key identity.
+func (r ExecutionAttestationRecord) Key() string {
+	return AttemptID(r.JobID, r.Generation)
+}
+
+// ObservedRuntime is the executor-observed runtime identity of one job
+// attempt: the platform, the runtime software, and the image digests the
+// attempt actually started from. It is evidence, not configuration: every
+// field is captured best-effort at execution time and omitted when it cannot
+// be determined.
+//
+// Digest contract: MainImageDigest and ServiceImageDigests come from
+// `docker image inspect --format '{{index .RepoDigests 0}}' <ref>` when the
+// reference is resolvable on the runner; when inspect fails, times out, or
+// reports no RepoDigests entry the digest is OMITTED — it is never
+// fabricated from the tag or guessed. A reference that is already pinned by
+// an @sha256: digest records that pinned digest even when inspect fails,
+// because the pin proves what was requested and the image was required to
+// match it. Components maps a resolved component/material name to the
+// content digest the control plane resolved at enqueue (read from the
+// persisted job at completion, not from the runner).
+type ObservedRuntime struct {
+	OS                  string            `json:"os,omitempty"`
+	Arch                string            `json:"arch,omitempty"`
+	RuntimeName         string            `json:"runtime_name,omitempty"`
+	RuntimeVersion      string            `json:"runtime_version,omitempty"`
+	MainImage           string            `json:"main_image,omitempty"`
+	MainImageDigest     string            `json:"main_image_digest,omitempty"`
+	ServiceImages       map[string]string `json:"service_images,omitempty"`
+	ServiceImageDigests map[string]string `json:"service_image_digests,omitempty"`
+	Components          map[string]string `json:"components,omitempty"`
+	CapturedAt          time.Time         `json:"captured_at,omitempty"`
 }
 
 type Runner struct {
@@ -516,6 +602,11 @@ type TestReport struct {
 	Duration  float64      `json:"duration,omitempty"`
 	Cases     []TestResult `json:"cases,omitempty"`
 	CreatedAt time.Time    `json:"created_at"`
+	// LeaseGeneration is the lease generation (attempt identity) the report
+	// was delivered under, stamped by the lease-fenced insert from the
+	// verified lease — never from client input. 0 for legacy records.
+	// Additive (payload JSON only).
+	LeaseGeneration int64 `json:"lease_generation,omitempty"`
 }
 
 type LogEntry struct {
@@ -526,6 +617,11 @@ type LogEntry struct {
 	Step      string    `json:"step"`
 	Line      string    `json:"line"`
 	CreatedAt time.Time `json:"created_at"`
+	// LeaseGeneration is the lease generation (attempt identity) the log line
+	// was delivered under. The runner already sends it on the wire; the
+	// server stamps it here so fs/memory log reads can attribute a line to an
+	// attempt. Additive: legacy entries decode as 0.
+	LeaseGeneration int64 `json:"lease_generation,omitempty"`
 }
 
 type AuditEvent struct {
@@ -539,17 +635,66 @@ type AuditEvent struct {
 	CreatedAt time.Time         `json:"created_at"`
 }
 
+// Semantic execution event types: the durable companion to the "<scope>.
+// <status>" transition vocabulary. The transition types describe the mutable
+// lifecycle resource changing state; these describe the significant ACTS a
+// controller cannot reconstruct from the resource snapshot (a graph mutation
+// committed, an artifact published, a secret/credential issued, a deployment
+// started). They are emitted in the same transaction as the act they
+// describe (PostgreSQL), so a rolled-back act never leaves an event, and
+// their payloads stay small and non-secret: ids, names, generations, digests
+// and claim KEY names only, never a secret value, token or plaintext claim.
+const (
+	// EventAttemptCreated records a job attempt (lease generation) being
+	// created: one attempt.created per successful claim, Attempt = the new
+	// lease generation, Actor = the runner.
+	EventAttemptCreated = "attempt.created"
+	// EventGraphMutationCommitted records a dynamic pipeline fragment being
+	// committed for a (parent job, mutation slot).
+	EventGraphMutationCommitted = "graph.mutation_committed"
+	// EventGraphMutationReplayed records an idempotent replay of an already
+	// committed fragment: no new mutation happened, the original children
+	// are returned.
+	EventGraphMutationReplayed = "graph.mutation_replayed"
+	// EventArtifactPublished records a new artifact record committed under a
+	// lease. An idempotent duplicate upload does NOT emit it again.
+	EventArtifactPublished = "artifact.published"
+	// EventCheckpointPublished records a workspace snapshot (checkpoint)
+	// record committed under a lease.
+	EventCheckpointPublished = "checkpoint.published"
+	// EventApprovalGranted records an environment-gated job approval.
+	EventApprovalGranted = "approval.granted"
+	// EventSecretIssued records a secret delivery commit (secret NAME and
+	// generation only; the sealed value never appears).
+	EventSecretIssued = "secret.issued"
+	// EventOIDCIssued records an OIDC id_token issuance (audience, kid and
+	// claim key names only; the token and claim values never appear).
+	EventOIDCIssued = "oidc.issued"
+	// EventDeploymentStarted records a deployment lifecycle record being
+	// created for a running environment job.
+	EventDeploymentStarted = "deployment.started"
+	// EventDeploymentCompleted records a deployment lifecycle record being
+	// finished (exactly once).
+	EventDeploymentCompleted = "deployment.completed"
+	// EventExecutionAttested is RESERVED for the completion-attestation /
+	// observed-runtime follow-up. The constant is declared so consumers can
+	// already ignore the name safely; no emitter exists yet.
+	EventExecutionAttested = "execution.attested"
+)
+
 // ExecutionEvent is one record of the canonical ordered execution event
 // stream. Seq is the durable cursor: it is assigned by the durable store
-// (PostgreSQL BIGSERIAL, the fs/memory journal's monotonic counter) and is
-// the only ordering external controllers may rely on. Event types are
-// "<scope>.<status>" (job.queued, job.running, job.succeeded, job.failed,
-// job.cancelled, job.requeued, run.running, run.succeeded, ...); FromStatus
-// and ToStatus carry the transition so consumers never diff mutable
-// resources to infer what happened. Attempt is the lease generation of the
-// attempt the transition belongs to (0 when none). Actor is the runner name
-// or principal that drove the transition when known. Additive and
-// self-describing: unknown fields/event types must be ignored by consumers.
+// (the commit-ordered PostgreSQL cursor, the fs/memory journal's monotonic
+// counter) and is the only ordering external controllers may rely on. Event
+// types are either "<scope>.<status>" transition names (job.queued,
+// job.running, job.succeeded, job.failed, job.cancelled, job.requeued,
+// run.running, run.succeeded, ...) or the semantic Event* vocabularies
+// above; FromStatus and ToStatus carry the transition so consumers never
+// diff mutable resources to infer what happened. Attempt is the lease
+// generation of the attempt the event belongs to (0 when none). Actor is
+// the runner name or principal that drove the event when known. Payload is
+// small and non-secret by contract. Additive and self-describing: unknown
+// fields/event types must be ignored by consumers.
 type ExecutionEvent struct {
 	Seq           int64             `json:"seq"`
 	SchemaVersion int               `json:"schema_version"`
@@ -573,6 +718,12 @@ type JobResult struct {
 	Attempts   int               `json:"attempts"`
 	Error      string            `json:"error,omitempty"`
 	Outputs    map[string]string `json:"outputs,omitempty"`
+	// ObservedRuntime carries the executor-captured runtime identity of this
+	// attempt (nil when nothing could be captured: a native execution with no
+	// runtime surface, a failure before the runtime started, capture errors).
+	// The distributed runner forwards it on the completion wire; the control
+	// plane persists it on the job. Additive.
+	ObservedRuntime *ObservedRuntime `json:"observed_runtime,omitempty"`
 }
 
 // CompletionReceipt deduplicates runner completion requests so a retried
@@ -602,6 +753,10 @@ type Deployment struct {
 	StartedAt   *time.Time `json:"started_at,omitempty"`
 	FinishedAt  *time.Time `json:"finished_at,omitempty"`
 	CreatedAt   time.Time  `json:"created_at"`
+	// LeaseGeneration is the lease generation (attempt identity) of the job
+	// attempt that started this deployment, stamped at start and preserved
+	// across the finish. 0 for legacy records. Additive (payload JSON only).
+	LeaseGeneration int64 `json:"lease_generation,omitempty"`
 }
 
 // SnapshotEntry is one regular file in a workspace snapshot manifest.

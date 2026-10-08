@@ -134,9 +134,12 @@ func pgITSchedLeader(t *testing.T, st *storage.PostgresStore) *DBScheduler {
 	return sched
 }
 
-// pgITSchedJob builds a minimal queued job.
+// pgITSchedJob builds a minimal queued job. Its Key is derived from the job id
+// so multiple fixture jobs of one run stay distinct under the run-scoped
+// logical identity index (migration 0048), exactly like the compiled graph the
+// fixture stands in for.
 func pgITSchedJob(runID, jobID string) model.Job {
-	return model.Job{ID: jobID, RunID: runID, Key: "build", RepoURL: pgITSchedRepo, RepoFullName: "kiwi-it/repo", Status: model.StatusQueued, CreatedAt: time.Now().UTC()}
+	return model.Job{ID: jobID, RunID: runID, Key: "build-" + jobID, RepoURL: pgITSchedRepo, RepoFullName: "kiwi-it/repo", Status: model.StatusQueued, CreatedAt: time.Now().UTC()}
 }
 
 // TestPostgresIntegrationSchedulerEnqueueAtomic proves DBScheduler.Enqueue

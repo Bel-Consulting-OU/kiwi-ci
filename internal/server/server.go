@@ -410,6 +410,10 @@ type Server struct {
 	// dev-mode mirror: DB mode persists through SnapshotStore (see
 	// snapshots.go).
 	snapshots map[string]model.SnapshotRecord
+	// attestations records the final execution attestations per attempt
+	// (keyed by model.AttemptID). It is the fs/memory mirror: DB mode
+	// persists through ExecutionAttestationStore (see attestation.go).
+	attestations map[string]model.ExecutionAttestationRecord
 
 	// snapshotMaxPerJob is the effective per-(run, job) snapshot retention
 	// cap: DefaultSnapshotMaxPerJob unless WithSnapshotMaxPerJob overrides it
@@ -554,6 +558,18 @@ type Server struct {
 	RunRetention    time.Duration
 	MaxRetainedRuns int
 
+	// EventsRetention bounds the durable execution event stream: DB mode's
+	// execution_events rows and fs mode's execution-events.jsonl prefix are
+	// pruned oldest-first, and the retained_from watermark makes every
+	// cursor below it answer 410 cursor_expired (re-bootstrap via
+	// latest_cursor). The built-in default is 7 days; a negative value
+	// disables retention explicitly. Pruning runs on Maintain's amortized
+	// cadence in bounded batches (see maybePruneExecutionEvents). The value
+	// is stable after wiring; eventsPruneMu guards only the cadence gate.
+	EventsRetention time.Duration
+	eventsPruneMu   sync.Mutex
+	lastEventsPrune time.Time
+
 	// CacheManifestRetention bounds durable shared-cache manifests: DB-mode
 	// cache_manifests rows and fs-mode manifest envelopes. Zero selects the
 	// built-in default (30 days); a negative value disables age pruning.
@@ -647,6 +663,7 @@ func newServer(token string) *Server {
 		AuthStore:         auth.NewTokenStore(),
 		deployments:       map[string]model.Deployment{},
 		snapshots:         map[string]model.SnapshotRecord{},
+		attestations:      map[string]model.ExecutionAttestationRecord{},
 		snapshotMaxPerJob: DefaultSnapshotMaxPerJob,
 		contracts:         map[string]map[string]storage.ArtifactContract{},
 		pendingSidecars:   map[string]string{},
@@ -659,6 +676,7 @@ func newServer(token string) *Server {
 		occurrences:       map[string]map[int64]string{},
 		orphanOccurrences: map[string]bool{},
 		MaxSchedules:      defaultMaxSchedules,
+		EventsRetention:   defaultEventsRetention,
 		downstreamLinks:   map[string]storage.DownstreamLink{},
 		profiles:          map[string]model.RunnerProfile{},
 		certProfiles:      map[string]string{},
@@ -974,6 +992,13 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 	// would be resolved arbitrarily (now: refuse). Older snapshots carry no
 	// pointers and the union leaves the (empty) mirror untouched.
 	s.restorePendingSidecarPointers(snap)
+	// Execution attestation records ride the snapshot so an acknowledged
+	// attestation survives a restart; older snapshots carry no field and
+	// load as an empty map.
+	s.attestations = snap.Attestations
+	if s.attestations == nil {
+		s.attestations = map[string]model.ExecutionAttestationRecord{}
+	}
 	s.rebuildArtifactContractsLocked()
 	// Completion receipts are restored before any request can be served so a
 	// replayed completion after a restart is answered from the durable
@@ -1190,6 +1215,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/jobs/{id}/log", s.log)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/log/batch", s.logBatch)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/complete", s.complete)
+	mux.HandleFunc("GET /api/v1/jobs/{id}/attestation", s.getJobAttestation)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/generated", s.generateJobs)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/snapshots", s.uploadSnapshot)
 	mux.HandleFunc("GET /api/v1/runs/{id}/snapshots", s.listSnapshots)
@@ -1218,9 +1244,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/v1/runner-profiles/{id}/runner/{runnerID}", s.bindRunnerProfileRunner)
 	mux.HandleFunc("DELETE /api/v1/runner-profiles/{id}/runner/{runnerID}", s.unbindRunnerProfileRunner)
 	mux.HandleFunc("GET /api/v1/audit", s.listAudit)
-	// Canonical ordered execution event stream (admin tier, same gate as
-	// audit). The list endpoint is the cursor-pull contract (after/limit/
-	// run_id); the stream endpoint is the SSE wrapper over the same cursor.
+	// Canonical ordered execution event stream (capability tier: admin or a
+	// controller principal holding execution.events:read, global for the
+	// unscoped cursor or repository-scoped for a run_id). The list endpoint
+	// is the cursor-pull contract (after/limit/run_id); the stream endpoint
+	// is the SSE wrapper over the same cursor.
 	mux.HandleFunc("GET /api/v1/events", s.listEvents)
 	mux.HandleFunc("GET /api/v1/events/stream", s.streamExecutionEvents)
 	// The auth middleware runs inside statusLogger/recoverer and outside
@@ -1462,6 +1490,49 @@ func (s *Server) auth(next http.Handler) http.Handler {
 			}
 			next.ServeHTTP(w, r)
 			return
+		case tierCapability:
+			// Controller capability routes: external controllers (for example
+			// a Faktor-style evidence consumer) read execution history and
+			// evidence without the admin role. Web sessions, the admin token
+			// and the legacy open mode keep their existing behavior; a store
+			// principal must carry the addressed capability somewhere (global
+			// or repository-scoped) or — for run-scoped event reads — any
+			// repository read capability. The handler then resolves the
+			// actual repository scope and answers 403 when the grant does not
+			// cover it, so this tier is a screen, never the decision.
+			if s.webSessionOK(r) {
+				if webMutatingMethod(r.Method) && !s.webCSRFOK(r) {
+					http.Error(w, "invalid csrf token", http.StatusForbidden)
+					return
+				}
+				next.ServeHTTP(w, r)
+				return
+			}
+			if s.adminOK(r) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if s.AdminToken == "" && (s.AuthStore == nil || s.AuthStore.Empty()) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			p, ok := auth.PrincipalFrom(r)
+			if !ok {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			route, ok := capabilityRouteFor(r.Method, r.URL.Path)
+			if !ok {
+				// classifyRoute only reaches this tier through the table; a
+				// disagreement fails closed rather than guessing a grant.
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+			if p.HasCapabilityInAnyScope(route.capability) || (route.readFallback && auth.CanReadAnyRepo(p)) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			http.Error(w, "forbidden", http.StatusForbidden)
 		case tierAdmin:
 			// Web sessions: a valid kiwi_session cookie authorizes admin-tier
 			// routes like the admin bearer token. Mutating requests
@@ -4162,6 +4233,10 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	// failed lease leaves no event claiming a lease the disk never saw
 	// (mirroring the audit's ordering at this site).
 	s.appendJobEventLocked(j, model.StatusQueued, model.StatusRunning, ri.Name, map[string]string{"job": j.Key, "runner": id})
+	// attempt.created is appended after the durable lease (best-effort in fs
+	// mode): one event per attempt, carrying the new lease generation and
+	// the runner.
+	s.appendExecutionEventLocked(storage.ExecutionEventAttemptCreated(j, id))
 	s.metricObserve("kiwi_queue_latency_seconds", now.Sub(j.CreatedAt).Seconds(), nil)
 	// The raw token travels on the wire once; the hash is not needed by the
 	// runner and is stripped from the task job.
@@ -4515,7 +4590,7 @@ func (s *Server) logBatch(w http.ResponseWriter, r *http.Request) {
 		if lbs, ok := s.DB.(storage.LogBatchStore); ok {
 			entries := make([]model.LogEntry, 0, len(in.Lines))
 			for _, l := range in.Lines {
-				entries = append(entries, model.LogEntry{RunID: j.RunID, JobID: j.ID, JobKey: j.Key, Step: l.Step, Line: l.Line, CreatedAt: now})
+				entries = append(entries, model.LogEntry{RunID: j.RunID, JobID: j.ID, JobKey: j.Key, Step: l.Step, Line: l.Line, CreatedAt: now, LeaseGeneration: in.LeaseGeneration})
 			}
 			inserted, err := lbs.AppendLogBatch(r.Context(), entries, storage.LogBatchReceipt{JobID: j.ID, Generation: in.LeaseGeneration, BatchID: in.BatchID})
 			if err != nil {
@@ -4562,7 +4637,7 @@ func (s *Server) logBatch(w http.ResponseWriter, r *http.Request) {
 	entries := make([]model.LogEntry, 0, len(in.Lines))
 	for _, l := range in.Lines {
 		s.logSeq++
-		entries = append(entries, model.LogEntry{Seq: s.logSeq, RunID: cur.RunID, JobID: cur.ID, JobKey: cur.Key, Step: l.Step, Line: l.Line, CreatedAt: now})
+		entries = append(entries, model.LogEntry{Seq: s.logSeq, RunID: cur.RunID, JobID: cur.ID, JobKey: cur.Key, Step: l.Step, Line: l.Line, CreatedAt: now, LeaseGeneration: in.LeaseGeneration})
 	}
 	s.mu.Unlock()
 	if s.store != nil {
@@ -4621,7 +4696,7 @@ func (s *Server) log(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.logSeq++
-	e := model.LogEntry{Seq: s.logSeq, RunID: cur.RunID, JobID: cur.ID, JobKey: cur.Key, Step: in.Step, Line: in.Line, CreatedAt: time.Now().UTC()}
+	e := model.LogEntry{Seq: s.logSeq, RunID: cur.RunID, JobID: cur.ID, JobKey: cur.Key, Step: in.Step, Line: in.Line, CreatedAt: time.Now().UTC(), LeaseGeneration: in.LeaseGeneration}
 	s.mu.Unlock()
 	if s.store != nil {
 		if err := s.store.AppendLog(e); err != nil {
@@ -4648,7 +4723,7 @@ func (s *Server) logDB(w http.ResponseWriter, r *http.Request, jobID string, in 
 // logDBWrite appends one line through the identity-sequenced DB path. The
 // job row is authoritative for run/job coordinates.
 func (s *Server) logDBWrite(ctx context.Context, j model.Job, in LogLine, now time.Time) bool {
-	e := model.LogEntry{RunID: j.RunID, JobID: j.ID, JobKey: j.Key, Step: in.Step, Line: in.Line, CreatedAt: now}
+	e := model.LogEntry{RunID: j.RunID, JobID: j.ID, JobKey: j.Key, Step: in.Step, Line: in.Line, CreatedAt: now, LeaseGeneration: in.LeaseGeneration}
 	return s.DB.AppendLog(ctx, e) == nil
 }
 
@@ -4662,6 +4737,13 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(in.Error) > 64<<10 {
 		http.Error(w, "error message exceeds 64 KiB", http.StatusBadRequest)
+		return
+	}
+	// Observed runtime evidence is runner-supplied: refuse a malformed shape
+	// or an oversized/control-character-laden payload before it can reach the
+	// job payload (400). Nil is valid (nothing captured).
+	if err := validateObservedRuntime(in.ObservedRuntime); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	// Completion is lease-fenced at the store, and additionally bound to the
@@ -4782,6 +4864,10 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 			j.Error = "runner returned invalid or oversized job outputs"
 		}
 		j.FinishedAt = &now
+		// Runtime evidence rides the completion: a deep copy of the validated
+		// wire value with Components replaced by the resolved component
+		// digests of the persisted job (server-owned, never client-trusted).
+		j.ObservedRuntime = observedRuntimeWithComponents(in.ObservedRuntime, j)
 	}
 	// Usage accounting: cost/energy from the frozen lease-time rates and
 	// the wall-clock duration. The amounts ride the snapshot write below;
@@ -4791,11 +4877,17 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	// usage_account effect a no-op on replay.
 	usageCost, usageEnergy, usageOK := computeJobUsage(&j, now)
 	j.UsageRecorded = true
+	// Bind the durable usage marker to the attempt that incurred it, matching
+	// the DB payload's usage_lease_generation.
+	j.UsageLeaseGeneration = in.LeaseGeneration
 	// The lease is spent: clear all lease state so nothing can reuse it,
 	// then dedupe future retries of this exact completion via the receipt.
+	// The completing runner identity survives in AttemptRunnerID: it is the
+	// durable runner evidence the final execution attestation binds.
 	j.LeaseRunnerID = ""
 	j.LeaseTokenHash = nil
 	j.LeaseExpiresAt = nil
+	j.AttemptRunnerID = in.RunnerID
 	runID := j.RunID
 	// Ordering: capture -> mutate -> persist -> roll back on failure ->
 	// effects and metrics only after success. The captured snapshot (the
@@ -4958,7 +5050,11 @@ func (s *Server) completeDB(w http.ResponseWriter, r *http.Request, jobID string
 		st = model.StatusFailure
 		errMsg = "runner returned invalid or oversized job outputs"
 	}
-	if err := s.Sched.Complete(ctx, jobID, in.LeaseGeneration, in.RunnerID, st, errMsg, outputs, hash); err != nil {
+	// Runtime evidence is persisted INSIDE the completion transaction: the
+	// resolved components come from the locked/authorized persisted job (the
+	// wire's Components are never trusted).
+	observed := observedRuntimeWithComponents(in.ObservedRuntime, j)
+	if err := s.Sched.Complete(ctx, jobID, in.LeaseGeneration, in.RunnerID, st, errMsg, outputs, hash, observed); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			http.NotFound(w, r)
 			return
@@ -5011,7 +5107,11 @@ func (s *Server) completeDB(w http.ResponseWriter, r *http.Request, jobID string
 
 // completionResultHash canonicalizes a completion payload so identical
 // retries can be recognized. encoding/json sorts map keys, making outputs
-// deterministic.
+// deterministic. The observed runtime is deliberately NOT part of the hash:
+// it is additive evidence, and excluding it keeps a receipt written by an
+// older server (before the field existed) matching a retry that now carries
+// the field, so a rolling upgrade cannot turn an idempotent replay into a
+// spurious 409.
 func completionResultHash(status model.Status, errMsg string, outputs map[string]string) string {
 	outJSON, _ := jsonMarshal(outputs)
 	h := sha256.New()
@@ -5549,6 +5649,9 @@ func (s *Server) approveJob(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "approval not durable", http.StatusServiceUnavailable)
 		return
 	}
+	// approval.granted is appended after the durable approval, next to the
+	// act it describes (best-effort in fs mode).
+	s.appendExecutionEventLocked(storage.ExecutionEventApprovalGranted(j, actor))
 	if waited {
 		s.metricObserve("kiwi_approval_wait_seconds", waitSeconds, nil)
 		s.metricObserve("kiwi_environment_wait_seconds", waitSeconds, nil)
@@ -5827,7 +5930,9 @@ func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if !s.requireAction(w, r, auth.ActionCancel, repoIDForRun(run), false) {
+	// Cancellation is the existing RBAC cancel action OR the runs:cancel
+	// controller capability, both scoped to the run's repository.
+	if !s.requireRunActionOrCapability(w, r, auth.ActionCancel, auth.CapRunsCancel, run) {
 		return
 	}
 	s.mu.Lock()
@@ -5888,7 +5993,7 @@ func (s *Server) cancelRunDB(w http.ResponseWriter, r *http.Request, id, actor s
 		s.internalError(w, r, err, "")
 		return
 	}
-	if !s.requireAction(w, r, auth.ActionCancel, repoIDForRun(run), false) {
+	if !s.requireRunActionOrCapability(w, r, auth.ActionCancel, auth.CapRunsCancel, run) {
 		return
 	}
 	reason := "cancelled by " + actor
@@ -6296,6 +6401,12 @@ func (s *Server) auditLocked(action, actor, runID, jobID, msg string, meta map[s
 	}
 }
 func (s *Server) listAudit(w http.ResponseWriter, r *http.Request) {
+	// The route is tierCapability: admin (token/role) is handled by the tier
+	// gate, and a controller principal must hold evidence:read GLOBALLY
+	// (audit spans every repository, so a repo-scoped grant never suffices).
+	if !s.requireGlobalCapability(w, r, auth.CapEvidenceRead) {
+		return
+	}
 	if s.DB != nil {
 		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 		v, err := s.DB.ReadAudit(r.Context(), limit)
@@ -6329,7 +6440,7 @@ func (s *Server) persistLocked() error {
 		s.notePersistResult(s.persistFailForTest)
 		return s.persistFailForTest
 	}
-	err := s.store.Save(storage.Snapshot{Version: 1, Runs: s.runs, Jobs: s.jobs, Runners: s.runners, Artifacts: s.artifacts, Reports: s.reports, DownstreamLinks: s.downstreamLinks, Profiles: s.profiles, CertProfileLinks: s.certProfiles, RunnerProfileLinks: s.runnerProfiles, Snapshots: s.snapshots, CompletionReceipts: s.completionReceiptRecordsLocked(), Deployments: s.deployments, CRL: s.crl, PendingSidecars: s.pendingSidecarSnapshotLocked(), RunIdempotency: s.idempotency, GeneratedFragments: s.generatedFragments})
+	err := s.store.Save(storage.Snapshot{Version: 1, Runs: s.runs, Jobs: s.jobs, Runners: s.runners, Artifacts: s.artifacts, Reports: s.reports, DownstreamLinks: s.downstreamLinks, Profiles: s.profiles, CertProfileLinks: s.certProfiles, RunnerProfileLinks: s.runnerProfiles, Snapshots: s.snapshots, Attestations: s.attestations, CompletionReceipts: s.completionReceiptRecordsLocked(), Deployments: s.deployments, CRL: s.crl, PendingSidecars: s.pendingSidecarSnapshotLocked(), RunIdempotency: s.idempotency, GeneratedFragments: s.generatedFragments})
 	s.noteSnapshotPersistResult(err)
 	return err
 }

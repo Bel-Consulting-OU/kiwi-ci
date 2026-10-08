@@ -1395,9 +1395,13 @@ func (s *DBScheduler) Heartbeat(ctx context.Context, jobID, runnerID string, tok
 
 // Complete applies a runner completion through the store's transactional
 // CompleteJob, passing the canonical completion receipt for idempotent replay.
-func (s *DBScheduler) Complete(ctx context.Context, jobID string, generation int64, runnerID string, status model.Status, errMsg string, outputs map[string]string, resultHash string) error {
+func (s *DBScheduler) Complete(ctx context.Context, jobID string, generation int64, runnerID string, status model.Status, errMsg string, outputs map[string]string, resultHash string, observed ...*model.ObservedRuntime) error {
 	receipt := model.CompletionReceipt{JobID: jobID, Generation: generation, RunnerID: runnerID, ResultHash: resultHash}
-	return s.Store.CompleteJob(ctx, jobID, generation, runnerID, status, errMsg, outputs, receipt)
+	var runtime *model.ObservedRuntime
+	if len(observed) > 0 {
+		runtime = observed[0]
+	}
+	return s.Store.CompleteJob(ctx, jobID, generation, runnerID, status, errMsg, outputs, receipt, runtime)
 }
 
 // CancelRun cancels every non-terminal job of the run and the run itself via

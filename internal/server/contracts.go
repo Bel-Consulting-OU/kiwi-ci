@@ -35,11 +35,12 @@ func buildJobContracts(cj pipeline.CompiledJob) map[string]storage.ArtifactContr
 			continue
 		}
 		c := storage.ArtifactContract{
-			Name:     name,
-			Paths:    append([]string(nil), a.Paths...),
-			Required: a.Required,
-			MaxSize:  int64(a.MaxSize),
-			SBOM:     strings.TrimSpace(a.SBOM),
+			Name:       name,
+			Paths:      append([]string(nil), a.Paths...),
+			Required:   a.Required,
+			MaxSize:    int64(a.MaxSize),
+			SBOM:       strings.TrimSpace(a.SBOM),
+			Provenance: strings.TrimSpace(a.Provenance),
 		}
 		if a.Sigstore != nil {
 			c.SigstoreRequired = a.Sigstore.Required
@@ -123,9 +124,11 @@ func lenientJobContracts(j model.Job) (map[string]storage.ArtifactContract, bool
 	var raw struct {
 		Jobs map[string]struct {
 			Artifacts []struct {
-				Name      string   `yaml:"name"`
-				Paths     []string `yaml:"paths"`
-				Retention string   `yaml:"retention"`
+				Name       string   `yaml:"name"`
+				Paths      []string `yaml:"paths"`
+				Retention  string   `yaml:"retention"`
+				Provenance string   `yaml:"provenance"`
+				Required   bool     `yaml:"required"`
 			} `yaml:"artifacts"`
 		} `yaml:"jobs"`
 	}
@@ -146,7 +149,7 @@ func lenientJobContracts(j model.Job) (map[string]storage.ArtifactContract, bool
 			if strings.TrimSpace(a.Name) == "" {
 				continue
 			}
-			c := storage.ArtifactContract{Name: a.Name, Paths: append([]string(nil), a.Paths...)}
+			c := storage.ArtifactContract{Name: a.Name, Paths: append([]string(nil), a.Paths...), Required: a.Required, Provenance: strings.TrimSpace(a.Provenance)}
 			if d, err := pipeline.ParseRetention(a.Retention); err == nil {
 				c.Retention = d
 			}
@@ -215,7 +218,10 @@ func contractRetention(d time.Duration) time.Duration {
 
 // requiredArtifactsMissingLocked returns the name of the first contract
 // entry with Required=true that has no artifact record for (job, name), or
-// "" when every required artifact is present. The caller holds s.mu.
+// "" when every required artifact is present. A contract with
+// Provenance=required additionally demands a non-empty ProvenanceSHA256 on
+// the matching record, so a required artifact whose provenance could not be
+// durably published cannot satisfy completion. The caller holds s.mu.
 func (s *Server) requiredArtifactsMissingLocked(j model.Job) string {
 	contracts := s.contracts[j.ID]
 	if len(contracts) == 0 {
@@ -227,9 +233,13 @@ func (s *Server) requiredArtifactsMissingLocked(j model.Job) string {
 		if !c.Required {
 			continue
 		}
+		provenanceRequired := c.Provenance == storage.ArtifactProvenanceRequired
 		found := false
 		for _, a := range s.artifacts {
 			if a.JobID == j.ID && a.Name == name {
+				if provenanceRequired && a.ProvenanceSHA256 == "" {
+					continue
+				}
 				found = true
 				break
 			}

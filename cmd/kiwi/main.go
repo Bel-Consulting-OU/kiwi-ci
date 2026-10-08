@@ -332,6 +332,7 @@ Usage:
   kiwi import   github-actions|gitlab|circleci|woodpecker [--file PATH] [--out PATH] [--list-unsupported]
   kiwi replay   RUN JOB [STEP] --server URL --token TOKEN [--attempt N] [--debug-rerun] [--pipeline FILE]
   kiwi verify   [--server URL] [--token TOKEN] [--trusted-key PATH] ARTIFACT_ID
+                (or) --attestation JOB [--generation N] | --attestation-file PATH
   kiwi runs [--server URL] [--token ADMIN_TOKEN]
   kiwi jobs RUN [--server URL] [--token ADMIN_TOKEN]
   kiwi logs RUN [--job KEY] [--follow] [--interactive] [--server URL] [--token ADMIN_TOKEN]

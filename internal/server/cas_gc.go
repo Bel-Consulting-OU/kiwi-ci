@@ -367,6 +367,10 @@ func (s *Server) collectCASReferences(ctx context.Context) (map[string]struct{},
 	for _, digest := range s.pendingSidecars {
 		pending = append(pending, digest)
 	}
+	attestationRefs := make([]string, 0, len(s.attestations))
+	for _, rec := range s.attestations {
+		attestationRefs = append(attestationRefs, rec.EnvelopeRef)
+	}
 	s.mu.Unlock()
 
 	for _, a := range artifacts {
@@ -377,6 +381,9 @@ func (s *Server) collectCASReferences(ctx context.Context) (map[string]struct{},
 	}
 	for _, digest := range pending {
 		addCASRef(refs, digest)
+	}
+	for _, ref := range attestationRefs {
+		addCASRef(refs, ref)
 	}
 
 	if s.DB != nil {
@@ -411,6 +418,13 @@ func (s *Server) collectCASReferences(ctx context.Context) (map[string]struct{},
 		}
 		for _, digest := range pendingDigests {
 			addCASRef(refs, digest)
+		}
+		attestationEnvelopeRefs, err := refStore.ListAllExecutionAttestationEnvelopeRefs(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list execution attestations: %w", err)
+		}
+		for _, ref := range attestationEnvelopeRefs {
+			addCASRef(refs, ref)
 		}
 	}
 

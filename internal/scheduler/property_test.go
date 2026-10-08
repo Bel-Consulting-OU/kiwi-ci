@@ -235,7 +235,7 @@ func (w *propWorld) assertCompletionIdempotent(jobID string, generation int64, r
 	if !ok {
 		return
 	}
-	err := w.store.CompleteJob(w.ctx, jobID, generation, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: jobID, Generation: generation, RunnerID: runnerID, ResultHash: "replay"})
+	err := w.store.CompleteJob(w.ctx, jobID, generation, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: jobID, Generation: generation, RunnerID: runnerID, ResultHash: "replay"}, nil)
 	if err != nil && !errors.Is(err, storage.ErrGenerationMismatch) {
 		w.t.Fatalf("replayed CompleteJob returned unexpected error: %v", err)
 	}
@@ -248,7 +248,7 @@ func (w *propWorld) assertCompletionIdempotent(jobID string, generation int64, r
 // assertCancelledBlocksPublication verifies the lease-invalidation path: a
 // cancelled job cannot publish a completion, and its lease fields are wiped.
 func (w *propWorld) assertCancelledBlocksPublication(stale model.Job) {
-	err := w.store.CompleteJob(w.ctx, stale.ID, stale.LeaseGeneration, stale.LeaseRunnerID, model.StatusSuccess, "", map[string]string{"sneaky": "1"}, model.CompletionReceipt{JobID: stale.ID, Generation: stale.LeaseGeneration, RunnerID: stale.LeaseRunnerID, ResultHash: "sneaky"})
+	err := w.store.CompleteJob(w.ctx, stale.ID, stale.LeaseGeneration, stale.LeaseRunnerID, model.StatusSuccess, "", map[string]string{"sneaky": "1"}, model.CompletionReceipt{JobID: stale.ID, Generation: stale.LeaseGeneration, RunnerID: stale.LeaseRunnerID, ResultHash: "sneaky"}, nil)
 	if !errors.Is(err, storage.ErrGenerationMismatch) && !errors.Is(err, storage.ErrLeaseConflict) {
 		w.t.Fatalf("cancelled job %s published a completion: %v", stale.ID, err)
 	}
@@ -401,7 +401,7 @@ func TestPropertyCancelledJobCannotPublish(t *testing.T) {
 	// Publication through the stale lease must be rejected.
 	w.assertCancelledBlocksPublication(leased)
 	// Publication with a bumped generation must also be rejected.
-	err := w.store.CompleteJob(w.ctx, leased.ID, leased.LeaseGeneration+1, leased.LeaseRunnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: leased.ID, Generation: leased.LeaseGeneration + 1, RunnerID: leased.LeaseRunnerID, ResultHash: "bump"})
+	err := w.store.CompleteJob(w.ctx, leased.ID, leased.LeaseGeneration+1, leased.LeaseRunnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: leased.ID, Generation: leased.LeaseGeneration + 1, RunnerID: leased.LeaseRunnerID, ResultHash: "bump"}, nil)
 	if !errors.Is(err, storage.ErrGenerationMismatch) {
 		t.Fatalf("bumped-generation completion was accepted: %v", err)
 	}

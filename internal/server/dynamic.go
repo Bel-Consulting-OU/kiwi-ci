@@ -70,6 +70,20 @@ type generatedMutationConflictResponse struct {
 // the 409 conflict response.
 const generatedMutationConflictReason = "GENERATED_MUTATION_CONFLICT"
 
+// generatedJobKeyConflictResponse is the 409 body of a run-scoped logical
+// identity collision: a generated child key already identifies a job in the
+// same run. Key is the run-scoped logical node identity, so a second row for
+// (run, key) would make key lookups ambiguous. The existing job is described
+// by its id only, and nothing of the fragment was inserted.
+type generatedJobKeyConflictResponse struct {
+	Reason  string `json:"reason"`
+	Message string `json:"message"`
+}
+
+// generatedJobKeyConflictReason is the stable machine-readable reason of the
+// run-scoped logical key conflict response.
+const generatedJobKeyConflictReason = "GENERATED_JOB_KEY_CONFLICT"
+
 // generateJobs implements POST /api/v1/jobs/{id}/generated. The caller must
 // hold the parent job's active lease; every generated child is admitted
 // under the parent's effective capabilities (children can only inherit or
@@ -105,6 +119,17 @@ func (s *Server) generateJobs(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusConflict, generatedMutationConflictResponse{
 				Reason:  generatedMutationConflictReason,
 				Message: "a nondeterministic generator retry cannot append a second child graph to the same parent job; the committed fragment differs from the submitted fragment",
+			})
+			return
+		}
+		// A generated child key already identifies a job in the same run:
+		// Key is the run-scoped logical node identity, so the fragment is
+		// refused whole with a stable, machine-readable 409.
+		var keyConflict *storage.GeneratedJobKeyConflictError
+		if errors.As(aerr, &keyConflict) {
+			writeJSON(w, http.StatusConflict, generatedJobKeyConflictResponse{
+				Reason:  generatedJobKeyConflictReason,
+				Message: fmt.Sprintf("generated job key %q already exists in run %s as job %s; the generated fragment was not inserted", keyConflict.Key, keyConflict.RunID, keyConflict.ExistingJobID),
 			})
 			return
 		}
@@ -276,7 +301,11 @@ func replayGeneratedResponse(parent model.Job, depth int, rec storage.GeneratedF
 // graph. The lease generation AUTHORIZES the mutation (the caller has already
 // validated the active lease before this function runs) but never defines it:
 // an infrastructure retry of the same logical parent under a new generation
-// re-submits the identical fragment and replays the SAME children.
+// re-submits the identical fragment and replays the SAME children. Every
+// child Key is additionally admitted under the run-scoped logical identity
+// rule (storage.CheckGeneratedJobKeyConflicts): a key that already identifies
+// a job in the run fails closed with *storage.GeneratedJobKeyConflictError
+// (mapped to 409, reason GENERATED_JOB_KEY_CONFLICT) and inserts nothing.
 func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job, in generatedFragment) (*generatedResponse, error) {
 	fragmentID, err := in.Digest()
 	if err != nil {
@@ -602,8 +631,8 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 	// nondeterministic-retry conflict and inserts nothing. A stale generation
 	// never reaches this lookup (the lease predicate above rejected it).
 	if rec, found := s.memoryGeneratedFragment(parent.ID, mutationSlot); found {
-		s.mu.Unlock()
 		if rec.FragmentID != fragmentID {
+			s.mu.Unlock()
 			return nil, &storage.GeneratedMutationConflictError{
 				ParentJobID:         parent.ID,
 				MutationSlot:        mutationSlot,
@@ -611,11 +640,25 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 				SubmittedFragmentID: fragmentID,
 			}
 		}
+		// The replay act is journaled best-effort under the same lock
+		// (fs mode is non-canonical by contract; a failed append is logged,
+		// never fails the replay).
+		s.appendExecutionEventLocked(storage.ExecutionEventGraphMutation(true, current, mutationSlot, rec.FragmentID, len(rec.Children)))
+		s.mu.Unlock()
 		return replayGeneratedResponse(parent, childDepth, rec), nil
 	}
 	if verr := verifyGeneratedFragmentGraph(parent, current, childDepth, runJobCount, len(created)); verr != nil {
 		s.mu.Unlock()
 		return nil, verr
+	}
+	// Run-scoped logical identity admission, shared with both stores: Key is
+	// the run's logical node identity, so a child colliding with any existing
+	// job of the run (compiled or generated) is refused whole. s.mu already
+	// serializes this critical section, so the index read here is
+	// authoritative.
+	if kerr := storage.CheckGeneratedJobKeyConflicts(parent.RunID, created, storage.GeneratedJobKeyIndex(parent.RunID, s.jobs)); kerr != nil {
+		s.mu.Unlock()
+		return nil, kerr
 	}
 	rb := s.captureStateRollbackLocked()
 	for id, j := range created {
@@ -649,6 +692,9 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 		s.mu.Unlock()
 		return nil, notDurable(perr)
 	}
+	// graph.mutation_committed is appended after the durable snapshot, next
+	// to the mutation it describes (best-effort in fs mode).
+	s.appendExecutionEventLocked(storage.ExecutionEventGraphMutation(false, current, mutationSlot, fragmentID, len(created)))
 	s.mu.Unlock()
 	return &generatedResponse{ParentJobID: parent.ID, RunID: parent.RunID, Depth: childDepth, JobIDs: ids, Keys: keys}, nil
 }

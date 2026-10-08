@@ -17,18 +17,37 @@ import (
 // returning their ids.
 func leaseClockITSetup(t *testing.T, st *PostgresStore) (runID, jobID, runnerID string) {
 	t.Helper()
-	ctx := context.Background()
-	runnerID = pgITNewID(t)
-	if err := st.UpsertRunner(ctx, model.Runner{
+	runnerID = leaseClockITRunner(t, st)
+	runID = pgITNewID(t)
+	jobID = pgITNewID(t)
+	pgITEnqueueOne(t, st, runID, jobID, pgITRepo)
+	return runID, jobID, runnerID
+}
+
+// leaseClockITSetupKeyed is leaseClockITSetup with an explicit run-scoped job
+// Key. Since (run_id, key) uniqueness is per run, two keyed setups in
+// different runs can deliberately share one Key (one repository test-history
+// suite across two jobs).
+func leaseClockITSetupKeyed(t *testing.T, st *PostgresStore, key string) (runID, jobID, runnerID string) {
+	t.Helper()
+	runnerID = leaseClockITRunner(t, st)
+	runID = pgITNewID(t)
+	jobID = pgITNewID(t)
+	pgITEnqueueOneKeyed(t, st, runID, jobID, pgITRepo, key)
+	return runID, jobID, runnerID
+}
+
+// leaseClockITRunner registers a native runner used by the lease-clock tests.
+func leaseClockITRunner(t *testing.T, st *PostgresStore) string {
+	t.Helper()
+	runnerID := pgITNewID(t)
+	if err := st.UpsertRunner(context.Background(), model.Runner{
 		ID: runnerID, Name: runnerID, Capacity: 2,
 		ReportedCapabilities: []string{"native"}, Capabilities: []string{"native"}, CapabilitiesEnforced: true,
 	}); err != nil {
 		t.Fatalf("seed runner: %v", err)
 	}
-	runID = pgITNewID(t)
-	jobID = pgITNewID(t)
-	pgITEnqueueOne(t, st, runID, jobID, pgITRepo)
-	return runID, jobID, runnerID
+	return runnerID
 }
 
 func leaseClockITClaim(jobID, runnerID string, ttl time.Duration) LeaseClaim {
@@ -250,7 +269,7 @@ func TestIntegrationCompletionRejectsLeaseExpiredWhileWaitingForLock(t *testing.
 	receipt := model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID, ResultHash: "h"}
 	done := make(chan error, 1)
 	go func() {
-		done <- st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, receipt)
+		done <- st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, receipt, nil)
 	}()
 	select {
 	case err := <-done:

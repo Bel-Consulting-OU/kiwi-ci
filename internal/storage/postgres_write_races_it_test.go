@@ -538,14 +538,14 @@ func TestPostgresRequiredArtifactScopedToGeneration(t *testing.T) {
 		t.Fatalf("stale-generation artifact: %v", err)
 	}
 	receiptA := model.CompletionReceipt{JobID: jobA, Generation: 1, RunnerID: runnerID}
-	if err := st.CompleteJob(ctx, jobA, 1, runnerID, model.StatusSuccess, "", nil, receiptA); !errors.Is(err, ErrRequiredArtifactMissing) {
+	if err := st.CompleteJob(ctx, jobA, 1, runnerID, model.StatusSuccess, "", nil, receiptA, nil); !errors.Is(err, ErrRequiredArtifactMissing) {
 		t.Fatalf("completion with a stale-generation artifact = %v, want ErrRequiredArtifactMissing", err)
 	}
 	// The same artifact at the lease generation satisfies it.
 	if _, _, err := st.InsertArtifactOnce(ctx, model.ArtifactRecord{ID: pgITNewID(t), RunID: runA, JobID: jobA, Name: "dist", LeaseGeneration: 1, CreatedAt: time.Now().UTC()}); err != nil {
 		t.Fatalf("current-generation artifact: %v", err)
 	}
-	if err := st.CompleteJob(ctx, jobA, 1, runnerID, model.StatusSuccess, "", nil, receiptA); err != nil {
+	if err := st.CompleteJob(ctx, jobA, 1, runnerID, model.StatusSuccess, "", nil, receiptA, nil); err != nil {
 		t.Fatalf("completion with the current-generation artifact: %v", err)
 	}
 }
@@ -569,13 +569,13 @@ func TestMemStoreRequiredArtifactScopedToGeneration(t *testing.T) {
 		t.Fatalf("stale artifact: %v", err)
 	}
 	receipt := model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID}
-	if err := m.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, receipt); !errors.Is(err, ErrRequiredArtifactMissing) {
+	if err := m.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, receipt, nil); !errors.Is(err, ErrRequiredArtifactMissing) {
 		t.Fatalf("stale-generation completion = %v, want ErrRequiredArtifactMissing", err)
 	}
 	if err := m.InsertArtifact(ctx, model.ArtifactRecord{ID: "ccccccccccccccccccccccccccccccc4", RunID: runID, JobID: jobID, Name: "dist", LeaseGeneration: 1}); err != nil {
 		t.Fatalf("current artifact: %v", err)
 	}
-	if err := m.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, receipt); err != nil {
+	if err := m.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, receipt, nil); err != nil {
 		t.Fatalf("current-generation completion: %v", err)
 	}
 }

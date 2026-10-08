@@ -1,0 +1,25 @@
+-- 0049_execution_event_retention.sql — windowed retention for the execution
+-- event stream.
+--
+-- 0045/0046 made execution_events the commit-ordered canonical stream, but
+-- retained every event forever: a long-lived control plane accumulates one
+-- row per job/run transition plus every semantic event for the lifetime of
+-- the deployment. This migration adds the retained_from watermark so a
+-- maintenance prune can delete the oldest events as a contiguous prefix
+-- without breaking the "seq > after" cursor contract:
+--
+--   - retained_from is the highest seq removed by retention (0 = nothing
+--     pruned yet). It lives on the single execution_event_cursor row, so the
+--     prune updates it while holding the SAME row lock the event appenders
+--     take to allocate seq: a prune can never race an allocation, and a
+--     rolled-back prune cannot advance the watermark.
+--   - Only a prefix strictly below the first event at or after the cutoff is
+--     deletable, so the surviving rows stay a gap-free "seq > after"
+--     sequence for every cursor at or above the watermark. Consumers below
+--     retainedFrom-1 must re-bootstrap via latest_cursor (the API answers
+--     410 cursor_expired with retained_from).
+--
+-- Additive column with a default: older binaries read the table unchanged
+-- (they never select retained_from), so the migration is compatible with a
+-- rolling upgrade at the storage layer.
+ALTER TABLE execution_event_cursor ADD COLUMN IF NOT EXISTS retained_from BIGINT NOT NULL DEFAULT 0;

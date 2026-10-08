@@ -24,14 +24,27 @@ import (
 // LatestCursor is the latest committed cursor: MAX(seq) in DB mode, the
 // durable journal watermark in fs mode. A consumer can snapshot state, read
 // latest_cursor, then poll after=latest_cursor and miss no event in between.
-// Events are currently retained indefinitely (no windowed retention exists
-// yet), so there is no 410 cursor-expired path; a cursor below the oldest
-// retained event is impossible today.
+//
+// RetainedFrom is the retention watermark: the highest seq already pruned
+// from the stream (0 when nothing was pruned). A cursor below
+// retained_from-1 has lost events; the endpoint answers 410 cursor_expired
+// with the watermark and latest_cursor so the consumer re-bootstraps.
+// after == retained_from-1 and after == retained_from stay valid.
 type executionEventsResponse struct {
 	Events       []model.ExecutionEvent `json:"events"`
 	NextCursor   string                 `json:"next_cursor"`
 	Canonical    bool                   `json:"canonical"`
 	LatestCursor string                 `json:"latest_cursor"`
+	RetainedFrom string                 `json:"retained_from,omitempty"`
+}
+
+// cursorExpiredResponse is the 410 body for a cursor below the retention
+// watermark (list and stream alike): the fixed reason plus the watermark and
+// the latest committed cursor the consumer must re-bootstrap from.
+type cursorExpiredResponse struct {
+	Error        string `json:"error"`
+	RetainedFrom string `json:"retained_from"`
+	LatestCursor string `json:"latest_cursor"`
 }
 
 // Execution event stream tuning, mirroring logs_stream.go.
@@ -127,14 +140,25 @@ func (s *Server) appendJobEventLocked(j model.Job, from, to model.Status, actor 
 // listEvents serves GET /api/v1/events: the canonical ascending event page
 // plus its next cursor, the store's latest committed cursor (bootstrap
 // reference) and the canonical flag (true only in DB mode). The route is
-// admin tier (same as /api/v1/audit: auth.ActionFor does not map it, so
-// classifyRoute sends it to the blanket admin gate).
+// capability tier: admin keeps its existing access, and a controller
+// principal needs execution.events:read — GLOBALLY for the unscoped cursor
+// read, or scoped to the run's repository (or plain read access to that
+// repository) when run_id is supplied. Enforcement runs before any store
+// read.
 func (s *Server) listEvents(w http.ResponseWriter, r *http.Request) {
+	if !s.requireExecutionEventsRead(w, r) {
+		return
+	}
 	if !s.executionEventsSupported(w) {
 		return
 	}
 	after, ok := parseEventCursor(w, r)
 	if !ok {
+		return
+	}
+	retained := s.executionEventRetainedFrom(r.Context())
+	if storage.ExecutionEventCursorExpired(after, retained) {
+		s.writeCursorExpired(w, r.Context(), retained)
 		return
 	}
 	limit := storage.ClampExecutionEventLimit(queryInt(r, "limit"))
@@ -153,6 +177,56 @@ func (s *Server) listEvents(w http.ResponseWriter, r *http.Request) {
 		Events:       events,
 		NextCursor:   strconv.FormatInt(cursor, 10),
 		Canonical:    s.DB != nil,
+		LatestCursor: strconv.FormatInt(latest, 10),
+		RetainedFrom: strconv.FormatInt(retained, 10),
+	})
+}
+
+// executionEventRetentionStore resolves the optional retention contract of
+// the configured store (PostgreSQL or the fs repository). A store without
+// the contract simply has no retention watermark (0) and can never expire a
+// cursor.
+func (s *Server) executionEventRetentionStore() (storage.RetentionExecutionEventStore, bool) {
+	if s.DB != nil {
+		rs, ok := s.DB.(storage.RetentionExecutionEventStore)
+		return rs, ok
+	}
+	if s.store == nil {
+		return nil, false
+	}
+	rs, ok := any(s.store).(storage.RetentionExecutionEventStore)
+	return rs, ok
+}
+
+// executionEventRetainedFrom reads the retention watermark best-effort. A
+// read failure reports 0 (no cursor is refused) and is logged: retention is
+// always conservative — a consumer is never told a cursor expired when the
+// watermark cannot be proven, and the page/stream read that follows would
+// surface the same storage failure where it matters.
+func (s *Server) executionEventRetainedFrom(ctx context.Context) int64 {
+	rs, ok := s.executionEventRetentionStore()
+	if !ok {
+		return 0
+	}
+	retained, err := rs.ExecutionEventRetainedFrom(ctx)
+	if err != nil {
+		s.logError("execution event retention watermark read failed", "error", err.Error())
+		return 0
+	}
+	return retained
+}
+
+// writeCursorExpired answers the retention refusal for list and stream
+// consumers: HTTP 410 with the fixed cursor_expired reason and the watermark
+// plus latest_cursor the consumer must re-bootstrap from.
+func (s *Server) writeCursorExpired(w http.ResponseWriter, ctx context.Context, retainedFrom int64) {
+	latest, err := s.latestExecutionEventSeq(ctx, retainedFrom)
+	if err != nil {
+		latest = retainedFrom
+	}
+	writeJSON(w, http.StatusGone, cursorExpiredResponse{
+		Error:        "cursor_expired",
+		RetainedFrom: strconv.FormatInt(retainedFrom, 10),
 		LatestCursor: strconv.FormatInt(latest, 10),
 	})
 }
@@ -236,9 +310,15 @@ func queryInt(r *http.Request, key string) int {
 // Events, reusing the logs stream pattern: one `event: execution` frame per
 // event carrying the ExecutionEvent JSON, `id: <seq>` so a reconnect can
 // resume with ?after=<last-id> without gaps or duplicates, a 250ms poll, and
-// a 30s idle timeout. The route is admin tier, so authorization runs before
-// any streaming begins.
+// a 30s idle timeout. The route is capability tier with the same run_id scope
+// as the cursor-pull list endpoint; authorization runs before any streaming
+// begins (before the 200 is committed), and an after cursor below the
+// retention watermark is refused with HTTP 410 cursor_expired before the
+// stream starts so a reconnect never silently resumes past lost events.
 func (s *Server) streamExecutionEvents(w http.ResponseWriter, r *http.Request) {
+	if !s.requireExecutionEventsRead(w, r) {
+		return
+	}
 	if s.DB == nil && s.store == nil {
 		http.Error(w, "event streaming requires a persistent server", http.StatusServiceUnavailable)
 		return
@@ -248,6 +328,13 @@ func (s *Server) streamExecutionEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	after, ok := parseEventCursor(w, r)
 	if !ok {
+		return
+	}
+	// Retention refusal BEFORE the 200 is committed: an SSE reconnect with
+	// an expired cursor must observe HTTP 410 cursor_expired (with the
+	// watermark), not a stream that silently resumes past the lost prefix.
+	if retained := s.executionEventRetainedFrom(r.Context()); storage.ExecutionEventCursorExpired(after, retained) {
+		s.writeCursorExpired(w, r.Context(), retained)
 		return
 	}
 	runID := strings.TrimSpace(r.URL.Query().Get("run_id"))

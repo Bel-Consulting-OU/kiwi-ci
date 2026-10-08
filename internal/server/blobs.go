@@ -470,6 +470,27 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 		http.Error(w, "lease expired during upload", http.StatusConflict)
 		return
 	}
+	// Ordering (required provenance): the artifact payload is published to
+	// the CAS first (its digest fence taken above), then the signed
+	// provenance envelope is built, signed and published under its own digest
+	// fence, and only then is the record inserted through the lease-fenced
+	// store method carrying BOTH references. A required-provenance artifact
+	// can therefore never commit without durable provenance: any
+	// signing/publication failure aborts before the insert (no artifact row,
+	// no completion gate satisfied) and the already-published CAS objects are
+	// left to the reference-aware GC, exactly like a lost-lease upload. The
+	// best-effort policy keeps the historical behavior: publication failures
+	// are logged and the record commits without provenance references.
+	provenanceRequired := contract.Provenance == storage.ArtifactProvenanceRequired
+	provenanceRefused := func(message string, cause error, logMsg string) {
+		if provenanceRequired {
+			removeStagedArtifact(dst, casMode)
+			s.logError(logMsg+"; upload refused (provenance required)", "job", j.ID, "error", cause.Error())
+			http.Error(w, message, http.StatusServiceUnavailable)
+		} else {
+			s.logError(logMsg+"; provenance not stored", "job", j.ID, "error", cause.Error())
+		}
+	}
 	publishedAt := time.Now().UTC()
 	signer := s.ensureProvenanceKey()
 	st := provenance.ArtifactStatement(artifactProvenanceInput(j, run, rec, runnerID, gen, publishedAt))
@@ -485,76 +506,115 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 	// takes one digest fence at a time, and the second acquisition is
 	// bounded (provenanceFenceTimeout) so a saturated advisory pool cannot
 	// pin the handler either. A provenance Put that cannot be fenced is
-	// SKIPPED (the envelope is non-essential metadata, exactly like a failed
-	// Put), never published unfenced.
+	// SKIPPED under best-effort (the envelope is non-essential metadata,
+	// exactly like a failed Put) and REFUSED under required, never published
+	// unfenced.
 	var releaseProvenance func()
-	if env, er := provenance.Sign(st, signer.KID, signer.Private); er == nil {
-		if ab, mer := json.MarshalIndent(env, "", "  "); mer == nil {
-			sum := sha256.Sum256(ab)
-			provDigest := hex.EncodeToString(sum[:])
-			// HA sidecars: the envelope bytes live in the shared CAS store
-			// and the record carries the digest reference; fs dev mode
-			// keeps the local sidecar file for compatibility.
-			if casMode {
-				fctx, cancel := context.WithTimeout(ctx, provenanceFenceTimeout)
-				release, ferr := s.acquireDigestFence(fctx, provDigest)
-				cancel()
-				if ferr != nil {
-					s.logError("artifact: provenance digest fence failed; provenance not stored", "job", j.ID, "sha256", provDigest, "error", ferr.Error())
-				} else {
-					releaseProvenance = release
-					// The provenance envelope is published only when the CAS
-					// object is the exact envelope bytes: the record must
-					// never reference a digest the shared store disagrees
-					// with (same invariant as the payload publication above).
-					// The bytes are in memory and their digest is known, so
-					// PutKnown publishes them without any scratch file.
-					if pobj, perr := s.CAS.PutKnown(ctx, provDigest, int64(len(ab)), bytes.NewReader(ab)); perr == nil && pobj.Key == provDigest && pobj.SHA256 == provDigest && pobj.Size == int64(len(ab)) {
-						rec.ProvenancePath = "cas:" + provDigest
-						rec.ProvenanceSHA256 = provDigest
-					} else if perr != nil {
-						s.logError("artifact: provenance store failed; provenance not stored", "job", j.ID, "sha256", provDigest, "error", perr.Error())
-					} else {
-						s.logError("artifact: provenance CAS object disagrees with the envelope; provenance not stored", "job", j.ID, "sha256", provDigest, "got_sha256", pobj.SHA256, "got_size", pobj.Size)
-					}
-				}
-			} else {
-				ap := dst + ".intoto.json"
-				if werr := s.publishProvenanceSidecarFS(ap, ab, provDigest); werr != nil {
-					if fsutil.Renamed(werr) {
-						// Post-rename (parent-directory fsync) failure: the
-						// sidecar bytes ARE visible at ap but their crash
-						// durability is not certified. The artifact must NOT
-						// be acknowledged — a durable record naming a
-						// ProvenanceSHA256 whose sidecar may vanish in a crash
-						// is exactly the defect this sequence prevents. Keep
-						// the published sidecar (and the already-fsynced
-						// payload) in place; the degraded marker folded by
-						// publishProvenanceSidecarFS fails /readiness closed
-						// until a later successful persist in this directory
-						// reconciles it.
-						s.logError("artifact: provenance sidecar published but not durably certified; upload refused", "job", j.ID, "path", ap, "error", werr.Error())
-						http.Error(w, statePersistenceDegradedBody, http.StatusServiceUnavailable)
-						return
-					}
-					// Definitely not published (or published bytes that could
-					// not be re-verified): never acknowledge an artifact whose
-					// provenance sidecar is not durably recorded, and never
-					// record a ProvenanceSHA256 whose bytes were not
-					// re-hashed. Drop the now-unreferenced payload; the
-					// envelope is regenerated on retry.
-					_ = os.Remove(dst)
-					s.logError("artifact: provenance sidecar not durably published; upload refused", "job", j.ID, "path", ap, "error", werr.Error())
-					http.Error(w, "artifact provenance sidecar not durable", http.StatusServiceUnavailable)
+	env, signErr := provenanceSignFn(st, signer.KID, signer.Private)
+	if signErr != nil {
+		provenanceRefused("artifact provenance could not be published", signErr, "artifact: provenance signing failed")
+		if provenanceRequired {
+			return
+		}
+	}
+	var ab []byte
+	if signErr == nil {
+		marshaled, mer := json.MarshalIndent(env, "", "  ")
+		if mer != nil {
+			provenanceRefused("artifact provenance could not be published", mer, "artifact: provenance encoding failed")
+			if provenanceRequired {
+				return
+			}
+		} else {
+			ab = marshaled
+		}
+	}
+	if len(ab) > 0 {
+		sum := sha256.Sum256(ab)
+		provDigest := hex.EncodeToString(sum[:])
+		// HA sidecars: the envelope bytes live in the shared CAS store
+		// and the record carries the digest reference; fs dev mode
+		// keeps the local sidecar file for compatibility.
+		if casMode {
+			fctx, cancel := context.WithTimeout(ctx, provenanceFenceTimeout)
+			release, ferr := s.acquireDigestFence(fctx, provDigest)
+			cancel()
+			if ferr != nil {
+				provenanceRefused("artifact provenance could not be published", ferr, "artifact: provenance digest fence failed")
+				if provenanceRequired {
 					return
 				}
-				rec.ProvenancePath = ap
-				rec.ProvenanceSHA256 = provDigest
+			} else {
+				releaseProvenance = release
+				// The provenance envelope is published only when the CAS
+				// object is the exact envelope bytes: the record must
+				// never reference a digest the shared store disagrees
+				// with (same invariant as the payload publication above).
+				// The bytes are in memory and their digest is known, so
+				// PutKnown publishes them without any scratch file.
+				pobj, perr := s.CAS.PutKnown(ctx, provDigest, int64(len(ab)), bytes.NewReader(ab))
+				if perr == nil && pobj.Key == provDigest && pobj.SHA256 == provDigest && pobj.Size == int64(len(ab)) {
+					rec.ProvenancePath = "cas:" + provDigest
+					rec.ProvenanceSHA256 = provDigest
+				} else {
+					if perr != nil {
+						provenanceRefused("artifact provenance could not be published", perr, "artifact: provenance store failed")
+					} else {
+						mismatch := fmt.Errorf("CAS object key %s sha256 %s size %d", pobj.Key, pobj.SHA256, pobj.Size)
+						provenanceRefused("artifact provenance could not be published", mismatch, "artifact: provenance CAS object disagrees with the envelope")
+					}
+					if provenanceRequired {
+						release()
+						releaseProvenance = nil
+						return
+					}
+				}
 			}
+		} else {
+			ap := dst + ".intoto.json"
+			if werr := s.publishProvenanceSidecarFS(ap, ab, provDigest); werr != nil {
+				if fsutil.Renamed(werr) {
+					// Post-rename (parent-directory fsync) failure: the
+					// sidecar bytes ARE visible at ap but their crash
+					// durability is not certified. The artifact must NOT
+					// be acknowledged — a durable record naming a
+					// ProvenanceSHA256 whose sidecar may vanish in a crash
+					// is exactly the defect this sequence prevents. Keep
+					// the published sidecar (and the already-fsynced
+					// payload) in place; the degraded marker folded by
+					// publishProvenanceSidecarFS fails /readiness closed
+					// until a later successful persist in this directory
+					// reconciles it.
+					s.logError("artifact: provenance sidecar published but not durably certified; upload refused", "job", j.ID, "path", ap, "error", werr.Error())
+					http.Error(w, statePersistenceDegradedBody, http.StatusServiceUnavailable)
+					return
+				}
+				// Definitely not published (or published bytes that could
+				// not be re-verified): never acknowledge an artifact whose
+				// provenance sidecar is not durably recorded, and never
+				// record a ProvenanceSHA256 whose bytes were not
+				// re-hashed. Drop the now-unreferenced payload; the
+				// envelope is regenerated on retry.
+				_ = os.Remove(dst)
+				s.logError("artifact: provenance sidecar not durably published; upload refused", "job", j.ID, "path", ap, "error", werr.Error())
+				http.Error(w, "artifact provenance sidecar not durable", http.StatusServiceUnavailable)
+				return
+			}
+			rec.ProvenancePath = ap
+			rec.ProvenanceSHA256 = provDigest
 		}
 	}
 	if releaseProvenance != nil {
 		defer releaseProvenance()
+	}
+	if provenanceRequired && rec.ProvenanceSHA256 == "" {
+		// Unreachable by construction (every failure above returned), but
+		// fail closed rather than commit a required artifact without
+		// provenance.
+		removeStagedArtifact(dst, casMode)
+		s.logError("artifact: required provenance missing at commit; upload refused", "job", j.ID, "name", name)
+		http.Error(w, "artifact provenance could not be published", http.StatusServiceUnavailable)
+		return
 	}
 	if s.DB != nil {
 		// PostgreSQL is authoritative: the (job, generation, name) unique
@@ -677,6 +737,10 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 	// only ITS OWN (job, generation, name) pending entries are consumed.
 	delete(s.pendingSidecars, sidecarPendingKey(j.ID, rec.LeaseGeneration, name, storage.ArtifactSidecarKindSBOM))
 	delete(s.pendingSidecars, sidecarPendingKey(j.ID, rec.LeaseGeneration, name, storage.ArtifactSidecarKindSigstore))
+	// artifact.published is appended after the durable snapshot, next to the
+	// record it describes (best-effort in fs mode). An idempotent duplicate
+	// never reaches this branch, so it emits nothing.
+	s.appendExecutionEventLocked(storage.ExecutionEventArtifactPublished(rec, gen, runnerID))
 	s.mu.Unlock()
 	s.metricAdd("kiwi_artifact_bytes_total", float64(n), nil)
 	s.metricObserve("kiwi_cas_latency_seconds", time.Since(start).Seconds(), nil)
@@ -845,6 +909,12 @@ func jobStart(j model.Job) time.Time {
 	}
 	return time.Now().UTC()
 }
+
+// provenanceSignFn is the artifact-provenance signing function. It is a
+// package variable so tests can inject a signing failure (the
+// provenance=required upload path must refuse the commit in that case);
+// production always uses provenance.Sign.
+var provenanceSignFn = provenance.Sign
 
 // artifactProvenanceInput assembles the signed provenance statement's input
 // for one published artifact from the persisted lease and compilation

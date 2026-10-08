@@ -888,7 +888,7 @@ func TestPostgresIntegrationClosedPoolBeginSweep(t *testing.T) {
 	if _, err := st.AcquireLease(ctx, jobID, runnerID, []byte("h"), 1, now.Add(time.Hour)); err == nil {
 		t.Fatal("AcquireLease on a closed pool = nil error")
 	}
-	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{}); err == nil {
+	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{}, nil); err == nil {
 		t.Fatal("CompleteJob on a closed pool = nil error")
 	}
 	if err := st.ReleaseRunnerJob(ctx, runnerID, jobID, model.StatusSuccess); err == nil {
@@ -1097,7 +1097,7 @@ func TestPostgresIntegrationMiscStatementBreaks(t *testing.T) {
 		runID, jobID := pgITNewID(t), pgITNewID(t)
 		pgITEnqueueOne(t, st, runID, jobID, pgITRepo)
 		pgITBoom(t, st, "completion_receipts")
-		if err := st.CompleteJob(context.Background(), jobID, 1, "r", model.StatusSuccess, "", nil, model.CompletionReceipt{}); err == nil {
+		if err := st.CompleteJob(context.Background(), jobID, 1, "r", model.StatusSuccess, "", nil, model.CompletionReceipt{}, nil); err == nil {
 			t.Fatal("CompleteJob receipt read over a boom trigger = nil error")
 		}
 	})
@@ -1106,7 +1106,7 @@ func TestPostgresIntegrationMiscStatementBreaks(t *testing.T) {
 		runID, jobID := pgITNewID(t), pgITNewID(t)
 		pgITEnqueueOne(t, st, runID, jobID, pgITRepo)
 		pgITDropColumn(t, st, "runs", "payload")
-		if err := st.CompleteJob(context.Background(), jobID, 1, "r", model.StatusSuccess, "", nil, model.CompletionReceipt{}); err == nil {
+		if err := st.CompleteJob(context.Background(), jobID, 1, "r", model.StatusSuccess, "", nil, model.CompletionReceipt{}, nil); err == nil {
 			t.Fatal("CompleteJob run lock over a broken runs table = nil error")
 		}
 	})

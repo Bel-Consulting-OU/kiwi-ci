@@ -199,6 +199,11 @@ func (s *PostgresStore) InsertTestReportWithHistoryDeliveryForLease(ctx context.
 	// instant the lease was validated against, so the ordering time IS the
 	// fence time, never a second sample or the serving replica's clock.
 	rep.CreatedAt = coords.DBNow
+	// The attempt identity is stamped from the VERIFIED lease, never from
+	// client input: the report payload is the durable evidence surface, and
+	// a superseded generation must not be able to attribute a report to a
+	// different attempt.
+	rep.LeaseGeneration = generation
 	return commitTestReportDeliveryTx(ctx, tx, rep, repoID, delivery)
 }
 

@@ -203,7 +203,7 @@ func pgITPlannerSeedGo(t *testing.T, st *PostgresStore, runID string, n int, now
 		j := model.Job{
 			ID:                 fmt.Sprintf("%032x", i+1),
 			RunID:              runID,
-			Key:                "build",
+			Key:                fmt.Sprintf("build-%d", i+1),
 			Status:             model.StatusQueued,
 			CreatedAt:          now.Add(-time.Duration(i+1) * time.Second),
 			Priority:           i % 4,
@@ -241,7 +241,7 @@ func pgITPlannerSeedSQL(t *testing.T, st *PostgresStore, runID string, n int, no
 	t.Helper()
 	_, err := st.pool.Exec(context.Background(), `
 		INSERT INTO jobs (id, run_id, key, status, dependency_status, priority, queue_boost, attempts, created_at, required_labels, placement_regions, payload)
-		SELECT lpad(to_hex(i), 32, '0'), $1, 'build', 'queued', 'success', (i - 1) % 4, i / 600, 0,
+		SELECT lpad(to_hex(i), 32, '0'), $1, 'build-' || i, 'queued', 'success', (i - 1) % 4, i / 600, 0,
 		       $2::timestamptz - (i * interval '1 second'),
 		       CASE WHEN i <= 100 THEN ARRAY['linux-x64']::text[] ELSE ARRAY['other']::text[] END,
 		       CASE WHEN i > 100 AND i <= 200 THEN ARRAY['eu-west']::text[] ELSE ARRAY['global']::text[] END,
@@ -671,7 +671,7 @@ func TestPostgresIntegrationQueuedJobsPageNormalizedColumnsParity(t *testing.T) 
 
 	// InsertJob stamps both columns.
 	inserted := model.Job{
-		ID: pgITNewID(t), RunID: runID, Key: "build", Status: model.StatusQueued, CreatedAt: now,
+		ID: pgITNewID(t), RunID: runID, Key: "build-inserted", Status: model.StatusQueued, CreatedAt: now,
 		RequiredLabels: []string{"linux", "x64"}, PlacementRegions: []string{"eu-west"},
 	}
 	if err := st.InsertJob(ctx, inserted); err != nil {
@@ -682,7 +682,7 @@ func TestPostgresIntegrationQueuedJobsPageNormalizedColumnsParity(t *testing.T) 
 	equal(inserted.ID, regions, inserted.PlacementRegions)
 
 	// A nil list is stored as '{}' (NOT NULL), exactly the model zero value.
-	plain := model.Job{ID: pgITNewID(t), RunID: runID, Key: "build", Status: model.StatusQueued, CreatedAt: now}
+	plain := model.Job{ID: pgITNewID(t), RunID: runID, Key: "build-plain", Status: model.StatusQueued, CreatedAt: now}
 	if err := st.InsertJob(ctx, plain); err != nil {
 		t.Fatalf("InsertJob(plain): %v", err)
 	}
@@ -708,7 +708,7 @@ func TestPostgresIntegrationQueuedJobsPageNormalizedColumnsParity(t *testing.T) 
 	// behind the store: the payload is authoritative and the approval path
 	// must re-derive the column from it.
 	approved := model.Job{
-		ID: pgITNewID(t), RunID: runID, Key: "build", Status: model.StatusWaitingApproval,
+		ID: pgITNewID(t), RunID: runID, Key: "build-approved", Status: model.StatusWaitingApproval,
 		ApprovalRequired: true, CreatedAt: now,
 		RequiredLabels: []string{"gpu"}, PlacementRegions: []string{"us"},
 	}

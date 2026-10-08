@@ -142,6 +142,12 @@ type Complete struct {
 	Error           string            `json:"error,omitempty"`
 	Outputs         map[string]string `json:"outputs,omitempty"`
 	Results         any               `json:"results,omitempty"`
+	// ObservedRuntime is the executor-captured runtime identity of the
+	// attempt (model.ObservedRuntime). It is validated server-side (bounded
+	// shape/size) and persisted with the completion as evidence; malformed
+	// input is refused with 400. Additive: runners that capture nothing omit
+	// it.
+	ObservedRuntime *model.ObservedRuntime `json:"observed_runtime,omitempty"`
 }
 
 // EnrollRequest asks the control plane to sign a runner's certificate

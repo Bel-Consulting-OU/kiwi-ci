@@ -35,17 +35,17 @@ func TestMemCompleteJobReceiptConflict(t *testing.T) {
 	)
 	wave1RunningJob(m, jobID, runID, runnerID)
 	receipt := model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID, ResultHash: "hash-success"}
-	if err := m.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", map[string]string{"o": "1"}, receipt); err != nil {
+	if err := m.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", map[string]string{"o": "1"}, receipt, nil); err != nil {
 		t.Fatalf("completion: %v", err)
 	}
 	// Exact replay (same result hash) is an idempotent success.
-	if err := m.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", map[string]string{"o": "1"}, receipt); err != nil {
+	if err := m.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", map[string]string{"o": "1"}, receipt, nil); err != nil {
 		t.Fatalf("identical replay = %v, want nil", err)
 	}
 	// A conflicting result for the same identity fails closed.
 	conflict := receipt
 	conflict.ResultHash = "hash-failure"
-	err := m.CompleteJob(ctx, jobID, 1, runnerID, model.StatusFailure, "boom", nil, conflict)
+	err := m.CompleteJob(ctx, jobID, 1, runnerID, model.StatusFailure, "boom", nil, conflict, nil)
 	if !errors.Is(err, ErrCompletionConflict) {
 		t.Fatalf("conflicting completion = %v, want ErrCompletionConflict", err)
 	}
@@ -69,19 +69,19 @@ func TestFaultyStoreCompletionConflictPassThrough(t *testing.T) {
 	f := &FaultyStore{Inner: inner}
 	ctx := context.Background()
 	receipt := model.CompletionReceipt{JobID: "job-1", Generation: 1, RunnerID: "runner-1", ResultHash: "a"}
-	if err := f.CompleteJob(ctx, "job-1", 1, "runner-1", model.StatusSuccess, "", nil, receipt); err != nil {
+	if err := f.CompleteJob(ctx, "job-1", 1, "runner-1", model.StatusSuccess, "", nil, receipt, nil); err != nil {
 		t.Fatalf("completion: %v", err)
 	}
 	conflict := receipt
 	conflict.ResultHash = "b"
-	if err := f.CompleteJob(ctx, "job-1", 1, "runner-1", model.StatusFailure, "boom", nil, conflict); !errors.Is(err, ErrCompletionConflict) {
+	if err := f.CompleteJob(ctx, "job-1", 1, "runner-1", model.StatusFailure, "boom", nil, conflict, nil); !errors.Is(err, ErrCompletionConflict) {
 		t.Fatalf("wrapper result = %v, want ErrCompletionConflict", err)
 	}
 	// A fault injected on the NEXT mutating call replaces the inner result.
 	injected := errors.New("injected completion failure")
 	f.FailAfter = f.Mutations() + 1
 	f.Err = injected
-	if err := f.CompleteJob(ctx, "job-1", 1, "runner-1", model.StatusFailure, "boom", nil, conflict); !errors.Is(err, injected) {
+	if err := f.CompleteJob(ctx, "job-1", 1, "runner-1", model.StatusFailure, "boom", nil, conflict, nil); !errors.Is(err, injected) {
 		t.Fatalf("injected fault = %v, want %v", err, injected)
 	}
 }

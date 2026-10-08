@@ -169,6 +169,9 @@ func (s *Server) effectDeploymentFinish(ctx context.Context, j model.Job) error 
 		return err
 	}
 	s.auditLocked("deployment.completed", "scheduler", j.RunID, j.ID, "deployment finished", map[string]string{"environment": j.Environment, "status": string(j.Status)})
+	// deployment.completed is appended next to the finished marker
+	// (best-effort in fs mode; the marker is already durable).
+	s.appendExecutionEventLocked(storage.ExecutionEventDeploymentCompleted(cur))
 	return nil
 }
 
@@ -200,7 +203,10 @@ func (s *Server) effectUsageAccount(ctx context.Context, j model.Job) error {
 			// so this is a programming-error guard, not a supported mode.
 			return errors.New("server: usage store lacks the exactly-once usage contract")
 		}
-		won, err := us.RecordUsageOnce(ctx, j.ID, cost, energy)
+		// The attempt that produced the usage: the completion effect knows the
+		// completed job's lease generation, and RecordUsageOnce persists it
+		// with the marker and amounts in one atomic write.
+		won, err := us.RecordUsageOnce(ctx, j.ID, j.LeaseGeneration, cost, energy)
 		if err != nil {
 			// Nothing was recorded; the marker and the metrics stay
 			// untouched so the retry converges on exactly one winner.
@@ -242,6 +248,7 @@ func (s *Server) effectUsageAccount(ctx context.Context, j model.Job) error {
 	// ACKed from a state the snapshot does not contain).
 	prev := live
 	live.UsageRecorded = true
+	live.UsageLeaseGeneration = live.LeaseGeneration
 	if computed {
 		live.Cost = cost
 		live.EnergyWh = energy
@@ -338,7 +345,7 @@ func (s *Server) enqueueCompletionEffects(ctx context.Context, j model.Job, run 
 // ORIGINAL generation's intent IDs even when the live job has since been
 // re-leased under a newer one. ctx reaches the durable enqueue per intent.
 func (s *Server) enqueueCompletionEffectIntents(ctx context.Context, jobID, runID string, generation int64) error {
-	payload, err := jsonMarshal(storage.CompletionEffectsPayload{JobID: jobID, RunID: runID})
+	payload, err := jsonMarshal(storage.CompletionEffectsPayload{JobID: jobID, RunID: runID, Generation: generation})
 	if err != nil {
 		return err
 	}
@@ -386,7 +393,7 @@ func (s *Server) repairCompletionIntents(ctx context.Context, jobID string, gene
 // inside the completion transaction under the deterministic effect IDs; the
 // local copies let this instance's flush loop dispatch and ack them.
 func (s *Server) enqueueCompletionEffectsLocal(jobID, runID string, generation int64) {
-	payload, err := jsonMarshal(storage.CompletionEffectsPayload{JobID: jobID, RunID: runID})
+	payload, err := jsonMarshal(storage.CompletionEffectsPayload{JobID: jobID, RunID: runID, Generation: generation})
 	if err != nil {
 		return
 	}

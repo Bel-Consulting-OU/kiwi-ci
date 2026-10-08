@@ -165,7 +165,7 @@ func TestPostgresIntegrationJobsRoundTrip(t *testing.T) {
 	}
 
 	got, err := st.GetJob(ctx, jobID)
-	if err != nil || got.ID != jobID || got.Key != "build" {
+	if err != nil || got.ID != jobID || got.Key != "build-"+jobID {
 		t.Fatalf("GetJob = %+v, %v", got, err)
 	}
 	if _, err := st.GetJob(ctx, "ffffffffffffffffffffffffffffffff"); !errors.Is(err, ErrNotFound) {
@@ -1658,17 +1658,17 @@ func TestPostgresIntegrationCompleteJobBranches(t *testing.T) {
 	pgITEnqueueOne(t, st, runID, jobID, pgITRepo)
 	pgITSeedRunner(t, st, runnerID, 2, 1, 1)
 
-	if err := st.CompleteJob(ctx, "bad", 1, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{}); err == nil {
+	if err := st.CompleteJob(ctx, "bad", 1, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{}, nil); err == nil {
 		t.Fatal("invalid job id must fail")
 	}
-	if err := st.CompleteJob(ctx, jobID, -1, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{}); err == nil {
+	if err := st.CompleteJob(ctx, jobID, -1, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{}, nil); err == nil {
 		t.Fatal("negative generation must fail")
 	}
-	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: jobID, Generation: 2, RunnerID: runnerID}); err == nil {
+	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: jobID, Generation: 2, RunnerID: runnerID}, nil); err == nil {
 		t.Fatal("mismatched receipt must fail")
 	}
 	missingID := pgITNewID(t)
-	if err := st.CompleteJob(ctx, missingID, 1, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: missingID, Generation: 1, RunnerID: runnerID}); !errors.Is(err, ErrNotFound) {
+	if err := st.CompleteJob(ctx, missingID, 1, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: missingID, Generation: 1, RunnerID: runnerID}, nil); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing job = %v", err)
 	}
 
@@ -1676,20 +1676,20 @@ func TestPostgresIntegrationCompleteJobBranches(t *testing.T) {
 	if _, err := st.AcquireLeaseAtomic(ctx, LeaseClaim{JobID: jobID, RunnerID: runnerID, Generation: 1, ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
 		t.Fatalf("lease: %v", err)
 	}
-	if err := st.CompleteJob(ctx, jobID, 2, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: jobID, Generation: 2, RunnerID: runnerID}); !errors.Is(err, ErrGenerationMismatch) {
+	if err := st.CompleteJob(ctx, jobID, 2, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: jobID, Generation: 2, RunnerID: runnerID}, nil); !errors.Is(err, ErrGenerationMismatch) {
 		t.Fatalf("stale generation = %v", err)
 	}
 	receipt := model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID, ResultHash: "h"}
-	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", map[string]string{"o": "1"}, receipt); err != nil {
+	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", map[string]string{"o": "1"}, receipt, nil); err != nil {
 		t.Fatalf("Completion: %v", err)
 	}
 	// A replay of the exact completion is idempotent.
-	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, receipt); err != nil {
+	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, receipt, nil); err != nil {
 		t.Fatalf("completion replay: %v", err)
 	}
 	// A different runner for a terminal job is a generation mismatch.
 	otherRunner := pgITNewID(t)
-	if err := st.CompleteJob(ctx, jobID, 1, otherRunner, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: otherRunner}); !errors.Is(err, ErrGenerationMismatch) {
+	if err := st.CompleteJob(ctx, jobID, 1, otherRunner, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: otherRunner}, nil); !errors.Is(err, ErrGenerationMismatch) {
 		t.Fatalf("foreign runner completion = %v", err)
 	}
 	got, _ := st.GetJob(ctx, jobID)
@@ -1716,7 +1716,7 @@ func TestPostgresIntegrationCompleteJobBranches(t *testing.T) {
 		t.Fatalf("lease required: %v", err)
 	}
 	blocked := model.CompletionReceipt{JobID: reqJob, Generation: 1, RunnerID: runnerID}
-	if err := st.CompleteJob(ctx, reqJob, 1, runnerID, model.StatusSuccess, "", nil, blocked); !errors.Is(err, ErrRequiredArtifactMissing) {
+	if err := st.CompleteJob(ctx, reqJob, 1, runnerID, model.StatusSuccess, "", nil, blocked, nil); !errors.Is(err, ErrRequiredArtifactMissing) {
 		t.Fatalf("required artifact = %v, want ErrRequiredArtifactMissing", err)
 	}
 	// The failed completion left the job running.
@@ -1726,7 +1726,7 @@ func TestPostgresIntegrationCompleteJobBranches(t *testing.T) {
 	}
 
 	// A non-terminal status is coerced to failure.
-	if err := st.CompleteJob(ctx, reqJob, 1, runnerID, model.StatusQueued, "boom", nil, blocked); err != nil {
+	if err := st.CompleteJob(ctx, reqJob, 1, runnerID, model.StatusQueued, "boom", nil, blocked, nil); err != nil {
 		t.Fatalf("coerced completion: %v", err)
 	}
 	got, _ = st.GetJob(ctx, reqJob)

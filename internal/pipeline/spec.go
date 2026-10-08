@@ -549,6 +549,11 @@ type Artifact struct {
 	SBOM      string          `yaml:"sbom,omitempty" json:"sbom,omitempty"`
 	Sigstore  *SigstoreConfig `yaml:"sigstore,omitempty" json:"sigstore,omitempty"`
 	Required  bool            `yaml:"required,omitempty" json:"required,omitempty"`
+	// Provenance is the artifact's provenance policy: "best_effort" (the
+	// default, empty means the same) keeps the historical post-commit
+	// best-effort envelope; "required" makes a durable signed provenance
+	// envelope a precondition of the upload commit and of completion.
+	Provenance string `yaml:"provenance,omitempty" json:"provenance,omitempty"`
 	// MaxSize caps the artifact payload in bytes ("10MiB" and plain byte
 	// counts both decode through ByteSize). The server enforces it at the
 	// upload reader, before any staging or hashing, and rejects oversize

@@ -35,6 +35,7 @@ func pgITBulkInsertQueuedJobs(t *testing.T, st *PostgresStore, runID string, job
 	}
 	seedNow := time.Now().UTC()
 	ids := make([]string, len(jobs))
+	keys := make([]string, len(jobs))
 	priorities := make([]int32, len(jobs))
 	boosts := make([]int32, len(jobs))
 	created := make([]string, len(jobs))
@@ -60,6 +61,7 @@ func pgITBulkInsertQueuedJobs(t *testing.T, st *PostgresStore, runID string, job
 			t.Fatalf("bulk insert job %d regions: %v", i, err)
 		}
 		ids[i] = j.ID
+		keys[i] = j.Key
 		priorities[i] = int32(j.Priority)
 		if j.BoostKnown {
 			boosts[i] = int32(j.QueueBoost)
@@ -76,14 +78,14 @@ func pgITBulkInsertQueuedJobs(t *testing.T, st *PostgresStore, runID string, job
 	}
 	_, err := st.pool.Exec(context.Background(), `
 		INSERT INTO jobs (id, run_id, key, status, dependency_status, priority, queue_boost, attempts, created_at, queue_deadline, required_labels, placement_regions, payload)
-		SELECT u.id, $1, 'build', 'queued', 'success', u.priority, u.queue_boost, 0,
+		SELECT u.id, $1, u.key, 'queued', 'success', u.priority, u.queue_boost, 0,
 		       u.created_at::timestamptz, NULLIF(u.queue_deadline,'')::timestamptz,
 		       ARRAY(SELECT jsonb_array_elements_text(u.required_labels::jsonb)),
 		       ARRAY(SELECT jsonb_array_elements_text(u.placement_regions::jsonb)),
 		       u.payload::jsonb
-		FROM unnest($2::text[], $3::int[], $4::int[], $5::text[], $6::text[], $7::text[], $8::text[], $9::text[])
-		     AS u(id, priority, queue_boost, created_at, queue_deadline, payload, required_labels, placement_regions)`,
-		runID, ids, priorities, boosts, created, deadlines, payloads, labelsJSON, regionsJSON)
+		FROM unnest($2::text[], $3::int[], $4::int[], $5::text[], $6::text[], $7::text[], $8::text[], $9::text[], $10::text[])
+		     AS u(id, priority, queue_boost, created_at, queue_deadline, payload, required_labels, placement_regions, key)`,
+		runID, ids, priorities, boosts, created, deadlines, payloads, labelsJSON, regionsJSON, keys)
 	if err != nil {
 		t.Fatalf("bulk insert %d jobs: %v", len(jobs), err)
 	}
@@ -108,7 +110,7 @@ func TestPostgresIntegrationQueuedJobsPageBoundedWalk(t *testing.T) {
 		jobs = append(jobs, model.Job{
 			ID:        fmt.Sprintf("%032x", i+1),
 			RunID:     runID,
-			Key:       "build",
+			Key:       fmt.Sprintf("build-%d", i+1),
 			Status:    model.StatusQueued,
 			Priority:  i % 5,
 			CreatedAt: now.Add(-time.Duration(i) * time.Minute),
@@ -117,8 +119,8 @@ func TestPostgresIntegrationQueuedJobsPageBoundedWalk(t *testing.T) {
 	pastID := fmt.Sprintf("%032x", total+1)
 	futureID := fmt.Sprintf("%032x", total+2)
 	jobs = append(jobs,
-		model.Job{ID: pastID, RunID: runID, Key: "build", Status: model.StatusQueued, CreatedAt: now.Add(-time.Hour), QueueDeadline: &past},
-		model.Job{ID: futureID, RunID: runID, Key: "build", Status: model.StatusQueued, CreatedAt: now.Add(-time.Hour), QueueDeadline: &future},
+		model.Job{ID: pastID, RunID: runID, Key: "build-past", Status: model.StatusQueued, CreatedAt: now.Add(-time.Hour), QueueDeadline: &past},
+		model.Job{ID: futureID, RunID: runID, Key: "build-future", Status: model.StatusQueued, CreatedAt: now.Add(-time.Hour), QueueDeadline: &future},
 	)
 	pgITBulkInsertQueuedJobs(t, st, runID, jobs)
 
@@ -224,7 +226,7 @@ func TestPostgresIntegrationQueuedJobsPageMemoryParity(t *testing.T) {
 		jobs = append(jobs, model.Job{
 			ID:        fmt.Sprintf("%032x", i+1),
 			RunID:     runID,
-			Key:       "build",
+			Key:       fmt.Sprintf("build-%d", i+1),
 			Status:    model.StatusQueued,
 			Priority:  i % 3,
 			CreatedAt: now.Add(-time.Duration(i) * 30 * time.Second),

@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executil"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
@@ -60,9 +61,17 @@ type TartBackend struct {
 	workspace string
 	sshDir    string
 	run       *exec.Cmd
+	// observed holds the runtime facts captured when the VM became ready
+	// (see ObservedRuntime()). Nil until StartJob succeeds.
+	observed *model.ObservedRuntime
 }
 
 func (*TartBackend) Name() string { return "tart" }
+
+// ObservedRuntime returns the runtime facts captured when the disposable VM
+// became ready, or nil when the VM never started. Tart captures the CLI
+// version and the host OS/arch; it has no image digest surface.
+func (b *TartBackend) ObservedRuntime() *model.ObservedRuntime { return b.observed }
 
 // tartIPWait bounds how long StartJob waits for the booted VM to report an
 // IP. It is a seam: production uses the fixed 60s bound, tests shorten it to
@@ -271,6 +280,9 @@ func (b *TartBackend) StartJob(ctx context.Context, workspace string, emit func(
 		_ = b.CloseJob()
 		return err
 	}
+	// Best-effort runtime evidence: a bounded `tart --version` probe whose
+	// failure only omits the version, never fails the job.
+	b.observed = captureTartObservedRuntime(ctx, tart)
 	emit("Tart VM ready " + b.clone)
 	return nil
 }

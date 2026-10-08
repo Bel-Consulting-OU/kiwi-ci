@@ -322,7 +322,7 @@ func faultOps() []opCase {
 			name:  "CompleteJob",
 			setup: func(m *memStore) { seedRunningJob(m); seedRunner(m) },
 			call: func(s Store) error {
-				return s.CompleteJob(ctx(), testJob.ID, 1, testRunner.ID, model.StatusSuccess, "", map[string]string{"o": "1"}, model.CompletionReceipt{JobID: testJob.ID, Generation: 1, RunnerID: testRunner.ID, ResultHash: "h"})
+				return s.CompleteJob(ctx(), testJob.ID, 1, testRunner.ID, model.StatusSuccess, "", map[string]string{"o": "1"}, model.CompletionReceipt{JobID: testJob.ID, Generation: 1, RunnerID: testRunner.ID, ResultHash: "h"}, nil)
 			},
 		},
 		{

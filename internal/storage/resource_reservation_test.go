@@ -144,7 +144,7 @@ func TestMemResourceOversubscriptionPrevented(t *testing.T) {
 
 	// Completion returns the capacity: the second job leases immediately.
 	receipt := model.CompletionReceipt{JobID: leaseJobID, Generation: 1, RunnerID: leaseRunner}
-	if err := m.CompleteJob(ctx(), leaseJobID, 1, leaseRunner, model.StatusSuccess, "", nil, receipt); err != nil {
+	if err := m.CompleteJob(ctx(), leaseJobID, 1, leaseRunner, model.StatusSuccess, "", nil, receipt, nil); err != nil {
 		t.Fatalf("complete first: %v", err)
 	}
 	assertReserved(t, m, leaseRunner, model.ResourceCapacity{})
@@ -169,13 +169,13 @@ func TestMemResourceReservationReleasedExactlyOnce(t *testing.T) {
 			t.Fatal(err)
 		}
 		receipt := model.CompletionReceipt{JobID: leaseJobID, Generation: 1, RunnerID: leaseRunner}
-		if err := m.CompleteJob(ctx(), leaseJobID, 1, leaseRunner, model.StatusSuccess, "", nil, receipt); err != nil {
+		if err := m.CompleteJob(ctx(), leaseJobID, 1, leaseRunner, model.StatusSuccess, "", nil, receipt, nil); err != nil {
 			t.Fatal(err)
 		}
 		assertReserved(t, m, leaseRunner, model.ResourceCapacity{})
 		// Replayed completion: still exactly zero, and the replay does not
 		// resurrect or double-release anything.
-		if err := m.CompleteJob(ctx(), leaseJobID, 1, leaseRunner, model.StatusSuccess, "", nil, receipt); err != nil {
+		if err := m.CompleteJob(ctx(), leaseJobID, 1, leaseRunner, model.StatusSuccess, "", nil, receipt, nil); err != nil {
 			t.Fatalf("replayed completion: %v", err)
 		}
 		assertReserved(t, m, leaseRunner, model.ResourceCapacity{})
@@ -189,7 +189,7 @@ func TestMemResourceReservationReleasedExactlyOnce(t *testing.T) {
 			t.Fatal(err)
 		}
 		receipt := model.CompletionReceipt{JobID: leaseJobID, Generation: 1, RunnerID: leaseRunner}
-		if err := m.CompleteJob(ctx(), leaseJobID, 1, leaseRunner, model.StatusFailure, "boom", nil, receipt); err != nil {
+		if err := m.CompleteJob(ctx(), leaseJobID, 1, leaseRunner, model.StatusFailure, "boom", nil, receipt, nil); err != nil {
 			t.Fatal(err)
 		}
 		assertReserved(t, m, leaseRunner, model.ResourceCapacity{})

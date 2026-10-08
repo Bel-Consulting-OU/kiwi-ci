@@ -14,6 +14,13 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/expr"
 )
 
+// CompiledJob is one compiled pipeline node. ID is the run-scoped logical
+// job identity: the declared job key with its matrix/shard suffix, unique
+// within a compiled graph (and therefore within one run). BaseID is the
+// DECLARED job key it came from, kept for grouping/display only — it
+// intentionally repeats across matrix/shard variants and must never be used
+// as a uniqueness key (the persisted model.Job fields are Key=ID and
+// BaseKey=BaseID).
 type CompiledJob struct {
 	ID     string            `json:"id"`
 	BaseID string            `json:"base_id"`

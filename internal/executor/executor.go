@@ -780,6 +780,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		b.WorkspaceQuota = e.Opt.WorkspaceQuota
 		b.CgroupParent = cgroupParent
 		b.ReportCleanupDebt = e.reportCleanupDebt
+		b.ServiceImages = serviceImageRefs(cj.Job.Services)
 	case *TartBackend:
 		b.RunID = e.Opt.RunID
 		b.JobID = cj.ID
@@ -817,6 +818,12 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		}
 		closeJob = lifecycle.CloseJob
 	}
+	// Observed runtime identity: every backend that captured runtime facts
+	// exposes them now (container/tart capture during StartJob, native is a
+	// platform fact), and the result carries them to the caller/completion.
+	// The lookup is an optional capability: a backend that captures nothing
+	// leaves the field nil rather than fabricating evidence.
+	res.ObservedRuntime = observedRuntimeOf(backend)
 	// Register the live backend session so job-scoped reads (generate.path)
 	// resolve through the execution boundary. The session stays registered
 	// until the backend is closed.

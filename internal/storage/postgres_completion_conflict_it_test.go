@@ -27,18 +27,18 @@ func TestPostgresIntegrationCompleteJobReceiptHashConflict(t *testing.T) {
 	}
 
 	receipt := model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID, ResultHash: "hash-success"}
-	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", map[string]string{"o": "1"}, receipt); err != nil {
+	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", map[string]string{"o": "1"}, receipt, nil); err != nil {
 		t.Fatalf("completion: %v", err)
 	}
 	// The exact replay is still an idempotent success.
-	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", map[string]string{"o": "1"}, receipt); err != nil {
+	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", map[string]string{"o": "1"}, receipt, nil); err != nil {
 		t.Fatalf("identical replay = %v, want nil", err)
 	}
 
 	// A different result for the same lease fails closed.
 	conflict := receipt
 	conflict.ResultHash = "hash-failure"
-	err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusFailure, "boom", nil, conflict)
+	err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusFailure, "boom", nil, conflict, nil)
 	if !errors.Is(err, ErrCompletionConflict) {
 		t.Fatalf("conflicting completion = %v, want ErrCompletionConflict", err)
 	}
@@ -84,7 +84,7 @@ func TestPostgresIntegrationCompleteJobInsertConflictHash(t *testing.T) {
 	// Same hash: the insert conflict is an idempotent success (the partial
 	// transaction is discarded, and the planted receipt is authoritative).
 	same := model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID, ResultHash: "planted"}
-	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, same); err != nil {
+	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, same, nil); err != nil {
 		t.Fatalf("same-hash insert conflict = %v, want nil", err)
 	}
 	got, ok, err := st.HasCompletionReceipt(ctx, jobID, 1, runnerID)
@@ -95,7 +95,7 @@ func TestPostgresIntegrationCompleteJobInsertConflictHash(t *testing.T) {
 	// Different hash: fail closed and roll the whole completion back.
 	different := same
 	different.ResultHash = "other"
-	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusFailure, "boom", nil, different); !errors.Is(err, ErrCompletionConflict) {
+	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusFailure, "boom", nil, different, nil); !errors.Is(err, ErrCompletionConflict) {
 		t.Fatalf("different-hash insert conflict = %v, want ErrCompletionConflict", err)
 	}
 	job, err := st.GetJob(ctx, jobID)

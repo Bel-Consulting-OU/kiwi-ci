@@ -41,7 +41,13 @@ type Statement struct {
 	Type          string    `json:"_type"`
 	Subject       []Subject `json:"subject"`
 	PredicateType string    `json:"predicateType"`
-	Predicate     Predicate `json:"predicate"`
+	Predicate     Predicate `json:"predicate,omitzero"`
+
+	// Attestation carries the final execution attestation evidence when
+	// PredicateType is ExecutionAttestationPredicateType. The artifact
+	// provenance predicate above is untouched: artifact statements never set
+	// this block.
+	Attestation *ExecutionAttestation `json:"attestation,omitempty"`
 
 	ResolvedPipelineSHA256 string `json:"resolvedPipelineSHA256,omitempty"`
 	PipelineDigest         string `json:"pipelineDigest,omitempty"`
@@ -98,6 +104,20 @@ type Predicate struct {
 	BuildDefinition BuildDefinition `json:"buildDefinition"`
 	RunDetails      RunDetails      `json:"runDetails"`
 }
+
+// IsZero reports whether the SLSA predicate carries no evidence. It exists so
+// the predicate field can be omitted (json:",omitzero") on statements that use
+// a different predicate shape (the execution attestation); artifact
+// statements always populate it.
+func (p Predicate) IsZero() bool {
+	return p.BuildDefinition.BuildType == "" &&
+		len(p.BuildDefinition.ExternalParameters) == 0 &&
+		p.RunDetails.Builder.ID == "" &&
+		p.RunDetails.Metadata.InvocationID == "" &&
+		p.RunDetails.Metadata.StartedOn.IsZero() &&
+		p.RunDetails.Metadata.FinishedOn == nil
+}
+
 type BuildDefinition struct {
 	BuildType          string         `json:"buildType"`
 	ExternalParameters map[string]any `json:"externalParameters,omitempty"`

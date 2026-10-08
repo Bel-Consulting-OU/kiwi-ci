@@ -7,8 +7,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
@@ -78,6 +80,20 @@ func markWorkspaceNeedsCleanup(dir string) error {
 type NativeBackend struct{}
 
 func (*NativeBackend) Name() string { return "native" }
+
+// ObservedRuntime reports the native runtime's platform identity. Native
+// execution has no runtime daemon or image to inspect, so RuntimeName is
+// "native", RuntimeVersion is omitted (there is no runner runtime version
+// surface), and no image digests are recorded. The value is constructed on
+// demand: it is a platform fact, not per-job state.
+func (*NativeBackend) ObservedRuntime() *model.ObservedRuntime {
+	return &model.ObservedRuntime{
+		OS:          runtime.GOOS,
+		Arch:        runtime.GOARCH,
+		RuntimeName: "native",
+		CapturedAt:  time.Now().UTC(),
+	}
+}
 
 // nativeResourceAdvisory reports the resource requests the native backend
 // cannot enforce. The native runtime has no container boundary to apply

@@ -1,0 +1,13 @@
+-- 0051_log_entry_lease_generation.sql — attempt identity on durable log rows.
+--
+-- The runner already sends the lease generation (attempt identity) with every
+-- log line and the fs/memory stores already persist it in the LogEntry
+-- payload, but the log_entries table had no column, so DB-mode reads always
+-- decoded generation 0 and a line could not be attributed to the attempt that
+-- produced it. This adds the column the lease-fenced append paths write and
+-- ReadLogs scans.
+--
+-- Additive with a default: older binaries never select the column and keep
+-- reading/writing the table unchanged, so the migration is compatible with a
+-- rolling upgrade at the storage layer. Legacy rows read as generation 0.
+ALTER TABLE log_entries ADD COLUMN IF NOT EXISTS lease_generation BIGINT NOT NULL DEFAULT 0;

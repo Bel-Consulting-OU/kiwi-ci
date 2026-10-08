@@ -25,7 +25,7 @@ func TestRecordUsageOnceIntegrationSequential(t *testing.T) {
 	pgITEnqueueOne(t, st, runID, jobID, pgITRepo)
 
 	const cost, energy = 1.25, 250.5
-	won, err := st.RecordUsageOnce(ctx, jobID, cost, energy)
+	won, err := st.RecordUsageOnce(ctx, jobID, 0, cost, energy)
 	if err != nil || !won {
 		t.Fatalf("first RecordUsageOnce = %v, %v; want true, nil", won, err)
 	}
@@ -38,7 +38,7 @@ func TestRecordUsageOnceIntegrationSequential(t *testing.T) {
 	}
 
 	// A replay loses and must not move the stored amounts.
-	won, err = st.RecordUsageOnce(ctx, jobID, 99, 99)
+	won, err = st.RecordUsageOnce(ctx, jobID, 0, 99, 99)
 	if err != nil || won {
 		t.Fatalf("replay RecordUsageOnce = %v, %v; want false, nil", won, err)
 	}
@@ -51,7 +51,7 @@ func TestRecordUsageOnceIntegrationSequential(t *testing.T) {
 	}
 
 	// An unknown job records nothing and is not an error.
-	if won, err := st.RecordUsageOnce(ctx, pgITNewID(t), 1, 1); err != nil || won {
+	if won, err := st.RecordUsageOnce(ctx, pgITNewID(t), 0, 1, 1); err != nil || won {
 		t.Fatalf("unknown job RecordUsageOnce = %v, %v; want false, nil", won, err)
 	}
 }
@@ -79,7 +79,7 @@ func TestRecordUsageOnceIntegrationConcurrent(t *testing.T) {
 			defer wg.Done()
 			cost := float64(i + 1)
 			energy := cost * 10
-			won, err := st.RecordUsageOnce(ctx, jobID, cost, energy)
+			won, err := st.RecordUsageOnce(ctx, jobID, 0, cost, energy)
 			results <- outcome{cost: cost, energy: energy, won: won, err: err}
 		}(i)
 	}
@@ -118,7 +118,7 @@ func TestRecordUsageOnceIntegrationPayloadAndUsageSum(t *testing.T) {
 	pgITEnqueueOne(t, st, runID, jobID, pgITRepo)
 
 	const cost, energy = 3.75, 420.25
-	won, err := st.RecordUsageOnce(ctx, jobID, cost, energy)
+	won, err := st.RecordUsageOnce(ctx, jobID, 0, cost, energy)
 	if err != nil || !won {
 		t.Fatalf("RecordUsageOnce = %v, %v; want true, nil", won, err)
 	}
@@ -156,7 +156,7 @@ func TestRecordUsageOnceIntegrationPayloadAndUsageSum(t *testing.T) {
 	}
 
 	// A replayed record call must not double-count in the sum.
-	if won, err := st.RecordUsageOnce(ctx, jobID, 50, 50); err != nil || won {
+	if won, err := st.RecordUsageOnce(ctx, jobID, 0, 50, 50); err != nil || won {
 		t.Fatalf("replay RecordUsageOnce = %v, %v; want false, nil", won, err)
 	}
 	sumCost, sumEnergy, err = st.RecentUsage(ctx, finished.Add(-time.Minute))

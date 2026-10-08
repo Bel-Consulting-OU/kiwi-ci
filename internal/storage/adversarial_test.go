@@ -291,7 +291,7 @@ func TestMemStoreQuotaQueuedRunningLifecycle(t *testing.T) {
 	}
 	// Completing the running job releases the running slot without
 	// resurrecting the queued reservation.
-	if err := m.CompleteJob(ctx(), ids[1], 1, leaseRunner, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: ids[1], Generation: 1, RunnerID: leaseRunner}); err != nil {
+	if err := m.CompleteJob(ctx(), ids[1], 1, leaseRunner, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: ids[1], Generation: 1, RunnerID: leaseRunner}, nil); err != nil {
 		t.Fatal(err)
 	}
 	running, queued, _ = m.QuotaCounts(ctx(), repoID, "")
@@ -299,7 +299,7 @@ func TestMemStoreQuotaQueuedRunningLifecycle(t *testing.T) {
 		t.Fatalf("after complete = %d/%d, want 0/%d", running, queued, queuedJobs-2)
 	}
 	// A late replay of the completion cannot double-release.
-	if err := m.CompleteJob(ctx(), ids[1], 1, leaseRunner, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: ids[1], Generation: 1, RunnerID: leaseRunner}); err != nil {
+	if err := m.CompleteJob(ctx(), ids[1], 1, leaseRunner, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: ids[1], Generation: 1, RunnerID: leaseRunner}, nil); err != nil {
 		t.Fatalf("replayed completion: %v", err)
 	}
 	running, queued, _ = m.QuotaCounts(ctx(), repoID, "")
@@ -345,7 +345,7 @@ func TestMemStoreCancelMatrixRunnerSlotInvariant(t *testing.T) {
 			}
 			// Completion after cancel must not resurrect anything.
 			before := ri
-			if err := m.CompleteJob(ctx(), leaseJobID, 1, leaseRunner, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: leaseJobID, Generation: 1, RunnerID: leaseRunner}); !errors.Is(err, ErrGenerationMismatch) {
+			if err := m.CompleteJob(ctx(), leaseJobID, 1, leaseRunner, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: leaseJobID, Generation: 1, RunnerID: leaseRunner}, nil); !errors.Is(err, ErrGenerationMismatch) {
 				t.Fatalf("completion after cancel = %v, want ErrGenerationMismatch", err)
 			}
 			after, _ := m.GetRunner(ctx(), leaseRunner)
@@ -373,7 +373,7 @@ func TestMemStoreCompleteJobReceiptIdentityGuard(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Negative generations are invalid (SQL parity).
-	if err := m.CompleteJob(ctx(), leaseJobID, -1, leaseRunner, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: leaseJobID, Generation: -1, RunnerID: leaseRunner}); err == nil {
+	if err := m.CompleteJob(ctx(), leaseJobID, -1, leaseRunner, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: leaseJobID, Generation: -1, RunnerID: leaseRunner}, nil); err == nil {
 		t.Fatal("negative generation completion accepted")
 	}
 	// A receipt keyed to a different job/generation/runner is refused.
@@ -383,7 +383,7 @@ func TestMemStoreCompleteJobReceiptIdentityGuard(t *testing.T) {
 		{JobID: leaseJobID, Generation: 1, RunnerID: leaseJob2ID},
 	}
 	for i, rec := range mismatch {
-		if err := m.CompleteJob(ctx(), leaseJobID, 1, leaseRunner, model.StatusSuccess, "", nil, rec); err == nil {
+		if err := m.CompleteJob(ctx(), leaseJobID, 1, leaseRunner, model.StatusSuccess, "", nil, rec, nil); err == nil {
 			t.Fatalf("mismatched receipt %d accepted", i)
 		}
 	}
@@ -393,11 +393,11 @@ func TestMemStoreCompleteJobReceiptIdentityGuard(t *testing.T) {
 	}
 	// The correct receipt still completes and dedupes exactly once.
 	good := model.CompletionReceipt{JobID: leaseJobID, Generation: 1, RunnerID: leaseRunner, ResultHash: "h"}
-	if err := m.CompleteJob(ctx(), leaseJobID, 1, leaseRunner, model.StatusSuccess, "", nil, good); err != nil {
+	if err := m.CompleteJob(ctx(), leaseJobID, 1, leaseRunner, model.StatusSuccess, "", nil, good, nil); err != nil {
 		t.Fatalf("correct completion: %v", err)
 	}
 	before := len(m.outbox)
-	if err := m.CompleteJob(ctx(), leaseJobID, 1, leaseRunner, model.StatusSuccess, "", nil, good); err != nil {
+	if err := m.CompleteJob(ctx(), leaseJobID, 1, leaseRunner, model.StatusSuccess, "", nil, good, nil); err != nil {
 		t.Fatalf("replayed completion: %v", err)
 	}
 	if len(m.outbox) != before {
@@ -585,7 +585,7 @@ func TestMemStoreErrNotFoundPaths(t *testing.T) {
 	if err := m.HeartbeatLease(ctx(), leaseJobID, leaseRunner, 1, time.Unix(3000, 0).UTC()); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("heartbeat of unknown job = %v, want ErrNotFound", err)
 	}
-	if err := m.CompleteJob(ctx(), leaseJobID, 1, leaseRunner, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: leaseJobID, Generation: 1, RunnerID: leaseRunner}); !errors.Is(err, ErrNotFound) {
+	if err := m.CompleteJob(ctx(), leaseJobID, 1, leaseRunner, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: leaseJobID, Generation: 1, RunnerID: leaseRunner}, nil); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("complete of unknown job = %v, want ErrNotFound", err)
 	}
 	if err := m.ReleaseRunnerJob(ctx(), leaseRunner, leaseJobID, model.StatusFailure); !errors.Is(err, ErrNotFound) {

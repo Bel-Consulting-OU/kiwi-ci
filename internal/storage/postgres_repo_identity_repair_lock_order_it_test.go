@@ -131,8 +131,8 @@ func TestPostgresIntegrationRepoIdentityRepairCompleteJobLockOrder(t *testing.T)
 
 		completeErr := make(chan error, 1)
 		go func() {
-			completeErr <- st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil,
-				model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID, ResultHash: "lock-order-result"})
+			completeErr <- st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID, ResultHash: "lock-order-result"}, nil)
+
 		}()
 		pgITWaitForLockBlockedQuery(t, st, ctx, "%UPDATE quota_reservations%")
 

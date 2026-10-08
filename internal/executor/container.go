@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executil"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
@@ -204,9 +205,22 @@ type ContainerBackend struct {
 	// the capability probe. Set by StartJob and run exactly once by CloseJob
 	// (or by StartJob itself on a failure after the probe succeeded).
 	quotaCleanup func() error
+	// ServiceImages maps a declared service name to its image reference for
+	// observed-runtime digest capture. The executor fills it from the
+	// compiled job's services; direct backend users may leave it nil.
+	ServiceImages map[string]string
+	// observed holds the runtime facts captured when the container started
+	// (see ObservedRuntime()). Nil until StartJob succeeds.
+	observed *model.ObservedRuntime
 }
 
 func (*ContainerBackend) Name() string { return "container" }
+
+// ObservedRuntime returns the runtime facts captured when the job container
+// started, or nil when the container never started. It implements the
+// executor's optional runtimeObserver capability; see runtime_capture.go for
+// the capture points and omission rules.
+func (b *ContainerBackend) ObservedRuntime() *model.ObservedRuntime { return b.observed }
 
 // StartJob creates one hardened, long-lived container for the whole CI job.
 // Every step is executed with docker exec so package installs and process state
@@ -363,6 +377,10 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("start job container: %w: %s", err, strings.TrimSpace(string(out)))}
 	}
 	emit("job container started " + b.container)
+	// Observed-runtime capture is best-effort evidence: it runs after the
+	// container is up, under the job context and its own bounded pass, and
+	// every failure is an omission that can never fail the job.
+	b.observed = captureContainerObservedRuntime(ctx, b.docker, b.Image, b.ServiceImages)
 	return nil
 }
 

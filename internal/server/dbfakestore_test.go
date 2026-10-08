@@ -225,6 +225,13 @@ type dbFakeStore struct {
 	// the delivery receipts that make a retried report upload idempotent.
 	reportDeliveries map[string]fakeReportDelivery
 
+	// attestations mirrors migration 0050's execution_attestations rows, and
+	// executionEvents records the semantic events committed with them;
+	// attestationErr injects a hard store failure (attestation retry tests).
+	attestations    map[string]model.ExecutionAttestationRecord
+	executionEvents []model.ExecutionEvent
+	attestationErr  error
+
 	insertRunCalls   []model.Run
 	insertJobCalls   []model.Job
 	acquireCalls     []acquireArgs
@@ -304,6 +311,7 @@ var _ storage.ArtifactIdempotentStore = (*dbFakeStore)(nil)
 var _ storage.GeneratedFragmentStore = (*dbFakeStore)(nil)
 var _ storage.CASReferenceStore = (*dbFakeStore)(nil)
 var _ storage.CASGCLeaseStore = (*dbFakeStore)(nil)
+var _ storage.ExecutionAttestationStore = (*dbFakeStore)(nil)
 var _ storage.MetricsAggregateStore = (*dbFakeStore)(nil)
 
 // fakeCASGCLease is one held in-memory collector lease.
@@ -373,6 +381,7 @@ func newDBFakeStore() *dbFakeStore {
 		historyAggregates: map[string]map[string]storage.TestHistoryAggregate{},
 		historyVersions:   map[string]int64{},
 		reportDeliveries:  map[string]fakeReportDelivery{},
+		attestations:      map[string]model.ExecutionAttestationRecord{},
 		leaderOK:          true,
 	}
 }
@@ -668,7 +677,7 @@ func (f *dbFakeStore) UpdateJob(ctx context.Context, job model.Job) error {
 // job wins, and the marker plus cost/energy commit together. It honors
 // updateJobErr so the existing "job row write down" fault injection keeps
 // covering the usage effect.
-func (f *dbFakeStore) RecordUsageOnce(ctx context.Context, jobID string, cost, energyWh float64) (bool, error) {
+func (f *dbFakeStore) RecordUsageOnce(ctx context.Context, jobID string, generation int64, cost, energyWh float64) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.updateJobErr != nil {
@@ -681,6 +690,7 @@ func (f *dbFakeStore) RecordUsageOnce(ctx context.Context, jobID string, cost, e
 	j.UsageRecorded = true
 	j.Cost = cost
 	j.EnergyWh = energyWh
+	j.UsageLeaseGeneration = generation
 	f.jobs[jobID] = j
 	f.updateJobCalls = append(f.updateJobCalls, j)
 	return true, nil
@@ -730,7 +740,7 @@ func (f *dbFakeStore) HeartbeatLease(ctx context.Context, jobID string, runnerID
 	return nil
 }
 
-func (f *dbFakeStore) CompleteJob(ctx context.Context, jobID string, generation int64, runnerID string, status model.Status, errMsg string, outputs map[string]string, receipt model.CompletionReceipt) error {
+func (f *dbFakeStore) CompleteJob(ctx context.Context, jobID string, generation int64, runnerID string, status model.Status, errMsg string, outputs map[string]string, receipt model.CompletionReceipt, observed *model.ObservedRuntime) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.completeCalls = append(f.completeCalls, completeArgs{jobID, generation, runnerID, status, receipt})
@@ -788,6 +798,7 @@ func (f *dbFakeStore) CompleteJob(ctx context.Context, jobID string, generation 
 	j.LeaseRunnerID = ""
 	j.LeaseTokenHash = nil
 	j.LeaseExpiresAt = nil
+	j.ObservedRuntime = observed
 	f.jobs[jobID] = j
 	f.receipts[key] = receipt
 	// The completed job releases its reserved running quota slot in the same
@@ -807,13 +818,14 @@ func (f *dbFakeStore) CompleteJob(ctx context.Context, jobID string, generation 
 	}
 	// Completion effect intents ride the completion, mirroring the SQL
 	// contract: completion_reconcile (internal consistency, unbounded
-	// retries) plus forge_delivery (external publication, bounded retries)
-	// under their deterministic effect IDs.
-	payload, perr := json.Marshal(storage.CompletionEffectsPayload{JobID: jobID, RunID: j.RunID})
+	// retries), forge_delivery (external publication, bounded retries) and
+	// execution_attest (internal, unbounded retries) under their
+	// deterministic effect IDs.
+	payload, perr := json.Marshal(storage.CompletionEffectsPayload{JobID: jobID, RunID: j.RunID, Generation: generation})
 	if perr != nil {
 		return perr
 	}
-	for _, kind := range []string{storage.OutboxKindCompletionReconcile, storage.OutboxKindForgeDelivery} {
+	for _, kind := range storage.NewCompletionEffectKinds() {
 		f.outboxItems = append(f.outboxItems, storage.OutboxItem{
 			ID:        storage.CompletionEffectID(jobID, generation, kind),
 			Kind:      kind,
@@ -1741,6 +1753,56 @@ func (f *dbFakeStore) ListAllPendingSidecarDigests(ctx context.Context) ([]strin
 	return out, nil
 }
 
+// ListAllExecutionAttestationEnvelopeRefs implements storage.CASReferenceStore:
+// the envelope_ref column of the durable execution_attestations rows.
+func (f *dbFakeStore) ListAllExecutionAttestationEnvelopeRefs(ctx context.Context) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.casRefErr != nil {
+		return nil, f.casRefErr
+	}
+	out := []string{}
+	for _, rec := range f.attestations {
+		if rec.EnvelopeRef != "" {
+			out = append(out, rec.EnvelopeRef)
+		}
+	}
+	return out, nil
+}
+
+// CommitExecutionAttestation implements storage.ExecutionAttestationStore: the
+// insert-once row plus the semantic event, mirroring the transactional store
+// method.
+func (f *dbFakeStore) CommitExecutionAttestation(ctx context.Context, rec model.ExecutionAttestationRecord, event model.ExecutionEvent) (model.ExecutionAttestationRecord, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.attestationErr != nil {
+		return model.ExecutionAttestationRecord{}, false, f.attestationErr
+	}
+	key := rec.Key()
+	if existing, ok := f.attestations[key]; ok {
+		return existing, false, nil
+	}
+	if rec.CreatedAt.IsZero() {
+		rec.CreatedAt = time.Now().UTC()
+	}
+	f.attestations[key] = rec
+	if event.Type != "" {
+		f.executionEvents = append(f.executionEvents, event)
+	}
+	return rec, true, nil
+}
+
+func (f *dbFakeStore) GetExecutionAttestation(ctx context.Context, jobID string, generation int64) (model.ExecutionAttestationRecord, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.attestationErr != nil {
+		return model.ExecutionAttestationRecord{}, false, f.attestationErr
+	}
+	rec, ok := f.attestations[model.AttemptID(jobID, generation)]
+	return rec, ok, nil
+}
+
 func (f *dbFakeStore) Migrate(ctx context.Context) error { return nil }
 
 // SchemaCompatibilityFloor: the fake has no migration history.
@@ -2319,6 +2381,8 @@ func (f *dbFakeStore) InsertTestReportWithHistoryDeliveryForLease(ctx context.Co
 	} else if f.leaseNow != nil {
 		rep.CreatedAt = f.leaseNow().UTC()
 	}
+	// Attempt identity from the verified lease, mirroring the SQL fence.
+	rep.LeaseGeneration = generation
 	return f.InsertTestReportWithHistoryDelivery(ctx, rep, repoID, delivery)
 }
 
@@ -3516,6 +3580,13 @@ func (f *dbFakeStore) InsertGeneratedFragmentTx(ctx context.Context, req storage
 			}
 		}
 		return rec, true, nil
+	}
+	// Run-scoped logical identity admission, mirrored from the SQL
+	// transaction: f.mu serializes every fake-store mutation, so the index
+	// read under the lock is authoritative and a collision fails the whole
+	// fragment closed with the shared typed error.
+	if kerr := storage.CheckGeneratedJobKeyConflicts(parent.RunID, req.Jobs, storage.GeneratedJobKeyIndex(parent.RunID, f.jobs)); kerr != nil {
+		return storage.GeneratedFragmentReceipt{}, false, kerr
 	}
 	count := 0
 	for _, j := range f.jobs {

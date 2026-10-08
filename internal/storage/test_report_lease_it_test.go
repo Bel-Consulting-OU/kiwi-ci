@@ -185,14 +185,21 @@ func TestIntegrationReplicaClockSkewCannotReorderTestHistory(t *testing.T) {
 	st := pgITStore(t)
 	ctx := context.Background()
 
-	// Two independent jobs on the same repository: their reports fold into
-	// one repository history.
-	_, jobAID, runnerA := leaseClockITSetup(t, st)
-	_, jobBID, runnerB := leaseClockITSetup(t, st)
+	// Two independent jobs on the same repository, in DIFFERENT runs: the
+	// unique (run_id, key) identity (migration 0048) permits the deliberately
+	// shared logical suite key across runs, so their reports still fold into
+	// ONE repository history suite (the same key inside one run would be a
+	// duplicate logical node and is rejected at admission).
+	const skewSuite = "shared"
+	_, jobAID, runnerA := leaseClockITSetupKeyed(t, st, skewSuite)
+	_, jobBID, runnerB := leaseClockITSetupKeyed(t, st, skewSuite)
 	jobA, repoA := testReportLeaseClaim(t, st, jobAID, runnerA, time.Minute)
 	jobB, repoB := testReportLeaseClaim(t, st, jobBID, runnerB, time.Minute)
 	if repoA != repoB {
 		t.Fatalf("fixture repositories differ: %s vs %s", repoA, repoB)
+	}
+	if jobA.Key != skewSuite || jobB.Key != skewSuite {
+		t.Fatalf("fixture suite keys = %q/%q, want the shared %q", jobA.Key, jobB.Key, skewSuite)
 	}
 
 	// Report A is committed FIRST but carries a future application instant;
@@ -221,7 +228,7 @@ func TestIntegrationReplicaClockSkewCannotReorderTestHistory(t *testing.T) {
 		t.Fatalf("application-clock skew reordered history: A committed first at %s but B sorts earlier at %s", storedA, storedB)
 	}
 	var raw []byte
-	if err := st.pool.QueryRow(ctx, `SELECT outcomes FROM test_history_aggregates WHERE repo_id=$1 AND suite=$2 AND test_class='' AND test_name='shared'`, repoA, jobA.Key).Scan(&raw); err != nil {
+	if err := st.pool.QueryRow(ctx, `SELECT outcomes FROM test_history_aggregates WHERE repo_id=$1 AND suite=$2 AND test_class='' AND test_name='shared'`, repoA, skewSuite).Scan(&raw); err != nil {
 		t.Fatalf("read folded outcomes: %v", err)
 	}
 	var outcomes []bool

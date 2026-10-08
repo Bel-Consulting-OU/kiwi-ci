@@ -56,29 +56,36 @@ func TestPostgresIntegrationMigrationPayloadCastsGuarded(t *testing.T) {
 		('a-missing', 'guard-run', 'art', now(), '{}'::jsonb),
 		('a-valid',   'guard-run', 'art', now(), '{"lease_generation":42}'::jsonb)`)
 
-	// 0022: malformed/valid queue_deadline payload shapes.
-	seed(`INSERT INTO jobs (id, run_id, key, status, created_at, payload) VALUES
-		('j-bad-month', 'guard-run', 'build', 'queued', now(), '{"queue_deadline":"2024-13-45T99:99:99Z"}'::jsonb),
-		('j-bad-feb',   'guard-run', 'build', 'queued', now(), '{"queue_deadline":"2024-02-30T00:00:00Z"}'::jsonb),
-		('j-bad-leap',  'guard-run', 'build', 'queued', now(), '{"queue_deadline":"2023-02-29T00:00:00Z"}'::jsonb),
-		('j-bad-str',   'guard-run', 'build', 'queued', now(), '{"queue_deadline":"abc"}'::jsonb),
-		('j-bad-obj',   'guard-run', 'build', 'queued', now(), '{"queue_deadline":{"x":1}}'::jsonb),
-		('j-bad-space', 'guard-run', 'build', 'queued', now(), '{"queue_deadline":"2024-01-02 15:04:05Z"}'::jsonb),
-		('j-valid',     'guard-run', 'build', 'queued', now(), '{"queue_deadline":"2024-01-02T15:04:05Z"}'::jsonb),
-		('j-valid-frac','guard-run', 'build', 'queued', now(), '{"queue_deadline":"2024-02-29T23:59:59.123Z"}'::jsonb)`)
+	// 0022: malformed/valid queue_deadline payload shapes. The Key is derived
+	// from the job id so the whole run stays unique under migration 0048.
+	seed(`INSERT INTO jobs (id, run_id, key, status, created_at, payload)
+		SELECT v.id, 'guard-run', 'build-' || v.id, 'queued', now(), v.payload
+		FROM (VALUES
+		('j-bad-month', '{"queue_deadline":"2024-13-45T99:99:99Z"}'::jsonb),
+		('j-bad-feb',   '{"queue_deadline":"2024-02-30T00:00:00Z"}'::jsonb),
+		('j-bad-leap',  '{"queue_deadline":"2023-02-29T00:00:00Z"}'::jsonb),
+		('j-bad-str',   '{"queue_deadline":"abc"}'::jsonb),
+		('j-bad-obj',   '{"queue_deadline":{"x":1}}'::jsonb),
+		('j-bad-space', '{"queue_deadline":"2024-01-02 15:04:05Z"}'::jsonb),
+		('j-valid',     '{"queue_deadline":"2024-01-02T15:04:05Z"}'::jsonb),
+		('j-valid-frac','{"queue_deadline":"2024-02-29T23:59:59.123Z"}'::jsonb)
+		) AS v(id, payload)`)
 
 	// 0041: malformed normalized-filter payload shapes. jsonb_array_elements_text
 	// raises on any non-array jsonb, so every backfill must skip them instead of
 	// aborting the migration transaction.
-	seed(`INSERT INTO jobs (id, run_id, key, status, created_at, payload) VALUES
-		('j-labels-str',     'guard-run', 'build', 'queued', now(), '{"required_labels":"abc"}'::jsonb),
-		('j-labels-obj',     'guard-run', 'build', 'queued', now(), '{"required_labels":{"x":1}}'::jsonb),
-		('j-labels-null',    'guard-run', 'build', 'queued', now(), '{"required_labels":null}'::jsonb),
-		('j-labels-num',     'guard-run', 'build', 'queued', now(), '{"required_labels":7}'::jsonb),
-		('j-regions-str',    'guard-run', 'build', 'queued', now(), '{"placement_regions":"abc"}'::jsonb),
-		('j-regions-obj',    'guard-run', 'build', 'queued', now(), '{"placement_regions":{"x":1}}'::jsonb),
-		('j-filter-arrays',  'guard-run', 'build', 'queued', now(), '{"required_labels":["linux","x64"],"placement_regions":["eu","us"]}'::jsonb),
-		('j-filter-empty',   'guard-run', 'build', 'queued', now(), '{"required_labels":[],"placement_regions":[]}'::jsonb)`)
+	seed(`INSERT INTO jobs (id, run_id, key, status, created_at, payload)
+		SELECT v.id, 'guard-run', 'build-' || v.id, 'queued', now(), v.payload
+		FROM (VALUES
+		('j-labels-str',     '{"required_labels":"abc"}'::jsonb),
+		('j-labels-obj',     '{"required_labels":{"x":1}}'::jsonb),
+		('j-labels-null',    '{"required_labels":null}'::jsonb),
+		('j-labels-num',     '{"required_labels":7}'::jsonb),
+		('j-regions-str',    '{"placement_regions":"abc"}'::jsonb),
+		('j-regions-obj',    '{"placement_regions":{"x":1}}'::jsonb),
+		('j-filter-arrays',  '{"required_labels":["linux","x64"],"placement_regions":["eu","us"]}'::jsonb),
+		('j-filter-empty',   '{"required_labels":[],"placement_regions":[]}'::jsonb)
+		) AS v(id, payload)`)
 
 	// The normal startup migration applies 0009/0010/0022 (and the rest). The
 	// bare pre-fix casts raised here and blocked startup.

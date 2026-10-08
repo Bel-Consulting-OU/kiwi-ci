@@ -17,6 +17,62 @@ import (
 // directories before GC removes them. Well above any upload lifetime.
 const tempFileMaxAge = 24 * time.Hour
 
+// Execution event retention cadence and bounds. Retention only has to keep
+// up with the event write rate averaged over a maintenance interval; one
+// tick deletes at most eventsPruneBatch events per bounded batch and at most
+// eventsPruneMaxBatchesPerTick batches, so a huge backlog ages out
+// gradually across ticks instead of stalling the loop. The 10-minute
+// cadence mirrors cacheManifestPruneEvery.
+const (
+	defaultEventsRetention       = 7 * 24 * time.Hour
+	eventsPruneEvery             = 10 * time.Minute
+	eventsPruneBatch             = 1000
+	eventsPruneMaxBatchesPerTick = 4
+)
+
+// maybePruneExecutionEvents applies the configured execution event retention
+// on an amortized cadence, in bounded batches, through the configured
+// store's optional RetentionExecutionEventStore contract (PostgreSQL or the
+// fs repository; memory-only servers have no durable stream to prune).
+// Nothing is pruned when EventsRetention <= 0 (explicitly disabled). Errors
+// are logged and never fail maintenance: the next tick retries, and a
+// consumer can never be told a cursor expired against a watermark that was
+// not durably advanced (the watermark update is part of the prune
+// transaction).
+func (s *Server) maybePruneExecutionEvents(ctx context.Context, now time.Time) {
+	if s.EventsRetention <= 0 {
+		return
+	}
+	s.eventsPruneMu.Lock()
+	if !s.lastEventsPrune.IsZero() && now.Sub(s.lastEventsPrune) < eventsPruneEvery {
+		s.eventsPruneMu.Unlock()
+		return
+	}
+	s.lastEventsPrune = now
+	s.eventsPruneMu.Unlock()
+	retention, ok := s.executionEventRetentionStore()
+	if !ok {
+		return
+	}
+	olderThan := now.Add(-s.EventsRetention)
+	var total int64
+	for i := 0; i < eventsPruneMaxBatchesPerTick; i++ {
+		pruned, _, err := retention.PruneExecutionEvents(ctx, olderThan, eventsPruneBatch)
+		if err != nil {
+			s.logError("execution event prune failed", "error", err.Error())
+			break
+		}
+		total += pruned
+		if pruned < int64(eventsPruneBatch) {
+			break
+		}
+	}
+	if total > 0 {
+		s.metricAdd("kiwi_execution_events_pruned_total", float64(total), nil)
+		s.logInfo("execution events pruned", "count", total)
+	}
+}
+
 // GCStats reports what one garbage-collection pass removed.
 type GCStats struct {
 	ArtifactsRemoved int `json:"artifacts_removed"`
@@ -94,6 +150,11 @@ func (s *Server) GC(ctx context.Context, now time.Time) GCStats {
 	if s.store != nil {
 		stats.TempFilesRemoved = sweepTempFiles(s.store.Root, now)
 	}
+	// Windowed execution event retention: the durable stream's oldest events
+	// age out (bounded batches) and the retained_from watermark makes an
+	// expired consumer cursor answer 410 cursor_expired. Leader-only in DB
+	// mode by construction (maintainDB calls GC after the leadership gates).
+	s.maybePruneExecutionEvents(ctx, now)
 	return stats
 }
 

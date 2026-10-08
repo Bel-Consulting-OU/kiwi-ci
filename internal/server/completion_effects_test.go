@@ -157,7 +157,7 @@ func TestCompletionEffectsReceiptReplayExactlyOnce(t *testing.T) {
 		t.Fatal("downstream link recorded before any effect ran")
 	}
 	kinds := effectKindsQueued(f)
-	for _, k := range []string{storage.OutboxKindCompletionReconcile, storage.OutboxKindForgeDelivery} {
+	for _, k := range []string{storage.OutboxKindCompletionReconcile, storage.OutboxKindForgeDelivery, storage.OutboxKindExecutionAttest} {
 		if kinds[k] != 1 {
 			t.Fatalf("effect kind %q queued %d times, want 1 (in-transaction intents)", k, kinds[k])
 		}

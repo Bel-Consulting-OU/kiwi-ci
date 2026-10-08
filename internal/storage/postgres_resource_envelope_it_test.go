@@ -115,7 +115,7 @@ func TestIntegrationResourceAdmissionServiceEnvelopePostgres(t *testing.T) {
 	// Completion deletes the single row; the plain job then reserves exactly
 	// its own request (no services -> zero envelope -> unchanged behavior).
 	receipt := model.CompletionReceipt{JobID: svcJob, Generation: 1, RunnerID: runnerID}
-	if err := st.CompleteJob(ctx, svcJob, 1, runnerID, model.StatusSuccess, "", nil, receipt); err != nil {
+	if err := st.CompleteJob(ctx, svcJob, 1, runnerID, model.StatusSuccess, "", nil, receipt, nil); err != nil {
 		t.Fatalf("complete service job: %v", err)
 	}
 	pgITAssertReservations(t, st, runnerID, model.ResourceCapacity{}, 0)

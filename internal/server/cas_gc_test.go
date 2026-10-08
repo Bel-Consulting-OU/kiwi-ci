@@ -379,11 +379,14 @@ func TestCollectCASReferencesGathersEverySource(t *testing.T) {
 	dbArtifact := digest(10)
 	dbPending := digest(11)
 	cacheManifest := digest(12)
+	attestation := digest(13)
+	dbAttestation := digest(14)
 
 	s.mu.Lock()
 	s.artifacts["a1"] = model.ArtifactRecord{ID: "a1", SHA256: payload, ProvenanceSHA256: prov, SBOMSHA256: sbom, SigstoreSHA256: sig, Path: "cas:" + casPath}
 	s.snapshots["sn1"] = model.SnapshotRecord{ID: "sn1", SHA256: snapDigest, RootSHA256: root, Path: "cas:" + root}
 	s.pendingSidecars["p1"] = pending
+	s.attestations[model.AttemptID("job-a", 1)] = model.ExecutionAttestationRecord{JobID: "job-a", Generation: 1, EnvelopeRef: "cas:" + attestation}
 	s.mu.Unlock()
 
 	// fs-mode cache manifest with a signed-envelope shape.
@@ -411,6 +414,7 @@ func TestCollectCASReferencesGathersEverySource(t *testing.T) {
 	f.artifacts = append(f.artifacts, model.ArtifactRecord{ID: "db-a1", SHA256: dbArtifact})
 	f.cacheMans["k1"] = storage.CacheManifestRecord{Repo: "r", TrustDomain: "t", LogicalKey: "k", BlobSHA256: cacheManifest}
 	f.pendingSidecars[fakePendingKey("job", 1, "art", storage.ArtifactSidecarKindSBOM)] = fakePendingSidecar{digest: dbPending}
+	f.attestations[model.AttemptID("job-b", 2)] = model.ExecutionAttestationRecord{JobID: "job-b", Generation: 2, EnvelopeRef: "cas:" + dbAttestation}
 	f.mu.Unlock()
 
 	refs, err := s.collectCASReferences(context.Background())
@@ -421,11 +425,47 @@ func TestCollectCASReferencesGathersEverySource(t *testing.T) {
 		"payload": payload, "provenance": prov, "sbom": sbom, "sigstore": sig,
 		"cas path": casPath, "snapshot": snapDigest, "root": root, "pending": pending,
 		"manifest": manifest, "db artifact": dbArtifact, "db pending": dbPending,
-		"db cache manifest": cacheManifest,
+		"db cache manifest": cacheManifest, "attestation": attestation, "db attestation": dbAttestation,
 	} {
 		if _, ok := refs[want]; !ok {
 			t.Fatalf("reference %s (%s) missing from %v", name, want, refs)
 		}
+	}
+}
+
+// TestCASGCKeepsExecutionAttestationEnvelope proves the durable attestation
+// envelope reference is part of the live set: the aged envelope survives a
+// collection pass while an equally aged unreferenced object is still removed,
+// so the attestation ref did not disable collection.
+func TestCASGCKeepsExecutionAttestationEnvelope(t *testing.T) {
+	s, _ := casGCTestServer(t)
+	f := newDBFakeStore()
+	if err := s.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	envelope := putCASBlob(t, s, `{"payloadType":"application/vnd.in-toto+json"}`)
+	orphan := putCASBlob(t, s, "unreferenced attestation-era object")
+	f.mu.Lock()
+	f.attestations[model.AttemptID("job-a", 4)] = model.ExecutionAttestationRecord{
+		JobID: "job-a", Generation: 4, StatementSHA256: strings.Repeat("a", 64),
+		EnvelopeRef: "cas:" + envelope.SHA256,
+	}
+	f.mu.Unlock()
+	ageCASBlob(t, s, envelope.SHA256, 48*time.Hour)
+	ageCASBlob(t, s, orphan.SHA256, 48*time.Hour)
+
+	stats, err := s.runCASGC(context.Background(), casGCOptions{MinAge: 24 * time.Hour, Batch: 100})
+	if err != nil {
+		t.Fatalf("runCASGC: %v", err)
+	}
+	if !casBlobExists(t, s, envelope.SHA256) {
+		t.Fatal("the durable attestation envelope was reclaimed")
+	}
+	if casBlobExists(t, s, orphan.SHA256) {
+		t.Fatal("the unreferenced object survived, so the pass proved nothing")
+	}
+	if stats.Deleted != 1 {
+		t.Fatalf("deleted = %d, want exactly the unreferenced object", stats.Deleted)
 	}
 }
 

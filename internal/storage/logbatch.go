@@ -126,8 +126,8 @@ func (s *PostgresStore) AppendLogBatch(ctx context.Context, entries []model.LogE
 		return false, nil
 	}
 	for _, e := range entries {
-		if _, err := tx.Exec(ctx, `INSERT INTO log_entries (run_id, job_id, job_key, step, line, created_at) VALUES ($1, $2, $3, $4, $5, $6)`,
-			e.RunID, e.JobID, e.JobKey, e.Step, e.Line, e.CreatedAt); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO log_entries (run_id, job_id, job_key, step, line, lease_generation, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+			e.RunID, e.JobID, e.JobKey, e.Step, e.Line, e.LeaseGeneration, e.CreatedAt); err != nil {
 			return false, err
 		}
 	}

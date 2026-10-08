@@ -991,7 +991,7 @@ func (f *fakeStore) HeartbeatLease(ctx context.Context, jobID string, runnerID s
 	return nil
 }
 
-func (f *fakeStore) CompleteJob(ctx context.Context, jobID string, generation int64, runnerID string, status model.Status, errMsg string, outputs map[string]string, receipt model.CompletionReceipt) error {
+func (f *fakeStore) CompleteJob(ctx context.Context, jobID string, generation int64, runnerID string, status model.Status, errMsg string, outputs map[string]string, receipt model.CompletionReceipt, observed *model.ObservedRuntime) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.completeCalls = append(f.completeCalls, completeCall{jobID, generation, runnerID, status, errMsg, outputs, receipt})

@@ -127,7 +127,7 @@ func TestMemStoreZeroCapacitySurvivesCompletionAndRelease(t *testing.T) {
 	if err := m.UpsertRunner(ctx(), ri); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.CompleteJob(ctx(), leaseJobID, 1, leaseRunner, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: leaseJobID, Generation: 1, RunnerID: leaseRunner}); err != nil {
+	if err := m.CompleteJob(ctx(), leaseJobID, 1, leaseRunner, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: leaseJobID, Generation: 1, RunnerID: leaseRunner}, nil); err != nil {
 		t.Fatal(err)
 	}
 	ri, err = m.GetRunner(ctx(), leaseRunner)

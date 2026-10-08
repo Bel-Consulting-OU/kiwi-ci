@@ -17,6 +17,16 @@ import (
 // cannot silently degrade deployment state to the process-local mirror.
 var errDeploymentStoreUnsupported = errors.New("server: deployment store unavailable")
 
+// newJobDeployment builds the deployment record for a job, stamping the
+// attempt identity (lease generation) the job is currently running under.
+// The stamp is preserved across the finish: the finish paths only rewrite
+// status/finished_at on the stored record.
+func newJobDeployment(j model.Job, startedAt time.Time) model.Deployment {
+	d := deploy.NewDeployment(j, j.ApprovedBy, nil, &startedAt)
+	d.LeaseGeneration = j.LeaseGeneration
+	return d
+}
+
 // recordDeploymentLocked creates the deployment record for a job starting
 // its environment deployment, if one does not exist yet. Idempotent per
 // job. Called under s.mu (memory mode scheduling path).
@@ -32,9 +42,12 @@ func (s *Server) recordDeploymentLocked(j model.Job, startedAt time.Time) model.
 	}
 	// ApprovedAt is nil: the job tracks ApprovedBy but not the approval
 	// timestamp.
-	d := deploy.NewDeployment(j, j.ApprovedBy, nil, &startedAt)
+	d := newJobDeployment(j, startedAt)
 	s.deployments[j.ID] = d
 	s.auditLocked("deployment.started", "scheduler", j.RunID, j.ID, "deployment started", map[string]string{"environment": j.Environment})
+	// deployment.started is appended next to the record it describes
+	// (best-effort in fs mode; the caller holds s.mu).
+	s.appendExecutionEventLocked(storage.ExecutionEventDeploymentStarted(d))
 	return d
 }
 
@@ -91,7 +104,7 @@ func (s *Server) recordDeploymentDB(ctx context.Context, j model.Job, startedAt 
 		RunID: j.RunID, JobID: j.ID, Message: "deployment started",
 		Metadata: map[string]string{"environment": j.Environment},
 	}
-	d, _, err := ds.StartDeployment(ctx, deploy.NewDeployment(j, j.ApprovedBy, nil, &startedAt), audit)
+	d, _, err := ds.StartDeployment(ctx, newJobDeployment(j, startedAt), audit)
 	if err != nil {
 		return model.Deployment{}, err
 	}
@@ -263,7 +276,7 @@ func (s *Server) finishDeploymentDB(ctx context.Context, j model.Job, status mod
 		if j.StartedAt != nil {
 			started = *j.StartedAt
 		}
-		stored, _, err := ds.InsertDeploymentOnce(ctx, deploy.NewDeployment(j, j.ApprovedBy, nil, &started))
+		stored, _, err := ds.InsertDeploymentOnce(ctx, newJobDeployment(j, started))
 		if err != nil {
 			return err
 		}

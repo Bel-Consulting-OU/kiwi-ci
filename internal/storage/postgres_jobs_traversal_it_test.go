@@ -45,7 +45,7 @@ func TestPostgresIntegrationQueuedJobsTraversalBoundedWalk(t *testing.T) {
 		jobs = append(jobs, model.Job{
 			ID:     fmt.Sprintf("%032x", i+1),
 			RunID:  runID,
-			Key:    "build",
+			Key:    fmt.Sprintf("build-%d", i+1),
 			Status: model.StatusQueued,
 			// Priorities are inverse to age, so the aged order is the REVERSE
 			// of the creation order and cannot accidentally satisfy this test.
@@ -56,8 +56,8 @@ func TestPostgresIntegrationQueuedJobsTraversalBoundedWalk(t *testing.T) {
 	pastID := fmt.Sprintf("%032x", total+1)
 	futureID := fmt.Sprintf("%032x", total+2)
 	jobs = append(jobs,
-		model.Job{ID: pastID, RunID: runID, Key: "build", Status: model.StatusQueued, CreatedAt: now.Add(-time.Hour), QueueDeadline: &past},
-		model.Job{ID: futureID, RunID: runID, Key: "build", Status: model.StatusQueued, CreatedAt: now.Add(-time.Hour), QueueDeadline: &future},
+		model.Job{ID: pastID, RunID: runID, Key: "build-past", Status: model.StatusQueued, CreatedAt: now.Add(-time.Hour), QueueDeadline: &past},
+		model.Job{ID: futureID, RunID: runID, Key: "build-future", Status: model.StatusQueued, CreatedAt: now.Add(-time.Hour), QueueDeadline: &future},
 	)
 	pgITBulkInsertQueuedJobs(t, st, runID, jobs)
 
@@ -148,7 +148,7 @@ func TestPostgresIntegrationQueuedJobsTraversalMemoryParity(t *testing.T) {
 		jobs = append(jobs, model.Job{
 			ID:        fmt.Sprintf("%032x", i+1),
 			RunID:     runID,
-			Key:       "build",
+			Key:       fmt.Sprintf("build-%d", i+1),
 			Status:    model.StatusQueued,
 			Priority:  i % 3,
 			CreatedAt: now.Add(-time.Duration((i*7)%total) * 30 * time.Second),

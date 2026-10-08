@@ -37,7 +37,7 @@ func pgITBoostSeed(runID string, n int, now time.Time, mutate func(i int, j *mod
 		j := model.Job{
 			ID:        fmt.Sprintf("%032x", i+1),
 			RunID:     runID,
-			Key:       "build",
+			Key:       fmt.Sprintf("build-%d", i+1),
 			Status:    model.StatusQueued,
 			CreatedAt: now.Add(-time.Duration(i+1) * time.Second),
 			Priority:  i % 4,
@@ -86,7 +86,7 @@ func TestPostgresIntegrationQueuedBoostPromotion(t *testing.T) {
 	jobs := make([]model.Job, 0, len(seeds))
 	for i, s := range seeds {
 		jobs = append(jobs, model.Job{
-			ID: fmt.Sprintf("%032x", i+1), RunID: runID, Key: "build",
+			ID: fmt.Sprintf("%032x", i+1), RunID: runID, Key: fmt.Sprintf("build-%d", i+1),
 			Status: model.StatusQueued, CreatedAt: now.Add(-s.age),
 		})
 	}

@@ -119,7 +119,7 @@ func TestIntegrationResourceAdmissionOversubscriptionPostgres(t *testing.T) {
 	pgITAssertReservations(t, st, runnerID, fiveGiB, 1)
 
 	receipt := model.CompletionReceipt{JobID: job1, Generation: 1, RunnerID: runnerID}
-	if err := st.CompleteJob(ctx, job1, 1, runnerID, model.StatusSuccess, "", nil, receipt); err != nil {
+	if err := st.CompleteJob(ctx, job1, 1, runnerID, model.StatusSuccess, "", nil, receipt, nil); err != nil {
 		t.Fatalf("complete first: %v", err)
 	}
 	pgITAssertReservations(t, st, runnerID, model.ResourceCapacity{}, 0)
@@ -204,11 +204,11 @@ func TestIntegrationResourceReservationReleaseLifecyclePostgres(t *testing.T) {
 	t.Run("completion", func(t *testing.T) {
 		st, runnerID, jobID := pgITLifecycleEnv(t)
 		receipt := model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID}
-		if err := st.CompleteJob(context.Background(), jobID, 1, runnerID, model.StatusSuccess, "", nil, receipt); err != nil {
+		if err := st.CompleteJob(context.Background(), jobID, 1, runnerID, model.StatusSuccess, "", nil, receipt, nil); err != nil {
 			t.Fatal(err)
 		}
 		assertZero(t, st, runnerID)
-		if err := st.CompleteJob(context.Background(), jobID, 1, runnerID, model.StatusSuccess, "", nil, receipt); err != nil {
+		if err := st.CompleteJob(context.Background(), jobID, 1, runnerID, model.StatusSuccess, "", nil, receipt, nil); err != nil {
 			t.Fatalf("replayed completion: %v", err)
 		}
 		assertZero(t, st, runnerID)
@@ -217,7 +217,7 @@ func TestIntegrationResourceReservationReleaseLifecyclePostgres(t *testing.T) {
 	t.Run("failure completion", func(t *testing.T) {
 		st, runnerID, jobID := pgITLifecycleEnv(t)
 		receipt := model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID}
-		if err := st.CompleteJob(context.Background(), jobID, 1, runnerID, model.StatusFailure, "boom", nil, receipt); err != nil {
+		if err := st.CompleteJob(context.Background(), jobID, 1, runnerID, model.StatusFailure, "boom", nil, receipt, nil); err != nil {
 			t.Fatal(err)
 		}
 		assertZero(t, st, runnerID)

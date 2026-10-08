@@ -118,7 +118,7 @@ func TestIntegrationServiceEnvelopeLeasePostgres(t *testing.T) {
 	// Completing the service job releases the aggregate row; the plain job
 	// then leases and reserves exactly its own request.
 	receipt := model.CompletionReceipt{JobID: fitJob, Generation: 1, RunnerID: runnerID}
-	if err := st.CompleteJob(ctx, fitJob, 1, runnerID, model.StatusSuccess, "", nil, receipt); err != nil {
+	if err := st.CompleteJob(ctx, fitJob, 1, runnerID, model.StatusSuccess, "", nil, receipt, nil); err != nil {
 		t.Fatalf("complete service job: %v", err)
 	}
 	leased, _, _, err = sched.Lease(ctx, runnerID, time.Now().UTC())

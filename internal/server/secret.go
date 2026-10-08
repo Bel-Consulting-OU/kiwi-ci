@@ -929,6 +929,10 @@ func (s *Server) commitSecretIssuanceLocked(req storage.SecretIssuance) (storage
 			return storage.SealedSecretDelivery{}, false, fmt.Errorf("%w: %v", errSecretIssuanceAudit, err)
 		}
 	}
+	// secret.issued is best-effort in fs/memory mode (the claim and audit are
+	// already durable): it carries only the secret NAME and generation,
+	// never the sealed value.
+	s.appendExecutionEventLocked(storage.ExecutionEventSecretIssued(req, j.RunID))
 	return rec.Envelope, false, nil
 }
 

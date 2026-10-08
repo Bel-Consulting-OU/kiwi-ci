@@ -444,13 +444,14 @@ func TestFaultyStoreReservationLedgerParity(t *testing.T) {
 }
 
 // TestCompletionEffectKindClassification pins the split completion-effect
-// classification: the two internal rows are completion effects and internal,
-// the bounded external forge rows (forge_delivery, legacy forge_status) are
-// completion effects but NOT internal, and unrelated kinds are neither.
+// classification: the internal rows (completion_reconcile, execution_attest)
+// are completion effects and internal, the bounded external forge rows
+// (forge_delivery, legacy forge_status) are completion effects but NOT
+// internal, and unrelated kinds are neither.
 func TestCompletionEffectKindClassification(t *testing.T) {
 	internalKinds := NewCompletionEffectKinds()
-	if len(internalKinds) != 2 || internalKinds[0] != OutboxKindCompletionReconcile || internalKinds[1] != OutboxKindForgeDelivery {
-		t.Fatalf("NewCompletionEffectKinds = %v, want the pinned pair", internalKinds)
+	if len(internalKinds) != 3 || internalKinds[0] != OutboxKindCompletionReconcile || internalKinds[1] != OutboxKindForgeDelivery || internalKinds[2] != OutboxKindExecutionAttest {
+		t.Fatalf("NewCompletionEffectKinds = %v, want the pinned triple", internalKinds)
 	}
 	if CompletionEffectIntentCount != len(internalKinds) {
 		t.Fatalf("CompletionEffectIntentCount = %d, want %d", CompletionEffectIntentCount, len(internalKinds))

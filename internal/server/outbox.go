@@ -1641,6 +1641,19 @@ func (s *Server) dispatchOutbox(ctx context.Context, item forge.OutboxItem) erro
 			return nil
 		}
 		return s.dispatchForgeDelivery(ctx, p.JobID)
+	case storage.OutboxKindExecutionAttest:
+		// The final execution attestation of one (job, generation) attempt:
+		// internal, marker-guarded by the attestation row, retried without
+		// dead-lettering until it converges.
+		var p storage.CompletionEffectsPayload
+		if err := json.Unmarshal(item.Payload, &p); err != nil {
+			return err
+		}
+		if p.JobID == "" {
+			log.Printf("outbox: dropping execution attestation with empty job id")
+			return nil
+		}
+		return s.attestExecution(ctx, p.JobID, p.Generation)
 	case storage.OutboxKindForgeStatus:
 		// Legacy pre-split forge_status rows publish the run's terminal
 		// state, exactly like the new forge_delivery kind.

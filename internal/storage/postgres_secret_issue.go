@@ -380,6 +380,13 @@ func (s *PostgresStore) CommitSecretIssuance(ctx context.Context, req SecretIssu
 		ev.ID, ev.Action, nullText(ev.Actor), nullText(ev.RunID), nullText(ev.JobID), nullText(ev.Message), meta, ev.CreatedAt); err != nil {
 		return SealedSecretDelivery{}, false, err
 	}
+	// secret.issued is one transaction with the claim and the audit: a
+	// failed append rolls the delivery back, so the envelope is never
+	// returned without its stream evidence. Only the NAME and generation
+	// travel in the event.
+	if err := appendExecutionEventTx(ctx, tx, ExecutionEventSecretIssued(req, runID)); err != nil {
+		return SealedSecretDelivery{}, false, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return SealedSecretDelivery{}, false, err
 	}

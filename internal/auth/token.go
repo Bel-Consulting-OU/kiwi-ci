@@ -77,7 +77,12 @@ func TokenDigest(raw string) string {
 //   - the global roles must form the same set (order and duplicates are
 //     irrelevant because every role decision goes through Has);
 //   - Repositories must have the same keys and equal RepositoryPermission
-//     values (all grant booleans).
+//     values (all grant booleans);
+//   - Capabilities must form the same set (order and duplicates are
+//     irrelevant because every capability decision goes through
+//     capabilitySetContains);
+//   - RepositoryCapabilities must have the same keys and equal capability
+//     SETS (same set rule as the global list).
 //
 // The comparison is deliberately value-based rather than json.DeepEqual:
 // two tokens authored in different order (roles reordered, repo map
@@ -97,6 +102,18 @@ func effectivePrincipalEqual(a, b Principal) bool {
 	for repo, perm := range a.Repositories {
 		other, ok := b.Repositories[repo]
 		if !ok || other != perm {
+			return false
+		}
+	}
+	if !sameCapabilitySet(a.Capabilities, b.Capabilities) {
+		return false
+	}
+	if len(a.RepositoryCapabilities) != len(b.RepositoryCapabilities) {
+		return false
+	}
+	for repo, caps := range a.RepositoryCapabilities {
+		other, ok := b.RepositoryCapabilities[repo]
+		if !ok || !sameCapabilitySet(caps, other) {
 			return false
 		}
 	}
@@ -169,12 +186,26 @@ func buildSubjectIndex(tokens map[string]Principal) (map[string]Principal, error
 // Go map could not hold both collapsed spellings. Save migrates the keys to
 // the explicit spelling and fails closed if that migration would merge a
 // conflict, so a persisted store always reloads under the strict Load schema.
+//
+// Capability VALUES (global and repository-scoped) are validated against the
+// known set here and by Load; unknown values are rejected. Repository
+// capability KEYS follow the same verbatim/migration contract as
+// Repositories: AddToken keeps them, Save normalizes them, Load validates
+// them strictly.
 func (t *TokenStore) AddToken(raw string, p Principal) error {
 	if t == nil {
 		return fmt.Errorf("auth: nil token store")
 	}
 	if raw == "" {
 		return fmt.Errorf("auth: token must not be empty")
+	}
+	// Capability VALUES are validated strictly here (the same known set Load
+	// enforces): an unknown capability would silently grant nothing, so a
+	// typo must fail the call instead of weakening the identity. Repository
+	// capability KEYS keep the same verbatim/migration contract as
+	// Repositories (Save normalizes them, Load validates them strictly).
+	if err := validatePrincipalCapabilities(p); err != nil {
+		return fmt.Errorf("auth: add token: %w", err)
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -325,14 +356,16 @@ func (t *TokenStore) Empty() bool {
 // never partially loaded.
 //
 // Repository grant keys are validated against the strict ACL schema
-// (ParseRepoGrantConfig): a canonical identity must be the unambiguous r1:
-// form and a bare alias must be the plain owner/name or a1: form. A legacy
-// ambiguous key — three or more path segments without an explicit tag, which
-// could be a dotless host plus a full name or a bare nested group path — is
-// refused with ErrRepoGrantAmbiguous naming the offending string and both
-// accepted spellings. The migration never guesses: an old token file must be
-// edited to the explicit form (or rewritten with AddToken + Save, which
-// migrate legacy in-process keys positionally).
+// (ParseRepoGrantConfig) in BOTH the permission map and the repository
+// capability map: a canonical identity must be the unambiguous r1: form and a
+// bare alias must be the plain owner/name or a1: form. A legacy ambiguous key
+// — three or more path segments without an explicit tag, which could be a
+// dotless host plus a full name or a bare nested group path — is refused with
+// ErrRepoGrantAmbiguous naming the offending string and both accepted
+// spellings. Capability values are validated against the known set
+// (validatePrincipalCapabilities). The migration never guesses: an old token
+// file must be edited to the explicit form (or rewritten with AddToken +
+// Save, which migrate legacy in-process keys positionally).
 func (t *TokenStore) Load(path string) error {
 	if t == nil {
 		return fmt.Errorf("auth: nil token store")
@@ -349,6 +382,9 @@ func (t *TokenStore) Load(path string) error {
 		if err := validatePrincipalRepoGrants(p); err != nil {
 			return fmt.Errorf("auth: load token file %s: token %s: %w", path, digest, err)
 		}
+		if err := validatePrincipalCapabilities(p); err != nil {
+			return fmt.Errorf("auth: load token file %s: token %s: %w", path, digest, err)
+		}
 	}
 	index, err := buildSubjectIndex(m)
 	if err != nil {
@@ -362,11 +398,16 @@ func (t *TokenStore) Load(path string) error {
 }
 
 // validatePrincipalRepoGrants applies the strict ACL grant schema to every
-// repository key of p. It never rewrites the keys: validation and migration
-// are separate steps so a load can fail closed with the operator's exact
-// string.
+// repository key of p, in both the permission map and the capability map. It
+// never rewrites the keys: validation and migration are separate steps so a
+// load can fail closed with the operator's exact string.
 func validatePrincipalRepoGrants(p Principal) error {
 	for key := range p.Repositories {
+		if _, err := ParseRepoGrantConfig(key); err != nil {
+			return err
+		}
+	}
+	for key := range p.RepositoryCapabilities {
 		if _, err := ParseRepoGrantConfig(key); err != nil {
 			return err
 		}
@@ -423,9 +464,15 @@ func (t *TokenStore) Save(path string) error {
 		m[k] = v
 	}
 	// Migrate any legacy in-process grant keys to the explicit schema so the
-	// persisted file always reloads under the strict Load validation.
+	// persisted file always reloads under the strict Load validation. The
+	// repository-scoped capability map is migrated with the same rule (and
+	// capability lists are canonicalized: deduped and sorted).
 	for k, v := range m {
 		normalized, err := normalizePrincipalRepoGrants(v)
+		if err != nil {
+			return fmt.Errorf("auth: save token file %s: %w", path, err)
+		}
+		normalized, err = normalizePrincipalRepoCapabilities(normalized)
 		if err != nil {
 			return fmt.Errorf("auth: save token file %s: %w", path, err)
 		}

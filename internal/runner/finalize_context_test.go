@@ -180,7 +180,7 @@ func TestCompleteBoundedByCompletionGrace(t *testing.T) {
 	r := testRunnerFor(t, ts, Config{})
 	task := basicTask(payloadPipeline)
 	start := time.Now()
-	r.complete(context.Background(), task, model.StatusCancelled, nil, nil)
+	r.complete(context.Background(), task, model.StatusCancelled, nil, nil, nil)
 	elapsed := time.Since(start)
 	if elapsed > 5*time.Second {
 		t.Fatalf("complete took %v with a %v grace; it is not bounded", elapsed, completionGrace)

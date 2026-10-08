@@ -23,11 +23,11 @@ func TestMemStoreRecordUsageOnce(t *testing.T) {
 	ctx := context.Background()
 	m.jobs["j1"] = model.Job{ID: "j1", RunID: "r1", Status: model.StatusSuccess}
 
-	won, err := m.RecordUsageOnce(ctx, "j1", 1.5, 2.5)
+	won, err := m.RecordUsageOnce(ctx, "j1", 0, 1.5, 2.5)
 	if err != nil || !won {
 		t.Fatalf("first RecordUsageOnce = %v, %v; want true, nil", won, err)
 	}
-	won, err = m.RecordUsageOnce(ctx, "j1", 9, 9)
+	won, err = m.RecordUsageOnce(ctx, "j1", 0, 9, 9)
 	if err != nil || won {
 		t.Fatalf("second RecordUsageOnce = %v, %v; want false, nil", won, err)
 	}
@@ -35,7 +35,7 @@ func TestMemStoreRecordUsageOnce(t *testing.T) {
 	if !got.UsageRecorded || got.Cost != 1.5 || got.EnergyWh != 2.5 {
 		t.Fatalf("job after RecordUsageOnce = %+v", got)
 	}
-	won, err = m.RecordUsageOnce(ctx, "missing", 1, 1)
+	won, err = m.RecordUsageOnce(ctx, "missing", 0, 1, 1)
 	if err != nil || won {
 		t.Fatalf("unknown job RecordUsageOnce = %v, %v; want false, nil", won, err)
 	}
@@ -64,7 +64,7 @@ func TestMemStoreRecordUsageOnceConcurrent(t *testing.T) {
 			defer wg.Done()
 			cost := float64(i + 1)
 			energy := cost * 10
-			won, err := m.RecordUsageOnce(ctx, "j1", cost, energy)
+			won, err := m.RecordUsageOnce(ctx, "j1", 0, cost, energy)
 			results <- outcome{cost: cost, energy: energy, won: won, err: err}
 		}(i)
 	}
@@ -117,13 +117,13 @@ func TestFaultyStoreRecordUsageOncePassthrough(t *testing.T) {
 	fault := &FaultyStore{Inner: inner, FailAfter: 1, Err: errUsageOnceDown}
 	ctx := context.Background()
 
-	if _, err := fault.RecordUsageOnce(ctx, "j1", 1, 1); err == nil {
+	if _, err := fault.RecordUsageOnce(ctx, "j1", 0, 1, 1); err == nil {
 		t.Fatal("injected failure must surface")
 	}
 	if inner.jobs["j1"].UsageRecorded {
 		t.Fatal("failed call must not mutate the inner store")
 	}
-	won, err := fault.RecordUsageOnce(ctx, "j1", 3, 4)
+	won, err := fault.RecordUsageOnce(ctx, "j1", 0, 3, 4)
 	if err != nil || !won {
 		t.Fatalf("retry RecordUsageOnce = %v, %v; want true, nil", won, err)
 	}

@@ -129,7 +129,7 @@ func TestIntegrationResourceReconcilePromotionPostgres(t *testing.T) {
 	pgITAssertReservations(t, st, runnerID, model.ResourceCapacity{Memory: 8 << 30}, 2)
 
 	// Completion releases one lease; the repair path reconciles the rest.
-	if err := st.CompleteJob(ctx, old1, 1, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: old1, Generation: 1, RunnerID: runnerID}); err != nil {
+	if err := st.CompleteJob(ctx, old1, 1, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: old1, Generation: 1, RunnerID: runnerID}, nil); err != nil {
 		t.Fatalf("complete old job: %v", err)
 	}
 	if _, err := st.ReconcileResourceReservations(ctx); err != nil {

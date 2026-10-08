@@ -35,7 +35,7 @@ func TestIntegrationExecutionEventsTransitions(t *testing.T) {
 		t.Fatalf("lease: %v", err)
 	}
 	receipt := model.CompletionReceipt{JobID: job1, Generation: 1, RunnerID: runner1, ResultHash: "h1"}
-	if err := st.CompleteJob(ctx, job1, 1, runner1, model.StatusSuccess, "", nil, receipt); err != nil {
+	if err := st.CompleteJob(ctx, job1, 1, runner1, model.StatusSuccess, "", nil, receipt, nil); err != nil {
 		t.Fatalf("complete: %v", err)
 	}
 
@@ -47,6 +47,10 @@ func TestIntegrationExecutionEventsTransitions(t *testing.T) {
 		{"run.queued", "", "queued", 0},
 		{"job.queued", "", "queued", 0},
 		{"job.running", "queued", "running", 1},
+		// The semantic companion of the claim, appended later in the SAME
+		// transaction (after the status trigger): one attempt.created per
+		// successful lease.
+		{model.EventAttemptCreated, "", "", 1},
 		{"job.succeeded", "running", "success", 1},
 		{"run.succeeded", "queued", "success", 0},
 	}
@@ -69,7 +73,11 @@ func TestIntegrationExecutionEventsTransitions(t *testing.T) {
 	if running.JobID != job1 || running.Payload["runner"] != runner1 || running.Payload["job"] == "" {
 		t.Fatalf("running event payload = %+v", running)
 	}
-	done := events[3]
+	attemptCreated := events[3]
+	if attemptCreated.JobID != job1 || attemptCreated.Payload["runner"] != runner1 {
+		t.Fatalf("attempt.created = %+v", attemptCreated)
+	}
+	done := events[4]
 	if done.Payload["started_at"] == "" || done.Payload["finished_at"] == "" || done.Payload["duration_ms"] == "" {
 		t.Fatalf("terminal event timings missing: %+v", done.Payload)
 	}

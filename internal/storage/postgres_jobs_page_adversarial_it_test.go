@@ -173,7 +173,7 @@ func pgITAdvSeedShape(t *testing.T, st *PostgresStore, runID string, n int, now 
 	t.Helper()
 	_, err := st.pool.Exec(context.Background(), `
 		INSERT INTO jobs (id, run_id, key, status, dependency_status, priority, queue_boost, attempts, created_at, required_labels, placement_regions, payload)
-		SELECT lpad(to_hex(i), 32, '0'), $1, 'build', 'queued', 'success', (i % 4), (i / 600), 0,
+		SELECT lpad(to_hex(i), 32, '0'), $1, 'build-' || lpad(to_hex(i), 32, '0'), 'queued', 'success', (i % 4), (i / 600), 0,
 		       $2::timestamptz - (i * interval '1 second'),
 		       `+shape.labels+`,
 		       `+shape.regions+`,
@@ -680,8 +680,8 @@ func pgITAdvSingleEndDistribution() pgITAdvDistribution {
 		seed: func(t *testing.T, st *PostgresStore, runID string, n int, now time.Time) {
 			t.Helper()
 			_, err := st.pool.Exec(context.Background(), `
-				INSERT INTO jobs (id, run_id, key, status, dependency_status, priority, queue_boost, attempts, created_at, required_labels, placement_regions, payload)
-				SELECT lpad(to_hex(i), 32, '0'), $1, 'build', 'queued', 'success',
+			INSERT INTO jobs (id, run_id, key, status, dependency_status, priority, queue_boost, attempts, created_at, required_labels, placement_regions, payload)
+			SELECT lpad(to_hex(i), 32, '0'), $1, 'build-' || lpad(to_hex(i), 32, '0'), 'queued', 'success',
 				       CASE WHEN i = `+fmt.Sprint(special)+` THEN 0 ELSE 3 END,
 				       CASE WHEN i = `+fmt.Sprint(special)+` THEN 0 ELSE 12 END,
 				       0,

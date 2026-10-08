@@ -190,8 +190,8 @@ func TestPostgresIntegrationValidationSweep(t *testing.T) {
 		_, err := st.AcquireLeaseAtomic(ctx, LeaseClaim{JobID: jobID, RunnerID: ""})
 		return err
 	}(), true)
-	bad("CompleteJob/bad-id", st.CompleteJob(ctx, "bad", 1, good, model.StatusSuccess, "", nil, model.CompletionReceipt{}), true)
-	bad("CompleteJob/negative-gen", st.CompleteJob(ctx, jobID, -1, good, model.StatusSuccess, "", nil, model.CompletionReceipt{}), true)
+	bad("CompleteJob/bad-id", st.CompleteJob(ctx, "bad", 1, good, model.StatusSuccess, "", nil, model.CompletionReceipt{}, nil), true)
+	bad("CompleteJob/negative-gen", st.CompleteJob(ctx, jobID, -1, good, model.StatusSuccess, "", nil, model.CompletionReceipt{}, nil), true)
 	bad("CancelRunJobs/bad-run", func() error { _, err := st.CancelRunJobs(ctx, "bad", "r"); return err }(), true)
 }
 
@@ -404,7 +404,7 @@ func TestPostgresIntegrationCorruptStateErrorBranches(t *testing.T) {
 	queuedRun := pgITNewID(t)
 	queuedJob := pgITNewID(t)
 	pgITEnqueueOne(t, st, queuedRun, queuedJob, pgITRepo)
-	err = st.CompleteJob(ctx, queuedJob, 0, "", model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: queuedJob, Generation: 0, RunnerID: ""})
+	err = st.CompleteJob(ctx, queuedJob, 0, "", model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: queuedJob, Generation: 0, RunnerID: ""}, nil)
 	if !errors.Is(err, ErrLeaseConflict) {
 		t.Fatalf("queued completion = %v, want ErrLeaseConflict", err)
 	}
@@ -416,7 +416,7 @@ func TestPostgresIntegrationCorruptStateErrorBranches(t *testing.T) {
 	if _, err := st.pool.Exec(ctx, `UPDATE jobs SET payload='"scalar"'::jsonb WHERE id=$1`, queuedJob); err != nil {
 		t.Fatalf("corrupt job: %v", err)
 	}
-	err = st.CompleteJob(ctx, queuedJob, 1, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: queuedJob, Generation: 1, RunnerID: runnerID})
+	err = st.CompleteJob(ctx, queuedJob, 1, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: queuedJob, Generation: 1, RunnerID: runnerID}, nil)
 	if err == nil {
 		t.Fatal("completing a scalar payload must fail the decode")
 	}
@@ -443,7 +443,7 @@ func TestPostgresIntegrationCompleteJobErrorBranches(t *testing.T) {
 	}
 	lease(t)
 	badHash := model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID, ResultHash: "bad\x00hash"}
-	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, badHash); err == nil {
+	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, badHash, nil); err == nil {
 		t.Fatal("a NUL result hash must fail the receipt insert")
 	}
 
@@ -454,7 +454,7 @@ func TestPostgresIntegrationCompleteJobErrorBranches(t *testing.T) {
 		t.Fatalf("occupy effect id: %v", err)
 	}
 	good := model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID}
-	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, good); err == nil {
+	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, good, nil); err == nil {
 		t.Fatal("an occupied effect id must roll the completion back")
 	}
 	stillRunning, _ := st.GetJob(ctx, jobID)
@@ -469,7 +469,7 @@ func TestPostgresIntegrationCompleteJobErrorBranches(t *testing.T) {
 	if _, err := st.pool.Exec(ctx, `ALTER TABLE quota_reservations RENAME TO quota_reservations_hidden`); err != nil {
 		t.Fatalf("hide quota table: %v", err)
 	}
-	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, good); err == nil {
+	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, good, nil); err == nil {
 		t.Fatal("a missing quota table must fail the quota adjustment")
 	}
 	if _, err := st.pool.Exec(ctx, `ALTER TABLE quota_reservations_hidden RENAME TO quota_reservations`); err != nil {
@@ -478,21 +478,21 @@ func TestPostgresIntegrationCompleteJobErrorBranches(t *testing.T) {
 	if _, err := st.pool.Exec(ctx, `UPDATE runners SET payload='42'::jsonb WHERE id=$1`, runnerID); err != nil {
 		t.Fatalf("corrupt runner: %v", err)
 	}
-	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, good); err == nil {
+	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, good, nil); err == nil {
 		t.Fatal("a corrupt runner payload must fail the completion")
 	}
 	// A corrupt active_jobs column is its own decode error.
 	if _, err := st.pool.Exec(ctx, `UPDATE runners SET payload='{}'::jsonb, active_jobs='{"not":"array"}'::jsonb WHERE id=$1`, runnerID); err != nil {
 		t.Fatalf("corrupt active jobs: %v", err)
 	}
-	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, good); err == nil {
+	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, good, nil); err == nil {
 		t.Fatal("a corrupt active_jobs column must fail the completion")
 	}
 	// A runner with a remaining active job promotes the next current job.
 	if _, err := st.pool.Exec(ctx, `UPDATE runners SET payload='{}'::jsonb, active_jobs=to_jsonb(ARRAY[$2::text]) WHERE id=$1`, runnerID, memJobID); err != nil {
 		t.Fatalf("seed active job: %v", err)
 	}
-	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, good); err != nil {
+	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, good, nil); err != nil {
 		t.Fatalf("completion with a remaining active job: %v", err)
 	}
 	runner, _ := st.GetRunner(ctx, runnerID)
@@ -519,7 +519,7 @@ func TestPostgresIntegrationCompleteJobErrorBranches(t *testing.T) {
 		t.Fatalf("lease dependent parent: %v", err)
 	}
 	depReceipt := model.CompletionReceipt{JobID: depParent, Generation: 1, RunnerID: runnerID}
-	if err := st.CompleteJob(ctx, depParent, 1, runnerID, model.StatusSuccess, "", nil, depReceipt); err == nil {
+	if err := st.CompleteJob(ctx, depParent, 1, runnerID, model.StatusSuccess, "", nil, depReceipt, nil); err == nil {
 		t.Fatal("a corrupt dependent payload must fail the completion")
 	}
 
@@ -536,7 +536,7 @@ func TestPostgresIntegrationCompleteJobErrorBranches(t *testing.T) {
 		t.Fatalf("lease orphan: %v", err)
 	}
 	orphanReceipt := model.CompletionReceipt{JobID: orphanJob, Generation: 1, RunnerID: runnerB}
-	if err := st.CompleteJob(ctx, orphanJob, 1, runnerB, model.StatusSuccess, "", nil, orphanReceipt); err == nil {
+	if err := st.CompleteJob(ctx, orphanJob, 1, runnerB, model.StatusSuccess, "", nil, orphanReceipt, nil); err == nil {
 		t.Fatal("a corrupt run payload must fail the completion")
 	}
 
@@ -551,14 +551,14 @@ func TestPostgresIntegrationCompleteJobErrorBranches(t *testing.T) {
 		t.Fatalf("lease contract job: %v", err)
 	}
 	contractReceipt := model.CompletionReceipt{JobID: contractJob, Generation: 1, RunnerID: runnerB}
-	if err := st.CompleteJob(ctx, contractJob, 1, runnerB, model.StatusSuccess, "", nil, contractReceipt); err == nil {
+	if err := st.CompleteJob(ctx, contractJob, 1, runnerB, model.StatusSuccess, "", nil, contractReceipt, nil); err == nil {
 		t.Fatal("a non-object contracts payload must fail the completion")
 	}
 	// A non-required contract entry does not block success.
 	if _, err := st.pool.Exec(ctx, `UPDATE jobs SET payload = jsonb_set(payload, '{artifact_contracts}', '{"report":{"name":"report"}}'::jsonb, true) WHERE id=$1`, contractJob); err != nil {
 		t.Fatalf("optional contract: %v", err)
 	}
-	if err := st.CompleteJob(ctx, contractJob, 1, runnerB, model.StatusSuccess, "", nil, contractReceipt); err != nil {
+	if err := st.CompleteJob(ctx, contractJob, 1, runnerB, model.StatusSuccess, "", nil, contractReceipt, nil); err != nil {
 		t.Fatalf("a non-required contract must not block success: %v", err)
 	}
 }

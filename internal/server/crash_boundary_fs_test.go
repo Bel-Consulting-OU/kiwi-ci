@@ -88,7 +88,7 @@ func crashStripCompletionArtifacts(t *testing.T, dir, jobID string) {
 		var it forge.OutboxItem
 		if err := json.Unmarshal(line, &it); err == nil {
 			switch it.Kind {
-			case storage.OutboxKindCompletionReconcile, storage.OutboxKindForgeDelivery, forge.OutboxKindDownstream:
+			case storage.OutboxKindCompletionReconcile, storage.OutboxKindForgeDelivery, storage.OutboxKindExecutionAttest, forge.OutboxKindDownstream:
 				continue
 			}
 		}
@@ -643,7 +643,7 @@ func crashStripPostPersistCompletionIntents(t *testing.T, dir string) {
 		var it forge.OutboxItem
 		if err := json.Unmarshal(line, &it); err == nil {
 			switch it.Kind {
-			case storage.OutboxKindCompletionReconcile, storage.OutboxKindForgeDelivery,
+			case storage.OutboxKindCompletionReconcile, storage.OutboxKindForgeDelivery, storage.OutboxKindExecutionAttest,
 				forge.OutboxKindGitHubCheck, forge.OutboxKindGitLabCheck, forge.OutboxKindForgejoCheck,
 				forge.OutboxKindGitHubStatus, forge.OutboxKindDownstream:
 				continue

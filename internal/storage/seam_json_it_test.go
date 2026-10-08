@@ -342,7 +342,7 @@ func TestPostgresIntegrationJSONSeamSweep(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer seamPGFailAll(t)()
-		err := st.CompleteJob(ctx, leased, 1, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: leased, Generation: 1, RunnerID: runnerID})
+		err := st.CompleteJob(ctx, leased, 1, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: leased, Generation: 1, RunnerID: runnerID}, nil)
 		if !errors.Is(err, errPGSeamJSON) {
 			t.Fatalf("CompleteJob = %v", err)
 		}
@@ -354,7 +354,7 @@ func TestPostgresIntegrationJSONSeamSweep(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer seamPGFailAt(t, 2)()
-		err := st.CompleteJob(ctx, leased, 1, runnerID, model.StatusSuccess, "", map[string]string{"o": "v"}, model.CompletionReceipt{JobID: leased, Generation: 1, RunnerID: runnerID})
+		err := st.CompleteJob(ctx, leased, 1, runnerID, model.StatusSuccess, "", map[string]string{"o": "v"}, model.CompletionReceipt{JobID: leased, Generation: 1, RunnerID: runnerID}, nil)
 		if !errors.Is(err, errPGSeamJSON) {
 			t.Fatalf("CompleteJob outputs = %v", err)
 		}

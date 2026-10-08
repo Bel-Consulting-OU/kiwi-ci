@@ -109,7 +109,7 @@ func faultyWrapperCases() map[string]wrapperCase {
 			return f.HeartbeatLease(ctx(), testJob.ID, testRunner.ID, 1, time.Now().UTC().Add(time.Minute))
 		}},
 		"CompleteJob": {mutates: true, seed: func(m *memStore) { seedRunningJob(m); seedRunner(m) }, call: func(f *FaultyStore) error {
-			return f.CompleteJob(ctx(), testJob.ID, 1, testRunner.ID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: testJob.ID, Generation: 1, RunnerID: testRunner.ID})
+			return f.CompleteJob(ctx(), testJob.ID, 1, testRunner.ID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: testJob.ID, Generation: 1, RunnerID: testRunner.ID}, nil)
 		}},
 		"CancelRunJobs": {mutates: true, seed: seedRunAndJob, call: func(f *FaultyStore) error {
 			_, err := f.CancelRunJobs(ctx(), testRun.ID, "reason")
@@ -687,7 +687,7 @@ func (storeOnlyInner) HeartbeatLease(context.Context, string, string, int64, tim
 	return nil
 }
 
-func (storeOnlyInner) CompleteJob(context.Context, string, int64, string, model.Status, string, map[string]string, model.CompletionReceipt) error {
+func (storeOnlyInner) CompleteJob(context.Context, string, int64, string, model.Status, string, map[string]string, model.CompletionReceipt, *model.ObservedRuntime) error {
 	return nil
 }
 
@@ -885,7 +885,7 @@ func missingOptionalInterfaceCases() map[string]missingIfaceCase {
 			return err
 		}},
 		"RecordUsageOnce": {mutates: true, iface: "UsageOnceStore", call: func(f *FaultyStore) error {
-			_, err := f.RecordUsageOnce(ctx(), "", 0, 0)
+			_, err := f.RecordUsageOnce(ctx(), "", 0, 0, 0)
 			return err
 		}},
 		"AppendDownstreamRun": {mutates: true, iface: "RunDownstreamStore", call: func(f *FaultyStore) error {

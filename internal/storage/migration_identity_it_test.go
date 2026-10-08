@@ -307,7 +307,7 @@ func TestPostgresIntegrationNonLeaseMutationFencedAgainstMigration(t *testing.T)
 	receipt := model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID}
 	done := make(chan error, 1)
 	go func() {
-		done <- st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, receipt)
+		done <- st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, receipt, nil)
 	}()
 	select {
 	case err := <-done:

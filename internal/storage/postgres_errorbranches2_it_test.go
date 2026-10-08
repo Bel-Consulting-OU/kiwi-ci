@@ -401,7 +401,7 @@ func TestPostgresIntegrationTriggerExtras(t *testing.T) {
 			t.Fatalf("lease: %v", err)
 		}
 		receipt := model.CompletionReceipt{JobID: ids.job, Generation: 1, RunnerID: ids.runner}
-		if err := st.CompleteJob(ctx, ids.job, 1, ids.runner, model.StatusFailure, "bad\x00error", nil, receipt); err == nil {
+		if err := st.CompleteJob(ctx, ids.job, 1, ids.runner, model.StatusFailure, "bad\x00error", nil, receipt, nil); err == nil {
 			t.Fatal("a NUL error message must fail the job update")
 		}
 	})

@@ -51,8 +51,11 @@ func pgITInsertRunIdentityStatus(t *testing.T, st *PostgresStore, runID, status,
 
 func pgITInsertJobIdentityStatus(t *testing.T, st *PostgresStore, runID, jobID, status, repoID, policyID, url, full string) {
 	t.Helper()
+	// The Key is derived from the job id so raw-inserted fixture jobs obey the
+	// run-scoped logical identity rule (migration 0048) when a run holds more
+	// than one of them.
 	_, err := st.pool.Exec(context.Background(),
-		`INSERT INTO jobs (id, run_id, key, status, created_at, payload) VALUES ($1, $2, 'build', $3, now(), $4::jsonb)`,
+		`INSERT INTO jobs (id, run_id, key, status, created_at, payload) VALUES ($1, $2, 'build-' || $1, $3, now(), $4::jsonb)`,
 		jobID, runID, status, pgITIdentityPayload(t, repoID, policyID, url, full))
 	if err != nil {
 		t.Fatalf("insert job %s: %v", jobID, err)

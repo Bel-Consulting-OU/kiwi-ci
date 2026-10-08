@@ -24,6 +24,15 @@ const fakeDockerScript = `#!/bin/sh
 echo "$@" >> "${FAKE_DOCKER_LOG:-/dev/null}"
 sub="$1"; shift
 case "$sub" in
+  version)
+    if [ -n "$FAKE_DOCKER_VERSION" ]; then printf '%s\n' "$FAKE_DOCKER_VERSION"; else echo "27.0.0"; fi
+    exit "${FAKE_DOCKER_VERSION_EXIT:-0}";;
+  image)
+    if [ "$1" = "inspect" ]; then
+      if [ "${FAKE_DOCKER_INSPECT_FAIL:-0}" = "1" ]; then echo "inspect failed" >&2; exit "${FAKE_DOCKER_INSPECT_EXIT:-1}"; fi
+      if [ -n "$FAKE_DOCKER_IMAGE_DIGEST" ]; then printf '%s\n' "$FAKE_DOCKER_IMAGE_DIGEST"; fi
+      exit "${FAKE_DOCKER_INSPECT_EXIT:-0}"
+    fi;;
   info)
     if [ -n "$FAKE_DOCKER_INFO" ]; then printf '%s\n' "$FAKE_DOCKER_INFO"; else echo "[name=seccomp,profile=builtin name=rootless]"; fi
     exit "${FAKE_DOCKER_INFO_EXIT:-0}";;
@@ -144,6 +153,9 @@ const fakeTartScript = `#!/bin/sh
 echo "$@" >> "${FAKE_TART_LOG:-/dev/null}"
 sub="$1"
 case "$sub" in
+  --version)
+    printf '%s\n' "${FAKE_TART_VERSION:-tart 2.0.0}"
+    exit "${FAKE_TART_VERSION_EXIT:-0}";;
   run)
     if [ "$2" = "--help" ]; then
       if [ "${FAKE_TART_SELF_DESTRUCT:-0}" = "1" ]; then rm -f "$0"; exit 0; fi

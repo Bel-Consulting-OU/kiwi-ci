@@ -32,6 +32,12 @@ listen = ":8080"
 # max_cache_manifests_per_repo = 4096
 # max_cache_manifest_bytes_per_repo = 68719476736
 
+# Durable execution event stream retention. The oldest events are pruned as
+# a contiguous prefix; a consumer cursor below the retained_from watermark
+# is answered with HTTP 410 cursor_expired and must re-bootstrap via
+# latest_cursor. Unset uses 7 days (168h); "0" disables retention.
+# events_retention = "168h"
+
 # CIDR ranges of reverse proxies in front of Kiwi. Only when the direct peer
 # is inside one of these ranges is X-Forwarded-For honored (rightmost
 # untrusted hop); otherwise the peer address is the rate-limit identity.
@@ -187,7 +193,42 @@ admin_token = "change-me"
 # below). Dev/bootstrap only.
 # runner_token = ""
 
-# JSON token-store path for fine-grained principals (auth.TokenStore format).
+# JSON token-store path for fine-grained principals (auth.TokenStore format:
+# a JSON object mapping the SHA-256 hex digest of a bearer token to its
+# principal). Roles and repository permissions remain the primary RBAC
+# grants; "capabilities" (all repositories) and "repository_capabilities"
+# (per repository grant key, same r1:/a1:/owner/name schema as
+# "repositories") are the fine-grained CONTROLLER grants for external
+# consumers that must not hold admin:
+#
+#   execution.events:read  GET /api/v1/events + /events/stream: the unscoped
+#                          cursor read requires a global grant; with a run_id
+#                          a repository-scoped grant (or plain read access to
+#                          that run's repository) suffices.
+#   evidence:read          GET /api/v1/audit (global only: the trail spans
+#                          repositories) and the exact-replay pipeline/payload
+#                          export (run-scoped).
+#   checkpoints:read       workspace snapshot listing and archive download
+#                          (run-scoped).
+#   runs:cancel            cancel a run (repo-scoped), like the cancel role.
+#   graph.mutations:write  reserved for the future generic graph API; it is
+#                          accepted and validated in this file but wires no
+#                          route yet.
+#
+# A global capability (in "capabilities") is additive: a repository entry can
+# only add capabilities, never take a global one away. Example controller
+# principal ("<sha256 hex of its bearer token>" -> grants):
+#
+# {
+#   "0123456789abcdef...": {
+#     "subject": "faktor",
+#     "capabilities": ["evidence:read"],
+#     "repository_capabilities": {
+#       "r1:Z2l0aHViLmNvbQ:YWNtZS9yZXBvLWE": ["checkpoints:read", "execution.events:read", "runs:cancel"]
+#     }
+#   }
+# }
+#
 # tokens_file = "/etc/kiwi/tokens.json"
 
 # JSON file of per-runner bearer credentials: maps a runner ID to the

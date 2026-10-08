@@ -703,6 +703,17 @@ func (s *PostgresStore) InsertCompiledRun(ctx context.Context, req InsertCompile
 	if err := s.insertRunTx(ctx, tx, req.Run); err != nil {
 		return err
 	}
+	// Defense in depth for the run-scoped logical identity (migration 0048):
+	// compilation guarantees unique Keys per run, so this probes only for a
+	// caller that bypassed compilation or a pre-0048 database that still
+	// carries a duplicate. It deliberately takes no per-run advisory lock:
+	// the compiled jobs of a run are always inserted in this single
+	// transaction before any dynamic child can exist, so no concurrent
+	// writer can race this probe. The unique index is the final backstop on
+	// clean databases.
+	if err := s.checkCompiledRunJobKeysTx(ctx, tx, req.Run.ID, req.Jobs); err != nil {
+		return err
+	}
 	for id, j := range req.Jobs {
 		if err := ValidateJobID(id); err != nil {
 			return err
@@ -1434,6 +1445,43 @@ func (s *PostgresStore) insertJobTx(ctx context.Context, tx pgx.Tx, j model.Job)
 	return s.replaceDependenciesTx(ctx, tx, j)
 }
 
+// checkCompiledRunJobKeysTx is the defense-in-depth run-scoped logical
+// identity probe for ordinary enqueues: it reads the run's committed job
+// keys (the run row was inserted moments earlier in this same transaction,
+// so on a healthy database this is always empty) and fails closed with
+// *GeneratedJobKeyConflictError when any requested Key already exists. See
+// InsertCompiledRun for why no advisory lock is taken here.
+func (s *PostgresStore) checkCompiledRunJobKeysTx(ctx context.Context, tx pgx.Tx, runID string, jobs map[string]model.Job) error {
+	if len(jobs) == 0 {
+		return nil
+	}
+	requestedKeys := make([]string, 0, len(jobs))
+	for _, j := range jobs {
+		requestedKeys = append(requestedKeys, j.Key)
+	}
+	existingByKey := make(map[string]string, len(requestedKeys))
+	rows, err := tx.Query(ctx, `SELECT key, id FROM jobs WHERE run_id=$1 AND key = ANY($2)`, runID, requestedKeys)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var key, id string
+		if err := rows.Scan(&key, &id); err != nil {
+			rows.Close()
+			return err
+		}
+		if _, ok := existingByKey[key]; !ok {
+			existingByKey[key] = id
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	return CheckGeneratedJobKeyConflicts(runID, jobs, existingByKey)
+}
+
 // insertJobRowTx inserts only the job row (no dependency edges) so the
 // atomic enqueue can insert every job before wiring the dependency graph,
 // avoiding foreign-key failures when dependency edges are inserted in
@@ -1672,6 +1720,12 @@ func (s *PostgresStore) ApproveJob(ctx context.Context, jobID, actor string) (mo
 	}
 	labels, regions := jobNormalizedFilterLists(j)
 	if _, err := tx.Exec(ctx, `UPDATE jobs SET status=$2, payload=$3, required_labels=$4, placement_regions=$5 WHERE id=$1`, jobID, string(j.Status), newPayload, labels, regions); err != nil {
+		return model.Job{}, err
+	}
+	// The approval act is part of the same transaction: a failed semantic
+	// append rolls the approval back (fail closed), so an approval can never
+	// commit without its stream evidence.
+	if err := appendExecutionEventTx(ctx, tx, ExecutionEventApprovalGranted(j, actor)); err != nil {
 		return model.Job{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -2046,6 +2100,12 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 	if ct.RowsAffected() == 0 {
 		return model.Job{}, ErrNoCapacity
 	}
+	// attempt.created is part of the claim transaction: a failed semantic
+	// append rolls the whole lease back (no token, no reservation), so the
+	// stream can never claim an attempt whose lease did not commit.
+	if err := appendExecutionEventTx(ctx, tx, ExecutionEventAttemptCreated(j, claim.RunnerID)); err != nil {
+		return model.Job{}, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return model.Job{}, err
 	}
@@ -2287,7 +2347,7 @@ func completionReceiptHashTx(ctx context.Context, tx pgx.Tx, jobID string, gener
 // UPDATE, verify generation+runner+status running, insert the receipt ON
 // CONFLICT DO NOTHING, update the job, update runner counters, recompute
 // dependent jobs and the run status, and record the audit event.
-func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generation int64, runnerID string, status model.Status, errMsg string, outputs map[string]string, receipt model.CompletionReceipt) error {
+func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generation int64, runnerID string, status model.Status, errMsg string, outputs map[string]string, receipt model.CompletionReceipt, observed *model.ObservedRuntime) error {
 	if err := ValidateJobID(jobID); err != nil {
 		return err
 	}
@@ -2395,6 +2455,14 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 	j.LeaseRunnerID = ""
 	j.LeaseTokenHash = nil
 	j.LeaseExpiresAt = nil
+	// The completing runner identity survives the lease in AttemptRunnerID:
+	// it is the durable runner evidence the final execution attestation
+	// binds after the lease columns are cleared.
+	j.AttemptRunnerID = runnerID
+	// The executor-observed runtime identity of this attempt is completion
+	// evidence: it rides the completion transaction's payload write, so a
+	// rolled-back completion leaves no evidence behind.
+	j.ObservedRuntime = observed
 	newPayload, err := jsonMarshal(j)
 	if err != nil {
 		return err
@@ -2499,7 +2567,7 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 // own backoff/dead-letter policy). Splitting them keeps a persistently
 // failing forge from retiring the internal consistency row.
 func (s *PostgresStore) insertCompletionEffectsTx(ctx context.Context, tx pgx.Tx, jobID, runID string, generation int64, now time.Time) error {
-	payload, err := jsonMarshal(CompletionEffectsPayload{JobID: jobID, RunID: runID})
+	payload, err := jsonMarshal(CompletionEffectsPayload{JobID: jobID, RunID: runID, Generation: generation})
 	if err != nil {
 		return err
 	}
@@ -2531,6 +2599,13 @@ func (s *PostgresStore) insertCompletionEffectsTx(ctx context.Context, tx pgx.Tx
 // is part of the artifact idempotency key (job_id, job_generation, name), so
 // an artifact uploaded under an earlier generation can no longer satisfy a
 // later lease's completion.
+//
+// A contract with Provenance=required additionally demands a durable signed
+// provenance reference on the committed row (payload provenance_sha256
+// non-empty): an artifact the upload could only commit without provenance
+// (best-effort signing path, legacy record) does NOT satisfy the completion,
+// so the required-provenance promise is enforced at the same transaction
+// boundary as the required-artifact promise.
 func (s *PostgresStore) requiredArtifactMissingTx(ctx context.Context, tx pgx.Tx, jobID string, generation int64, payload []byte) (string, error) {
 	var wrapper struct {
 		ArtifactContracts map[string]ArtifactContract `json:"artifact_contracts"`
@@ -2542,8 +2617,9 @@ func (s *PostgresStore) requiredArtifactMissingTx(ctx context.Context, tx pgx.Tx
 		if !c.Required {
 			continue
 		}
+		provenanceRequired := c.Provenance == ArtifactProvenanceRequired
 		var exists bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM artifacts WHERE job_id=$1 AND COALESCE(NULLIF(job_generation,0), CASE WHEN jsonb_typeof(payload->'lease_generation')='number' AND (payload->>'lease_generation') ~ '^[0-9]{1,18}$' THEN (payload->>'lease_generation')::bigint ELSE 0 END) = $2 AND name=$3)`, jobID, generation, name).Scan(&exists); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM artifacts WHERE job_id=$1 AND COALESCE(NULLIF(job_generation,0), CASE WHEN jsonb_typeof(payload->'lease_generation')='number' AND (payload->>'lease_generation') ~ '^[0-9]{1,18}$' THEN (payload->>'lease_generation')::bigint ELSE 0 END) = $2 AND name=$3 AND (NOT $4 OR COALESCE(payload->>'provenance_sha256','') <> ''))`, jobID, generation, name, provenanceRequired).Scan(&exists); err != nil {
 			return "", err
 		}
 		if !exists {
@@ -3685,13 +3761,15 @@ func (s *PostgresStore) listTestReports(ctx context.Context, query string, args 
 // table. The caller-supplied e.Seq is ignored: the sequence is allocated by
 // Postgres inside the insert transaction (INSERT ... RETURNING seq), so
 // appends stay strictly increasing regardless of clock ordering across
-// replicas or restarts.
+// replicas or restarts. e.LeaseGeneration is the attempt identity the lease
+// delivered the line under and is persisted with it (migration 0051), so DB
+// reads can attribute a line to an attempt exactly like the fs/memory paths.
 func (s *PostgresStore) AppendLog(ctx context.Context, e model.LogEntry) error {
 	if err := ValidateRunID(e.RunID); err != nil {
 		return err
 	}
-	err := s.queryRowSchemaCompatible(ctx, `INSERT INTO log_entries (run_id, job_id, job_key, step, line, created_at) VALUES ($1, $2, $3, $4, $5, $6) RETURNING seq`,
-		[]any{e.RunID, nullText(e.JobID), nullText(e.JobKey), nullText(e.Step), e.Line, e.CreatedAt}, func(row pgx.Row) error {
+	err := s.queryRowSchemaCompatible(ctx, `INSERT INTO log_entries (run_id, job_id, job_key, step, line, lease_generation, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING seq`,
+		[]any{e.RunID, nullText(e.JobID), nullText(e.JobKey), nullText(e.Step), e.Line, e.LeaseGeneration, e.CreatedAt}, func(row pgx.Row) error {
 			return row.Scan(&e.Seq)
 		})
 	return err
@@ -3704,7 +3782,7 @@ func (s *PostgresStore) ReadLogs(ctx context.Context, runID string, after int64,
 	if limit <= 0 || limit > 10000 {
 		limit = 2000
 	}
-	rows, err := s.pool.Query(ctx, `SELECT COALESCE(job_id, ''), COALESCE(job_key, ''), COALESCE(step, ''), seq, line, created_at FROM log_entries WHERE run_id=$1 AND seq>$2 ORDER BY seq ASC LIMIT $3`, runID, after, limit)
+	rows, err := s.pool.Query(ctx, `SELECT COALESCE(job_id, ''), COALESCE(job_key, ''), COALESCE(step, ''), seq, line, COALESCE(lease_generation, 0), created_at FROM log_entries WHERE run_id=$1 AND seq>$2 ORDER BY seq ASC LIMIT $3`, runID, after, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -3712,7 +3790,7 @@ func (s *PostgresStore) ReadLogs(ctx context.Context, runID string, after int64,
 	out := []model.LogEntry{}
 	for rows.Next() {
 		var e model.LogEntry
-		if err := rows.Scan(&e.JobID, &e.JobKey, &e.Step, &e.Seq, &e.Line, &e.CreatedAt); err != nil {
+		if err := rows.Scan(&e.JobID, &e.JobKey, &e.Step, &e.Seq, &e.Line, &e.LeaseGeneration, &e.CreatedAt); err != nil {
 			return nil, err
 		}
 		e.RunID = runID
@@ -4542,6 +4620,11 @@ func (s *PostgresStore) StartDeployment(ctx context.Context, d model.Deployment,
 			// The audit is part of the creation: roll the row back too.
 			return model.Deployment{}, false, err
 		}
+		// The semantic event shares the creation transaction: a failed
+		// append rolls the deployment back as well.
+		if err := appendExecutionEventTx(ctx, tx, ExecutionEventDeploymentStarted(stored)); err != nil {
+			return model.Deployment{}, false, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return model.Deployment{}, false, err
@@ -4589,6 +4672,11 @@ func (s *PostgresStore) FinishDeploymentOnce(ctx context.Context, id string, sta
 		return false, err
 	}
 	if err := startDeploymentAuditTx(ctx, tx, audit); err != nil {
+		return false, err
+	}
+	// deployment.completed is exactly-once with the finish marker: both
+	// commit or neither does.
+	if err := appendExecutionEventTx(ctx, tx, ExecutionEventDeploymentCompleted(d)); err != nil {
 		return false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -4869,10 +4957,15 @@ func (s *PostgresStore) GetGeneratedFragment(ctx context.Context, parentJobID, m
 //     slot is refused with ErrGeneratedMutationConflict before any row is
 //     written — a nondeterministic generator retry cannot append a second
 //     child graph;
-//  3. the run's current job count is read inside the transaction and the
+//  3. the per-run advisory lock (kiwi_run_jobs namespace) serializes
+//     concurrent fragment insertions of the same run, and every requested
+//     child Key is checked against the run's existing job rows — the
+//     run-scoped logical identity rule: a collision fails closed with
+//     *GeneratedJobKeyConflictError and nothing in the transaction commits;
+//  4. the run's current job count is read inside the transaction and the
 //     verifier re-checks graph invariants and the max-jobs-per-run bound
 //     against that fresh state;
-//  4. the child jobs, dependency edges, artifact contracts and the receipt
+//  5. the child jobs, dependency edges, artifact contracts and the receipt
 //     commit together — a generated job with a Required artifact has its
 //     contract row present before any completion can run, and a crash can
 //     never leave a receipt without its children (or children without a
@@ -4934,7 +5027,56 @@ func (s *PostgresStore) InsertGeneratedFragmentTx(ctx context.Context, req Gener
 		return GeneratedFragmentReceipt{}, false, err
 	}
 	if found {
+		// The replay act is journaled in the same transaction that proved it
+		// (the tx mutated nothing, so committing is exactly the no-op the
+		// rollback would have been, plus the durable semantic event).
+		if err := appendExecutionEventTx(ctx, tx, ExecutionEventGraphMutation(true, parent, slot, rec.FragmentID, len(rec.Children))); err != nil {
+			return GeneratedFragmentReceipt{}, false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return GeneratedFragmentReceipt{}, false, err
+		}
 		return rec, true, nil
+	}
+	// Run-scoped logical identity admission. The advisory lock serializes
+	// fragment insertions of the SAME run across concurrent transactions
+	// (different parents of one run lock different rows above, so the parent
+	// FOR UPDATE alone cannot order them), and the key probe then sees every
+	// committed sibling. The lock is transaction-scoped and keyed by the run
+	// in its own namespace, so it never aliases the schema-migrations lock.
+	// Ordinary InsertCompiledRun deliberately takes no such lock: a run's
+	// compiled jobs are always inserted before any dynamic child can exist.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('kiwi_run_jobs'), hashtext($1))`, parent.RunID); err != nil {
+		return GeneratedFragmentReceipt{}, false, err
+	}
+	requestedKeys := make([]string, 0, len(req.Jobs))
+	for _, j := range req.Jobs {
+		requestedKeys = append(requestedKeys, j.Key)
+	}
+	existingByKey := make(map[string]string, len(requestedKeys))
+	if len(requestedKeys) > 0 {
+		rows, err := tx.Query(ctx, `SELECT key, id FROM jobs WHERE run_id=$1 AND key = ANY($2)`, parent.RunID, requestedKeys)
+		if err != nil {
+			return GeneratedFragmentReceipt{}, false, err
+		}
+		for rows.Next() {
+			var key, id string
+			if err := rows.Scan(&key, &id); err != nil {
+				rows.Close()
+				return GeneratedFragmentReceipt{}, false, err
+			}
+			if _, ok := existingByKey[key]; !ok {
+				existingByKey[key] = id
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return GeneratedFragmentReceipt{}, false, err
+		}
+		rows.Close()
+	}
+	if err := CheckGeneratedJobKeyConflicts(parent.RunID, req.Jobs, existingByKey); err != nil {
+		return GeneratedFragmentReceipt{}, false, err
 	}
 	var runJobCount int
 	if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM jobs WHERE run_id=$1`, parent.RunID).Scan(&runJobCount); err != nil {
@@ -4993,7 +5135,22 @@ func (s *PostgresStore) InsertGeneratedFragmentTx(ctx context.Context, req Gener
 		if !found {
 			return GeneratedFragmentReceipt{}, false, fmt.Errorf("storage: generated fragment slot %q lost its winner row", slot)
 		}
+		// Roll the losing transaction back FIRST (it staged duplicate job
+		// rows that must not commit), then journal the replay in its own
+		// transaction so a failed append fails the request closed.
+		if err := tx.Rollback(ctx); err != nil {
+			return GeneratedFragmentReceipt{}, false, err
+		}
+		if err := s.AppendExecutionEvent(ctx, ExecutionEventGraphMutation(true, parent, slot, winner.FragmentID, len(winner.Children))); err != nil {
+			return GeneratedFragmentReceipt{}, false, err
+		}
 		return winner, true, nil
+	}
+	// The committed mutation and its semantic event are ONE transaction: a
+	// failed append rolls the fragment (and its children) back, so a
+	// committed fragment can never be missing from the stream.
+	if err := appendExecutionEventTx(ctx, tx, ExecutionEventGraphMutation(false, parent, slot, req.FragmentID, len(children))); err != nil {
+		return GeneratedFragmentReceipt{}, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return GeneratedFragmentReceipt{}, false, err

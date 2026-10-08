@@ -139,8 +139,7 @@ func TestIntegrationResourceReconcilePromotionServerPostgres(t *testing.T) {
 
 	// The pre-existing lease ending releases its reservation; the waiter then
 	// leases normally.
-	if err := st.CompleteJob(context.Background(), oldJobID, 1, runner.ID, model.StatusSuccess, "", nil,
-		model.CompletionReceipt{JobID: oldJobID, Generation: 1, RunnerID: runner.ID}); err != nil {
+	if err := st.CompleteJob(context.Background(), oldJobID, 1, runner.ID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: oldJobID, Generation: 1, RunnerID: runner.ID}, nil); err != nil {
 		t.Fatalf("complete pre-existing lease: %v", err)
 	}
 	if rows := pgITReservationRows(t, env); rows != 0 {

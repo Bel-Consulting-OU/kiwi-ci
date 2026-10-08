@@ -36,7 +36,7 @@ func TestPostgresIntegrationEntropyFailureRollsBack(t *testing.T) {
 
 	// CompleteJob: the audit-event id cannot be minted, so the completion
 	// rolls back and the job stays running.
-	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID}); err == nil {
+	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID}, nil); err == nil {
 		t.Fatal("CompleteJob with failing entropy must fail")
 	}
 	if j, err := st.GetJob(ctx, jobID); err != nil || j.Status != model.StatusRunning {

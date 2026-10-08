@@ -955,6 +955,10 @@ func (s *Server) commitOIDCIssuanceLocked(req storage.OIDCIssuance) (storage.OID
 			return storage.OIDCIssuanceResult{}, fmt.Errorf("%w: %v", errOIDCIssuanceAudit, err)
 		}
 	}
+	// oidc.issued is best-effort in fs/memory mode (the audit is already
+	// durable): audience, kid and claim KEY names only, never claim values
+	// or the token.
+	s.appendExecutionEventLocked(storage.ExecutionEventOIDCIssued(req, j.RunID))
 	return storage.OIDCIssuanceResult{Identity: locked, IssuedAt: commitNow, ExpiresAt: commitNow.Add(req.TTL)}, nil
 }
 

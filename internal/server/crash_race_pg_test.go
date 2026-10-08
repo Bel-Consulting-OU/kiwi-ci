@@ -137,7 +137,7 @@ func TestPostgresIntegrationServerCompletionRaceDifferingResults(t *testing.T) {
 		t.Fatalf("durable receipt hash = %q, want the winner's %q", rec.ResultHash, wantHash)
 	}
 	// The exactly-once usage transition is durable: a replayed effect loses.
-	won, err := st.RecordUsageOnce(ctx, job.ID, 0, 0)
+	won, err := st.RecordUsageOnce(ctx, job.ID, 0, 0, 0)
 	if err != nil || won {
 		t.Fatalf("second RecordUsageOnce = won=%v err=%v, want false/nil", won, err)
 	}

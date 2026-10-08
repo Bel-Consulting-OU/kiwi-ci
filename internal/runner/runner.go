@@ -1201,7 +1201,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 
 	tmp, err := os.MkdirTemp("", "kiwi-run-*")
 	if err != nil {
-		r.complete(parent, t, model.StatusFailure, err, nil)
+		r.complete(parent, t, model.StatusFailure, err, nil, nil)
 		return
 	}
 	// Durable ownership BEFORE the workspace becomes visible to the job: a
@@ -1213,7 +1213,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		// workspace unreclaimably: refuse before any checkout or external
 		// resource creation.
 		_ = os.RemoveAll(tmp)
-		r.complete(parent, t, model.StatusFailure, fmt.Errorf("crash-recovery ledger: %w", ledgerErr), nil)
+		r.complete(parent, t, model.StatusFailure, fmt.Errorf("crash-recovery ledger: %w", ledgerErr), nil, nil)
 		return
 	}
 	untrusted := !t.Job.Trusted
@@ -1254,14 +1254,14 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 					Resource: fmt.Sprintf("project %d on %s", pending.Assignment.ProjectID, pending.Assignment.MountPoint),
 					Err:      setupErr,
 				})
-				r.complete(parent, t, model.StatusFailure, fmt.Errorf("workspace disk quota cleanup pending: %w", setupErr), nil)
+				r.complete(parent, t, model.StatusFailure, fmt.Errorf("workspace disk quota cleanup pending: %w", setupErr), nil, nil)
 				return
 			}
 			// No workspace may be populated (checkout, dependency restore)
 			// without the hard bound its ledger ownership record exists for.
 			r.ledgerRemove(ledgerID)
 			_ = os.RemoveAll(tmp)
-			r.complete(parent, t, model.StatusFailure, fmt.Errorf("workspace disk quota ownership: %w", setupErr), nil)
+			r.complete(parent, t, model.StatusFailure, fmt.Errorf("workspace disk quota ownership: %w", setupErr), nil, nil)
 			return
 		}
 		workspaceQuota = &status
@@ -1327,7 +1327,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 			if rerr != nil {
 				detail = detail + "; effective runtime could not be resolved: " + rerr.Error()
 			}
-			r.complete(parent, t, model.StatusFailure, executor.UntrustedDiskQuotaGateError(detail), nil)
+			r.complete(parent, t, model.StatusFailure, executor.UntrustedDiskQuotaGateError(detail), nil, nil)
 			return
 		}
 	}
@@ -1346,7 +1346,8 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 			r.complete(parent, t, model.StatusFailure, &executor.RunError{
 				Kind: executor.ErrorInfra,
 				Err:  fmt.Errorf("workspace quota: %w", aerr),
-			}, nil)
+			}, nil, nil)
+
 			return
 		}
 		availabilityChecked = true
@@ -1367,17 +1368,17 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	defer setupCancel()
 	checkoutStart := time.Now()
 	if err = r.checkoutTask(setupCtx, t.Job, tmp); err != nil {
-		r.complete(parent, t, statusForErr(setupCtx, err), err, nil)
+		r.complete(parent, t, statusForErr(setupCtx, err), err, nil, nil)
 		return
 	}
 	r.Metrics.Observe("kiwi_runner_checkout_duration_seconds", time.Since(checkoutStart).Seconds())
 	spec, err := pipeline.Parse([]byte(t.Job.Pipeline))
 	if err != nil {
-		r.complete(parent, t, model.StatusFailure, err, nil)
+		r.complete(parent, t, model.StatusFailure, err, nil, nil)
 		return
 	}
 	if err := policy.ValidateAdmission(spec, t.Job.Trusted); err != nil {
-		r.complete(parent, t, model.StatusFailure, err, nil)
+		r.complete(parent, t, model.StatusFailure, err, nil, nil)
 		return
 	}
 	// When the control plane attached the enqueue-time compilation record,
@@ -1399,31 +1400,31 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		var policyOK bool
 		cj, caps, policyOK, err = verifyCompiledPayload(spec, t.Job.Key, t.Job.CompiledJobPayload, t.Job.Trusted)
 		if err != nil {
-			r.complete(parent, t, model.StatusFailure, err, nil)
+			r.complete(parent, t, model.StatusFailure, err, nil, nil)
 			return
 		}
 		if policyOK {
 			if err := policy.ValidateAdmissionWithCapabilities(spec, caps); err != nil {
-				r.complete(parent, t, model.StatusFailure, fmt.Errorf("compiled payload policy admission: %w", err), nil)
+				r.complete(parent, t, model.StatusFailure, fmt.Errorf("compiled payload policy admission: %w", err), nil, nil)
 				return
 			}
 		}
 	} else {
 		g, gerr := pipeline.Compile(spec)
 		if gerr != nil {
-			r.complete(parent, t, model.StatusFailure, gerr, nil)
+			r.complete(parent, t, model.StatusFailure, gerr, nil, nil)
 			return
 		}
 		var ok bool
 		cj, ok = g.Jobs[t.Job.Key]
 		if !ok {
-			r.complete(parent, t, model.StatusFailure, fmt.Errorf("compiled job %q not found", t.Job.Key), nil)
+			r.complete(parent, t, model.StatusFailure, fmt.Errorf("compiled job %q not found", t.Job.Key), nil, nil)
 			return
 		}
 	}
 	eff, merr := execution.MaterializeEffectiveExecution(cj, t.Job.CompiledJobPayload, t.Job, caps)
 	if merr != nil {
-		r.complete(parent, t, model.StatusFailure, merr, nil)
+		r.complete(parent, t, model.StatusFailure, merr, nil, nil)
 		return
 	}
 	cj = eff.CompiledJob
@@ -1432,11 +1433,11 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// discover is refused up front (never silently executed by a backend
 	// the host cannot provide).
 	if err := r.checkCapability(cj.Job.Runtime); err != nil {
-		r.complete(parent, t, model.StatusFailure, err, nil)
+		r.complete(parent, t, model.StatusFailure, err, nil, nil)
 		return
 	}
 	if err := checkShardAssignment(cj); err != nil {
-		r.complete(parent, t, model.StatusFailure, err, nil)
+		r.complete(parent, t, model.StatusFailure, err, nil, nil)
 		return
 	}
 	masker := &secrets.Masker{}
@@ -1449,7 +1450,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		if err := masker.AddStrict(t.LeaseToken); err != nil {
 			// An unmaskable lease token would leak into logs/outputs; fail the
 			// job instead of running without masking coverage.
-			r.complete(parent, t, model.StatusFailure, fmt.Errorf("lease token cannot be registered with the masker: %w", err), nil)
+			r.complete(parent, t, model.StatusFailure, fmt.Errorf("lease token cannot be registered with the masker: %w", err), nil, nil)
 			return
 		}
 	}
@@ -1460,7 +1461,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		// this the identical deadline produced different terminal semantics
 		// depending on which setup subphase it interrupted (checkout ->
 		// cancelled, restore -> failure).
-		r.complete(parent, t, statusForErr(setupCtx, err), err, nil)
+		r.complete(parent, t, statusForErr(setupCtx, err), err, nil, nil)
 		return
 	}
 	// The setup phase ends here: checkout, dependency restore and
@@ -1487,7 +1488,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// journal fails the job instead of silently dropping durable state.
 	journal, jerr := r.openJobLogJournal(t.Job.ID, t.LeaseGeneration, masker.MaskMulti)
 	if jerr != nil {
-		r.complete(parent, t, model.StatusFailure, fmt.Errorf("log journal: %w", jerr), nil)
+		r.complete(parent, t, model.StatusFailure, fmt.Errorf("log journal: %w", jerr), nil, nil)
 		return
 	}
 	if journal != nil {
@@ -1527,7 +1528,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	}
 	cacheStore, cacheErr := r.newJobCache(t, r.Metrics)
 	if cacheErr != nil {
-		r.complete(parent, t, model.StatusFailure, cacheErr, nil)
+		r.complete(parent, t, model.StatusFailure, cacheErr, nil, nil)
 		return
 	}
 	// Distributed artifact packaging is a TEMPORARY, budgeted publication
@@ -1546,14 +1547,14 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	if len(cj.Job.Artifacts) > 0 {
 		d, derr := os.MkdirTemp(r.Cfg.WorkDir, "kiwi-artifacts-"+t.Job.ID+"-*")
 		if derr != nil {
-			r.complete(parent, t, model.StatusFailure, fmt.Errorf("artifact capture directory: %w", derr), nil)
+			r.complete(parent, t, model.StatusFailure, fmt.Errorf("artifact capture directory: %w", derr), nil, nil)
 			return
 		}
 		if lerr := r.ledgerAddArtifacts(ledgerID, d); lerr != nil {
 			// The scratch tree must be crash-reclaimable before it can hold
 			// data: refuse and remove it otherwise.
 			_ = os.RemoveAll(d)
-			r.complete(parent, t, model.StatusFailure, fmt.Errorf("artifact capture ledger: %w", lerr), nil)
+			r.complete(parent, t, model.StatusFailure, fmt.Errorf("artifact capture ledger: %w", lerr), nil, nil)
 			return
 		}
 		captureDir = d
@@ -1773,7 +1774,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 			status = model.StatusFailure
 		}
 	}
-	r.complete(parent, t, status, runErr, res.Outputs)
+	r.complete(parent, t, status, runErr, res.Outputs, res.ObservedRuntime)
 }
 
 // logBatchPost is the async sink's delivery callback for one immutable
@@ -2629,7 +2630,12 @@ func (r *Runner) putArtifact(ctx context.Context, t server.Task, name, path stri
 // committed but the runner never saw the 204) must therefore be retried:
 // without the retry the job stays leased until expiry and is re-queued and
 // re-executed even though it already finished.
-func (r *Runner) complete(ctx context.Context, t server.Task, st model.Status, err error, outputs map[string]string) {
+//
+// observed carries the executor's captured runtime identity of the attempt
+// (nil when nothing was captured; setup failures complete before a runtime
+// existed). It is additive evidence: the server persists it with the
+// completion and never uses it for authorization.
+func (r *Runner) complete(ctx context.Context, t server.Task, st model.Status, err error, outputs map[string]string, observed *model.ObservedRuntime) {
 	// Complete receives the RUNNER context (every production caller passes
 	// parent), never the job context, so there is no job cancellation to
 	// strip here: a timed-out job still reports. Deriving directly from the
@@ -2644,7 +2650,7 @@ func (r *Runner) complete(ctx context.Context, t server.Task, st model.Status, e
 	if err != nil {
 		msg = err.Error()
 	}
-	body := server.Complete{RunnerID: r.ID, LeaseToken: t.LeaseToken, LeaseGeneration: t.LeaseGeneration, Status: st, Error: msg, Outputs: outputs}
+	body := server.Complete{RunnerID: r.ID, LeaseToken: t.LeaseToken, LeaseGeneration: t.LeaseGeneration, Status: st, Error: msg, Outputs: outputs, ObservedRuntime: observed}
 	_ = retryDelivery(completeCtx, func() error {
 		return r.post(completeCtx, "/api/v1/jobs/"+t.Job.ID+"/complete", body, nil)
 	})

@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -93,6 +94,13 @@ type Snapshot struct {
 	// The server validates every referenced archive/manifest pair at load
 	// and drops records whose files no longer match.
 	Snapshots map[string]model.SnapshotRecord `json:"snapshots,omitempty"`
+	// Attestations persists the fs-mode final execution attestation records
+	// (the execution_attestations equivalents), keyed by the canonical attempt
+	// identity (model.AttemptID). The signed envelope bytes stay in the CAS
+	// sidecar file the record references, so a restarted control plane keeps
+	// serving the same attestation. Additive; older snapshots load with a nil
+	// map, which the server treats as empty.
+	Attestations map[string]model.ExecutionAttestationRecord `json:"attestations,omitempty"`
 	// CompletionReceipts persists the fs-mode completion idempotency
 	// receipts (the completion_receipts equivalents) so a restarted control
 	// plane answers a replayed completion from the durable receipt instead
@@ -780,6 +788,15 @@ func (r *Repository) ReadAudit(limit int) ([]model.AuditEvent, error) {
 // executionEventsFile is the durable fs-mode execution event journal.
 const executionEventsFile = "execution-events.jsonl"
 
+// executionEventsRetainedFile is the fs-mode retention watermark: the
+// highest seq removed by PruneExecutionEvents, persisted as a sibling file
+// so compaction of the journal and the watermark advance are two atomic
+// writes with the journal first. A crash between them leaves the watermark
+// CONSERVATIVE (lower than the compacted prefix), never ahead of the
+// journal, so a consumer can never be told a cursor expired while the event
+// it names is still readable.
+const executionEventsRetainedFile = "execution-events.retained"
+
 // AppendExecutionEvent appends one event to the durable journal with the
 // next monotonically increasing seq, returning after the record is fsynced
 // (the same durability the audit append provides). The seq is allocated
@@ -894,6 +911,132 @@ func (r *Repository) initExecutionEventSeqLocked() error {
 	r.executionEventSeq = maxSeq
 	r.executionEventSeqLoaded = true
 	return nil
+}
+
+// ExecutionEventRetainedFrom implements RetentionExecutionEventStore for the
+// filesystem journal: the durable sibling watermark (0 when never pruned).
+// It is read from disk every call so a second process (or a crash-restarted
+// one) sees the current value without any snapshot plumbing.
+func (r *Repository) ExecutionEventRetainedFrom(ctx context.Context) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return readExecutionEventRetainedFrom(r.Root)
+}
+
+// readExecutionEventRetainedFrom reads the sibling watermark file. A missing
+// file means nothing has been pruned; an unreadable or corrupt file fails
+// closed (the caller must not assume a higher retention window than reality,
+// or a consumer would silently miss events).
+func readExecutionEventRetainedFrom(root string) (int64, error) {
+	b, err := os.ReadFile(filepath.Join(root, executionEventsRetainedFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	v, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if err != nil || v < 0 {
+		return 0, fmt.Errorf("storage: corrupt execution event retained watermark %q", strings.TrimSpace(string(b)))
+	}
+	return v, nil
+}
+
+// PruneExecutionEvents implements RetentionExecutionEventStore for the
+// filesystem journal by compacting the oldest contiguous prefix of events
+// older than olderThan: the journal is decoded in order, the first limit
+// events below both the cutoff and the first event at or after it are
+// dropped, and the survivors are atomically rewritten (the fs analog of the
+// secret-receipt journal compaction). The watermark file is advanced AFTER
+// the journal rewrite, so a crash can only make retention look smaller than
+// it is. Pruned events are gone from ListExecutionEvents; the surviving seq
+// values are unchanged, so cursor paging over the compacted journal is still
+// gap-free.
+func (r *Repository) PruneExecutionEvents(ctx context.Context, olderThan time.Time, limit int) (int64, int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, 0, err
+	}
+	if limit <= 0 {
+		limit = DefaultExecutionEventPruneLimit
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.initExecutionEventSeqLocked(); err != nil {
+		return 0, 0, err
+	}
+	retainedFrom, err := readExecutionEventRetainedFrom(r.Root)
+	if err != nil {
+		return 0, 0, err
+	}
+	path := filepath.Join(r.Root, executionEventsFile)
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, retainedFrom, nil
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	var events []model.ExecutionEvent
+	dec := json.NewDecoder(f)
+	for {
+		var e model.ExecutionEvent
+		if err := dec.Decode(&e); err != nil {
+			if jsonlStreamFinished(err) {
+				break
+			}
+			f.Close()
+			return 0, 0, err
+		}
+		events = append(events, e)
+	}
+	f.Close()
+	keepFrom := int64(0)
+	hasKeep := false
+	for _, e := range events {
+		if !e.CreatedAt.Before(olderThan) {
+			keepFrom = e.Seq
+			hasKeep = true
+			break
+		}
+	}
+	var (
+		kept    = make([]model.ExecutionEvent, 0, len(events))
+		victims int64
+		highest = retainedFrom
+	)
+	for _, e := range events {
+		if victims < int64(limit) && e.Seq > retainedFrom && (!hasKeep || e.Seq < keepFrom) {
+			victims++
+			if e.Seq > highest {
+				highest = e.Seq
+			}
+			continue
+		}
+		kept = append(kept, e)
+	}
+	if victims == 0 {
+		return 0, retainedFrom, nil
+	}
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	for _, e := range kept {
+		if err := enc.Encode(e); err != nil {
+			return 0, 0, err
+		}
+	}
+	if err := AtomicWriteFile(path, b.Bytes(), 0o600); err != nil {
+		return 0, 0, err
+	}
+	if highest > retainedFrom {
+		if err := AtomicWriteFile(filepath.Join(r.Root, executionEventsRetainedFile), []byte(strconv.FormatInt(highest, 10)+"\n"), 0o600); err != nil {
+			return 0, 0, err
+		}
+		retainedFrom = highest
+	}
+	return victims, retainedFrom, nil
 }
 
 // maxExecutionEventSeqLocked scans the journal for its highest seq.

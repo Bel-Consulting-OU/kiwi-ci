@@ -46,6 +46,13 @@ type ServerConfig struct {
 	// duration string (e.g. "720h"). Unset uses the built-in default of 30
 	// days; "0" disables age-based retention.
 	RunRetention string `toml:"run_retention"`
+	// EventsRetention bounds the durable execution event stream (the DB
+	// execution_events rows and the fs event journal): the oldest events are
+	// pruned as a contiguous prefix, and a consumer cursor below the
+	// retained_from watermark is answered with HTTP 410 cursor_expired
+	// (re-bootstrap via latest_cursor). Unset uses the built-in default of
+	// 7 days; "0" disables retention.
+	EventsRetention string `toml:"events_retention"`
 	// MaxRetainedRuns bounds the fs-mode run count; the oldest terminal runs
 	// are pruned first. 0 uses the built-in default (10000); -1 disables the
 	// bound.
@@ -191,6 +198,12 @@ type AuthConfig struct {
 	// database opens.
 	RunnerToken string `toml:"runner_token"`
 	// TokensFile is the JSON token-store path for fine-grained principals.
+	// Each principal may additionally carry controller capabilities
+	// ("capabilities" for all repositories, "repository_capabilities" for
+	// the same repository grant keys as "repositories") so external
+	// consumers (for example an execution-history or evidence controller)
+	// can read the routes they need without the admin role. No separate
+	// config field exists: capabilities live in the token file.
 	TokensFile string `toml:"tokens_file"`
 	// RunnerTokensFile is a JSON file of per-runner bearer credentials:
 	// {"<runner-id>": "<sha256-hex-token-digest>"}. The server provisions
@@ -358,8 +371,15 @@ type Config struct {
 // chain).
 func Default() *Config {
 	return &Config{
-		Server: ServerConfig{Listen: ":8080", Mode: "dev"},
-		Blob:   BlobConfig{Backend: "fs"},
+		Server: ServerConfig{
+			Listen: ":8080", Mode: "dev",
+			// The execution event stream is retained for 7 days by default:
+			// long enough for a controller to bootstrap and catch up, short
+			// enough that the commit-ordered table cannot grow without
+			// bound. "0" disables retention (unbounded stream).
+			EventsRetention: "168h",
+		},
+		Blob: BlobConfig{Backend: "fs"},
 		Quota: QuotaConfig{
 			// Built-in per-repository queue bound: production refuses the
 			// explicit 0 = unlimited pair (see Validate), so a config that
@@ -492,6 +512,15 @@ func (c *Config) Validate() error {
 		}
 		if d < 0 {
 			return fmt.Errorf("server.run_retention must not be negative, got %q", raw)
+		}
+	}
+	if raw := strings.TrimSpace(c.Server.EventsRetention); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return fmt.Errorf("server.events_retention must be a duration such as \"168h\": %v", err)
+		}
+		if d < 0 {
+			return fmt.Errorf("server.events_retention must not be negative, got %q", raw)
 		}
 	}
 	if c.Server.ExternalURL != "" {

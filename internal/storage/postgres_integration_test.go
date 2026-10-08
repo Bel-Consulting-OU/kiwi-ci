@@ -317,17 +317,36 @@ func pgITSeedRunner(t *testing.T, st *PostgresStore, runnerID string, capacity i
 	}
 }
 
-// pgITJob builds a minimal queued job.
+// pgITJob builds a minimal queued job. Its Key is derived from the job id so
+// fixtures obey the run-scoped logical identity rule (migration 0048): every
+// job of one run has a unique Key, exactly like a compiled graph (and unlike
+// BaseKey, which intentionally repeats across matrix variants).
 func pgITJob(runID, jobID, repo string) model.Job {
-	return model.Job{ID: jobID, RunID: runID, Key: "build", RepoURL: repo, RepoFullName: "kiwi-it/repo", Status: model.StatusQueued, CreatedAt: time.Now().UTC()}
+	return model.Job{ID: jobID, RunID: runID, Key: "build-" + jobID, RepoURL: repo, RepoFullName: "kiwi-it/repo", Status: model.StatusQueued, CreatedAt: time.Now().UTC()}
+}
+
+// pgITJobKeyed builds a minimal queued job with an explicit run-scoped Key.
+// The (run_id, key) uniqueness is per run, so two jobs in DIFFERENT runs may
+// deliberately share one Key (e.g. to fold their test reports into one suite).
+func pgITJobKeyed(runID, jobID, key, repo string) model.Job {
+	j := pgITJob(runID, jobID, repo)
+	j.Key = key
+	return j
 }
 
 // pgITEnqueueOne enqueues one run with one job through the atomic enqueue.
 func pgITEnqueueOne(t *testing.T, st *PostgresStore, runID, jobID, repo string) {
 	t.Helper()
+	pgITEnqueueOneKeyed(t, st, runID, jobID, repo, "build-"+jobID)
+}
+
+// pgITEnqueueOneKeyed enqueues one run with one job carrying an explicit
+// run-scoped Key through the atomic enqueue.
+func pgITEnqueueOneKeyed(t *testing.T, st *PostgresStore, runID, jobID, repo, key string) {
+	t.Helper()
 	req := InsertCompiledRunRequest{
 		Run:  model.Run{ID: runID, Repo: repo, Status: model.StatusQueued, CreatedAt: time.Now().UTC()},
-		Jobs: map[string]model.Job{jobID: pgITJob(runID, jobID, repo)},
+		Jobs: map[string]model.Job{jobID: pgITJobKeyed(runID, jobID, key, repo)},
 	}
 	if err := st.InsertCompiledRun(context.Background(), req); err != nil {
 		t.Fatalf("enqueue %s/%s: %v", runID, jobID, err)
@@ -881,7 +900,7 @@ func TestPostgresIntegrationCompleteJob(t *testing.T) {
 
 	// A success without the required artifact fails closed inside the
 	// transaction: the job stays running and no counter moves.
-	err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, receipt)
+	err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", nil, receipt, nil)
 	if !errors.Is(err, ErrRequiredArtifactMissing) {
 		t.Fatalf("completion without required artifact = %v, want ErrRequiredArtifactMissing", err)
 	}
@@ -901,7 +920,7 @@ func TestPostgresIntegrationCompleteJob(t *testing.T) {
 		t.Fatalf("artifact insert = %+v created=%v err=%v", stored, created, err)
 	}
 	outputs := map[string]string{"out": "1"}
-	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", outputs, receipt); err != nil {
+	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", outputs, receipt, nil); err != nil {
 		t.Fatalf("completion: %v", err)
 	}
 	j, err := st.GetJob(ctx, jobID)
@@ -925,17 +944,17 @@ func TestPostgresIntegrationCompleteJob(t *testing.T) {
 
 	// Receipt idempotency: the exact replay is acknowledged without moving
 	// counters, and a mismatched generation fails closed.
-	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", outputs, receipt); err != nil {
+	if err := st.CompleteJob(ctx, jobID, 1, runnerID, model.StatusSuccess, "", outputs, receipt, nil); err != nil {
 		t.Fatalf("idempotent replay: %v", err)
 	}
 	ri, _ = st.GetRunner(ctx, runnerID)
 	if ri.Completed != 1 {
 		t.Fatalf("runner completed after replay = %d, want 1", ri.Completed)
 	}
-	if err := st.CompleteJob(ctx, jobID, 2, runnerID, model.StatusSuccess, "", outputs, model.CompletionReceipt{JobID: jobID, Generation: 2, RunnerID: runnerID}); !errors.Is(err, ErrGenerationMismatch) {
+	if err := st.CompleteJob(ctx, jobID, 2, runnerID, model.StatusSuccess, "", outputs, model.CompletionReceipt{JobID: jobID, Generation: 2, RunnerID: runnerID}, nil); !errors.Is(err, ErrGenerationMismatch) {
 		t.Fatalf("mismatched generation replay = %v, want ErrGenerationMismatch", err)
 	}
-	if err := st.CompleteJob(ctx, jobID, 1, pgITNewID(t), model.StatusSuccess, "", outputs, model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID}); err == nil {
+	if err := st.CompleteJob(ctx, jobID, 1, pgITNewID(t), model.StatusSuccess, "", outputs, model.CompletionReceipt{JobID: jobID, Generation: 1, RunnerID: runnerID}, nil); err == nil {
 		t.Fatal("mismatched runner completion must fail")
 	}
 
@@ -959,7 +978,7 @@ func TestPostgresIntegrationCompleteJob(t *testing.T) {
 	if _, err := st.AcquireLeaseAtomic(ctx, LeaseClaim{JobID: failJob, RunnerID: failRunner, TokenHash: []byte("h"), Generation: 1, ExpiresAt: time.Now().UTC().Add(time.Hour), RunnerCapacity: 1}); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.CompleteJob(ctx, failJob, 1, failRunner, model.StatusFailure, "boom", nil, model.CompletionReceipt{JobID: failJob, Generation: 1, RunnerID: failRunner}); err != nil {
+	if err := st.CompleteJob(ctx, failJob, 1, failRunner, model.StatusFailure, "boom", nil, model.CompletionReceipt{JobID: failJob, Generation: 1, RunnerID: failRunner}, nil); err != nil {
 		t.Fatalf("failure completion: %v", err)
 	}
 	if d, _ := st.GetJob(ctx, failDep); d.Status != model.StatusBlocked || d.DependencyStatus != model.StatusFailure {

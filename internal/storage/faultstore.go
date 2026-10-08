@@ -436,13 +436,13 @@ func (f *FaultyStore) HeartbeatLease(ctx context.Context, jobID string, runnerID
 	return f.Inner.HeartbeatLease(ctx, jobID, runnerID, generation, expiresAt)
 }
 
-func (f *FaultyStore) CompleteJob(ctx context.Context, jobID string, generation int64, runnerID string, status model.Status, errMsg string, outputs map[string]string, receipt model.CompletionReceipt) error {
+func (f *FaultyStore) CompleteJob(ctx context.Context, jobID string, generation int64, runnerID string, status model.Status, errMsg string, outputs map[string]string, receipt model.CompletionReceipt, observed *model.ObservedRuntime) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.fail(); err != nil {
 		return err
 	}
-	return f.Inner.CompleteJob(ctx, jobID, generation, runnerID, status, errMsg, outputs, receipt)
+	return f.Inner.CompleteJob(ctx, jobID, generation, runnerID, status, errMsg, outputs, receipt, observed)
 }
 
 func (f *FaultyStore) CancelRunJobs(ctx context.Context, runID string, reason string) ([]string, error) {
@@ -1258,7 +1258,7 @@ func (f *FaultyStore) RecentUsage(ctx context.Context, since time.Time) (float64
 	return inner.RecentUsage(ctx, since)
 }
 
-func (f *FaultyStore) RecordUsageOnce(ctx context.Context, jobID string, cost, energyWh float64) (bool, error) {
+func (f *FaultyStore) RecordUsageOnce(ctx context.Context, jobID string, generation int64, cost, energyWh float64) (bool, error) {
 	inner, ok := f.Inner.(UsageOnceStore)
 	if !ok {
 		return false, errMissingInnerInterface("UsageOnceStore")
@@ -1268,7 +1268,7 @@ func (f *FaultyStore) RecordUsageOnce(ctx context.Context, jobID string, cost, e
 	if err := f.fail(); err != nil {
 		return false, err
 	}
-	return inner.RecordUsageOnce(ctx, jobID, cost, energyWh)
+	return inner.RecordUsageOnce(ctx, jobID, generation, cost, energyWh)
 }
 
 func (f *FaultyStore) AppendDownstreamRun(ctx context.Context, runID, childRunID string) error {
@@ -2072,6 +2072,11 @@ type memStore struct {
 	// idempotent. Keyed by (job, lease generation, delivery ID).
 	reportDeliveries map[string]memReportDelivery
 
+	// attestations mirrors migration 0050's execution_attestations rows: the
+	// one-per-attempt final execution attestation index, keyed by
+	// model.AttemptID.
+	attestations map[string]model.ExecutionAttestationRecord
+
 	// enqueueFaultOps, when > 0, makes the next InsertCompiledRun fail after
 	// staging that many operations (superseded cancellations first, then
 	// enqueued jobs) with enqueueFaultErr: the in-memory analogue of a
@@ -2103,9 +2108,12 @@ type memStore struct {
 	// events is the in-memory mirror of execution_events: an append-ordered
 	// slice with the seq watermark eventSeq. AppendExecutionEvent allocates
 	// the next seq under mu (mirroring the BIGSERIAL cursor), so the memStore
-	// stream pages exactly like the SQL and fs stores.
-	events   []model.ExecutionEvent
-	eventSeq int64
+	// stream pages exactly like the SQL and fs stores. eventRetainedFrom is
+	// the retention watermark: the highest seq removed by a prefix prune
+	// (0 = nothing pruned), mirroring execution_event_cursor.retained_from.
+	events            []model.ExecutionEvent
+	eventSeq          int64
+	eventRetainedFrom int64
 }
 
 // quotaCounts is the in-memory reserved counter pair for one quota key.
@@ -2181,6 +2189,7 @@ func newMemStore() *memStore {
 		historyAggregates: map[string]map[string]TestHistoryAggregate{},
 		historyVersions:   map[string]int64{},
 		reportDeliveries:  map[string]memReportDelivery{},
+		attestations:      map[string]model.ExecutionAttestationRecord{},
 		undecodableJobs:   map[string]bool{},
 	}
 	// The in-memory store models a single-process replica that always holds
@@ -2514,6 +2523,7 @@ func (m *memStore) ApproveJob(ctx context.Context, jobID, actor string) (model.J
 		j.WaitingSince = nil
 	}
 	m.jobs[jobID] = j
+	m.appendExecutionEventLocked(ExecutionEventApprovalGranted(j, actor))
 	return j, nil
 }
 
@@ -2552,6 +2562,7 @@ func (m *memStore) AcquireLease(ctx context.Context, jobID, runnerID string, tok
 	j.LeaseExpiresAt = &expiresAt
 	m.jobs[jobID] = j
 	m.adjustQuotaLocked(RepoIDForJob(j), 1, -1)
+	m.appendExecutionEventLocked(ExecutionEventAttemptCreated(j, runnerID))
 	return j, nil
 }
 
@@ -2576,7 +2587,7 @@ func (m *memStore) HeartbeatLease(ctx context.Context, jobID string, runnerID st
 	return nil
 }
 
-func (m *memStore) CompleteJob(ctx context.Context, jobID string, generation int64, runnerID string, status model.Status, errMsg string, outputs map[string]string, receipt model.CompletionReceipt) error {
+func (m *memStore) CompleteJob(ctx context.Context, jobID string, generation int64, runnerID string, status model.Status, errMsg string, outputs map[string]string, receipt model.CompletionReceipt, observed *model.ObservedRuntime) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if generation < 0 {
@@ -2632,6 +2643,14 @@ func (m *memStore) CompleteJob(ctx context.Context, jobID string, generation int
 	j.LeaseRunnerID = ""
 	j.LeaseTokenHash = nil
 	j.LeaseExpiresAt = nil
+	// The completing runner identity survives the lease in AttemptRunnerID,
+	// mirroring the SQL payload write: it is the durable runner evidence the
+	// final execution attestation binds.
+	j.AttemptRunnerID = runnerID
+	// Completion evidence mirrors the SQL payload write: the observed runtime
+	// is part of the completion's critical section, so a rejected completion
+	// stores nothing.
+	j.ObservedRuntime = observed
 	m.jobs[jobID] = j
 	m.receipts[key] = receipt
 	m.adjustQuotaLocked(RepoIDForJob(j), -1, 0)
@@ -2664,7 +2683,7 @@ func (m *memStore) CompleteJob(ctx context.Context, jobID string, generation int
 	// strings, so marshaling cannot fail. The kind table is shared with the
 	// SQL completion transaction and its size is pinned by
 	// CompletionEffectIntentCount.
-	payload, _ := json.Marshal(CompletionEffectsPayload{JobID: jobID, RunID: j.RunID})
+	payload, _ := json.Marshal(CompletionEffectsPayload{JobID: jobID, RunID: j.RunID, Generation: generation})
 	kinds := NewCompletionEffectKinds()
 	if len(kinds) != CompletionEffectIntentCount {
 		return fmt.Errorf("storage: completion effect kind table has %d entries, want CompletionEffectIntentCount=%d", len(kinds), CompletionEffectIntentCount)
@@ -3483,6 +3502,17 @@ func (m *memStore) ReadAudit(ctx context.Context, limit int) ([]model.AuditEvent
 func (m *memStore) AppendExecutionEvent(_ context.Context, e model.ExecutionEvent) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.appendExecutionEventLocked(e)
+	return nil
+}
+
+// appendExecutionEventLocked is the memStore-internal semantic append. The
+// caller holds m.mu (this store's transaction), so the event commits with
+// the mutation it describes and the seq is strictly monotonic. A zero
+// CreatedAt is stamped here; memory mode cannot fail the append, so a
+// semantic event never fails a mutation (the DB mode's fail-closed contract
+// is exercised by PostgreSQL, where the append is a real transaction step).
+func (m *memStore) appendExecutionEventLocked(e model.ExecutionEvent) {
 	if e.SchemaVersion <= 0 {
 		e.SchemaVersion = 1
 	}
@@ -3492,7 +3522,74 @@ func (m *memStore) AppendExecutionEvent(_ context.Context, e model.ExecutionEven
 	m.eventSeq++
 	e.Seq = m.eventSeq
 	m.events = append(m.events, e)
-	return nil
+}
+
+// PruneExecutionEvents mirrors the SQL prefix prune: it removes the oldest
+// contiguous run of events older than olderThan (bounded by limit), never
+// crossing the first event at or after the cutoff, and advances the
+// retainedFrom watermark to the highest removed seq. The surviving slice
+// keeps its original seq values, so "seq > after" addressing is unchanged.
+func (m *memStore) PruneExecutionEvents(_ context.Context, olderThan time.Time, limit int) (int64, int64, error) {
+	if limit <= 0 {
+		limit = DefaultExecutionEventPruneLimit
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	keepFrom := int64(0)
+	hasKeep := false
+	for _, e := range m.events {
+		if !e.CreatedAt.Before(olderThan) {
+			keepFrom = e.Seq
+			hasKeep = true
+			break
+		}
+	}
+	victims := 0
+	highest := m.eventRetainedFrom
+	for victims < len(m.events) && victims < limit {
+		e := m.events[victims]
+		if (hasKeep && e.Seq >= keepFrom) || e.Seq <= m.eventRetainedFrom {
+			break
+		}
+		victims++
+		if e.Seq > highest {
+			highest = e.Seq
+		}
+	}
+	if victims == 0 {
+		return 0, m.eventRetainedFrom, nil
+	}
+	m.events = append([]model.ExecutionEvent(nil), m.events[victims:]...)
+	if highest > m.eventRetainedFrom {
+		m.eventRetainedFrom = highest
+	}
+	return int64(victims), m.eventRetainedFrom, nil
+}
+
+// ExecutionEventRetainedFrom mirrors the SQL watermark read.
+func (m *memStore) ExecutionEventRetainedFrom(_ context.Context) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.eventRetainedFrom, nil
+}
+
+// PruneExecutionEvents forwards the inner retention implementation.
+func (f *FaultyStore) PruneExecutionEvents(ctx context.Context, olderThan time.Time, limit int) (int64, int64, error) {
+	inner, ok := f.Inner.(RetentionExecutionEventStore)
+	if !ok {
+		return 0, 0, errMissingInnerInterface("RetentionExecutionEventStore")
+	}
+	return inner.PruneExecutionEvents(ctx, olderThan, limit)
+}
+
+// ExecutionEventRetainedFrom is a watermark read and passes through
+// untouched, like the other read methods.
+func (f *FaultyStore) ExecutionEventRetainedFrom(ctx context.Context) (int64, error) {
+	inner, ok := f.Inner.(RetentionExecutionEventStore)
+	if !ok {
+		return 0, errMissingInnerInterface("RetentionExecutionEventStore")
+	}
+	return inner.ExecutionEventRetainedFrom(ctx)
 }
 
 // ListExecutionEvents mirrors the SQL keyset read: seq > after, ascending,
@@ -4338,6 +4435,7 @@ func (m *memStore) StartDeployment(ctx context.Context, d model.Deployment, audi
 		}
 		m.audit = append(m.audit, audit)
 	}
+	m.appendExecutionEventLocked(ExecutionEventDeploymentStarted(d))
 	return d, true, nil
 }
 
@@ -4367,6 +4465,7 @@ func (m *memStore) FinishDeploymentOnce(ctx context.Context, id string, status m
 			}
 			m.audit = append(m.audit, audit)
 		}
+		m.appendExecutionEventLocked(ExecutionEventDeploymentCompleted(d))
 		return true, nil
 	}
 	return false, ErrNotFound
@@ -4606,9 +4705,10 @@ func (m *memStore) RecentUsage(ctx context.Context, since time.Time) (float64, f
 }
 
 // RecordUsageOnce mirrors the SQL conditional update: only the first caller
-// for a job wins; the marker and the cost/energy amounts are written in one
-// critical section so they can never diverge.
-func (m *memStore) RecordUsageOnce(ctx context.Context, jobID string, cost, energyWh float64) (bool, error) {
+// for a job wins; the marker, the cost/energy amounts and the attempt's
+// lease generation are written in one critical section so they can never
+// diverge.
+func (m *memStore) RecordUsageOnce(ctx context.Context, jobID string, generation int64, cost, energyWh float64) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	j, ok := m.jobs[jobID]
@@ -4618,6 +4718,7 @@ func (m *memStore) RecordUsageOnce(ctx context.Context, jobID string, cost, ener
 	j.UsageRecorded = true
 	j.Cost = cost
 	j.EnergyWh = energyWh
+	j.UsageLeaseGeneration = generation
 	m.jobs[jobID] = j
 	return true, nil
 }
@@ -5480,6 +5581,7 @@ func (m *memStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim) (mo
 	}
 	m.runners[claim.RunnerID] = r
 	m.adjustQuotaLocked(RepoIDForJob(j), 1, -1)
+	m.appendExecutionEventLocked(ExecutionEventAttemptCreated(j, claim.RunnerID))
 	return j, nil
 }
 
@@ -5539,12 +5641,14 @@ func (m *memStore) GetGeneratedFragment(ctx context.Context, parentJobID, mutati
 // committed receipt for the canonical (parent, mutation slot) key is
 // resolved — the SAME fragment digest replays with replayed=true and nothing
 // is inserted, a DIFFERENT digest is refused with
-// ErrGeneratedMutationConflict; otherwise the parent is re-validated (via
-// the verifier, with the run's job count read under the same lock), the
-// whole fragment is staged, and the receipt commits with the jobs. The lease
-// generation authorizes the mutation but never defines it: a retry under a
-// new generation of the same logical parent still replays an identical
-// fragment.
+// ErrGeneratedMutationConflict; otherwise the requested child keys are
+// checked against the run's existing logical Key index (the run-scoped
+// identity rule, fails closed with ErrGeneratedJobKeyConflict), the parent
+// is re-validated (via the verifier, with the run's job count read under the
+// same lock), the whole fragment is staged, and the receipt commits with the
+// jobs. The lease generation authorizes the mutation but never defines it: a
+// retry under a new generation of the same logical parent still replays an
+// identical fragment.
 func (m *memStore) InsertGeneratedFragmentTx(ctx context.Context, req GeneratedFragmentRequest, verify GeneratedJobVerifier) (GeneratedFragmentReceipt, bool, error) {
 	slot := GeneratedFragmentSlot(req.MutationSlot)
 	m.mu.Lock()
@@ -5571,7 +5675,16 @@ func (m *memStore) InsertGeneratedFragmentTx(ctx context.Context, req GeneratedF
 				SubmittedFragmentID: req.FragmentID,
 			}
 		}
+		m.appendExecutionEventLocked(ExecutionEventGraphMutation(true, parent, slot, rec.FragmentID, len(rec.Children)))
 		return rec, true, nil
+	}
+	// Run-scoped logical identity admission, mirrored from the SQL
+	// transaction: m.mu already serializes every memStore mutation, so the
+	// index built under the lock is authoritative and no advisory lock is
+	// needed. A collision fails the whole fragment closed with the same
+	// typed error the SQL store returns.
+	if err := CheckGeneratedJobKeyConflicts(parent.RunID, req.Jobs, GeneratedJobKeyIndex(parent.RunID, m.jobs)); err != nil {
+		return GeneratedFragmentReceipt{}, false, err
 	}
 	count := 0
 	for _, j := range m.jobs {
@@ -5625,6 +5738,7 @@ func (m *memStore) InsertGeneratedFragmentTx(ctx context.Context, req GeneratedF
 		CreatedAt:       commitNow,
 	}
 	m.fragments[fragmentKey(req.ParentJobID, slot)] = rec
+	m.appendExecutionEventLocked(ExecutionEventGraphMutation(false, parent, slot, rec.FragmentID, len(rec.Children)))
 	return rec, false, nil
 }
 
@@ -5742,7 +5856,9 @@ func (m *memStore) PrunePendingSidecars(ctx context.Context, olderThan time.Time
 // contract entry with no artifact record for (job, generation, name), or ""
 // when every required artifact is present. The generation is part of the
 // artifact idempotency key, so an artifact uploaded under an earlier lease
-// generation cannot satisfy a later completion. The caller holds m.mu.
+// generation cannot satisfy a later completion. A contract with
+// Provenance=required also demands a non-empty ProvenanceSHA256 on the
+// matching row, mirroring the SQL gate. The caller holds m.mu.
 func (m *memStore) requiredArtifactMissingLocked(jobID string, generation int64) string {
 	contracts, ok := m.contracts[jobID]
 	if !ok || len(contracts) == 0 {
@@ -5752,9 +5868,13 @@ func (m *memStore) requiredArtifactMissingLocked(jobID string, generation int64)
 		if !c.Required {
 			continue
 		}
+		provenanceRequired := c.Provenance == ArtifactProvenanceRequired
 		found := false
 		for _, a := range m.artifacts {
 			if a.JobID == jobID && a.LeaseGeneration == generation && a.Name == name {
+				if provenanceRequired && a.ProvenanceSHA256 == "" {
+					continue
+				}
 				found = true
 				break
 			}
@@ -5834,6 +5954,8 @@ func (m *memStore) CommitSecretIssuance(ctx context.Context, req SecretIssuance)
 	}
 	m.claims[key] = memSecretClaim{At: time.Now().UTC(), Stored: stored}
 	m.audit = append(m.audit, SecretIssuanceAuditEvent(req, j.RunID, auditID))
+	// secret.issued commits with the claim (name and generation only).
+	m.appendExecutionEventLocked(ExecutionEventSecretIssued(req, j.RunID))
 	return stored.Envelope, false, nil
 }
 
@@ -6216,6 +6338,8 @@ func (m *memStore) InsertTestReportWithHistoryDeliveryForLease(ctx context.Conte
 	if repoID != coords.RepoID {
 		return TestReportInsertOutcome{}, leaseIdentityErrorf("test report %s repository %q does not match leased job repository %q", rep.ID, repoID, coords.RepoID)
 	}
+	// Attempt identity from the VERIFIED lease, mirroring the SQL fence.
+	rep.LeaseGeneration = generation
 	return m.InsertTestReportWithHistoryDelivery(ctx, rep, repoID, delivery)
 }
 
@@ -6642,6 +6766,9 @@ func (m *memStore) CommitOIDCIssuance(ctx context.Context, req OIDCIssuance) (OI
 		return OIDCIssuanceResult{}, err
 	}
 	m.audit = append(m.audit, OIDCIssuanceAuditEvent(req, auditID, commitNow))
+	// oidc.issued commits with the audit (audience, kid, claim key names
+	// only).
+	m.appendExecutionEventLocked(ExecutionEventOIDCIssued(req, j.RunID))
 	return OIDCIssuanceResult{Identity: locked, IssuedAt: commitNow, ExpiresAt: commitNow.Add(req.TTL)}, nil
 }
 

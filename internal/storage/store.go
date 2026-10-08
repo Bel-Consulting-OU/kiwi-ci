@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -205,8 +206,11 @@ type Store interface {
 	// job FOR UPDATE, verify generation+runner+status running, insert the
 	// completion receipt ON CONFLICT DO NOTHING (idempotent replay), update
 	// the job, update runner counters, recompute dependent jobs and the run
-	// status, and insert the audit event.
-	CompleteJob(ctx context.Context, jobID string, generation int64, runnerID string, status model.Status, errMsg string, outputs map[string]string, receipt model.CompletionReceipt) error
+	// status, and insert the audit event. observed, when non-nil, is the
+	// executor-captured runtime identity of the attempt and is persisted on
+	// the job payload in the SAME transaction (additive evidence, never used
+	// for authorization).
+	CompleteJob(ctx context.Context, jobID string, generation int64, runnerID string, status model.Status, errMsg string, outputs map[string]string, receipt model.CompletionReceipt, observed *model.ObservedRuntime) error
 	CancelRunJobs(ctx context.Context, runID string, reason string) ([]string, error)
 
 	// runners
@@ -351,6 +355,14 @@ const OutboxVersionLockNamespace = "forge-check-state"
 const (
 	OutboxKindCompletionReconcile = "completion_reconcile"
 
+	// OutboxKindExecutionAttest is the FINAL EXECUTION ATTESTATION intent: it
+	// builds, signs and durably records the terminal attempt's execution
+	// attestation. It is INTERNAL (marker-guarded by the
+	// execution_attestations primary key, unbounded retries, never
+	// dead-lettered), so a transient signing/CAS/store failure retries until
+	// the evidence converges.
+	OutboxKindExecutionAttest = "execution_attest"
+
 	// OutboxKindForgeDelivery is the EXTERNAL forge-publication intent. It is
 	// split from completion_reconcile so a persistently failing forge can
 	// back off and dead-letter without ever retiring the INTERNAL consistency
@@ -367,10 +379,14 @@ const (
 )
 
 // CompletionEffectsPayload is the outbox payload carried by completion
-// effect intents.
+// effect intents. Generation is the lease generation (attempt identity) of
+// the completion the effects belong to, so a durable effect row names the
+// exact attempt even after the job row's lease fields are cleared. Additive:
+// rows persisted before the field decode as 0.
 type CompletionEffectsPayload struct {
-	JobID string `json:"job_id"`
-	RunID string `json:"run_id"`
+	JobID      string `json:"job_id"`
+	RunID      string `json:"run_id"`
+	Generation int64  `json:"generation,omitempty"`
 }
 
 // CompletionEffectKinds lists the legacy effect kinds (kept for dispatch
@@ -389,27 +405,31 @@ func CompletionEffectKinds() []string {
 }
 
 // CompletionEffectIntentCount is how many intents a NEW completion persists
-// (completion_reconcile + forge_delivery). Legacy rows persist the five
-// per-kind intents listed by CompletionEffectKinds.
-const CompletionEffectIntentCount = 2
+// (completion_reconcile + forge_delivery + execution_attest). Legacy rows
+// persist the five per-kind intents listed by CompletionEffectKinds.
+const CompletionEffectIntentCount = 3
 
 // NewCompletionEffectKinds is the ordered set of intents a NEW completion
 // persists: ONE completion_reconcile row (internal consistency, unbounded
-// retries) and ONE forge_delivery row (external publication, bounded retries
-// + dead-letter). It is the single source of truth for the SQL completion
-// transaction, the memStore mirror and the server's fs/memory enqueue path,
-// and its size is pinned by CompletionEffectIntentCount.
+// retries), ONE forge_delivery row (external publication, bounded retries +
+// dead-letter) and ONE execution_attest row (the final signed execution
+// attestation, internal/unbounded retries until its row and event commit). It
+// is the single source of truth for the SQL completion transaction, the
+// memStore mirror and the server's fs/memory enqueue path, and its size is
+// pinned by CompletionEffectIntentCount.
 func NewCompletionEffectKinds() []string {
 	return []string{
 		OutboxKindCompletionReconcile,
 		OutboxKindForgeDelivery,
+		OutboxKindExecutionAttest,
 	}
 }
 
 // IsCompletionEffectKind reports whether kind is a completion effect intent:
-// the split reconcile/forge_delivery rows or a legacy per-kind row.
+// the split reconcile/forge_delivery/execution_attest rows or a legacy
+// per-kind row.
 func IsCompletionEffectKind(kind string) bool {
-	if kind == OutboxKindCompletionReconcile || kind == OutboxKindForgeDelivery {
+	if kind == OutboxKindCompletionReconcile || kind == OutboxKindForgeDelivery || kind == OutboxKindExecutionAttest {
 		return true
 	}
 	for _, k := range CompletionEffectKinds() {
@@ -649,6 +669,16 @@ type SnapshotStore interface {
 	ListSnapshotsByRun(ctx context.Context, runID string) ([]model.SnapshotRecord, error)
 }
 
+// Artifact provenance policy values. BestEffort (the default) keeps the
+// historical post-commit provenance sidecar flow; Required makes a durable
+// signed provenance envelope a PRECONDITION of the upload commit and of
+// completion (a required artifact without ProvenanceSHA256 cannot satisfy a
+// successful completion).
+const (
+	ArtifactProvenanceBestEffort = "best_effort"
+	ArtifactProvenanceRequired   = "required"
+)
+
 // ArtifactContract declares the artifacts a job promises to produce,
 // persisted per job so consumers can verify uploads before use.
 type ArtifactContract struct {
@@ -662,6 +692,13 @@ type ArtifactContract struct {
 	SigstoreRequired bool          `json:"sigstore_required,omitempty"`
 	SigstoreIssuer   string        `json:"sigstore_issuer,omitempty"`
 	SigstoreIdentity string        `json:"sigstore_identity,omitempty"`
+	// Provenance is the artifact's provenance policy: "required" or
+	// "best_effort" (empty means best_effort, the historical behavior).
+	// Required uploads build+sign+store the envelope BEFORE the lease-fenced
+	// record insert and fail closed when signing/storage fails, so a
+	// committed record with an empty ProvenanceSHA256 can never satisfy the
+	// contract's completion gate.
+	Provenance string `json:"provenance,omitempty"`
 }
 
 // ArtifactContractStore is the durable per-job artifact contract contract.
@@ -761,6 +798,93 @@ func GeneratedFragmentSlot(slot string) string {
 // fragment ids from *GeneratedMutationConflictError.
 var ErrGeneratedMutationConflict = errors.New("storage: generated fragment mutation conflict")
 
+// ErrGeneratedJobKeyConflict marks a generated fragment whose child logical
+// Job.Key already identifies a job in the same run. Key is the run-scoped
+// logical node identity (matrix/shard suffix included, so matrix variants
+// stay distinct), so inserting a second row for the same (run, key) would
+// make key lookups ambiguous and duplicate the logical node. Callers compare
+// with errors.Is and read the colliding key from *GeneratedJobKeyConflictError.
+var ErrGeneratedJobKeyConflict = errors.New("storage: generated job key conflict")
+
+// GeneratedJobKeyConflictError carries the run-scoped logical key that
+// collided and the id of the existing run job it collides with. The handler
+// maps it to HTTP 409 (reason GENERATED_JOB_KEY_CONFLICT) and the whole
+// fragment transaction is rolled back: no partial child graph is ever
+// inserted. The existing job is described by its id only.
+type GeneratedJobKeyConflictError struct {
+	RunID         string
+	Key           string
+	ExistingJobID string
+}
+
+func (e *GeneratedJobKeyConflictError) Error() string {
+	return fmt.Sprintf("storage: generated job key %q already exists in run %s as job %s; Key is the run-scoped logical job identity, so a generated child cannot duplicate an existing node",
+		e.Key, e.RunID, e.ExistingJobID)
+}
+
+// Unwrap makes errors.Is(err, ErrGeneratedJobKeyConflict) true.
+func (e *GeneratedJobKeyConflictError) Unwrap() error { return ErrGeneratedJobKeyConflict }
+
+// GeneratedJobKeyIndex builds the run-scoped logical identity index of a
+// job map keyed by job id: Key -> existing job id for runID. Iteration order
+// is sorted by job id and the first row wins, so a database that already
+// carries bug-created duplicates still yields a deterministic index. The
+// memory stores and the server's fs-mode maps call it; the SQL stores build
+// the same index from a run-scoped SELECT.
+func GeneratedJobKeyIndex(runID string, jobs map[string]model.Job) map[string]string {
+	ids := make([]string, 0, len(jobs))
+	for id := range jobs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	index := make(map[string]string, len(ids))
+	for _, id := range ids {
+		j := jobs[id]
+		if j.RunID != runID {
+			continue
+		}
+		if _, ok := index[j.Key]; !ok {
+			index[j.Key] = j.ID
+		}
+	}
+	return index
+}
+
+// CheckGeneratedJobKeyConflicts enforces the run-scoped logical identity rule
+// shared by every admission path: every requested child job's Key must be
+// free among the existingByKey index of the run. requested maps child job id
+// -> job (the fragment about to be inserted) and existingByKey maps Key ->
+// existing job id (GeneratedJobKeyIndex or the equivalent SQL projection).
+// The requested jobs are inspected in sorted Key order, so the returned
+// *GeneratedJobKeyConflictError is deterministic when several keys collide.
+// An ordinary compiled run enqueued through InsertCompiledRun needs no
+// advisory lock for this rule (compilation makes Keys unique per run and the
+// run's jobs are always inserted before any dynamic child can exist), but the
+// check is applied there too as defense in depth.
+func CheckGeneratedJobKeyConflicts(runID string, requested map[string]model.Job, existingByKey map[string]string) error {
+	if len(requested) == 0 || len(existingByKey) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(requested))
+	for id := range requested {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		ki, kj := requested[ids[i]].Key, requested[ids[j]].Key
+		if ki != kj {
+			return ki < kj
+		}
+		return ids[i] < ids[j]
+	})
+	for _, id := range ids {
+		key := requested[id].Key
+		if existingID, ok := existingByKey[key]; ok {
+			return &GeneratedJobKeyConflictError{RunID: runID, Key: key, ExistingJobID: existingID}
+		}
+	}
+	return nil
+}
+
 // GeneratedMutationConflictError carries the committed fragment digest and
 // the submitted one for a refused mutation-slot conflict. The handler maps it
 // to HTTP 409 (reason GENERATED_MUTATION_CONFLICT) instead of appending a
@@ -827,7 +951,9 @@ type GeneratedFragmentReceipt struct {
 // FragmentID) with a client-supplied mutation key, at which point a slot may
 // legitimately hold several distinct graphs; until then a differing digest in
 // one slot is a conflict. An empty MutationSlot is read as the default by
-// every store.
+// every store. Each job's Key is the run-scoped logical node identity and is
+// admitted against the run's existing jobs (CheckGeneratedJobKeyConflicts);
+// BaseKey is display/grouping only and is never used for uniqueness.
 type GeneratedFragmentRequest struct {
 	ParentJobID     string
 	RunnerID        string
@@ -891,7 +1017,11 @@ type GeneratedFragmentStore interface {
 // replayed fragment (same canonical mutation key parent+mutation slot with
 // the same fragment digest) returns the ORIGINAL receipt with replayed=true
 // and inserts nothing, while a DIFFERENT digest in the same slot fails
-// closed with ErrGeneratedMutationConflict before any row is written. The
+// closed with ErrGeneratedMutationConflict before any row is written. Before
+// any child row is inserted, the requested child keys are admitted under the
+// run-scoped logical identity rule (CheckGeneratedJobKeyConflicts): a Key
+// that already identifies a job of the run fails closed with
+// ErrGeneratedJobKeyConflict, also before any row is written. The
 // fragment's artifact contracts commit in the SAME transaction as the jobs —
 // a generated job with a required artifact has its contract row visible
 // before any completion can run.

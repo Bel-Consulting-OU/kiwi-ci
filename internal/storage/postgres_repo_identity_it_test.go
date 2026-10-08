@@ -183,8 +183,8 @@ func TestPostgresIntegrationEnvironmentConcurrencyCanonicalRepoID(t *testing.T) 
 	if err := st.InsertCompiledRun(ctx, InsertCompiledRunRequest{
 		Run: model.Run{ID: otherRun, Repo: pgITRepo, RepoID: pgITRepoID, Status: model.StatusQueued, CreatedAt: time.Now().UTC()},
 		Jobs: map[string]model.Job{
-			githubJob: {ID: githubJob, RunID: otherRun, Key: "deploy", RepoURL: pgITRepo, RepoFullName: "kiwi-it/repo", RepoID: pgITRepoID, Environment: "staging", EnvironmentConcurrency: 1, Status: model.StatusQueued, CreatedAt: time.Now().UTC()},
-			gitlabJob: {ID: gitlabJob, RunID: otherRun, Key: "deploy", RepoURL: "https://gitlab.company.com/kiwi-it/repo.git", RepoFullName: "kiwi-it/repo", RepoID: "gitlab.company.com/kiwi-it/repo", Environment: "staging", EnvironmentConcurrency: 1, Status: model.StatusQueued, CreatedAt: time.Now().UTC()},
+			githubJob: {ID: githubJob, RunID: otherRun, Key: "deploy-github", RepoURL: pgITRepo, RepoFullName: "kiwi-it/repo", RepoID: pgITRepoID, Environment: "staging", EnvironmentConcurrency: 1, Status: model.StatusQueued, CreatedAt: time.Now().UTC()},
+			gitlabJob: {ID: gitlabJob, RunID: otherRun, Key: "deploy-gitlab", RepoURL: "https://gitlab.company.com/kiwi-it/repo.git", RepoFullName: "kiwi-it/repo", RepoID: "gitlab.company.com/kiwi-it/repo", Environment: "staging", EnvironmentConcurrency: 1, Status: model.StatusQueued, CreatedAt: time.Now().UTC()},
 		},
 	}); err != nil {
 		t.Fatal(err)
