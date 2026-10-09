@@ -349,6 +349,42 @@ func TestExecutionAttestationDigestBindsCompletionResultAndEvidenceRoot(t *testi
 	}
 }
 
+// TestVerifyExecutionAttestationSchemaVersionError proves an envelope whose
+// block carries a different schema version is refused with a clear
+// unsupported-schema error (not the misleading subject-binding error a v1
+// digest mismatch used to produce), while a current-version tamper is still
+// caught by the digest comparison.
+func TestVerifyExecutionAttestationSchemaVersionError(t *testing.T) {
+	base, err := ExecutionAttestationStatement(attestationTestInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyExecutionAttestation(base); err != nil {
+		t.Fatalf("intact statement does not verify: %v", err)
+	}
+
+	// A v1 envelope: the block claims schema 1 (and its digest no longer
+	// matches the subject), so the error must name the unsupported schema.
+	v1 := base
+	block := *base.Attestation
+	block.SchemaVersion = 1
+	v1.Attestation = &block
+	err = VerifyExecutionAttestation(v1)
+	if err == nil || !strings.Contains(err.Error(), "schemaVersion 1") {
+		t.Fatalf("v1 envelope error = %v, want a clear unsupported schemaVersion 1", err)
+	}
+
+	// A current-version tamper still fails the subject-digest check.
+	tampered := base
+	blockV2 := *base.Attestation
+	blockV2.Status = "failure"
+	tampered.Attestation = &blockV2
+	err = VerifyExecutionAttestation(tampered)
+	if err == nil || !strings.Contains(err.Error(), "does not bind its evidence block") {
+		t.Fatalf("v2 tamper error = %v, want the subject-binding failure", err)
+	}
+}
+
 func TestTestReportSuiteDigestBindsCases(t *testing.T) {
 	rep := model.TestReport{ID: "r1", Cases: []model.TestResult{
 		{Name: "a", Passed: true, Duration: 1.5},

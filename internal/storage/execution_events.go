@@ -266,9 +266,9 @@ var (
 )
 
 // ListExecutionEvents implements ExecutionEventStore for PostgreSQL with a
-// keyset scan over the BIGSERIAL cursor: seq > after, ascending, bounded by
-// limit, optional run filter. The read is not schema-fenced: it mutates
-// nothing.
+// keyset scan over the commit-ordered execution-event cursor: seq > after,
+// ascending, bounded by limit, optional run filter. The read is not
+// schema-fenced: it mutates nothing.
 func (s *PostgresStore) ListExecutionEvents(ctx context.Context, afterSeq int64, limit int, runID string) ([]model.ExecutionEvent, int64, error) {
 	limit = ClampExecutionEventLimit(limit)
 	rows, err := s.pool.Query(ctx, `

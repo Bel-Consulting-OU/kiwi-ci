@@ -670,11 +670,12 @@ type SnapshotStore interface {
 }
 
 // LogCursorStore reports a run's monotonic log high-water (migration 0052's
-// log_cursors row; the durable global journal watermark in fs mode). It is
-// the value a stream/bootstrap consumer uses as "latest committed log seq":
-// it never goes backwards, even when retention removes rows or a rollback
-// frees an allocated range. Stores without the capability are simply skipped
-// by consumers that report it as advisory metadata.
+// log_cursors row in PostgreSQL; the maximum Seq among the run's durable
+// journal and committed batch records in fs mode, where no per-run cursor
+// exists). It is the value a stream/bootstrap consumer uses as "latest
+// committed log seq": it never goes backwards, even when retention removes
+// rows or a rollback frees an allocated range. Stores without the capability
+// are simply skipped by consumers that report it as advisory metadata.
 type LogCursorStore interface {
 	LatestLogSeq(ctx context.Context, runID string) (int64, error)
 }

@@ -41,10 +41,11 @@ func parseLogCursor(w http.ResponseWriter, r *http.Request) (int64, bool) {
 	return after, true
 }
 
-// latestLogSeq resolves the run's monotonic log high-water for the stream's
-// advisory header: the store's LogCursorStore (PostgreSQL log_cursors /
-// fs journal watermark). A store without the contract simply gets no header;
-// an error also omits it (the header is advisory metadata, never a read
+// latestLogSeq resolves the RUN's monotonic log high-water for the stream's
+// advisory header: PostgreSQL's per-run log_cursors row, or the addressed
+// run's maximum durable seq in fs mode (single-line journal plus committed
+// batch records). A store without the contract simply gets no header; an
+// error also omits it (the header is advisory metadata, never a read
 // precondition).
 func (s *Server) latestLogSeq(ctx context.Context, runID string) (int64, bool) {
 	if s.DB != nil {

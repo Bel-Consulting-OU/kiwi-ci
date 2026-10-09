@@ -227,7 +227,10 @@ func yamlScalarStart(prev byte) bool {
 // yamlLineBeforeComment returns line truncated at the first '#' that starts a
 // comment: at line start or after whitespace, outside a quoted scalar. Quotes
 // are tracked so a '#' inside "double" or 'single' quotes is scalar content.
+// A trailing carriage return (CRLF documents) is stripped first so a comment
+// after a block-scalar header cannot hide the header's line ending.
 func yamlLineBeforeComment(line []byte) []byte {
+	line = bytes.TrimSuffix(line, []byte("\r"))
 	var quote byte
 	for i := 0; i < len(line); i++ {
 		c := line[i]
@@ -262,8 +265,14 @@ func yamlLineBeforeComment(line []byte) []byte {
 // trailing run of indicator characters, it starts with '|' or '>', and it is
 // preceded by whitespace whose own predecessor is a value-position indicator
 // (':', '-' or '?').
+//
+// Two line-ending subtleties are handled explicitly: a trailing CR of a CRLF
+// document is line-ending bytes, not header content (otherwise every CRLF
+// header misses and its body is counted as YAML), and an interior ' - |' is
+// plain-scalar content ("run: echo a - |"), so a '-' or '?' value-position
+// indicator must start the line while a ':' may follow a key.
 func yamlOpensBlockScalar(line []byte) bool {
-	trimmed := bytes.TrimRight(yamlLineBeforeComment(line), " \t")
+	trimmed := bytes.TrimRight(yamlLineBeforeComment(line), " \t\r")
 	n := len(trimmed)
 	if n == 0 || !yamlBlockScalarTail(trimmed[n-1]) {
 		return false
@@ -299,7 +308,17 @@ func yamlOpensBlockScalar(line []byte) bool {
 		return false
 	}
 	switch trimmed[j] {
-	case ':', '-', '?':
+	case ':':
+		return true
+	case '-', '?':
+		// A block sequence entry or explicit-key indicator can only open the
+		// line: anything else before it means the '-'/'?' is plain-scalar
+		// content and the trailing '|'/'>' is too.
+		for k := 0; k < j; k++ {
+			if trimmed[k] != ' ' && trimmed[k] != '\t' {
+				return false
+			}
+		}
 		return true
 	}
 	return false

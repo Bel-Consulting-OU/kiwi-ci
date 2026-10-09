@@ -73,6 +73,14 @@ const (
 	// 10000-part limit.
 	s3MultipartPartSize = 64 << 20
 
+	// s3MultipartMinPartSize and s3MultipartMaxPartSize are the S3 protocol
+	// bounds for a configured part size: every part except the last must be
+	// at least 5 MiB, and no single part may exceed 5 GiB. The resolvers
+	// enforce them so an invalid advanced configuration fails before any
+	// request instead of a remote rejection halfway through an upload.
+	s3MultipartMinPartSize int64 = 5 << 20
+	s3MultipartMaxPartSize int64 = 5 << 30
+
 	// s3MaxMultipartParts is S3's ceiling on the number of parts in one
 	// multipart upload. A declared size that would need more parts is
 	// rejected before the upload is created, so an impossible upload never
@@ -378,14 +386,23 @@ type S3 struct {
 
 	// MultipartThreshold is the object size above which Put uses a multipart
 	// upload instead of a single PUT. Zero means s3MultipartThreshold. A
+	// negative value is rejected by the resolver before any request. A
 	// declared size that would need more than s3MaxMultipartParts parts at
 	// MultipartPartSize is rejected before the upload starts.
 	MultipartThreshold int64
 
 	// MultipartPartSize is the size of every multipart part except the last.
 	// Zero means s3MultipartPartSize. The value exists as an advanced/test
-	// seam: the production default is the vetted 64 MiB constant.
+	// seam: the production default is the vetted 64 MiB constant. A
+	// configured value outside S3's protocol bounds (at least 5 MiB, at most
+	// 5 GiB per part) or negative is rejected by the resolver before any
+	// request.
 	MultipartPartSize int64
+
+	// multipartTestParts disables the S3 part-size range validation for the
+	// package's small in-memory multipart fixtures (see multipartTestS3);
+	// production never sets it.
+	multipartTestParts bool
 
 	// endpointOnce caches the endpoint resolution: endpointURL is the parsed
 	// endpoint and endpointErr is the sticky validation error.
@@ -410,20 +427,40 @@ func (s *S3) listPageTimeout() time.Duration {
 	return DefaultListPageTimeout
 }
 
-// multipartThreshold resolves the effective multipart switchover size.
-func (s *S3) multipartThreshold() int64 {
-	if s.MultipartThreshold > 0 {
-		return s.MultipartThreshold
+// multipartThreshold resolves the effective multipart switchover size. A
+// negative configured value is invalid and fails before any request.
+func (s *S3) multipartThreshold() (int64, error) {
+	if s.MultipartThreshold < 0 {
+		return 0, fmt.Errorf("blob: s3 multipart threshold must not be negative (got %d)", s.MultipartThreshold)
 	}
-	return s3MultipartThreshold
+	if s.MultipartThreshold > 0 {
+		return s.MultipartThreshold, nil
+	}
+	return s3MultipartThreshold, nil
 }
 
-// multipartPartSize resolves the effective per-part size.
-func (s *S3) multipartPartSize() int64 {
-	if s.MultipartPartSize > 0 {
-		return s.MultipartPartSize
+// multipartPartSize resolves the effective per-part size and validates the
+// configured knob against the S3 protocol bounds (5 MiB minimum for every
+// part except the last, 5 GiB maximum per part), so an out-of-range advanced
+// configuration fails before any request instead of a remote rejection
+// halfway through an upload. multipartTestParts (test-only) bypasses the
+// range check for the small in-memory multipart fixtures.
+func (s *S3) multipartPartSize() (int64, error) {
+	if s.MultipartPartSize == 0 {
+		return s3MultipartPartSize, nil
 	}
-	return s3MultipartPartSize
+	if s.MultipartPartSize < 0 {
+		return 0, fmt.Errorf("blob: s3 multipart part size must not be negative (got %d)", s.MultipartPartSize)
+	}
+	if !s.multipartTestParts {
+		if s.MultipartPartSize < s3MultipartMinPartSize {
+			return 0, fmt.Errorf("blob: s3 multipart part size %d is below the S3 minimum of %d bytes", s.MultipartPartSize, s3MultipartMinPartSize)
+		}
+		if s.MultipartPartSize > s3MultipartMaxPartSize {
+			return 0, fmt.Errorf("blob: s3 multipart part size %d exceeds the S3 maximum of %d bytes", s.MultipartPartSize, s3MultipartMaxPartSize)
+		}
+	}
+	return s.MultipartPartSize, nil
 }
 
 func (s *S3) client() *http.Client {
@@ -714,7 +751,11 @@ func (s *S3) Put(ctx context.Context, key string, r io.Reader, size int64) (Obje
 	if size < 0 {
 		return Object{}, fmt.Errorf("blob: negative size")
 	}
-	if size > s.multipartThreshold() {
+	threshold, err := s.multipartThreshold()
+	if err != nil {
+		return Object{}, err
+	}
+	if size > threshold {
 		return s.putMultipart(ctx, key, r, size)
 	}
 	return s.putSingle(ctx, key, r, size)
@@ -783,9 +824,15 @@ func (s *S3) putSingle(ctx context.Context, key string, r io.Reader, size int64)
 // the returned error without masking the primary failure.
 //
 // A declared size that would need more than s3MaxMultipartParts parts is
-// rejected before Create, so an impossible upload never starts.
+// rejected before Create, so an impossible upload never starts. The
+// configured part size is validated here (range and sign) before any
+// request, so an invalid advanced configuration cannot create an upload it
+// could never complete.
 func (s *S3) putMultipart(ctx context.Context, key string, r io.Reader, size int64) (Object, error) {
-	partSize := s.multipartPartSize()
+	partSize, err := s.multipartPartSize()
+	if err != nil {
+		return Object{}, err
+	}
 	parts := s3MultipartPartCount(size, partSize)
 	if parts > s3MaxMultipartParts {
 		return Object{}, fmt.Errorf("%w: size %d needs %d parts of %d bytes, limit is %d",

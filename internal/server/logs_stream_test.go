@@ -177,9 +177,10 @@ func TestStreamLogsRunDeletedMidStream(t *testing.T) {
 }
 
 // TestStreamLogsReportsLatestHighWater proves the stream advertises the
-// run's monotonic log high-water (from the store's LogCursorStore; fs mode
-// uses the durable journal watermark) as X-Kiwi-Log-Latest, so a client can
-// tell how far the committed stream reaches without racing the poll loop.
+// ADDRESSED RUN's log high-water as X-Kiwi-Log-Latest: PostgreSQL's per-run
+// log_cursors row, and in fs mode the run's own durable journal/batch maximum
+// (never the process-global watermark), so a client can tell how far the
+// committed stream reaches without racing the poll loop.
 func TestStreamLogsReportsLatestHighWater(t *testing.T) {
 	s, err := NewPersistent("secret", "secret", t.TempDir())
 	if err != nil {
@@ -192,6 +193,11 @@ func TestStreamLogsReportsLatestHighWater(t *testing.T) {
 		if err := s.store.AppendLog(model.LogEntry{Seq: i, RunID: "r1", JobID: "j1", JobKey: "build", Step: "s", Line: "line", CreatedAt: time.Now().UTC()}); err != nil {
 			t.Fatal(err)
 		}
+	}
+	// Another run's later line raises the process-global watermark but must
+	// not raise r1's header.
+	if err := s.store.AppendLog(model.LogEntry{Seq: 4, RunID: "r2", JobID: "j2", JobKey: "build", Step: "s", Line: "other", CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
 	}
 	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()

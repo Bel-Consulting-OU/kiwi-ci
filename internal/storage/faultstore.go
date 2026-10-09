@@ -2153,10 +2153,11 @@ type memStore struct {
 
 	// events is the in-memory mirror of execution_events: an append-ordered
 	// slice with the seq watermark eventSeq. AppendExecutionEvent allocates
-	// the next seq under mu (mirroring the BIGSERIAL cursor), so the memStore
-	// stream pages exactly like the SQL and fs stores. eventRetainedFrom is
-	// the retention watermark: the highest seq removed by a prefix prune
-	// (0 = nothing pruned), mirroring execution_event_cursor.retained_from.
+	// the next seq under mu (mirroring the commit-ordered
+	// execution_event_cursor allocation), so the memStore stream pages
+	// exactly like the SQL and fs stores. eventRetainedFrom is the retention
+	// watermark: the highest seq removed by a prefix prune (0 = nothing
+	// pruned), mirroring execution_event_cursor.retained_from.
 	events            []model.ExecutionEvent
 	eventSeq          int64
 	eventRetainedFrom int64

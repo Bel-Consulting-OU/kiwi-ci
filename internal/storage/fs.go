@@ -1189,17 +1189,38 @@ func (r *Repository) MaxLogSeq() (int64, error) {
 	return maxSeq, nil
 }
 
-// LatestLogSeq exposes the same monotonic high-water semantics for the fs
-// log store as the PostgreSQL log cursor table: the highest durable log
-// sequence ever allocated, never a MAX over the surviving rows. The fs store
-// keeps one global watermark (there is no per-run cursor), so runID is
-// accepted for contract parity and deliberately ignored. Errors fail closed:
-// an unreadable watermark is never reported as 0.
+// LatestLogSeq reports the addressed run's highest durable log sequence: the
+// maximum Seq among that run's single-line journal entries and committed
+// batch records (0 when the run has no durable lines). PostgreSQL can report
+// the run's monotonic cursor (log_cursors) even after rows are removed, but
+// the fs journal has no per-run cursor, so this is a MAX over the run's
+// surviving records — still monotonic under normal operation because fs logs
+// are append-only and never pruned, and always attributable to runID instead
+// of a process-global watermark that would over-report another run's latest.
+// Errors fail closed: an unreadable journal is never reported as 0.
 func (r *Repository) LatestLogSeq(ctx context.Context, runID string) (int64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	return r.MaxLogSeq()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.recoverLogBatchesLocked(); err != nil {
+		return 0, err
+	}
+	maxSeq, err := r.maxRunLogSeqJSONL(runID)
+	if err != nil {
+		return 0, err
+	}
+	batched, err := r.committedLogBatchEntriesLocked(runID, 0)
+	if err != nil {
+		return 0, err
+	}
+	for _, e := range batched {
+		if e.Seq > maxSeq {
+			maxSeq = e.Seq
+		}
+	}
+	return maxSeq, nil
 }
 
 // readMaxLogSeqIndexLocked reads the durable max-seq checkpoint. ok=false
@@ -1458,6 +1479,13 @@ func (r *Repository) PruneLogBatches(runID string) error {
 
 // maxLogSeqJSONL returns the highest Seq in the single-line log stream.
 func (r *Repository) maxLogSeqJSONL() (int64, error) {
+	return r.maxRunLogSeqJSONL("")
+}
+
+// maxRunLogSeqJSONL returns the highest Seq in the single-line log stream,
+// restricted to one run when runID is non-empty (the empty runID scans every
+// run, the process-global watermark MaxLogSeq reports).
+func (r *Repository) maxRunLogSeqJSONL(runID string) (int64, error) {
 	f, err := os.Open(filepath.Join(r.Root, "logs.jsonl"))
 	if errors.Is(err, os.ErrNotExist) {
 		return 0, nil
@@ -1476,7 +1504,7 @@ func (r *Repository) maxLogSeqJSONL() (int64, error) {
 			}
 			return 0, err
 		}
-		if e.Seq > maxSeq {
+		if e.Seq > maxSeq && (runID == "" || e.RunID == runID) {
 			maxSeq = e.Seq
 		}
 	}

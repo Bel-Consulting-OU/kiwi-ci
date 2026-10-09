@@ -206,6 +206,21 @@ claims themselves.
 
 ## Behavioral compatibility notes
 
+- Completion receipts written before runtime evidence was bound (legacy v1
+  receipts) replay a retried completion only when the retry's NORMALIZED
+  runtime evidence is nil-or-equal to the evidence the original attempt
+  persisted. The server re-fills the server-owned `Components` map from the
+  job's component digest before the comparison, so a byte-identical retry of
+  a component job whose 204 was lost in the upgrade window still replays
+  instead of conflicting; a retry whose captured evidence genuinely differs
+  still fails closed with 409.
+- Durable schedules that predate the admission-time cron shape check
+  (`pipeline.validateCronTriggers`) and declare more than one
+  `on.schedule.cron` entry or more than one branch are disabled fail-closed
+  when loaded (server load, replica promotion and DB reload), with an
+  audited/logged `schedule.invalid_disabled` warning. They never fire a
+  silently truncated subset; re-saving the schedule through the API with a
+  single cron entry and at most one branch re-enables it.
 - Migration 0052 replaces the identity-sequenced `log_entries.seq` with the
   commit-ordered `log_cursors` allocation: a log append's sequence is now
   allocated under the run's cursor row lock and held to commit, so allocation
@@ -214,7 +229,8 @@ claims themselves.
   before it applies (an old replica would allocate log sequences outside the
   cursor table). Readers are unaffected: `seq > after` paging is unchanged,
   and the log stream's advisory `X-Kiwi-Log-Latest` high-water comes from
-  `log_cursors.value`.
+  `log_cursors.value` in DB mode and from the addressed run's durable
+  journal/batch maximum in fs mode.
 - Unrunning jobs carry their pipeline text, so a control plane
   restarted on a new version recompiles deterministically against the
   new compiler; test canary pipelines before rolling upgrades across

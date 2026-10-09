@@ -4731,10 +4731,11 @@ func (s *Server) log(w http.ResponseWriter, r *http.Request) {
 }
 
 // logDB appends the log line through the store. The sequence is NOT
-// wall-clock derived: the store allocates it from the identity-sequenced
-// log_entries table inside the append transaction (INSERT ... RETURNING
-// seq), so appends stay strictly increasing regardless of clock ordering
-// across replicas.
+// wall-clock derived: the store allocates it from the run's commit-ordered
+// log_cursors row inside the append transaction (UPDATE ... RETURNING), with
+// the cursor row lock held to commit, so allocation order equals visible
+// order across replicas and a rollback frees its range instead of leaving a
+// hole.
 func (s *Server) logDB(w http.ResponseWriter, r *http.Request, jobID string, in LogLine, j model.Job, now time.Time) {
 	if !s.logDBWrite(r.Context(), j, in, now) {
 		http.Error(w, "log append failed", 500)
@@ -4743,8 +4744,8 @@ func (s *Server) logDB(w http.ResponseWriter, r *http.Request, jobID string, in 
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// logDBWrite appends one line through the identity-sequenced DB path. The
-// job row is authoritative for run/job coordinates.
+// logDBWrite appends one line through the commit-ordered DB path. The job row
+// is authoritative for run/job coordinates.
 func (s *Server) logDBWrite(ctx context.Context, j model.Job, in LogLine, now time.Time) bool {
 	e := model.LogEntry{RunID: j.RunID, JobID: j.ID, JobKey: j.Key, Step: in.Step, Line: in.Line, CreatedAt: now, LeaseGeneration: in.LeaseGeneration}
 	return s.DB.AppendLog(ctx, e) == nil
@@ -5168,7 +5169,16 @@ func completionResultHash(status model.Status, errMsg string, outputs map[string
 // the job row is read ONLY when the request actually carries runtime evidence
 // and the payback (a v2-evidence-bearing retry) is exactly what must be
 // compared: a missing job reads as no stored evidence.
+//
+// The REQUEST evidence is normalized with observedRuntimeWithComponents before
+// the legacy comparison, exactly like the evidence the original completion
+// persisted: the runner never sends Components, they are server-owned and
+// filled from the job's ComponentDigest, so comparing the raw wire value
+// against the normalized stored attempt would conflict an identical retry of a
+// component job (an upgrade-window v1 receipt). The v2 request hash stays the
+// raw digest (it is what the stored v2 receipt was computed from).
 func (s *Server) completionReceiptReplay(ctx context.Context, jobID string, in Complete, rec model.CompletionReceipt, requestHash string) (bool, error) {
+	requestObserved := in.ObservedRuntime
 	var storedObserved *model.ObservedRuntime
 	if rec.ResultHashVersion < storage.CompletionResultHashVersionV2 && in.ObservedRuntime != nil {
 		j, err := s.DB.GetJob(ctx, jobID)
@@ -5176,10 +5186,11 @@ func (s *Server) completionReceiptReplay(ctx context.Context, jobID string, in C
 			return false, err
 		}
 		if err == nil {
+			requestObserved = observedRuntimeWithComponents(in.ObservedRuntime, j)
 			storedObserved = storage.StoredAttemptObservedRuntime(j, in.LeaseGeneration)
 		}
 	}
-	return storage.CompletionReceiptReplayMatches(rec, requestHash, storage.CompletionResultHashVersionV2, in.Status, in.Error, in.Outputs, in.ObservedRuntime, storedObserved), nil
+	return storage.CompletionReceiptReplayMatches(rec, requestHash, storage.CompletionResultHashVersionV2, in.Status, in.Error, in.Outputs, requestObserved, storedObserved), nil
 }
 
 func completionReceiptKey(jobID string, generation int64, runnerID string) string {
@@ -5517,19 +5528,25 @@ func (s *Server) rollbackStateLocked(rb stateRollback) {
 // receipt replays only against the request's v1 digest and only when the
 // request's runtime evidence is nil-or-equal against the stored attempt's
 // evidence. The stored evidence is only attributable while the live job row
-// still represents this generation.
+// still represents this generation. The REQUEST evidence is normalized with
+// observedRuntimeWithComponents first (Components are server-owned and filled
+// from the job's ComponentDigest), so an identical retry of a component job
+// matches the stored attempt instead of conflicting over the runner-omitted
+// Components map; the v2 request hash itself stays the raw wire digest. When
+// no live job is attributable the raw evidence is compared against no stored
+// evidence, which fails closed.
 func (s *Server) completionReplayReadyLocked(jobID string, generation int64, runnerID string, in Complete, hash string) (matched bool, perr error) {
 	rec, has := s.completions[completionReceiptKey(jobID, generation, runnerID)]
 	if !has {
 		return false, nil
 	}
+	requestObserved := in.ObservedRuntime
 	var storedObserved *model.ObservedRuntime
-	if in.ObservedRuntime != nil {
-		if j, ok := s.jobs[jobID]; ok {
-			storedObserved = storage.StoredAttemptObservedRuntime(j, generation)
-		}
+	if j, ok := s.jobs[jobID]; ok {
+		requestObserved = observedRuntimeWithComponents(in.ObservedRuntime, j)
+		storedObserved = storage.StoredAttemptObservedRuntime(j, generation)
 	}
-	if !storage.CompletionReceiptReplayMatches(rec, hash, storage.CompletionResultHashVersionV2, in.Status, in.Error, in.Outputs, in.ObservedRuntime, storedObserved) {
+	if !storage.CompletionReceiptReplayMatches(rec, hash, storage.CompletionResultHashVersionV2, in.Status, in.Error, in.Outputs, requestObserved, storedObserved) {
 		return false, nil
 	}
 	return true, s.persistCheckedErrLocked("job.complete.replay")

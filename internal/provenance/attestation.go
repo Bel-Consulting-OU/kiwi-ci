@@ -443,6 +443,13 @@ func VerifyExecutionAttestation(st Statement) error {
 	if st.Attestation == nil {
 		return fmt.Errorf("provenance: execution attestation has no evidence block")
 	}
+	// The digest is schema-tagged (schemaVersion is part of the preimage), so
+	// a v1 envelope would otherwise fail the subject-digest comparison with a
+	// misleading "does not bind its evidence block" error. Refuse an
+	// unsupported schema explicitly, before any digest comparison.
+	if st.Attestation.SchemaVersion != executionAttestationSchemaVersion {
+		return fmt.Errorf("provenance: unsupported attestation schemaVersion %d (want %d)", st.Attestation.SchemaVersion, executionAttestationSchemaVersion)
+	}
 	want, err := ExecutionAttestationDigest(*st.Attestation)
 	if err != nil {
 		return err

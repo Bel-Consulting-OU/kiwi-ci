@@ -44,10 +44,11 @@ type LogBatchReceipt = LogBatchIdentity
 //     response was lost look like a payload conflict (ErrLogBatchConflict)
 //     even though every line was already durable, defeating the runner's
 //     immutable-batch-id retry.
-//   - Seq is allocated per delivery too (the log_entries identity column, or
-//     the server's monotonic counter in fs mode), so it is excluded for the
-//     same reason (see LogBatchStore: an identical ordered payload under the
-//     same identity is an idempotent duplicate).
+//   - Seq is allocated per delivery too (the run's commit-ordered
+//     log_cursors allocation in DB mode, or the server's monotonic counter
+//     in fs mode), so it is excluded for the same reason (see
+//     LogBatchStore: an identical ordered payload under the same identity
+//     is an idempotent duplicate).
 //
 // The digest is therefore a pure function of the logical batch content:
 // identical lines in the same order under the same identity always digest

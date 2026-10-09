@@ -8,8 +8,14 @@ the state of the `main` branch.
 
 ## [Unreleased]
 
-Nothing yet beyond v0.1.0 content. Future releases add items to this
-section.
+### Changed
+
+- Completion receipt replay across the runtime-evidence upgrade: a stored
+  legacy (v1) receipt now replays only when the retried completion's
+  normalized runtime evidence is nil-or-equal to the evidence the original
+  attempt persisted (the server owns and re-fills the `Components` map from
+  the job's component digest), exactly as before the v1 receipt was written.
+  A retry whose runtime evidence genuinely differs still conflicts.
 
 ## [0.1.0] - unreleased
 

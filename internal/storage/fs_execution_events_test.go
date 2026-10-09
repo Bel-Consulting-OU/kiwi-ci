@@ -217,9 +217,10 @@ func TestRepositoryExecutionEventsRetentionAtomicRead(t *testing.T) {
 	}
 }
 
-// TestRepositoryLatestLogSeqParity proves the fs LatestLogSeq exposes the
-// same monotonic high-water as MaxLogSeq (including batch lines), so the log
-// stream's advisory latest header has one contract across storage modes.
+// TestRepositoryLatestLogSeqParity proves the fs LatestLogSeq is the ADDRESSED
+// RUN's durable high-water (single-line journal plus batch lines): for one run
+// it equals MaxLogSeq, and another run's higher sequence never leaks into the
+// per-run value.
 func TestRepositoryLatestLogSeqParity(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -239,5 +240,19 @@ func TestRepositoryLatestLogSeqParity(t *testing.T) {
 	}
 	if max, err := repo.MaxLogSeq(); err != nil || max != latest {
 		t.Fatalf("MaxLogSeq = %d err %v, want LatestLogSeq %d", max, err, latest)
+	}
+	// Another run's higher sequence is invisible to run-a's per-run latest
+	// (the process-global watermark still reports it).
+	if err := repo.AppendLog(model.LogEntry{Seq: 10, RunID: "run-b", Line: "other"}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := repo.LatestLogSeq(ctx, "run-a"); err != nil || got != 9 {
+		t.Fatalf("LatestLogSeq(run-a) = %d err %v, want 9 (not the global max)", got, err)
+	}
+	if got, err := repo.LatestLogSeq(ctx, "run-b"); err != nil || got != 10 {
+		t.Fatalf("LatestLogSeq(run-b) = %d err %v, want 10", got, err)
+	}
+	if max, err := repo.MaxLogSeq(); err != nil || max != 10 {
+		t.Fatalf("MaxLogSeq = %d err %v, want 10", max, err)
 	}
 }

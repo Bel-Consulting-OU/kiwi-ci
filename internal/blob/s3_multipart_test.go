@@ -95,12 +95,15 @@ func newFakeS3Multipart(t *testing.T) (*S3, *fakeS3Multipart) {
 }
 
 // multipartTestS3 returns a store whose multipart switchover and part size
-// are small enough for cheap in-memory tests.
+// are small enough for cheap in-memory tests. The explicit test seam also
+// bypasses the production S3 part-size range validation, which those small
+// sizes would otherwise fail.
 func multipartTestS3(t *testing.T, threshold, partSize int64) (*S3, *fakeS3Multipart) {
 	t.Helper()
 	s, f := newFakeS3Multipart(t)
 	s.MultipartThreshold = threshold
 	s.MultipartPartSize = partSize
+	s.multipartTestParts = true
 	return s, f
 }
 

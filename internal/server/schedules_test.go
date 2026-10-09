@@ -27,6 +27,87 @@ jobs:
       - run: echo nightly
 `
 
+// TestDurableMultiCronScheduleDisabledAtLoad is the upgrade regression for
+// legacy durable schedule rows admitted before pipeline.validateCronTriggers:
+// a row declaring more than one cron entry (or more than one branch) would
+// silently fire only Cron[0]/Branches[0], so load-time validation must
+// disable it fail-closed and it must never fire, while a valid single-entry
+// schedule still does.
+func TestDurableMultiCronScheduleDisabledAtLoad(t *testing.T) {
+	f := newDBFakeStore()
+	s := New("token")
+	if err := s.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	base := func(id string, spec string) storage.Schedule {
+		return storage.Schedule{
+			ID: id, Repository: "acme/app", RepoID: "github.com/acme/app",
+			RepoURL: "https://github.com/acme/app.git", Forge: "github",
+			Enabled: true, Spec: spec, CreatedAt: time.Now().UTC().Add(-3 * time.Minute),
+		}
+	}
+	multiEntry := base("multi-entry", `version: 1
+on:
+  schedule:
+    - cron: "* * * * *"
+    - cron: "*/2 * * * *"
+jobs:
+  j:
+    runtime: container
+    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    steps:
+      - run: echo hi
+`)
+	multiBranch := base("multi-branch", `version: 1
+on:
+  schedule:
+    cron: "* * * * *"
+    branches: [main, release]
+jobs:
+  j:
+    runtime: container
+    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    steps:
+      - run: echo hi
+`)
+	valid := base("valid", scheduleSpec)
+	for _, sc := range []storage.Schedule{multiEntry, multiBranch, valid} {
+		if err := f.UpsertSchedule(context.Background(), sc); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.reloadSchedulesDB(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	loadedEntry, hasEntry := s.schedules["multi-entry"]
+	loadedBranch, hasBranch := s.schedules["multi-branch"]
+	loadedValid, hasValid := s.schedules["valid"]
+	s.mu.Unlock()
+	if !hasEntry || loadedEntry.Enabled {
+		t.Fatalf("multi-entry schedule = %+v (present=%v), want present and disabled at load", loadedEntry, hasEntry)
+	}
+	if !hasBranch || loadedBranch.Enabled {
+		t.Fatalf("multi-branch schedule = %+v (present=%v), want present and disabled at load", loadedBranch, hasBranch)
+	}
+	if !hasValid || !loadedValid.Enabled {
+		t.Fatalf("valid schedule = %+v (present=%v), want present and enabled", loadedValid, hasValid)
+	}
+
+	s.fireDueSchedules(context.Background(), time.Now().UTC())
+	f.mu.Lock()
+	entryOcc := len(f.occurrences["multi-entry"])
+	branchOcc := len(f.occurrences["multi-branch"])
+	validOcc := len(f.occurrences["valid"])
+	f.mu.Unlock()
+	if entryOcc != 0 || branchOcc != 0 {
+		t.Fatalf("disabled schedules fired: multi-entry=%d multi-branch=%d occurrences", entryOcc, branchOcc)
+	}
+	if validOcc == 0 {
+		t.Fatal("valid schedule did not fire its due occurrence")
+	}
+}
+
 func TestParseCron(t *testing.T) {
 	c, err := ParseCron("*/15 2,14 * * 1-5")
 	if err != nil {

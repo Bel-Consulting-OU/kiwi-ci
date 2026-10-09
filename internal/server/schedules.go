@@ -158,6 +158,33 @@ func durableScheduleIdentity(sc storage.Schedule) (storage.Schedule, error) {
 	return sc, nil
 }
 
+// validateDurableScheduleCron enforces the cron shape the scheduler can
+// execute faithfully: exactly one on.schedule entry with at most one branch.
+// Admission (pipeline.validateCronTriggers) rejects larger declarations, but
+// a durable row admitted before that check could still carry several entries,
+// and firing would silently use only Cron[0]/Branches[0]. Such a row is
+// disabled fail-closed at load instead of executing a subset of the declared
+// schedules. The spec is decoded with the schema's own Trigger unmarshalling
+// (scalar/sequence/mapping cron spellings all count); a missing on.schedule
+// trigger is the zero-entry case and is disabled too.
+func validateDurableScheduleCron(sc storage.Schedule) error {
+	var spec pipeline.Spec
+	if err := yaml.Unmarshal([]byte(sc.Spec), &spec); err != nil {
+		return fmt.Errorf("schedule spec does not parse: %w", err)
+	}
+	tr, ok := spec.On["schedule"]
+	if !ok {
+		return errors.New("schedule spec declares no on.schedule trigger")
+	}
+	if len(tr.Cron) != 1 {
+		return fmt.Errorf("on.schedule declares %d cron entries; exactly one is supported", len(tr.Cron))
+	}
+	if len(tr.Cron[0].Branches) > 1 {
+		return fmt.Errorf("on.schedule declares %d branches; at most one is supported", len(tr.Cron[0].Branches))
+	}
+	return nil
+}
+
 // disabledSchedule is one durable schedule that failed load-time identity
 // validation and was disabled (fail closed) with its reason.
 type disabledSchedule struct {
@@ -166,15 +193,20 @@ type disabledSchedule struct {
 }
 
 // validateLoadedSchedules validates every durable schedule and DISABLES each
-// one whose stored identity is inconsistent. Disabling is the policy for
-// TRUSTED and UNTRUSTED rows alike (consistency; documented here): a durable
-// row whose identity cannot be proven must never fire, and a disabled row is
-// never silently re-enabled — fixing it requires an explicit API update,
-// which re-runs the same binding checks. Kept rows carry the canonical
-// identity fields.
+// one whose stored identity is inconsistent or whose on.schedule shape the
+// scheduler cannot execute faithfully (see validateDurableScheduleCron).
+// Disabling is the policy for TRUSTED and UNTRUSTED rows alike (consistency;
+// documented here): a durable row whose identity cannot be proven, or whose
+// cron declaration would be silently truncated to its first entry/branch,
+// must never fire, and a disabled row is never silently re-enabled — fixing
+// it requires an explicit API update, which re-runs the same binding checks.
+// Kept rows carry the canonical identity fields.
 func validateLoadedSchedules(list []storage.Schedule) (kept []storage.Schedule, disabled []disabledSchedule) {
 	for _, sc := range list {
 		valid, err := durableScheduleIdentity(sc)
+		if err == nil {
+			err = validateDurableScheduleCron(valid)
+		}
 		if err != nil {
 			sc.Enabled = false
 			kept = append(kept, sc)

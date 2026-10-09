@@ -106,7 +106,8 @@ func yamlBlockScalarDoc(header string, bodyLines, bodyBlankAt int) []byte {
 // forms the old last-character heuristic got wrong: chomping and indentation
 // indicators in either order, indicators followed by a trailing comment, and
 // sequence-item headers. A plain scalar that merely ends in a spaced '>' or
-// '|' must NOT be treated as a header.
+// '|' must NOT be treated as a header, including an interior ' - |' (the '-'
+// is scalar content, not a sequence indicator).
 func TestYAMLPreflightBlockScalarHeaderForms(t *testing.T) {
 	for _, line := range []string{
 		"run: |",
@@ -119,6 +120,10 @@ func TestYAMLPreflightBlockScalarHeaderForms(t *testing.T) {
 		"run: >-2 # strip",
 		"- |",
 		"key:\t|+",
+		"run: |\r",
+		"run: |-2 # strip\r",
+		"run: >- # fold\r",
+		"  - |+\r",
 	} {
 		if !yamlOpensBlockScalar([]byte(line)) {
 			t.Errorf("yamlOpensBlockScalar(%q) = false, want true", line)
@@ -132,6 +137,9 @@ func TestYAMLPreflightBlockScalarHeaderForms(t *testing.T) {
 		"run: echo x > # redirect",
 		"run: a|b",
 		"run: |0",
+		"run: echo a - |",
+		"run: echo a - |\r",
+		"run: echo a ? |",
 	} {
 		if yamlOpensBlockScalar([]byte(line)) {
 			t.Errorf("yamlOpensBlockScalar(%q) = true, want false", line)
@@ -168,5 +176,67 @@ func TestYAMLPreflightSkipsBlockScalarBodiesWithIndicatorsAndComments(t *testing
 	}
 	if _, err := Parse(docs["blank line body"]); err != nil {
 		t.Fatalf("Parse of a block scalar with a blank line failed: %v", err)
+	}
+}
+
+// yamlBlockScalarDocCRLF is yamlBlockScalarDoc rendered with CRLF line
+// endings, the document shape that used to defeat the header scanner: the
+// header line ended in '\r', so the block body was counted as YAML and a
+// legitimately parseable document was rejected by the structural budget.
+func yamlBlockScalarDocCRLF(header string, bodyLines, bodyBlankAt int) []byte {
+	var b strings.Builder
+	b.WriteString("version: 1\r\njobs:\r\n  a:\r\n    steps:\r\n      - run: " + header + "\r\n")
+	for i := 0; i < bodyLines; i++ {
+		if bodyBlankAt >= 0 && i == bodyBlankAt {
+			b.WriteString("\r\n")
+		}
+		b.WriteString("          ::\r\n")
+	}
+	return []byte(b.String())
+}
+
+// TestYAMLPreflightSkipsCRLFBlockScalarBodies is the CRLF regression: a
+// literal/folded block scalar with indicators or chomping and a CRLF header
+// must have its whole body (blank lines included) skipped by the preflight,
+// so the document parses end to end instead of being rejected by the 100k
+// structural-token budget.
+func TestYAMLPreflightSkipsCRLFBlockScalarBodies(t *testing.T) {
+	bodyLines := maxYAMLStructuralTokens/2 + 10
+	docs := map[string][]byte{
+		"literal":          yamlBlockScalarDocCRLF("|", bodyLines, -1),
+		"chomping":         yamlBlockScalarDocCRLF("|-2 # strip", bodyLines, -1),
+		"keep+comment":     yamlBlockScalarDocCRLF("|+ # keep trailing newlines", bodyLines, -1),
+		"folded":           yamlBlockScalarDocCRLF(">- # fold", bodyLines, -1),
+		"blank line body":  yamlBlockScalarDocCRLF("|", bodyLines, 5),
+		"indent indicator": yamlBlockScalarDocCRLF("|2", bodyLines, -1),
+	}
+	for name, doc := range docs {
+		if err := preflightYAMLStructure(doc); err != nil {
+			t.Errorf("%s: CRLF block-scalar body counted as YAML: %v", name, err)
+		}
+		if _, err := Parse(doc); err != nil {
+			t.Errorf("%s: CRLF block scalar failed to parse: %v", name, err)
+		}
+	}
+}
+
+// TestYAMLPreflightPlainScalarSpacedPipeIsNotHeader pins that an interior
+// " - |" is plain-scalar content, not a block-scalar header: its indented
+// continuation lines are counted as YAML (so an over-budget continuation is
+// rejected), while the same step line parses as a scalar end to end.
+func TestYAMLPreflightPlainScalarSpacedPipeIsNotHeader(t *testing.T) {
+	if yamlOpensBlockScalar([]byte("run: echo a - |")) {
+		t.Fatal("interior ' - |' treated as a block-scalar header")
+	}
+	bodyLines := maxYAMLStructuralTokens/2 + 10
+	doc := []byte("version: 1\njobs:\n  a:\n    steps:\n      - run: echo a - |\n" +
+		strings.Repeat("          ::\n", bodyLines))
+	if err := preflightYAMLStructure(doc); err == nil || !strings.Contains(err.Error(), "complexity budget") {
+		t.Fatalf("plain-scalar continuation not counted: err = %v", err)
+	}
+	// A plain scalar that merely contains a spaced '-' and '|' is valid.
+	var spec Spec
+	if err := parseYAML([]byte("version: 1\njobs:\n  a:\n    steps:\n      - run: echo a - | continued\n"), &spec); err != nil {
+		t.Fatalf("valid plain scalar rejected: %v", err)
 	}
 }
