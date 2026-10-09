@@ -257,7 +257,6 @@ on:
   schedule:
     - cron: "0 0 * * *"
       branches: [main]
-    - cron: "0 12 * * *"
 jobs:
   a:
     steps:
@@ -266,8 +265,20 @@ jobs:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := s.On["schedule"].Cron; len(got) != 2 || got[0].Cron != "0 0 * * *" || got[0].Branches[0] != "main" {
+	if got := s.On["schedule"].Cron; len(got) != 1 || got[0].Cron != "0 0 * * *" || got[0].Branches[0] != "main" {
 		t.Fatalf("cron sequence = %+v", got)
+	}
+
+	// Multiple cron entries and multiple branches per entry are refused at
+	// admission: the scheduler executes exactly one entry with one branch,
+	// so accepting either would silently run only part of the declaration.
+	multiEntry := "version: 1\non:\n  schedule:\n    - cron: \"0 0 * * *\"\n    - cron: \"0 12 * * *\"\njobs:\n  a:\n    steps:\n      - run: echo hi\n"
+	if _, err := Parse([]byte(multiEntry)); err == nil || !strings.Contains(err.Error(), "multiple cron entries are not supported") {
+		t.Fatalf("multi-entry cron = %v, want the multiple-cron-entries refusal", err)
+	}
+	multiBranch := "version: 1\non:\n  schedule:\n    - cron: \"0 0 * * *\"\n      branches: [main, release]\njobs:\n  a:\n    steps:\n      - run: echo hi\n"
+	if _, err := Parse([]byte(multiBranch)); err == nil || !strings.Contains(err.Error(), "multiple cron branches are not supported") {
+		t.Fatalf("multi-branch cron = %v, want the multiple-cron-branches refusal", err)
 	}
 
 	s, err = Parse([]byte(`version: 1

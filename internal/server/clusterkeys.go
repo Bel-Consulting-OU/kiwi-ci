@@ -225,12 +225,14 @@ func createClusterKey(kind string) ([]byte, error) {
 }
 
 // createWebSessionKey honors the KIWI_WEB_SESSION_SECRET env override before
-// generating, matching the legacy loader's precedence.
+// generating, matching the legacy loader's precedence. A malformed override
+// is an error: generating a different key would silently split sessions
+// across replicas that all set the same (mistyped) value.
 func createWebSessionKey() ([]byte, error) {
-	if raw := strings.TrimSpace(os.Getenv("KIWI_WEB_SESSION_SECRET")); raw != "" {
-		if b, err := hex.DecodeString(raw); err == nil && len(b) == 32 {
-			return b, nil
-		}
+	if b, ok, err := webSessionSecretFromEnv(); err != nil {
+		return nil, err
+	} else if ok {
+		return b, nil
 	}
 	b := make([]byte, 32)
 	if _, err := io.ReadFull(randReader, b); err != nil {
@@ -900,6 +902,12 @@ func (s *Server) loadCacheSignerCluster(store ClusterKeyStore) error {
 }
 
 func (s *Server) loadWebSessionCluster(store ClusterKeyStore) error {
+	// Validate a configured override up front: even when the shared store
+	// already holds a key, a malformed KIWI_WEB_SESSION_SECRET means the
+	// replica would silently ignore the operator's configuration.
+	if _, _, err := webSessionSecretFromEnv(); err != nil {
+		return err
+	}
 	b, err := store.LoadOrCreate(clusterKindWebSession)
 	if err != nil {
 		return fmt.Errorf("cluster web session secret: %w", err)

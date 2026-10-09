@@ -67,7 +67,7 @@ func pgITLatestVersion(t *testing.T) int {
 }
 
 // pgITRandomHex returns n random lowercase hex characters.
-func pgITRandomHex(t *testing.T, n int) string {
+func pgITRandomHex(t testing.TB, n int) string {
 	t.Helper()
 	b := make([]byte, (n+1)/2)
 	if _, err := rand.Read(b); err != nil {
@@ -77,7 +77,7 @@ func pgITRandomHex(t *testing.T, n int) string {
 }
 
 // pgITNewID returns a canonical 32-hex-char ID accepted by ValidateID.
-func pgITNewID(t *testing.T) string {
+func pgITNewID(t testing.TB) string {
 	t.Helper()
 	return pgITRandomHex(t, 32)
 }

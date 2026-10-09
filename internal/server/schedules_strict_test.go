@@ -95,6 +95,18 @@ func TestParseScheduleSpecStrictRejections(t *testing.T) {
 			doc:  "version: 1\non:\n  schedule:\n    branches: [main]\njobs:\n  a:\n    steps:\n      - run: x\n",
 			want: "on.schedule.cron",
 		},
+		{
+			// The scheduler executes exactly Cron[0] with Branches[0];
+			// admitting more would silently truncate the declaration.
+			name: "multiple cron entries",
+			doc:  "version: 1\non:\n  schedule:\n    - cron: \"0 0 * * *\"\n    - cron: \"0 1 * * *\"\njobs:\n  a:\n    steps:\n      - run: x\n",
+			want: "multiple cron entries are not supported",
+		},
+		{
+			name: "multiple cron branches",
+			doc:  "version: 1\non:\n  schedule:\n    - cron: \"0 0 * * *\"\n      branches: [main, release]\njobs:\n  a:\n    steps:\n      - run: x\n",
+			want: "multiple cron branches are not supported",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -34,6 +34,13 @@ const (
 // on an amortized cadence, in bounded batches, through the configured
 // store's optional RetentionExecutionEventStore contract (PostgreSQL or the
 // fs repository; memory-only servers have no durable stream to prune).
+//
+// TWO-PHASE ACTIVATION: pruning is OPT-IN behind EventsRetentionPrune. The
+// window may be configured first (EventsRetention > 0), but nothing is
+// pruned until the operator has upgraded every replica and enabled the gate:
+// a pre-0052 replica does not understand retained_from and would answer an
+// expired cursor as a silently truncated 200. While the window is set and
+// the gate is false, a one-time warning explains the activation step.
 // Nothing is pruned when EventsRetention <= 0 (explicitly disabled). Errors
 // are logged and never fail maintenance: the next tick retries, and a
 // consumer can never be told a cursor expired against a watermark that was
@@ -41,6 +48,10 @@ const (
 // transaction).
 func (s *Server) maybePruneExecutionEvents(ctx context.Context, now time.Time) {
 	if s.EventsRetention <= 0 {
+		return
+	}
+	if !s.EventsRetentionPrune {
+		s.warnEventsRetentionPruneDisabled()
 		return
 	}
 	s.eventsPruneMu.Lock()
@@ -71,6 +82,22 @@ func (s *Server) maybePruneExecutionEvents(ctx context.Context, now time.Time) {
 		s.metricAdd("kiwi_execution_events_pruned_total", float64(total), nil)
 		s.logInfo("execution events pruned", "count", total)
 	}
+}
+
+// warnEventsRetentionPruneDisabled emits the one-time two-phase activation
+// warning when a retention window is configured but pruning is still gated
+// off. It is emitted once per process (JIT on the first maintenance tick) and
+// never blocks the tick.
+func (s *Server) warnEventsRetentionPruneDisabled() {
+	s.eventsPruneMu.Lock()
+	if s.eventsPruneWarned {
+		s.eventsPruneMu.Unlock()
+		return
+	}
+	s.eventsPruneWarned = true
+	s.eventsPruneMu.Unlock()
+	s.logInfo("execution event retention window configured but pruning is disabled; upgrade all replicas to a build that understands retained_from, then set server.events_retention_prune = true to activate pruning",
+		"events_retention", s.EventsRetention.String())
 }
 
 // GCStats reports what one garbage-collection pass removed.

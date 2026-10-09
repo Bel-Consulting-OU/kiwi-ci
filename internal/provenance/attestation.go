@@ -25,11 +25,20 @@ const ExecutionAttestationPredicateType = "kiwi-ci/execution-attestation/v1"
 
 // executionAttestationSchemaVersion is the attestation block's schema
 // version. It is part of the canonical digest preimage, so a future field
-// change must bump it.
-const executionAttestationSchemaVersion = 1
+// change must bump it. Version 2 added completionResultDigest (the durable v2
+// completion identity) and evidenceRootSha256 (the full artifact-side
+// evidence graph root); an envelope signed under schema 1 predates both
+// fields and no longer verifies under this digest.
+const executionAttestationSchemaVersion = 2
 
 // executionAttestationDigestVersion tags the canonical hashing encoding.
 const executionAttestationDigestVersion = "kiwi-ci/execution-attestation-digest/v1"
+
+// executionEvidenceRootVersion tags the canonical evidence-root encoding: the
+// binding over the FULL artifact-side evidence graph of one attempt (every
+// artifact with its sidecar references, every test-report suite digest, every
+// snapshot identity), not just the human-readable per-item lists.
+const executionEvidenceRootVersion = "kiwi-ci/execution-evidence-root/v1"
 
 // ExecutionAttestationArtifact is one artifact committed under the attempt:
 // the payload digest/size and the digest of its signed provenance statement
@@ -89,6 +98,18 @@ type ExecutionAttestation struct {
 	// post_job workspace snapshot (the outcome material), when one was
 	// committed.
 	MaterialRootSHA256 string `json:"materialRootSha256,omitempty"`
+	// CompletionResultDigest is the v2 completion identity digest of the
+	// attempt, read from the job's durable completion receipt when the
+	// receipt was written under the v2 encoding. It binds the terminal
+	// status/error/outputs/runtime evidence by digest only: no raw output or
+	// error value is ever embedded in the envelope.
+	CompletionResultDigest string `json:"completionResultDigest,omitempty"`
+	// EvidenceRootSHA256 is the canonical digest over the FULL artifact-side
+	// evidence graph of the attempt (see ExecutionEvidenceRoot): every
+	// artifact with its sidecar references plus suite digests and snapshot
+	// identities. The per-item lists above remain the human-readable detail;
+	// this root is the binding.
+	EvidenceRootSHA256 string `json:"evidenceRootSha256,omitempty"`
 }
 
 // ExecutionAttestationInput assembles the attestation statement's evidence.
@@ -112,6 +133,16 @@ type ExecutionAttestationInput struct {
 	Snapshots              []ExecutionAttestationSnapshot
 	WorkspaceRootSHA256    string
 	MaterialRootSHA256     string
+	// CompletionResultDigest is the job's durable v2 completion identity
+	// digest, when one exists (legacy completions have none). It is copied
+	// into the signed block and the canonical digest, so a verifier detects
+	// any tampering with it.
+	CompletionResultDigest string
+	// EvidenceRootSHA256 binds the full artifact-side evidence graph of the
+	// attempt (see ExecutionEvidenceRoot). The emitter computes it from the
+	// durable records; it is copied into the signed block and canonical
+	// digest like every other field.
+	EvidenceRootSHA256 string
 }
 
 // ExecutionAttestationStatement builds the signed statement of a final
@@ -141,6 +172,8 @@ func ExecutionAttestationStatement(in ExecutionAttestationInput) (Statement, err
 		Snapshots:              append([]ExecutionAttestationSnapshot(nil), in.Snapshots...),
 		WorkspaceRootSHA256:    in.WorkspaceRootSHA256,
 		MaterialRootSHA256:     in.MaterialRootSHA256,
+		CompletionResultDigest: in.CompletionResultDigest,
+		EvidenceRootSHA256:     in.EvidenceRootSHA256,
 	}
 	SortAttestationEvidence(&att)
 	digest, err := ExecutionAttestationDigest(att)
@@ -224,6 +257,115 @@ func putUint64(b []byte, v uint64) {
 	}
 }
 
+// ExecutionEvidenceArtifact is one artifact's FULL evidence identity for the
+// evidence root: the payload identity (name, sha256, size, generation) and
+// every sidecar reference the artifact record carries (provenance statement,
+// SBOM document, Sigstore bundle). It is intentionally richer than the
+// human-readable ExecutionAttestationArtifact list: the root binds the sidecar
+// graph even though the envelope keeps only the per-item detail.
+type ExecutionEvidenceArtifact struct {
+	Name             string
+	SHA256           string
+	Size             int64
+	Generation       int64
+	ProvenanceSHA256 string
+	SBOMPath         string
+	SBOMSHA256       string
+	SigstorePath     string
+	SigstoreSHA256   string
+}
+
+// ExecutionEvidenceGraph is the full artifact-side evidence committed under
+// one attempt: artifacts (with sidecars), test-report suite digests and
+// workspace snapshot identities.
+type ExecutionEvidenceGraph struct {
+	Artifacts   []ExecutionEvidenceArtifact
+	TestReports []ExecutionAttestationReport
+	Snapshots   []ExecutionAttestationSnapshot
+}
+
+// ExecutionEvidenceRoot returns the canonical digest that binds the full
+// artifact-side evidence graph of one attempt: a length-prefixed encoding
+// tagged "kiwi-ci/execution-evidence-root/v1" over the sorted artifact list
+// (identity plus every sidecar reference), the test-report suite digests and
+// the snapshot identities. Sorting makes the root independent of store row
+// order, and the length-prefixed field style makes every boundary
+// unambiguous, so changing any artifact, sidecar reference, suite digest or
+// snapshot changes the root. The statement embeds this root inside the
+// canonical attestation digest, so tampering with the graph invalidates the
+// signature.
+func ExecutionEvidenceRoot(g ExecutionEvidenceGraph) string {
+	arts := append([]ExecutionEvidenceArtifact(nil), g.Artifacts...)
+	sort.Slice(arts, func(i, j int) bool {
+		a, b := arts[i], arts[j]
+		if a.Name != b.Name {
+			return a.Name < b.Name
+		}
+		if a.SHA256 != b.SHA256 {
+			return a.SHA256 < b.SHA256
+		}
+		return a.Generation < b.Generation
+	})
+	reports := append([]ExecutionAttestationReport(nil), g.TestReports...)
+	sort.Slice(reports, func(i, j int) bool {
+		a, b := reports[i], reports[j]
+		if a.Name != b.Name {
+			return a.Name < b.Name
+		}
+		if a.SuiteDigest != b.SuiteDigest {
+			return a.SuiteDigest < b.SuiteDigest
+		}
+		return a.Generation < b.Generation
+	})
+	snaps := append([]ExecutionAttestationSnapshot(nil), g.Snapshots...)
+	sort.Slice(snaps, func(i, j int) bool {
+		a, b := snaps[i], snaps[j]
+		if a.ID != b.ID {
+			return a.ID < b.ID
+		}
+		if a.Phase != b.Phase {
+			return a.Phase < b.Phase
+		}
+		if a.SHA256 != b.SHA256 {
+			return a.SHA256 < b.SHA256
+		}
+		return a.Generation < b.Generation
+	})
+
+	h := sha256.New()
+	field := func(label, value string) {
+		fmt.Fprintf(h, "%d:%s=%d:", len(label), label, len(value))
+		_, _ = io.WriteString(h, value)
+	}
+	field("evidenceRootVersion", executionEvidenceRootVersion)
+	field("artifactCount", strconv.Itoa(len(arts)))
+	for _, a := range arts {
+		field("artifactName", a.Name)
+		field("artifactSha256", a.SHA256)
+		field("artifactSize", strconv.FormatInt(a.Size, 10))
+		field("artifactGeneration", strconv.FormatInt(a.Generation, 10))
+		field("artifactProvenanceSha256", a.ProvenanceSHA256)
+		field("artifactSBOMPath", a.SBOMPath)
+		field("artifactSBOMSha256", a.SBOMSHA256)
+		field("artifactSigstorePath", a.SigstorePath)
+		field("artifactSigstoreSha256", a.SigstoreSHA256)
+	}
+	field("testReportCount", strconv.Itoa(len(reports)))
+	for _, r := range reports {
+		field("testReportName", r.Name)
+		field("testReportSuiteDigest", r.SuiteDigest)
+		field("testReportGeneration", strconv.FormatInt(r.Generation, 10))
+	}
+	field("snapshotCount", strconv.Itoa(len(snaps)))
+	for _, s := range snaps {
+		field("snapshotID", s.ID)
+		field("snapshotPhase", s.Phase)
+		field("snapshotSha256", s.SHA256)
+		field("snapshotGeneration", strconv.FormatInt(s.Generation, 10))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 // ExecutionAttestationDigest returns the canonical digest that binds the
 // whole attestation block: a length-prefixed encoding (the same
 // `%d:%s=%d:` field style as CapsuleDigest) over every field in stable
@@ -272,6 +414,8 @@ func ExecutionAttestationDigest(att ExecutionAttestation) (string, error) {
 	}
 	field("workspaceRootSha256", att.WorkspaceRootSHA256)
 	field("materialRootSha256", att.MaterialRootSHA256)
+	field("completionResultDigest", att.CompletionResultDigest)
+	field("evidenceRootSha256", att.EvidenceRootSHA256)
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 

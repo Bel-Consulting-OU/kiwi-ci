@@ -189,3 +189,79 @@ func TestExecutionEventTerminalStatusesIncludeBlocked(t *testing.T) {
 		}
 	}
 }
+
+// TestExecutionEventCursorExpiredBoundary pins the retained_from expiry rule:
+// retainedFrom is the HIGHEST removed seq, so after == retainedFrom is the
+// consumed boundary and stays valid while after == retainedFrom-1 is expired
+// (seq retainedFrom was removed unobserved).
+func TestExecutionEventCursorExpiredBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		after, retained int64
+		expired         bool
+	}{
+		{0, 0, false},
+		{5, 0, false},
+		{0, 5, true},
+		{4, 5, true},
+		{5, 5, false},
+		{6, 5, false},
+		{9, 5, false},
+	} {
+		if got := ExecutionEventCursorExpired(tc.after, tc.retained); got != tc.expired {
+			t.Errorf("ExecutionEventCursorExpired(%d, %d) = %v, want %v", tc.after, tc.retained, got, tc.expired)
+		}
+	}
+}
+
+// TestExecutionEventDeploymentAttempt pins the semantic deployment events'
+// attempt identity: both deployment.started and deployment.completed carry
+// the deployment record's lease generation as ExecutionEvent.Attempt, so a
+// consumer can attribute a deployment to the exact job attempt.
+func TestExecutionEventDeploymentAttempt(t *testing.T) {
+	d := testDeployment
+	d.LeaseGeneration = 4
+	started := ExecutionEventDeploymentStarted(d)
+	if started.Attempt != 4 {
+		t.Fatalf("deployment.started attempt = %d, want 4: %+v", started.Attempt, started)
+	}
+	d.Status = model.StatusSuccess
+	done := ExecutionEventDeploymentCompleted(d)
+	if done.Attempt != 4 {
+		t.Fatalf("deployment.completed attempt = %d, want 4: %+v", done.Attempt, done)
+	}
+	// A legacy record without a generation reads as 0, never a fabricated
+	// attempt.
+	d.LeaseGeneration = 0
+	if got := ExecutionEventDeploymentStarted(d).Attempt; got != 0 {
+		t.Fatalf("legacy deployment attempt = %d, want 0", got)
+	}
+}
+
+// TestMemStoreAtomicRetentionReadLatestMonotonic proves the memStore mirror
+// of the atomic retention read: latest comes from the monotonic allocated
+// watermark, so pruning every row cannot regress it, and the page/watermark
+// are returned together.
+func TestMemStoreAtomicRetentionReadLatestMonotonic(t *testing.T) {
+	ctx := context.Background()
+	m := newMemStore()
+	now := time.Now().UTC()
+	for i := 0; i < 3; i++ {
+		if err := m.AppendExecutionEvent(ctx, model.ExecutionEvent{RunID: "run-a", Type: "job.queued", CreatedAt: now.Add(-time.Duration(3-i) * time.Hour)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, cursor, retained, latest, err := m.ReadExecutionEventsRetention(ctx, 0, 100, "run-a")
+	if err != nil || len(page) != 3 || cursor != 3 || retained != 0 || latest != 3 {
+		t.Fatalf("initial atomic read = %d cursor %d retained %d latest %d err %v", len(page), cursor, retained, latest, err)
+	}
+	if _, _, err := m.PruneExecutionEvents(ctx, now.Add(time.Hour), 100); err != nil {
+		t.Fatal(err)
+	}
+	page, cursor, retained, latest, err = m.ReadExecutionEventsRetention(ctx, 3, 100, "")
+	if err != nil || len(page) != 0 || cursor != 3 || retained != 3 || latest != 3 {
+		t.Fatalf("all-pruned atomic read = %d cursor %d retained %d latest %d err %v", len(page), cursor, retained, latest, err)
+	}
+	if ExecutionEventCursorExpired(2, retained) != true || ExecutionEventCursorExpired(3, retained) != false {
+		t.Fatalf("memStore expiry boundary at retained %d disagrees", retained)
+	}
+}

@@ -669,6 +669,26 @@ type SnapshotStore interface {
 	ListSnapshotsByRun(ctx context.Context, runID string) ([]model.SnapshotRecord, error)
 }
 
+// LogCursorStore reports a run's monotonic log high-water (migration 0052's
+// log_cursors row; the durable global journal watermark in fs mode). It is
+// the value a stream/bootstrap consumer uses as "latest committed log seq":
+// it never goes backwards, even when retention removes rows or a rollback
+// frees an allocated range. Stores without the capability are simply skipped
+// by consumers that report it as advisory metadata.
+type LogCursorStore interface {
+	LatestLogSeq(ctx context.Context, runID string) (int64, error)
+}
+
+// RunKeyIndexStore reports whether the run-scoped logical job key uniqueness
+// index (migration 0048/0053 jobs_run_key_idx) is present. A false result
+// means the database was dirty when 0048 ran and the operator has not yet
+// repaired the duplicate (run_id, key) rows and re-migrated; readiness
+// surfaces it as not-ready until then. In-memory/fs stores have no index and
+// do not implement this contract.
+type RunKeyIndexStore interface {
+	RunKeyIndexPresent(ctx context.Context) (bool, error)
+}
+
 // Artifact provenance policy values. BestEffort (the default) keeps the
 // historical post-commit provenance sidecar flow; Required makes a durable
 // signed provenance envelope a PRECONDITION of the upload commit and of

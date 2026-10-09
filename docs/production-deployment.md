@@ -254,7 +254,10 @@ session cookies and CSRF protection.
 ## Production capabilities
 
 - Server-side schedules: cron-parsed, leader-gated firing with
-  exactly-once nominal occurrence claims (`schedule_occurrences`).
+  exactly-once nominal occurrence claims (`schedule_occurrences`). A schedule
+  spec must declare exactly one `on.schedule` cron entry and at most one
+  branch per entry; admission rejects multiple entries or branches instead of
+  silently running only the first.
 - OIDC signing-key rotation: active + previous verification keys with
   retire-after windows — see [oidc.md](oidc.md).
 - OpenTelemetry export: OTLP/HTTP traces for requests, forge intake,
@@ -487,7 +490,9 @@ In **DB mode the database clock is the authority for a lease's lifetime**:
   predecessor's runtimes BEFORE leasing. XFS project IDs already present on
   the filesystem are discovered and reserved before allocation, so a restart
   cannot reuse a live assignment. Production also requires a shared
-  `KIWI_WEB_SESSION_SECRET`, set `sandbox.non_root` is enforced (or the
+  dashboard session key — either `KIWI_WEB_SESSION_SECRET` (a malformed
+  value is a startup error, never a silent random fallback) or the shared
+  cluster key store above — set `sandbox.non_root` is enforced (or the
   runtime is refused), corrupt current-format parent policy metadata fails
   generated children closed, and lease scheduling ages waiting jobs so
   low-priority work cannot be starved.

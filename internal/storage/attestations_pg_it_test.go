@@ -181,9 +181,11 @@ func TestPostgresIntegrationLogEntryLeaseGeneration(t *testing.T) {
 		}
 	}
 
-	// Legacy row: written without the column so the DEFAULT 0 applies.
+	// Legacy row: written without the lease_generation column so the column
+	// DEFAULT 0 applies. seq is explicit because migration 0052 dropped the
+	// identity default (appends allocate through log_cursors).
 	legacyRun := pgITNewID(t)
-	if _, err := st.pool.Exec(ctx, `INSERT INTO log_entries (run_id, line, created_at) VALUES ($1, $2, $3)`, legacyRun, "legacy", time.Now().UTC()); err != nil {
+	if _, err := st.pool.Exec(ctx, `INSERT INTO log_entries (seq, run_id, line, created_at) VALUES (1, $1, $2, $3)`, legacyRun, "legacy", time.Now().UTC()); err != nil {
 		t.Fatalf("legacy insert: %v", err)
 	}
 	entries, err = st.ReadLogs(ctx, legacyRun, -1, 100)

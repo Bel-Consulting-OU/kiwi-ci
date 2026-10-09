@@ -26,6 +26,12 @@ import (
 // runner enforce. Every layer (parser, runner pre-check, /tests decode) uses
 // those constants, so there is exactly one size contract.
 //
+// Nesting is bounded separately: readSuiteElement recurses into nested
+// <testsuite> elements, so a hostile document could otherwise exhaust the
+// stack with one <testsuite> per byte. maxSuiteNestingDepth caps the
+// recursion; a deeper document is a parse error (ErrLimitExceeded), never a
+// crash.
+//
 // Sanitize, don't reject: producer-declared METADATA that exceeds a shared
 // budget is clamped at the parser-side aggregation points (budgetCounters,
 // clampDuration) exactly like a negative counter or an oversized failure
@@ -46,6 +52,13 @@ const (
 	// may legitimately merge many suites whose separate times each sit at
 	// the bound.
 	maxReportDuration = 1e9
+	// maxSuiteNestingDepth bounds how deep <testsuite> elements may nest.
+	// readSuiteElement recurses once per nested <testsuite>, so without a
+	// ceiling a hostile document with thousands of nested elements would
+	// grow the parser stack without bound. Real producers nest one or two
+	// levels (a <testsuites> wrapper plus suites and occasionally nested
+	// suites); 128 is far above anything legitimate and cheap to enforce.
+	maxSuiteNestingDepth = 128
 )
 
 // Suite is one <testsuite> element. Counts are the attributes when present
@@ -162,7 +175,7 @@ func parseReport(r io.Reader, name string, mask func(string) string) (Report, er
 		switch se.Name.Local {
 		case "testsuites", "testsuite":
 			seen = true
-			suites, serr := readSuiteElement(dec, se, mask, &cases)
+			suites, serr := readSuiteElement(dec, se, mask, &cases, 1)
 			if serr != nil {
 				return out, fmt.Errorf("parse %s: %w", name, serr)
 			}
@@ -204,7 +217,16 @@ func parseReport(r io.Reader, name string, mask func(string) string) (Report, er
 
 // readSuiteElement reads one <testsuite> element (recursing into nested
 // suites) or a <testsuites> wrapper, returning every suite it contains.
-func readSuiteElement(dec *xml.Decoder, se xml.StartElement, mask func(string) string, cases *int) ([]Suite, error) {
+//
+// depth is the 1-based nesting level of the <testsuite> being read; the
+// <testsuites> wrapper does not consume a level because it is a collection
+// container, not a suite. A nested <testsuite> beyond maxSuiteNestingDepth is
+// rejected with ErrLimitExceeded instead of recursing further, so a hostile
+// document cannot exhaust the stack.
+func readSuiteElement(dec *xml.Decoder, se xml.StartElement, mask func(string) string, cases *int, depth int) ([]Suite, error) {
+	if depth > maxSuiteNestingDepth {
+		return nil, fmt.Errorf("%w: testsuite nesting exceeds %d levels", ErrLimitExceeded, maxSuiteNestingDepth)
+	}
 	if se.Name.Local == "testsuites" {
 		var suites []Suite
 		for {
@@ -219,7 +241,9 @@ func readSuiteElement(dec *xml.Decoder, se xml.StartElement, mask func(string) s
 			case xml.StartElement:
 				switch t.Name.Local {
 				case "testsuite":
-					nested, nerr := readSuiteElement(dec, t, mask, cases)
+					// The wrapper is a collection container, not a suite:
+					// its direct children start at the wrapper's own level.
+					nested, nerr := readSuiteElement(dec, t, mask, cases, depth)
 					if nerr != nil {
 						return nil, nerr
 					}
@@ -290,7 +314,7 @@ func readSuiteElement(dec *xml.Decoder, se xml.StartElement, mask func(string) s
 				}
 				s.Cases = append(s.Cases, c)
 			case "testsuite":
-				nested, nerr := readSuiteElement(dec, t, mask, cases)
+				nested, nerr := readSuiteElement(dec, t, mask, cases, depth+1)
 				if nerr != nil {
 					return nil, nerr
 				}

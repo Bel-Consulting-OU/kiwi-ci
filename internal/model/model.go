@@ -729,11 +729,23 @@ type JobResult struct {
 // CompletionReceipt deduplicates runner completion requests so a retried
 // complete() after a lost response is idempotent for the same generation.
 // ResultHash is the SHA-256 of the canonicalized completion payload.
+//
+// ResultHashVersion tags how ResultHash was computed, so replay resolution can
+// compare like with like across a rolling upgrade:
+//
+//   - 2: storage.CompletionResultDigestV2 over status, error digest, outputs
+//     and the observed runtime evidence. New completions always write this.
+//   - 1 (or 0, a record persisted before the field existed): the legacy
+//     computation over status, error and outputs only. A stored v1 receipt can
+//     replay only when the retry's legacy digest matches AND the runtime
+//     evidence is nil-or-equal (see storage.CompletionReceiptReplayMatches):
+//     a v2-evidence-bearing retry must never masquerade as the legacy identity.
 type CompletionReceipt struct {
-	JobID      string `json:"job_id"`
-	Generation int64  `json:"generation"`
-	RunnerID   string `json:"runner_id"`
-	ResultHash string `json:"result_hash"`
+	JobID             string `json:"job_id"`
+	Generation        int64  `json:"generation"`
+	RunnerID          string `json:"runner_id"`
+	ResultHash        string `json:"result_hash"`
+	ResultHashVersion int    `json:"result_hash_version,omitempty"`
 }
 
 // Deployment is the server-side record of one environment deployment. It is

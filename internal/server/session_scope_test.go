@@ -199,8 +199,9 @@ func TestWebCSRFRequiredForEveryMutatingMethod(t *testing.T) {
 
 // TestWebSessionSecretConfiguration pins the KIWI_WEB_SESSION_SECRET
 // contract: a valid 64-hex value is used verbatim (so replicas with the
-// same secret validate each other's cookies), an invalid value falls back
-// to a fresh random secret (never a weak/empty key).
+// same secret validate each other's cookies), an unset value generates a
+// fresh random secret (the documented dev default), and a malformed
+// configured value is a startup error, never a silent random fallback.
 func TestWebSessionSecretConfiguration(t *testing.T) {
 	valid := strings.Repeat("ab", 32)
 	t.Setenv("KIWI_WEB_SESSION_SECRET", valid)
@@ -230,16 +231,27 @@ func TestWebSessionSecretConfiguration(t *testing.T) {
 	if w := serveWithSession(s3, http.MethodGet, "/api/v1/runs", cookie, ""); w.Code != http.StatusUnauthorized {
 		t.Fatalf("foreign-secret session accepted: %d", w.Code)
 	}
-	// Invalid configured values fall back to a fresh random 32-byte key.
-	for _, bad := range []string{"", "   ", "zz", strings.Repeat("a", 63), strings.Repeat("a", 65), "not-hex!"} {
+	// Unset configured values fall back to a fresh random 32-byte key.
+	for _, unset := range []string{"", "   "} {
+		t.Setenv("KIWI_WEB_SESSION_SECRET", unset)
+		s := New("admin-token")
+		if err := s.ensureWebSessionSecret(); err != nil {
+			t.Fatalf("unset secret %q = %v, want a fresh random key", unset, err)
+		}
+		if len(s.WebSessionSecret) != 32 {
+			t.Fatalf("unset secret %q produced a %d-byte key", unset, len(s.WebSessionSecret))
+		}
+	}
+	// Malformed configured values are a startup error: falling back to a
+	// random key would silently split sessions across replicas.
+	for _, bad := range []string{"zz", strings.Repeat("a", 63), strings.Repeat("a", 65), "not-hex!"} {
 		t.Setenv("KIWI_WEB_SESSION_SECRET", bad)
 		s := New("admin-token")
-		s.ensureWebSessionSecret()
-		if len(s.WebSessionSecret) != 32 {
-			t.Fatalf("invalid secret %q produced a %d-byte key", bad, len(s.WebSessionSecret))
+		if err := s.ensureWebSessionSecret(); err == nil {
+			t.Fatalf("malformed secret %q accepted, want an error", bad)
 		}
-		if strings.Contains(string(s.WebSessionSecret), bad) && bad != "" {
-			t.Fatalf("invalid secret %q leaked into the key", bad)
+		if len(s.WebSessionSecret) != 0 {
+			t.Fatalf("malformed secret %q still produced a key", bad)
 		}
 	}
 }

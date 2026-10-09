@@ -77,11 +77,12 @@ func TestIDCovCreateClusterKey(t *testing.T) {
 	if hexKey[0] != 0xef {
 		t.Fatalf("createWebSessionKey ignored the env override: %x", hexKey)
 	}
-	// An invalid override falls back to fresh random material.
+	// A malformed override is refused: falling back to fresh random material
+	// would silently split dashboard sessions across replicas.
 	t.Setenv("KIWI_WEB_SESSION_SECRET", "not-hex")
 	fresh, err := createWebSessionKey()
-	if err != nil || len(fresh) != 32 {
-		t.Fatalf("createWebSessionKey(fallback) = %v (%d bytes)", err, len(fresh))
+	if err == nil || fresh != nil {
+		t.Fatalf("createWebSessionKey(malformed env) = %v (%d bytes), want an error", err, len(fresh))
 	}
 	t.Setenv("KIWI_WEB_SESSION_SECRET", "")
 }

@@ -1,0 +1,14 @@
+-- 0054_completion_receipt_result_hash_version.sql — versioned completion
+-- receipt identity.
+--
+-- Completion receipts used to bind only status/error/outputs, so the same
+-- completion identity (job, generation, runner) could replay with
+-- contradictory ObservedRuntime evidence. New completions hash the runtime
+-- evidence too (storage.CompletionResultDigestV2) and record that semantic in
+-- result_hash_version. Existing rows keep their historical hash and read as
+-- version 1, whose replay resolution additionally requires the retry's runtime
+-- evidence to be nil-or-equal against the stored attempt evidence.
+--
+-- Additive with a default: older binaries never select the column and keep
+-- reading/writing the table unchanged.
+ALTER TABLE completion_receipts ADD COLUMN IF NOT EXISTS result_hash_version INT NOT NULL DEFAULT 1;

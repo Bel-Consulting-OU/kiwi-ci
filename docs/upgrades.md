@@ -74,6 +74,56 @@ transaction, so each file is its own lock window:
 - No manual step is required: the server migrates at startup, the split keeps
   each lock window independent, and re-running is idempotent (`IF NOT EXISTS`).
 
+### Execution event retention (two-phase activation)
+
+Migration 0049 adds the execution event stream's `retained_from` retention
+watermark; pruning deletes the oldest events as a contiguous prefix and a
+consumer cursor strictly below the watermark is answered `410 cursor_expired`
+(after == retained_from stays valid). Because a replica that predates the
+watermark would serve such a cursor as a silently truncated `200`, pruning is
+OPT-IN behind `server.events_retention_prune` (default `false`):
+
+1. Set `server.events_retention` (the window) on every replica. Nothing is
+   pruned; a one-time startup warning explains the remaining step.
+2. Upgrade every replica to a build that understands `retained_from` and
+   confirm the readiness of the fleet.
+3. Set `server.events_retention_prune = true` and restart the replicas (or
+   roll the setting out with the next upgrade). Only then may any replica
+   delete events and advance the watermark.
+
+Reversing the setting is safe: disabling the gate stops new prunes but never
+restores deleted events or rewinds the watermark, and consumers whose cursors
+are below `retained_from` keep re-bootstrapping through `latest_cursor`.
+
+### Run/key identity index repair (0048/0053)
+
+Migration 0048 creates the run-scoped logical job key uniqueness index
+(`jobs_run_key_idx`) only when the database has no duplicate `(run_id, key)`
+job rows. A database that was dirty at 0048 time keeps its recorded version
+row without the index, and the generated-fragment admission checks remain the
+only guard; `/readiness` now reports `503` with
+`X-Kiwi-State: run-key-index-missing` and `kiwi_run_key_index_present` stays
+`0` until the index exists.
+
+Repair path:
+
+1. Find duplicate `(run_id, key)` job rows:
+
+   ```sql
+   SELECT run_id, key, count(*) FROM jobs GROUP BY run_id, key HAVING count(*) > 1;
+   ```
+
+2. Cancel or remove the duplicate rows (never delete a live attempt without
+   cancelling it first), then
+3. re-run the migrator (`kiwi database migrate`); migration 0053 re-runs the
+   conditional `CREATE UNIQUE INDEX`, or create it manually:
+
+   ```sql
+   CREATE UNIQUE INDEX IF NOT EXISTS jobs_run_key_idx ON jobs (run_id, key);
+   ```
+
+`/readiness` returns to `200` once the probe sees the index.
+
 ## Upgrade procedure
 
 1. Back up PostgreSQL, the data directory key files (lease, OIDC, CA),
@@ -156,6 +206,15 @@ claims themselves.
 
 ## Behavioral compatibility notes
 
+- Migration 0052 replaces the identity-sequenced `log_entries.seq` with the
+  commit-ordered `log_cursors` allocation: a log append's sequence is now
+  allocated under the run's cursor row lock and held to commit, so allocation
+  order equals visible order and a rollback frees its range. The migration
+  records compatibility floor 52, so replicas that predate it must drain
+  before it applies (an old replica would allocate log sequences outside the
+  cursor table). Readers are unaffected: `seq > after` paging is unchanged,
+  and the log stream's advisory `X-Kiwi-Log-Latest` high-water comes from
+  `log_cursors.value`.
 - Unrunning jobs carry their pipeline text, so a control plane
   restarted on a new version recompiles deterministically against the
   new compiler; test canary pipelines before rolling upgrades across

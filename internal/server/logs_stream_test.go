@@ -103,6 +103,29 @@ func TestStreamLogsRequiresAuth(t *testing.T) {
 	}
 }
 
+// TestLogsMalformedCursor400 proves both log read routes refuse a malformed
+// ?after with HTTP 400 instead of silently replaying from zero (a cursor typo
+// must never be interpreted as "start over").
+func TestLogsMalformedCursor400(t *testing.T) {
+	s, err := NewPersistent("secret", "secret", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	s.runs["r1"] = model.Run{ID: "r1", Repo: "https://github.com/kiwi/repo.git", RepoFullName: "kiwi/repo", Status: model.StatusRunning}
+	s.mu.Unlock()
+	for _, path := range []string{
+		"/api/v1/runs/r1/logs?after=oops",
+		"/api/v1/runs/r1/logs?after=-1",
+		"/api/v1/runs/r1/logs/stream?after=oops",
+		"/api/v1/runs/r1/logs/stream?after=-1",
+	} {
+		if w := doJSON(t, s, http.MethodGet, path, "secret", ""); w.Code != http.StatusBadRequest {
+			t.Fatalf("%s = %d, want 400: %s", path, w.Code, w.Body.String())
+		}
+	}
+}
+
 // streamDeleteStore wraps a working store and starts reporting ErrNotFound
 // after failAfter reads, simulating a run deleted while its log stream is
 // open.
@@ -150,6 +173,45 @@ func TestStreamLogsRunDeletedMidStream(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("stream did not terminate after the run disappeared")
+	}
+}
+
+// TestStreamLogsReportsLatestHighWater proves the stream advertises the
+// run's monotonic log high-water (from the store's LogCursorStore; fs mode
+// uses the durable journal watermark) as X-Kiwi-Log-Latest, so a client can
+// tell how far the committed stream reaches without racing the poll loop.
+func TestStreamLogsReportsLatestHighWater(t *testing.T) {
+	s, err := NewPersistent("secret", "secret", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	s.runs["r1"] = model.Run{ID: "r1", Repo: "https://github.com/kiwi/repo.git", RepoFullName: "kiwi/repo", Status: model.StatusRunning}
+	s.mu.Unlock()
+	for i := int64(1); i <= 3; i++ {
+		if err := s.store.AppendLog(model.LogEntry{Seq: i, RunID: "r1", JobID: "j1", JobKey: "build", Step: "s", Line: "line", CreatedAt: time.Now().UTC()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/api/v1/runs/r1/logs/stream", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer secret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stream status = %d", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Kiwi-Log-Latest"); got != "3" {
+		t.Fatalf("X-Kiwi-Log-Latest = %q, want 3", got)
 	}
 }
 

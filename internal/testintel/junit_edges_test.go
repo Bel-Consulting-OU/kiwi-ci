@@ -369,3 +369,54 @@ func TestAggregateRejectsMoreThanMaxJobCases(t *testing.T) {
 		t.Fatalf("error = %v, want ErrLimitExceeded", err)
 	}
 }
+
+// nestedSuiteDoc builds a JUnit document with the given number of nested
+// <testsuite> elements around one <testcase>.
+func nestedSuiteDoc(depth int) string {
+	var b strings.Builder
+	for i := 0; i < depth; i++ {
+		b.WriteString(`<testsuite name="s">`)
+	}
+	b.WriteString(`<testcase name="ok"/>`)
+	for i := 0; i < depth; i++ {
+		b.WriteString(`</testsuite>`)
+	}
+	return b.String()
+}
+
+// TestParseRejectsDeeplyNestedSuites is the adversarial regression for the
+// unbounded readSuiteElement recursion: a document nesting more than
+// maxSuiteNestingDepth suites must be refused with ErrLimitExceeded (not a
+// stack overflow), while a document at the limit still parses.
+func TestParseRejectsDeeplyNestedSuites(t *testing.T) {
+	over := writeReport(t, "over.xml", nestedSuiteDoc(maxSuiteNestingDepth+8))
+	if _, err := Parse(over); !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("deeply nested report err = %v, want ErrLimitExceeded", err)
+	}
+	at := writeReport(t, "at.xml", nestedSuiteDoc(maxSuiteNestingDepth))
+	rep, err := Parse(at)
+	if err != nil {
+		t.Fatalf("report at the nesting limit rejected: %v", err)
+	}
+	if rep.Tests != 1 {
+		t.Fatalf("report at the nesting limit tests = %d, want 1", rep.Tests)
+	}
+}
+
+// TestParseRejectsDeepNestingThroughWrapper pins that the <testsuites>
+// wrapper does not consume a nesting level: a wrapper plus
+// maxSuiteNestingDepth nested suites is still accepted, and one more level is
+// refused.
+func TestParseRejectsDeepNestingThroughWrapper(t *testing.T) {
+	doc := func(depth int) string {
+		return `<testsuites>` + nestedSuiteDoc(depth) + `</testsuites>`
+	}
+	at := writeReport(t, "wrapped-at.xml", doc(maxSuiteNestingDepth))
+	if _, err := Parse(at); err != nil {
+		t.Fatalf("wrapped report at the nesting limit rejected: %v", err)
+	}
+	over := writeReport(t, "wrapped-over.xml", doc(maxSuiteNestingDepth+1))
+	if _, err := Parse(over); !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("wrapped deeply nested report err = %v, want ErrLimitExceeded", err)
+	}
+}

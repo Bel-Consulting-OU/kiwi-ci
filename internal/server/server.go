@@ -108,9 +108,14 @@ type Server struct {
 	SecretBroker secretbroker.Broker
 
 	// WebSessionSecret is the HMAC key for short-lived web UI session
-	// cookies (see session.go). It is 32 bytes, generated from crypto/rand
-	// or the KIWI_WEB_SESSION_SECRET env var on first use. Empty disables
-	// cookie authentication until a login is attempted.
+	// cookies (see session.go). It is 32 bytes, loaded from the
+	// KIWI_WEB_SESSION_SECRET env var (a malformed value is a startup
+	// error) or derived/persisted through the configured cluster key store
+	// so HA replicas agree. A server with neither a configured value nor a
+	// shared store (dev/fs without a store) generates a random process-local
+	// key on first use: sessions then do not survive a restart and are not
+	// shared across replicas. Empty disables cookie authentication until a
+	// login is attempted.
 	WebSessionSecret []byte
 
 	// RunnerCA signs runner client certificates for enrollment and mTLS
@@ -566,9 +571,20 @@ type Server struct {
 	// disables retention explicitly. Pruning runs on Maintain's amortized
 	// cadence in bounded batches (see maybePruneExecutionEvents). The value
 	// is stable after wiring; eventsPruneMu guards only the cadence gate.
-	EventsRetention time.Duration
-	eventsPruneMu   sync.Mutex
-	lastEventsPrune time.Time
+	//
+	// EventsRetentionPrune is the TWO-PHASE activation gate: pruning only
+	// happens when it is true (the operator has upgraded every replica and
+	// set server.events_retention_prune). A pre-0052-era replica is unaware
+	// of retained_from and would serve an expired cursor as a truncated 200,
+	// so pruning must not start until every replica understands the
+	// watermark. With the window configured and the gate false, startup/JIT
+	// logs a one-time warning explaining the activation. Guarded by
+	// eventsPruneMu together with the cadence state below.
+	EventsRetention      time.Duration
+	EventsRetentionPrune bool
+	eventsPruneMu        sync.Mutex
+	lastEventsPrune      time.Time
+	eventsPruneWarned    bool
 
 	// CacheManifestRetention bounds durable shared-cache manifests: DB-mode
 	// cache_manifests rows and fs-mode manifest envelopes. Zero selects the
@@ -1251,6 +1267,10 @@ func (s *Server) Handler() http.Handler {
 	// is the SSE wrapper over the same cursor.
 	mux.HandleFunc("GET /api/v1/events", s.listEvents)
 	mux.HandleFunc("GET /api/v1/events/stream", s.streamExecutionEvents)
+	// Atomic execution bootstrap: the event cursor and the active-run/state
+	// summary from ONE consistency point (cursor first), so a controller can
+	// start browsing with after=cursor and miss no committed transition.
+	mux.HandleFunc("GET /api/v1/execution-snapshot", s.executionSnapshot)
 	// The auth middleware runs inside statusLogger/recoverer and outside
 	// s.auth so authenticated principals are available to handlers; s.auth
 	// keeps the legacy bearer checks and classifies routes. The rate
@@ -2819,7 +2839,10 @@ func (s *Server) getLogs(w http.ResponseWriter, r *http.Request) {
 	if !s.requireRunRead(w, r, run) {
 		return
 	}
-	after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
+	after, ok := parseLogCursor(w, r)
+	if !ok {
+		return
+	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	if s.DB != nil {
 		v, err := s.DB.ReadLogs(r.Context(), id, after, limit)
@@ -4753,7 +4776,10 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "runner session superseded by a newer registration", http.StatusConflict)
 		return
 	}
-	hash := completionResultHash(in.Status, in.Error, in.Outputs)
+	// The completion identity is the v2 digest: it binds status, error,
+	// outputs AND the observed runtime evidence, so a retried completion can
+	// never replay a receipt with contradictory runtime evidence.
+	hash := storage.CompletionResultDigestV2(in.Status, in.Error, in.Outputs, in.ObservedRuntime)
 	if s.Sched != nil {
 		s.completeDB(w, r, jobID, in, hash)
 		return
@@ -4773,7 +4799,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 			// snapshot answers 503 so effects never dispatch off state the
 			// disk does not contain.
 			s.mu.Lock()
-			matched, perr := s.completionReplayReadyLocked(jobID, in.LeaseGeneration, in.RunnerID, hash)
+			matched, perr := s.completionReplayReadyLocked(jobID, in.LeaseGeneration, in.RunnerID, in, hash)
 			s.mu.Unlock()
 			if matched {
 				if perr != nil {
@@ -4810,7 +4836,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.validActiveLease(cur, in.RunnerID, in.LeaseToken, in.LeaseGeneration, now) {
-		matched, perr := s.completionReplayReadyLocked(jobID, in.LeaseGeneration, in.RunnerID, hash)
+		matched, perr := s.completionReplayReadyLocked(jobID, in.LeaseGeneration, in.RunnerID, in, hash)
 		s.mu.Unlock()
 		if matched {
 			if perr != nil {
@@ -5013,26 +5039,40 @@ func (s *Server) completeDB(w http.ResponseWriter, r *http.Request, jobID string
 	if rec, has, err := s.DB.HasCompletionReceipt(ctx, jobID, in.LeaseGeneration, in.RunnerID); err != nil {
 		s.internalError(w, r, err, "")
 		return
-	} else if has && rec.ResultHash == hash {
-		if derr := s.reconcileCompletionEffects(ctx, jobID); derr != nil {
-			s.internalError(w, r, derr, "")
+	} else if has {
+		matched, merr := s.completionReceiptReplay(ctx, jobID, in, rec, hash)
+		if merr != nil {
+			s.internalError(w, r, merr, "")
 			return
 		}
-		w.WriteHeader(http.StatusNoContent)
-		return
+		if matched {
+			if derr := s.reconcileCompletionEffects(ctx, jobID); derr != nil {
+				s.internalError(w, r, derr, "")
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 	}
 	j, authErr := s.authorizeRunnerLease(r, in.RunnerID, in.LeaseToken, in.LeaseGeneration)
 	if authErr != nil {
 		if errors.Is(authErr, errStaleLease) {
 			// The completion may have raced a concurrent replay: the durable
 			// receipt wins, and its effects are reconciled before ack.
-			if rec, has, herr := s.DB.HasCompletionReceipt(ctx, jobID, in.LeaseGeneration, in.RunnerID); herr == nil && has && rec.ResultHash == hash {
-				if derr := s.reconcileCompletionEffects(ctx, jobID); derr != nil {
-					s.internalError(w, r, derr, "")
+			if rec, has, herr := s.DB.HasCompletionReceipt(ctx, jobID, in.LeaseGeneration, in.RunnerID); herr == nil && has {
+				matched, merr := s.completionReceiptReplay(ctx, jobID, in, rec, hash)
+				if merr != nil {
+					s.internalError(w, r, merr, "")
 					return
 				}
-				w.WriteHeader(http.StatusNoContent)
-				return
+				if matched {
+					if derr := s.reconcileCompletionEffects(ctx, jobID); derr != nil {
+						s.internalError(w, r, derr, "")
+						return
+					}
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
 			}
 		}
 		s.writeLeaseAuthError(w, r, authErr)
@@ -5078,15 +5118,22 @@ func (s *Server) completeDB(w http.ResponseWriter, r *http.Request, jobID string
 			http.Error(w, "completion result conflicts with stored receipt", http.StatusConflict)
 			return
 		}
-		if rec, has, herr := s.DB.HasCompletionReceipt(ctx, jobID, in.LeaseGeneration, in.RunnerID); herr == nil && has && rec.ResultHash == hash {
-			// Idempotent replay: re-apply post-completion effects that may
-			// have failed after the durable completion committed.
-			if derr := s.reconcileCompletionEffects(ctx, jobID); derr != nil {
-				s.internalError(w, r, derr, "")
+		if rec, has, herr := s.DB.HasCompletionReceipt(ctx, jobID, in.LeaseGeneration, in.RunnerID); herr == nil && has {
+			matched, merr := s.completionReceiptReplay(ctx, jobID, in, rec, hash)
+			if merr != nil {
+				s.internalError(w, r, merr, "")
 				return
 			}
-			w.WriteHeader(http.StatusNoContent)
-			return
+			if matched {
+				// Idempotent replay: re-apply post-completion effects that may
+				// have failed after the durable completion committed.
+				if derr := s.reconcileCompletionEffects(ctx, jobID); derr != nil {
+					s.internalError(w, r, derr, "")
+					return
+				}
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
 		}
 		http.Error(w, "stale or invalid lease", http.StatusConflict)
 		return
@@ -5105,22 +5152,34 @@ func (s *Server) completeDB(w http.ResponseWriter, r *http.Request, jobID string
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// completionResultHash canonicalizes a completion payload so identical
-// retries can be recognized. encoding/json sorts map keys, making outputs
-// deterministic. The observed runtime is deliberately NOT part of the hash:
-// it is additive evidence, and excluding it keeps a receipt written by an
-// older server (before the field existed) matching a retry that now carries
-// the field, so a rolling upgrade cannot turn an idempotent replay into a
-// spurious 409.
+// completionResultHash is the LEGACY (v1) completion identity: it binds only
+// status, error and outputs. Production completions use
+// storage.CompletionResultDigestV2, which also binds the observed runtime
+// evidence; the v1 computation is retained for the v1-receipt compatibility
+// path (a receipt persisted before the version field existed) and for tests.
 func completionResultHash(status model.Status, errMsg string, outputs map[string]string) string {
-	outJSON, _ := jsonMarshal(outputs)
-	h := sha256.New()
-	_, _ = h.Write([]byte(status))
-	_, _ = h.Write([]byte{0})
-	_, _ = h.Write([]byte(errMsg))
-	_, _ = h.Write([]byte{0})
-	_, _ = h.Write(outJSON)
-	return hex.EncodeToString(h.Sum(nil))
+	return storage.CompletionResultDigestV1(status, errMsg, outputs)
+}
+
+// completionReceiptReplay resolves whether the incoming DB-mode completion
+// (whose v2 digest is requestHash) replays the durable receipt rec. A stored
+// v2 receipt is compared by digest alone. A stored legacy (v1) receipt needs
+// the stored attempt's runtime evidence to decide the nil-or-equal rule, so
+// the job row is read ONLY when the request actually carries runtime evidence
+// and the payback (a v2-evidence-bearing retry) is exactly what must be
+// compared: a missing job reads as no stored evidence.
+func (s *Server) completionReceiptReplay(ctx context.Context, jobID string, in Complete, rec model.CompletionReceipt, requestHash string) (bool, error) {
+	var storedObserved *model.ObservedRuntime
+	if rec.ResultHashVersion < storage.CompletionResultHashVersionV2 && in.ObservedRuntime != nil {
+		j, err := s.DB.GetJob(ctx, jobID)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return false, err
+		}
+		if err == nil {
+			storedObserved = storage.StoredAttemptObservedRuntime(j, in.LeaseGeneration)
+		}
+	}
+	return storage.CompletionReceiptReplayMatches(rec, requestHash, storage.CompletionResultHashVersionV2, in.Status, in.Error, in.Outputs, in.ObservedRuntime, storedObserved), nil
 }
 
 func completionReceiptKey(jobID string, generation int64, runnerID string) string {
@@ -5138,7 +5197,7 @@ func (s *Server) recordCompletionReceiptLocked(jobID string, generation int64, r
 		delete(s.completionReceiptAt, oldestKey)
 	}
 	key := completionReceiptKey(jobID, generation, runnerID)
-	s.completions[key] = model.CompletionReceipt{JobID: jobID, Generation: generation, RunnerID: runnerID, ResultHash: resultHash}
+	s.completions[key] = model.CompletionReceipt{JobID: jobID, Generation: generation, RunnerID: runnerID, ResultHash: resultHash, ResultHashVersion: storage.CompletionResultHashVersionV2}
 	s.completionReceiptAt[key] = time.Now().UTC()
 	s.markCompletionReceiptsChangedLocked()
 }
@@ -5448,13 +5507,29 @@ func (s *Server) rollbackStateLocked(rb stateRollback) {
 // completionReplayReadyLocked recognizes an idempotent completion replay from
 // the in-memory receipt and, when it matches, makes the replayed state
 // durable BEFORE the caller runs any completion effect. The caller holds
-// s.mu. matched=false means there is no receipt for this (job, generation,
-// runner) triple; a non-nil error means the receipt matched but the snapshot
-// write failed, so the replay must be refused with 503 instead of acking
-// effects against state the disk does not contain.
-func (s *Server) completionReplayReadyLocked(jobID string, generation int64, runnerID, hash string) (matched bool, perr error) {
+// s.mu. matched=false means there is no receipt (or a contradictory one) for
+// this (job, generation, runner) triple; a non-nil error means the receipt
+// matched but the snapshot write failed, so the replay must be refused with
+// 503 instead of acking effects against state the disk does not contain.
+//
+// Matching is versioned (storage.CompletionReceiptReplayMatches): a v2 receipt
+// must equal the request's v2 digest, while a legacy (version-less/v1)
+// receipt replays only against the request's v1 digest and only when the
+// request's runtime evidence is nil-or-equal against the stored attempt's
+// evidence. The stored evidence is only attributable while the live job row
+// still represents this generation.
+func (s *Server) completionReplayReadyLocked(jobID string, generation int64, runnerID string, in Complete, hash string) (matched bool, perr error) {
 	rec, has := s.completions[completionReceiptKey(jobID, generation, runnerID)]
-	if !has || rec.ResultHash != hash {
+	if !has {
+		return false, nil
+	}
+	var storedObserved *model.ObservedRuntime
+	if in.ObservedRuntime != nil {
+		if j, ok := s.jobs[jobID]; ok {
+			storedObserved = storage.StoredAttemptObservedRuntime(j, generation)
+		}
+	}
+	if !storage.CompletionReceiptReplayMatches(rec, hash, storage.CompletionResultHashVersionV2, in.Status, in.Error, in.Outputs, in.ObservedRuntime, storedObserved) {
 		return false, nil
 	}
 	return true, s.persistCheckedErrLocked("job.complete.replay")

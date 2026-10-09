@@ -116,7 +116,9 @@ func applyQuotaConfig(srv *server.Server, cfg *config.Config) {
 	// Durable execution event stream retention: empty keeps the server's
 	// built-in default (7 days), "0" explicitly disables retention
 	// (translated to the negative sentinel), and a positive duration is the
-	// age window.
+	// age window. Pruning itself is gated by the two-phase
+	// server.events_retention_prune flag (default false): the window can be
+	// configured on every replica before any of them starts deleting.
 	if raw := strings.TrimSpace(cfg.Server.EventsRetention); raw != "" {
 		if d, err := time.ParseDuration(raw); err == nil {
 			if d <= 0 {
@@ -125,6 +127,7 @@ func applyQuotaConfig(srv *server.Server, cfg *config.Config) {
 			srv.EventsRetention = d
 		}
 	}
+	srv.EventsRetentionPrune = cfg.Server.EventsRetentionPrune
 	// Durable cache-manifest retention: empty keeps the server's built-in
 	// default, "0" explicitly disables age pruning (translated to the
 	// negative sentinel), and -1 disables the per-repo caps.

@@ -199,6 +199,27 @@ func oidcSignerFromRing(b []byte) (*oidcSigner, error) {
 	return s, nil
 }
 
+// persistOIDCKeyRing durably writes the ring through whichever sink the
+// signer uses, and BOTH sinks share one durability implementation:
+//
+//   - cluster mode (s.cluster != nil) persists through the cluster key
+//     store's Store — for the FS store that is fsutil.AtomicWriteFile with
+//     the store's persist observer attached, for the DB store a shared row;
+//   - file mode (s.ringPath != "") calls fsutil.AtomicWriteFile directly:
+//     a UNIQUE temp file in the ring directory, checked write/chmod/fsync/
+//     close, a rename over the ring, and a parent-directory fsync.
+//
+// The previous file-mode sequence was a raw fixed "<ring>.tmp" scratch file
+// plus os.WriteFile plus os.Rename: it certified neither temp uniqueness nor
+// any fsync step, so a crash right after activation could leave the newly
+// active ring non-durable while the old ring survived, and the next start
+// would silently serve different signing material.
+//
+// File-mode failures are typed *fsutil.AtomicWriteError. Before the rename
+// the previous ring is bit-for-bit intact (the caller keeps the current key
+// active); after the rename (only the directory fsync can fail, see
+// fsutil.Renamed) the new ring IS visible, so its identity is recorded for
+// the mtime/size change detector and the caller retains it in memory.
 func persistOIDCKeyRing(s *oidcSigner) error {
 	rf := oidcKeyRingJSON{
 		Active: oidcActiveKeyFile{
@@ -236,11 +257,18 @@ func persistOIDCKeyRing(s *oidcSigner) error {
 	if s.ringPath == "" {
 		return nil
 	}
-	tmp := s.ringPath + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, s.ringPath); err != nil {
+	if err := fsutil.AtomicWriteFile(s.ringPath, b, 0o600); err != nil {
+		// A post-rename failure means the new ring is already visible at
+		// ringPath with uncertified crash durability: record its identity so
+		// the refresh's mtime/size comparison sees the published ring (the
+		// caller retains it in memory on fsutil.Renamed) instead of treating
+		// it as an externally rotated file.
+		if fsutil.Renamed(err) {
+			if info, serr := os.Stat(s.ringPath); serr == nil {
+				s.ringMod = info.ModTime()
+				s.ringSize = info.Size()
+			}
+		}
 		return err
 	}
 	if info, err := os.Stat(s.ringPath); err == nil {

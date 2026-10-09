@@ -15,6 +15,9 @@ func FuzzJUnit(f *testing.F) {
 	f.Add([]byte(`<testsuites><testsuite name="a" tests="1" failures="1"><testcase name="f"><failure message="boom">stack</failure></testcase></testsuite></testsuites>`))
 	f.Add([]byte("<not-junit/>"))
 	f.Add([]byte{})
+	// Adversarial nesting seed: the parser must refuse the depth, not
+	// recurse until the stack dies.
+	f.Add([]byte(strings.Repeat("<testsuite>", maxSuiteNestingDepth+8) + "<testcase/>" + strings.Repeat("</testsuite>", maxSuiteNestingDepth+8)))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		path := filepath.Join(t.TempDir(), "report.xml")
 		if err := os.WriteFile(path, data, 0o644); err != nil {

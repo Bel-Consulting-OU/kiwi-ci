@@ -14,7 +14,9 @@ import "github.com/Bel-Consulting-OU/kiwi-ci/internal/execution"
 // (RequireUntrustedDiskQuota) is deliberately NOT derived here: whether an
 // OS-level workspace bound can be installed is a property of the runner host
 // and its operator escape hatch, not of the persisted job, so the distributed
-// runner sets it from its own environment and local replay leaves it off.
+// runner sets it from its own capability probe and local exact replay installs
+// the same probe on the replay workspace itself (see app.Replay) before
+// restoring the snapshot.
 func OptionsFromExecution(base Options, e execution.EffectiveExecution) Options {
 	base.Untrusted = e.Untrusted
 	base.RequireImmutableImages = e.RequireImmutableImages

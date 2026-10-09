@@ -140,6 +140,18 @@ Admin and API traffic uses hashed bearer tokens
 `run` does not imply `trusted_run`. Audit actor identity comes from the
 authenticated principal, never from client-supplied headers.
 
+Controller principals may additionally carry fine-grained capabilities,
+as global grants or per-repository grants: `execution.events:read`
+(execution event list/stream plus the atomic
+`GET /api/v1/execution-snapshot` bootstrap), `evidence:read` (audit
+trail and exact-replay pipeline exports), `checkpoints:read` (workspace
+snapshot listing/download) and `runs:cancel`. The snapshot and the
+unscoped event cursor read require the capability GLOBALLY (they span
+repositories); a `run_id`-scoped event read also accepts read access to
+that run's repository. Every capability route is enforced by the tier
+gate and re-resolved against the addressed repository in the handler;
+runner credentials never satisfy a capability.
+
 ## Policy enforcement points
 
 1. **Admission** (enqueue): capability intersection, trust floor,

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 // eventsRetentionFakeStore adds the RetentionExecutionEventStore contract to
@@ -46,6 +47,28 @@ func (f *eventsRetentionFakeStore) LatestExecutionEventSeq(_ context.Context) (i
 	f.eventsMu.Lock()
 	defer f.eventsMu.Unlock()
 	return f.seq, nil
+}
+
+// ReadExecutionEventsRetention mirrors the atomic retention read of the real
+// stores: the page, the watermark and the monotonic watermark share one fake
+// lock critical section.
+func (f *eventsRetentionFakeStore) ReadExecutionEventsRetention(_ context.Context, afterSeq int64, limit int, runID string) ([]model.ExecutionEvent, int64, int64, int64, error) {
+	f.eventsMu.Lock()
+	defer f.eventsMu.Unlock()
+	limit = storage.ClampExecutionEventLimit(limit)
+	out := []model.ExecutionEvent{}
+	cursor := afterSeq
+	for _, e := range f.events {
+		if e.Seq <= afterSeq || (runID != "" && e.RunID != runID) {
+			continue
+		}
+		out = append(out, e)
+		cursor = e.Seq
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, cursor, f.retainedFrom, f.seq, nil
 }
 
 func (f *eventsRetentionFakeStore) PruneExecutionEvents(_ context.Context, olderThan time.Time, limit int) (int64, int64, error) {
@@ -99,9 +122,10 @@ func newRetentionServer(t *testing.T) (*Server, *eventsRetentionFakeStore) {
 }
 
 // TestEventsCursorExpiredList pins the 410 contract: a nonzero after cursor
-// below retained_from-1 is refused with cursor_expired and the watermark,
-// while retained_from-1 and retained_from remain valid and latest_cursor is
-// still the bootstrap reference.
+// strictly below retained_from is refused with cursor_expired and the
+// watermark, while after == retained_from stays valid (the consumer consumed
+// the removed prefix's last seq) and latest_cursor is still the bootstrap
+// reference.
 func TestEventsCursorExpiredList(t *testing.T) {
 	s, f := newRetentionServer(t)
 	now := time.Now().UTC()
@@ -119,8 +143,9 @@ func TestEventsCursorExpiredList(t *testing.T) {
 		t.Fatalf("prune = %d/%d err %v, want 3/3", pruned, retained, err)
 	}
 
-	// Expired: after=0 and after=retainedFrom-2 (retention deleted through 3).
-	for _, after := range []string{"0", "1"} {
+	// Expired: after=0 (the very start), 1 and retainedFrom-1=2: seq 3 was
+	// removed and never consumed.
+	for _, after := range []string{"0", "1", "2"} {
 		w := doJSON(t, s, http.MethodGet, "/api/v1/events?after="+after, "admin-tok", "")
 		if w.Code != http.StatusGone {
 			t.Fatalf("after=%s = %d, want 410: %s", after, w.Code, w.Body.String())
@@ -134,22 +159,20 @@ func TestEventsCursorExpiredList(t *testing.T) {
 		}
 	}
 
-	// Valid boundary: after=retainedFrom-1 and after=retainedFrom both page
-	// the survivors, and the response carries the watermark.
-	for _, after := range []string{"2", "3"} {
-		w := doJSON(t, s, http.MethodGet, "/api/v1/events?after="+after, "admin-tok", "")
-		if w.Code != http.StatusOK {
-			t.Fatalf("after=%s = %d, want 200: %s", after, w.Code, w.Body.String())
-		}
-		resp := decodeEventsResponse(t, w.Body.Bytes())
-		if len(resp.Events) != 2 || resp.Events[0].Seq != 4 || resp.RetainedFrom != "3" {
-			t.Fatalf("after=%s page = %+v, want seqs 4,5 retained_from 3", after, resp)
-		}
+	// Valid boundary: after == retainedFrom pages the survivors (4,5), and
+	// the response carries the watermark.
+	w := doJSON(t, s, http.MethodGet, "/api/v1/events?after=3", "admin-tok", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("after=3 = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	resp := decodeEventsResponse(t, w.Body.Bytes())
+	if len(resp.Events) != 2 || resp.Events[0].Seq != 4 || resp.RetainedFrom != "3" {
+		t.Fatalf("after=3 page = %+v, want seqs 4,5 retained_from 3", resp)
 	}
 
 	// Bootstrap: after=latest_cursor returns nothing until a new event, then
 	// exactly the new event.
-	w := doJSON(t, s, http.MethodGet, "/api/v1/events?after=5", "admin-tok", "")
+	w = doJSON(t, s, http.MethodGet, "/api/v1/events?after=5", "admin-tok", "")
 	if resp := decodeEventsResponse(t, w.Body.Bytes()); len(resp.Events) != 0 || resp.LatestCursor != "5" {
 		t.Fatalf("bootstrap empty page = %+v", resp)
 	}
@@ -222,10 +245,10 @@ func TestEventsCursorExpiredStream(t *testing.T) {
 		t.Fatalf("expired stream 410 = %+v, want cursor_expired/2/4", body)
 	}
 
-	// A valid cursor (retainedFrom-1) streams the survivors.
+	// A valid cursor (retainedFrom) streams the survivors.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	frames := startStream(t, ctx, srv.URL+"/api/v1/events/stream?after=1", "admin-tok")
+	frames := startStream(t, ctx, srv.URL+"/api/v1/events/stream?after=2", "admin-tok")
 	expectEventFrame(t, frames, 3)
 	expectEventFrame(t, frames, 4)
 	cancel()
@@ -293,10 +316,11 @@ func TestEventsFSBestEffortCanonicalFalse(t *testing.T) {
 	}
 }
 
-// TestEventsMaintenancePrunesAndExpires proves the maintenance hook: with a
-// positive EventsRetention the GC tick prunes the old fs prefix and advances
-// the durable watermark (so the API then answers 410), while the disabled
-// sentinel never prunes.
+// TestEventsMaintenancePrunesAndExpires proves the two-phase maintenance
+// gate: a configured window alone never prunes (the pre-0052 rolling-upgrade
+// fence), enabling events_retention_prune prunes the old fs prefix and
+// advances the durable watermark (so the API then answers 410), and the
+// disabled sentinel never prunes.
 func TestEventsMaintenancePrunesAndExpires(t *testing.T) {
 	dir := t.TempDir()
 	s, err := NewPersistent("token", "token", dir)
@@ -311,12 +335,31 @@ func TestEventsMaintenancePrunesAndExpires(t *testing.T) {
 		}
 	}
 	s.EventsRetention = -1 // explicitly disabled
+	s.EventsRetentionPrune = true
 	s.GC(ctx, now)
 	if rf, err := s.store.ExecutionEventRetainedFrom(ctx); err != nil || rf != 0 {
 		t.Fatalf("disabled retention pruned: watermark %d err %v, want 0", rf, err)
 	}
 
+	// Window configured but the two-phase gate still off: NOTHING is pruned,
+	// so a replica that predates the retained_from watermark can never serve
+	// a silently truncated 200 during the upgrade.
 	s.EventsRetention = time.Hour
+	s.EventsRetentionPrune = false
+	s.GC(ctx, now)
+	if rf, err := s.store.ExecutionEventRetainedFrom(ctx); err != nil || rf != 0 {
+		t.Fatalf("gated retention pruned: watermark %d err %v, want 0", rf, err)
+	}
+	if !s.eventsPruneWarned {
+		t.Fatal("gated retention did not emit the one-time two-phase activation warning")
+	}
+	if w := doJSON(t, s, http.MethodGet, "/api/v1/events?after=0", "token", ""); w.Code != http.StatusOK {
+		t.Fatalf("gated retention expired a cursor = %d, want 200: %s", w.Code, w.Body.String())
+	}
+
+	// Gate enabled: the old prefix is pruned and the durable watermark makes
+	// the cursor expired (410) with the watermark and latest cursor.
+	s.EventsRetentionPrune = true
 	s.GC(ctx, now)
 	rf, err := s.store.ExecutionEventRetainedFrom(ctx)
 	if err != nil || rf != 4 {
@@ -325,8 +368,8 @@ func TestEventsMaintenancePrunesAndExpires(t *testing.T) {
 	if w := doJSON(t, s, http.MethodGet, "/api/v1/events?after=0", "token", ""); w.Code != http.StatusGone {
 		t.Fatalf("after maintenance prune = %d, want 410: %s", w.Code, w.Body.String())
 	}
-	if w := doJSON(t, s, http.MethodGet, "/api/v1/events?after=3", "token", ""); w.Code != http.StatusOK {
-		t.Fatalf("after=retainedFrom-1 = %d, want 200: %s", w.Code, w.Body.String())
+	if w := doJSON(t, s, http.MethodGet, "/api/v1/events?after=4", "token", ""); w.Code != http.StatusOK {
+		t.Fatalf("after=retainedFrom = %d, want 200: %s", w.Code, w.Body.String())
 	}
 }
 

@@ -64,6 +64,7 @@ func seamRand(t *testing.T, r io.Reader) func() {
 }
 
 func TestSeamRandIdentifierHelpersFailClosed(t *testing.T) {
+	t.Setenv("KIWI_WEB_SESSION_SECRET", "")
 	s := New("secret")
 	restore := seamRand(t, seamErrReader{})
 	defer restore()
@@ -79,6 +80,9 @@ func TestSeamRandIdentifierHelpersFailClosed(t *testing.T) {
 	}
 	if v, exp, err := newWebToken([]byte("secret"), "web", "fp"); err == nil || v != "" || exp != 0 {
 		t.Fatalf("newWebToken with failing entropy = %q, %d, %v; want empty, 0, error", v, exp, err)
+	}
+	if b, err := webSessionSecret(); err == nil || b != nil {
+		t.Fatalf("webSessionSecret with failing entropy = %v, %v; want nil, error", b, err)
 	}
 	if b, err := createWebSessionKey(); err == nil || b != nil {
 		t.Fatalf("createWebSessionKey with failing entropy = %v, %v; want nil, error", b, err)
@@ -118,7 +122,6 @@ func TestSeamRandPanicPaths(t *testing.T) {
 		fn()
 	}
 	assertPanics("newEphemeralEd25519", "failed to generate Ed25519 key", func() { newEphemeralEd25519() })
-	assertPanics("webSessionSecret", "failed to generate web session secret", func() { webSessionSecret() })
 	assertPanics("newOIDCSigner", "failed to generate OIDC signing key", func() { newOIDCSigner() })
 
 	restore()

@@ -176,18 +176,24 @@ type ComponentUse struct {
 }
 
 type Trigger struct {
-	Branches       []string    `yaml:"branches,omitempty" json:"branches,omitempty"`
-	BranchesIgnore []string    `yaml:"branches_ignore,omitempty" json:"branches_ignore,omitempty"`
-	Tags           []string    `yaml:"tags,omitempty" json:"tags,omitempty"`
-	TagsIgnore     []string    `yaml:"tags_ignore,omitempty" json:"tags_ignore,omitempty"`
-	Paths          []string    `yaml:"paths,omitempty" json:"paths,omitempty"`
-	PathsIgnore    []string    `yaml:"paths_ignore,omitempty" json:"paths_ignore,omitempty"`
-	Actions        []string    `yaml:"actions,omitempty" json:"actions,omitempty"`
-	Draft          *bool       `yaml:"draft,omitempty" json:"draft,omitempty"`
-	Cron           []CronEntry `yaml:"cron,omitempty" json:"cron,omitempty"`
+	Branches       []string `yaml:"branches,omitempty" json:"branches,omitempty"`
+	BranchesIgnore []string `yaml:"branches_ignore,omitempty" json:"branches_ignore,omitempty"`
+	Tags           []string `yaml:"tags,omitempty" json:"tags,omitempty"`
+	TagsIgnore     []string `yaml:"tags_ignore,omitempty" json:"tags_ignore,omitempty"`
+	Paths          []string `yaml:"paths,omitempty" json:"paths,omitempty"`
+	PathsIgnore    []string `yaml:"paths_ignore,omitempty" json:"paths_ignore,omitempty"`
+	Actions        []string `yaml:"actions,omitempty" json:"actions,omitempty"`
+	Draft          *bool    `yaml:"draft,omitempty" json:"draft,omitempty"`
+	// Cron carries the schedule declaration. The schema accepts a list, but
+	// exactly one entry with at most one branch is executable; validation
+	// rejects anything larger (see validateCronTriggers).
+	Cron []CronEntry `yaml:"cron,omitempty" json:"cron,omitempty"`
 }
 
-// CronEntry is one scheduled occurrence declaration under on.schedule.
+// CronEntry is one scheduled occurrence declaration under on.schedule. The
+// scheduler executes exactly one entry with at most one branch; admission
+// (validateCronTriggers) refuses a document that declares more, because the
+// parser used to silently truncate to Cron[0]/Branches[0].
 type CronEntry struct {
 	Cron     string   `yaml:"cron" json:"cron"`
 	Branches []string `yaml:"branches,omitempty" json:"branches,omitempty"`

@@ -112,6 +112,26 @@ Configuration can also come from a `kiwi.toml` file
 (`--config kiwi.toml`, checked with `kiwi config check`); precedence is
 CLI flags > `KIWI_*` environment variables > config file > defaults.
 
+External controllers have two ordered-history surfaces. `GET
+/api/v1/events` pages the commit-ordered execution event stream
+(`after`/`limit`/optional `run_id`) and reports `next_cursor`,
+`latest_cursor` and `retained_from`; `GET /api/v1/events/stream` is the
+SSE wrapper resumable with `?after=<last-id>`. `GET
+/api/v1/execution-snapshot` is the atomic bootstrap: it returns `cursor`,
+`generated_at`, a bounded list of active runs and queued/running job
+counts from ONE consistency point (the cursor is read first), so a
+consumer that starts from `cursor` and then pages the event stream can
+never miss a transition committed between the two. All three consume the
+controller capability `execution.events:read`: the snapshot and the
+unscoped cursor read require it globally, a `run_id`-scoped read also
+accepts read access to that run's repository. In DB mode the stream is
+canonical (`canonical: true`); the fs/dev journal is best-effort
+telemetry (`canonical: false`) and its events may lag or be lost while a
+mutation still commits. Retention (`server.events_retention`) answers
+`410 cursor_expired` for cursors strictly below `retained_from`; pruning
+is opt-in behind `server.events_retention_prune` (see
+[docs/upgrades.md](docs/upgrades.md)).
+
 Untrusted jobs are bounded at admission by server-side resource ceilings —
 2 CPU, 4 GiB memory, 10 GiB disk and 256 PIDs per job plus at most 8
 services — and a declaration above a ceiling is rejected before the run is

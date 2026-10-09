@@ -306,6 +306,209 @@ func captureReplayOptions(t *testing.T) func() (executor.Options, bool) {
 	return func() (executor.Options, bool) { return got, seen }
 }
 
+// stubReplayQuota replaces the OS-level quota probe exact replay uses for
+// untrusted records and returns a counter of how many times it was invoked.
+func stubReplayQuota(t *testing.T, status executor.DiskQuotaStatus, cleanup func() error) *int {
+	t.Helper()
+	orig := replayWorkspaceDiskQuotaSetup
+	calls := 0
+	replayWorkspaceDiskQuotaSetup = func(string, int64) (executor.DiskQuotaStatus, func() error) {
+		calls++
+		return status, cleanup
+	}
+	t.Cleanup(func() { replayWorkspaceDiskQuotaSetup = orig })
+	return &calls
+}
+
+// untrustedRecord builds the export for an untrusted job with the untrusted
+// policy floor (the same shape TestReplayExactEnforcesUntrustedFloor uses).
+func untrustedRecord(t *testing.T, historical, key string) string {
+	t.Helper()
+	return recordedExportWithPersisted(t, historical, key,
+		func(p *model.CompiledJobPayload) {
+			b, merr := json.Marshal(policy.DefaultUntrustedCapabilities())
+			if merr != nil {
+				t.Fatal(merr)
+			}
+			p.EffectivePolicy = json.RawMessage(b)
+		},
+		map[string]any{"trusted": false, "network": "internet"})
+}
+
+// TestReplayExactUntrustedRefusesWithoutQuotaOrFlag: an untrusted recorded
+// job must not run when the host cannot establish the same OS-level hard
+// workspace quota the distributed runner installs; replay refuses with an
+// actionable pointer to --allow-unbounded-workspace and downloads nothing.
+func TestReplayExactUntrustedRefusesWithoutQuotaOrFlag(t *testing.T) {
+	historical := "version: 1\njobs:\n  build:\n    steps:\n      - run: echo historical\n"
+	env := newExactReplayEnv(t,
+		untrustedRecord(t, historical, "build"),
+		[][]model.SnapshotRecord{exactPage(model.SnapshotRecord{ID: "snap-pre", JobKey: "build", LeaseGeneration: 1, Phase: model.SnapshotPhasePreJob, CreatedAt: time.Now().UTC()})},
+		nil,
+		map[string][]byte{"snap-pre": snapshotArchive(t)},
+	)
+	probes := stubReplayQuota(t, executor.DiskQuotaStatus{Detail: "no XFS prjquota on this host"}, nil)
+	gotOptions := captureReplayOptions(t)
+	err := Replay(context.Background(), []string{"--server", env.srv.URL, "run1", "build"})
+	if err == nil || !strings.Contains(err.Error(), "allow-unbounded-workspace") || !strings.Contains(err.Error(), "refusing to replay untrusted job") {
+		t.Fatalf("untrusted replay without quota = %v, want the actionable refusal", err)
+	}
+	if *probes != 1 {
+		t.Fatalf("quota probe calls = %d, want 1", *probes)
+	}
+	if len(env.downloads) != 0 {
+		t.Fatalf("downloaded %v despite the refusal", env.downloads)
+	}
+	if _, seen := gotOptions(); seen {
+		t.Fatal("options seam fired: execution started despite the refusal")
+	}
+}
+
+// TestReplayExactUntrustedAllowUnboundedWarnsAndProceeds: the explicit
+// operator escape hatch prints a loud warning, skips the probe, and runs the
+// recorded job without requiring a hard quota.
+func TestReplayExactUntrustedAllowUnboundedWarnsAndProceeds(t *testing.T) {
+	historical := "version: 1\njobs:\n  build:\n    steps:\n      - run: echo historical\n"
+	env := newExactReplayEnv(t,
+		untrustedRecord(t, historical, "build"),
+		[][]model.SnapshotRecord{exactPage(model.SnapshotRecord{ID: "snap-pre", JobKey: "build", LeaseGeneration: 1, Phase: model.SnapshotPhasePreJob, CreatedAt: time.Now().UTC()})},
+		nil,
+		map[string][]byte{"snap-pre": snapshotArchive(t)},
+	)
+	probes := stubReplayQuota(t, executor.DiskQuotaStatus{Detail: "unsupported"}, nil)
+	gotOptions := captureReplayOptions(t)
+
+	origStderr := os.Stderr
+	pipeR, pipeW, perr := os.Pipe()
+	if perr != nil {
+		t.Fatal(perr)
+	}
+	os.Stderr = pipeW
+	replayErr := Replay(context.Background(), []string{"--server", env.srv.URL, "--allow-unbounded-workspace", "run1", "build"})
+	_ = pipeW.Close()
+	os.Stderr = origStderr
+	warned, _ := io.ReadAll(pipeR)
+	// The untrusted native floor still fails closed on the non-root sandbox
+	// requirement: reaching "failures" proves execution started.
+	if replayErr == nil || !strings.Contains(replayErr.Error(), "failures") {
+		t.Fatalf("escape-hatch replay = %v, want the sandbox-floor failure", replayErr)
+	}
+	if *probes != 0 {
+		t.Fatalf("quota probe calls = %d, want 0 under the escape hatch", *probes)
+	}
+	if len(env.downloads) != 1 {
+		t.Fatalf("downloads = %v, want the snapshot restored", env.downloads)
+	}
+	opts, ok := gotOptions()
+	if !ok {
+		t.Fatal("replay options seam never fired")
+	}
+	if opts.RequireUntrustedDiskQuota || opts.WorkspaceQuota != nil {
+		t.Fatalf("escape-hatch options = quota-required %t status %v, want unbounded", opts.RequireUntrustedDiskQuota, opts.WorkspaceQuota)
+	}
+	if !strings.Contains(string(warned), "--allow-unbounded-workspace") || !strings.Contains(string(warned), "UNTRUSTED") {
+		t.Fatalf("missing loud unbounded-workspace warning: %q", string(warned))
+	}
+}
+
+// TestReplayExactUntrustedQuotaEnforcedWhenSupported: when the host supports
+// the hard quota, it is installed BEFORE the snapshot is restored, passed
+// through to the executor, and cleaned up after the replay.
+func TestReplayExactUntrustedQuotaEnforcedWhenSupported(t *testing.T) {
+	historical := "version: 1\njobs:\n  build:\n    steps:\n      - run: echo historical\n"
+	env := newExactReplayEnv(t,
+		untrustedRecord(t, historical, "build"),
+		[][]model.SnapshotRecord{exactPage(model.SnapshotRecord{ID: "snap-pre", JobKey: "build", LeaseGeneration: 1, Phase: model.SnapshotPhasePreJob, CreatedAt: time.Now().UTC()})},
+		nil,
+		map[string][]byte{"snap-pre": snapshotArchive(t)},
+	)
+	cleaned := 0
+	probes := stubReplayQuota(t, executor.DiskQuotaStatus{Hard: true, Limit: 123, Detail: "fake XFS project quota"}, func() error {
+		cleaned++
+		return nil
+	})
+	gotOptions := captureReplayOptions(t)
+	replayErr := Replay(context.Background(), []string{"--server", env.srv.URL, "run1", "build"})
+	if replayErr == nil || !strings.Contains(replayErr.Error(), "failures") {
+		t.Fatalf("quota-supported untrusted replay = %v, want the sandbox-floor failure", replayErr)
+	}
+	if *probes != 1 {
+		t.Fatalf("quota probe calls = %d, want 1", *probes)
+	}
+	opts, ok := gotOptions()
+	if !ok {
+		t.Fatal("replay options seam never fired")
+	}
+	if !opts.RequireUntrustedDiskQuota {
+		t.Fatal("hard quota installed but RequireUntrustedDiskQuota not set")
+	}
+	if opts.WorkspaceQuota == nil || !opts.WorkspaceQuota.Hard || opts.WorkspaceQuota.Limit != 123 {
+		t.Fatalf("WorkspaceQuota = %+v, want the installed hard quota", opts.WorkspaceQuota)
+	}
+	if cleaned != 1 {
+		t.Fatalf("quota cleanup calls = %d, want 1", cleaned)
+	}
+}
+
+// TestReplayExactTrustedDoesNotProbeQuota: trusted jobs keep today's
+// behavior; the untrusted quota probe must never run for them.
+func TestReplayExactTrustedDoesNotProbeQuota(t *testing.T) {
+	historical := "version: 1\njobs:\n  build:\n    steps:\n      - run: echo historical\n"
+	env := newExactReplayEnv(t,
+		recordedExport(t, historical, "build", nil),
+		[][]model.SnapshotRecord{exactPage(model.SnapshotRecord{ID: "snap-pre", JobKey: "build", LeaseGeneration: 1, Phase: model.SnapshotPhasePreJob, CreatedAt: time.Now().UTC()})},
+		nil,
+		map[string][]byte{"snap-pre": snapshotArchive(t)},
+	)
+	probes := stubReplayQuota(t, executor.DiskQuotaStatus{Detail: "must not be consulted"}, nil)
+	if err := Replay(context.Background(), []string{"--server", env.srv.URL, "run1", "build"}); err != nil {
+		t.Fatalf("trusted replay: %v", err)
+	}
+	if *probes != 0 {
+		t.Fatalf("quota probe calls for a trusted job = %d, want 0", *probes)
+	}
+}
+
+// TestReplayExactEnforcesUntrustedFloor: an untrusted recorded job must be
+// replayed under the untrusted network/sandbox/resource floor even when the
+// persisted fields pretend otherwise (network=internet). The recorded
+// effective policy is the authority; the persisted network field is ignored
+// whenever a verified payload policy exists, and the untrusted floor toggles
+// the immutable-image requirement and the mandatory workspace bound.
+func TestReplayExactEnforcesUntrustedFloor(t *testing.T) {
+	historical := "version: 1\njobs:\n  build:\n    steps:\n      - run: echo historical\n"
+	untrusted := untrustedRecord(t, historical, "build")
+	env := newExactReplayEnv(t,
+		untrusted,
+		[][]model.SnapshotRecord{exactPage(
+			model.SnapshotRecord{ID: "snap-pre", JobKey: "build", LeaseGeneration: 1, Phase: model.SnapshotPhasePreJob, CreatedAt: time.Now().UTC()},
+		)},
+		nil,
+		map[string][]byte{"snap-pre": snapshotArchive(t)},
+	)
+	gotOptions := captureReplayOptions(t)
+	// The recorded effective execution demands the hard workspace quota; the
+	// probe reports a supported host so the replay reaches the sandbox floor.
+	stubReplayQuota(t, executor.DiskQuotaStatus{Hard: true, Limit: 10 << 30, Detail: "fake XFS project quota"}, nil)
+	// The untrusted floor demands non-root, which the native runtime cannot
+	// enforce: the replay must finish with failures instead of silently
+	// running the job under weaker conditions.
+	replayErr := Replay(context.Background(), []string{"--server", env.srv.URL, "run1", "build"})
+	if replayErr == nil || !strings.Contains(replayErr.Error(), "failures") {
+		t.Fatalf("untrusted replay = %v, want the sandbox-floor refusal", replayErr)
+	}
+	opts, ok := gotOptions()
+	if !ok {
+		t.Fatal("replay options seam never fired")
+	}
+	if !opts.Untrusted || !opts.RequireImmutableImages {
+		t.Fatalf("replay options = untrusted %t immutable %t, want the untrusted floor", opts.Untrusted, opts.RequireImmutableImages)
+	}
+	if opts.WorkspaceMaxBytes != execution.DefaultUntrustedWorkspaceMaxBytes {
+		t.Fatalf("WorkspaceMaxBytes = %d, want the untrusted default %d", opts.WorkspaceMaxBytes, execution.DefaultUntrustedWorkspaceMaxBytes)
+	}
+}
+
 // TestReplayExactPrefersPreJobSnapshot: when an attempt has BOTH a pre_job
 // checkpoint and a post_job outcome snapshot, exact replay must select the
 // pre_job record (the only state that predates the attempt's mutations).
@@ -375,50 +578,5 @@ func TestReplayExactRefusesPostJobOnlyAndEscapeHatch(t *testing.T) {
 	}
 	if !strings.Contains(string(warned), "POST-execution") {
 		t.Fatalf("missing post-execution warning: %q", string(warned))
-	}
-}
-
-// TestReplayExactEnforcesUntrustedFloor: an untrusted recorded job must be
-// replayed under the untrusted network/sandbox/resource floor even when the
-// persisted fields pretend otherwise (network=internet). The recorded
-// effective policy is the authority; the persisted network field is ignored
-// whenever a verified payload policy exists, and the untrusted floor toggles
-// the immutable-image requirement and the mandatory workspace bound.
-func TestReplayExactEnforcesUntrustedFloor(t *testing.T) {
-	historical := "version: 1\njobs:\n  build:\n    steps:\n      - run: echo historical\n"
-	untrusted := recordedExportWithPersisted(t, historical, "build",
-		func(p *model.CompiledJobPayload) {
-			b, merr := json.Marshal(policy.DefaultUntrustedCapabilities())
-			if merr != nil {
-				t.Fatal(merr)
-			}
-			p.EffectivePolicy = json.RawMessage(b)
-		},
-		map[string]any{"trusted": false, "network": "internet"})
-	env := newExactReplayEnv(t,
-		untrusted,
-		[][]model.SnapshotRecord{exactPage(
-			model.SnapshotRecord{ID: "snap-pre", JobKey: "build", LeaseGeneration: 1, Phase: model.SnapshotPhasePreJob, CreatedAt: time.Now().UTC()},
-		)},
-		nil,
-		map[string][]byte{"snap-pre": snapshotArchive(t)},
-	)
-	gotOptions := captureReplayOptions(t)
-	// The untrusted floor demands non-root, which the native runtime cannot
-	// enforce: the replay must finish with failures instead of silently
-	// running the job under weaker conditions.
-	replayErr := Replay(context.Background(), []string{"--server", env.srv.URL, "run1", "build"})
-	if replayErr == nil || !strings.Contains(replayErr.Error(), "failures") {
-		t.Fatalf("untrusted replay = %v, want the sandbox-floor refusal", replayErr)
-	}
-	opts, ok := gotOptions()
-	if !ok {
-		t.Fatal("replay options seam never fired")
-	}
-	if !opts.Untrusted || !opts.RequireImmutableImages {
-		t.Fatalf("replay options = untrusted %t immutable %t, want the untrusted floor", opts.Untrusted, opts.RequireImmutableImages)
-	}
-	if opts.WorkspaceMaxBytes != execution.DefaultUntrustedWorkspaceMaxBytes {
-		t.Fatalf("WorkspaceMaxBytes = %d, want the untrusted default %d", opts.WorkspaceMaxBytes, execution.DefaultUntrustedWorkspaceMaxBytes)
 	}
 }

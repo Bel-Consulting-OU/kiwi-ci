@@ -393,8 +393,8 @@ func (s *PostgresStore) InsertSnapshotForLease(ctx context.Context, jobID, runne
 	if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO workspace_snapshots (id, run_id, job_id, created_at, payload) VALUES ($1, $2, $3, $4, $5)`,
-		rec.ID, rec.RunID, nullText(rec.JobID), rec.CreatedAt, payload); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO workspace_snapshots (id, run_id, job_id, created_at, lease_generation, payload) VALUES ($1, $2, $3, $4, $5, $6)`,
+		rec.ID, rec.RunID, nullText(rec.JobID), rec.CreatedAt, rec.LeaseGeneration, payload); err != nil {
 		return err
 	}
 	// checkpoint.published shares the record's transaction: a failed append

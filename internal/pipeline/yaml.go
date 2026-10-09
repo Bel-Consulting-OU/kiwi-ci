@@ -14,7 +14,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"strings"
 	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
@@ -123,7 +122,9 @@ var yamlDecodeDocument = func(data []byte) (yaml.Node, error) {
 //     document;
 //   - quotes never span a line in this scanner (a plain scalar cannot), so an
 //     unterminated quote simply stops counting at end of line;
-//   - block scalars (|, >, with +/-/digits) skip their more-indented body;
+//   - block scalars (|, >, with +/-/digits and a possible trailing comment,
+//     in either indicator order) consume their whole more-indented body;
+//     blank lines inside a block scalar do not end it;
 //   - '#' starts a comment only at line start or after whitespace.
 func preflightYAMLStructure(data []byte) error {
 	structural := 0
@@ -139,7 +140,11 @@ func preflightYAMLStructure(data []byte) error {
 		start = i + 1
 		indent := yamlLineIndent(line)
 		if blockIndent >= 0 {
-			if indent > blockIndent {
+			// A blank line inside a block scalar is scalar content, not a
+			// terminator: block scalars may span blank lines, so only a
+			// non-blank line that is not more indented than the header ends
+			// the body.
+			if len(bytes.TrimSpace(line)) == 0 || indent > blockIndent {
 				continue
 			}
 			blockIndent = -1
@@ -219,36 +224,92 @@ func yamlScalarStart(prev byte) bool {
 	return false
 }
 
+// yamlLineBeforeComment returns line truncated at the first '#' that starts a
+// comment: at line start or after whitespace, outside a quoted scalar. Quotes
+// are tracked so a '#' inside "double" or 'single' quotes is scalar content.
+func yamlLineBeforeComment(line []byte) []byte {
+	var quote byte
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		if quote != 0 {
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '#':
+			if i == 0 || line[i-1] == ' ' || line[i-1] == '\t' {
+				return line[:i]
+			}
+		case '\'', '"':
+			quote = c
+		}
+	}
+	return line
+}
+
 // yamlOpensBlockScalar reports whether a line ends with a block-scalar
-// indicator (| or > plus optional chomping/indent digits) at a value
-// position.
+// header — '|' or '>' optionally followed by a chomping indicator (+/-) and
+// an indentation indicator (1-9) in either order, with an optional trailing
+// comment — at a mapping-value or sequence-item position.
+//
+// The previous implementation inspected only the last character after
+// stripping " #..."-style comments, so valid headers with indicators
+// (|+, |-2, |2, >- # note) were missed and their bodies were counted as YAML,
+// while a plain scalar ending in a spaced '>' ("run: echo x >") was treated as
+// a header. The header token is parsed structurally instead: it is the
+// trailing run of indicator characters, it starts with '|' or '>', and it is
+// preceded by whitespace whose own predecessor is a value-position indicator
+// (':', '-' or '?').
 func yamlOpensBlockScalar(line []byte) bool {
-	trimmed := strings.TrimRight(string(line), " \t")
-	if trimmed == "" {
+	trimmed := bytes.TrimRight(yamlLineBeforeComment(line), " \t")
+	n := len(trimmed)
+	if n == 0 || !yamlBlockScalarTail(trimmed[n-1]) {
 		return false
 	}
-	// Strip an unquoted trailing comment.
-	if idx := strings.Index(trimmed, " #"); idx >= 0 {
-		trimmed = strings.TrimSpace(trimmed[:idx])
-		if trimmed == "" {
-			// A comment-only line (e.g. " #note"): nothing but the comment
-			// remains, so there is no block-scalar indicator. Without this
-			// guard the index below reads position -1 and panics on
-			// attacker-submitted pipeline text.
+	j := n - 1
+	for j >= 0 && yamlBlockScalarTail(trimmed[j]) {
+		j--
+	}
+	header := trimmed[j+1:]
+	if header[0] != '|' && header[0] != '>' {
+		return false
+	}
+	// After the indicator: at most one chomping indicator ('+'/'-') and at
+	// most one explicit indentation digit (1-9), in either order.
+	var chomp, indent bool
+	for _, c := range header[1:] {
+		switch {
+		case (c == '+' || c == '-') && !chomp:
+			chomp = true
+		case c >= '1' && c <= '9' && !indent:
+			indent = true
+		default:
 			return false
 		}
 	}
-	indicator := trimmed[len(trimmed)-1]
-	if indicator != '|' && indicator != '>' {
+	if j < 0 || (trimmed[j] != ' ' && trimmed[j] != '\t') {
 		return false
 	}
-	body := strings.TrimRight(trimmed[:len(trimmed)-1], "+-0123456789")
-	if body == "" || !strings.HasSuffix(body, " ") {
+	for j >= 0 && (trimmed[j] == ' ' || trimmed[j] == '\t') {
+		j--
+	}
+	if j < 0 {
 		return false
 	}
-	// Require a mapping key before the indicator; a bare expression ending in
-	// '>' must not suppress counting.
-	return strings.Contains(body, ":")
+	switch trimmed[j] {
+	case ':', '-', '?':
+		return true
+	}
+	return false
+}
+
+// yamlBlockScalarTail reports whether c may appear in a block-scalar header
+// after (or as) the '|'/'>' indicator: the indicator itself, a chomping
+// indicator, or an explicit indentation digit.
+func yamlBlockScalarTail(c byte) bool {
+	return c == '|' || c == '>' || c == '+' || c == '-' || (c >= '1' && c <= '9')
 }
 
 func yamlError(err error) error {

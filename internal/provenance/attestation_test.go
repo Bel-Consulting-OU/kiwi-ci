@@ -228,6 +228,127 @@ func TestExecutionAttestationConstraints(t *testing.T) {
 	}
 }
 
+// TestExecutionEvidenceRootBindsEvidenceGraph pins the canonical evidence
+// root: deterministic under list order, and changed by ANY artifact identity,
+// sidecar reference, report suite digest or snapshot identity.
+func TestExecutionEvidenceRootBindsEvidenceGraph(t *testing.T) {
+	artA := ExecutionEvidenceArtifact{
+		Name: "bin", SHA256: strings.Repeat("1", 64), Size: 42, Generation: 7,
+		ProvenanceSHA256: strings.Repeat("2", 64),
+		SBOMPath:         "cas:sbom-1", SBOMSHA256: strings.Repeat("3", 64),
+		SigstorePath: "cas:sigstore-1", SigstoreSHA256: strings.Repeat("4", 64),
+	}
+	artB := ExecutionEvidenceArtifact{Name: "aaa", SHA256: strings.Repeat("0", 64), Size: 1, Generation: 7}
+	rep := ExecutionAttestationReport{Name: "test", SuiteDigest: strings.Repeat("5", 64), Generation: 7}
+	snapA := ExecutionAttestationSnapshot{ID: "snap-1", Phase: model.SnapshotPhasePreJob, SHA256: strings.Repeat("6", 64), Generation: 7}
+	snapB := ExecutionAttestationSnapshot{ID: "snap-2", Phase: model.SnapshotPhasePostJob, SHA256: strings.Repeat("7", 64), Generation: 7}
+
+	graph := func(mut func(*ExecutionEvidenceGraph)) string {
+		g := ExecutionEvidenceGraph{
+			Artifacts:   []ExecutionEvidenceArtifact{artA, artB},
+			TestReports: []ExecutionAttestationReport{rep},
+			Snapshots:   []ExecutionAttestationSnapshot{snapA, snapB},
+		}
+		mut(&g)
+		return ExecutionEvidenceRoot(g)
+	}
+	base := graph(func(*ExecutionEvidenceGraph) {})
+	if len(base) != 64 {
+		t.Fatalf("evidence root = %q, want 64 hex chars", base)
+	}
+	reordered := ExecutionEvidenceRoot(ExecutionEvidenceGraph{
+		Artifacts: []ExecutionEvidenceArtifact{artB, artA}, TestReports: []ExecutionAttestationReport{rep},
+		Snapshots: []ExecutionAttestationSnapshot{snapB, snapA},
+	})
+	if reordered != base {
+		t.Fatalf("evidence root not order independent: %q != %q", reordered, base)
+	}
+	changes := map[string]string{
+		"artifact name":       graph(func(g *ExecutionEvidenceGraph) { g.Artifacts[0].Name = "other" }),
+		"artifact sha":        graph(func(g *ExecutionEvidenceGraph) { g.Artifacts[0].SHA256 = strings.Repeat("8", 64) }),
+		"artifact size":       graph(func(g *ExecutionEvidenceGraph) { g.Artifacts[0].Size = 43 }),
+		"artifact generation": graph(func(g *ExecutionEvidenceGraph) { g.Artifacts[0].Generation = 8 }),
+		"provenance sha":      graph(func(g *ExecutionEvidenceGraph) { g.Artifacts[0].ProvenanceSHA256 = strings.Repeat("9", 64) }),
+		"sbom path":           graph(func(g *ExecutionEvidenceGraph) { g.Artifacts[0].SBOMPath = "cas:other" }),
+		"sbom sha":            graph(func(g *ExecutionEvidenceGraph) { g.Artifacts[0].SBOMSHA256 = strings.Repeat("9", 64) }),
+		"sigstore path":       graph(func(g *ExecutionEvidenceGraph) { g.Artifacts[0].SigstorePath = "cas:other" }),
+		"sigstore sha":        graph(func(g *ExecutionEvidenceGraph) { g.Artifacts[0].SigstoreSHA256 = strings.Repeat("9", 64) }),
+		"report name":         graph(func(g *ExecutionEvidenceGraph) { g.TestReports[0].Name = "other" }),
+		"report digest":       graph(func(g *ExecutionEvidenceGraph) { g.TestReports[0].SuiteDigest = strings.Repeat("9", 64) }),
+		"report generation":   graph(func(g *ExecutionEvidenceGraph) { g.TestReports[0].Generation = 8 }),
+		"snapshot id":         graph(func(g *ExecutionEvidenceGraph) { g.Snapshots[0].ID = "other" }),
+		"snapshot phase":      graph(func(g *ExecutionEvidenceGraph) { g.Snapshots[0].Phase = model.SnapshotPhasePostJob }),
+		"snapshot sha":        graph(func(g *ExecutionEvidenceGraph) { g.Snapshots[0].SHA256 = strings.Repeat("9", 64) }),
+		"snapshot generation": graph(func(g *ExecutionEvidenceGraph) { g.Snapshots[0].Generation = 8 }),
+	}
+	for name, got := range changes {
+		if got == base {
+			t.Fatalf("%s did not change the evidence root", name)
+		}
+	}
+}
+
+// TestExecutionAttestationDigestBindsCompletionResultAndEvidenceRoot proves
+// the new binding fields are part of the canonical digest: changing either
+// changes the subject digest, and an intact statement still verifies.
+func TestExecutionAttestationDigestBindsCompletionResultAndEvidenceRoot(t *testing.T) {
+	const completionA = "1111111111111111111111111111111111111111111111111111111111111111"
+	const completionB = "2222222222222222222222222222222222222222222222222222222222222222"
+	const rootA = "3333333333333333333333333333333333333333333333333333333333333333"
+	const rootB = "4444444444444444444444444444444444444444444444444444444444444444"
+
+	in := attestationTestInput()
+	in.CompletionResultDigest = completionA
+	in.EvidenceRootSHA256 = rootA
+	base, err := ExecutionAttestationStatement(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if base.Attestation.CompletionResultDigest != completionA || base.Attestation.EvidenceRootSHA256 != rootA {
+		t.Fatalf("binding fields not copied: %+v", base.Attestation)
+	}
+	if err := VerifyExecutionAttestation(base); err != nil {
+		t.Fatalf("intact statement does not verify: %v", err)
+	}
+	d0, _ := ExecutionAttestationDigest(*base.Attestation)
+
+	changedCompletion := in
+	changedCompletion.CompletionResultDigest = completionB
+	stCompletion, err := ExecutionAttestationStatement(changedCompletion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d1, _ := ExecutionAttestationDigest(*stCompletion.Attestation)
+	if d1 == d0 {
+		t.Fatal("changing completionResultDigest did not change the attestation digest")
+	}
+	changedRoot := in
+	changedRoot.EvidenceRootSHA256 = rootB
+	stRoot, err := ExecutionAttestationStatement(changedRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d2, _ := ExecutionAttestationDigest(*stRoot.Attestation)
+	if d2 == d0 {
+		t.Fatal("changing evidenceRootSha256 did not change the attestation digest")
+	}
+
+	// Tampering with either field in the signed block is detected by
+	// verification even though the signature itself is intact.
+	for _, mutate := range []func(a *ExecutionAttestation){
+		func(a *ExecutionAttestation) { a.CompletionResultDigest = completionB },
+		func(a *ExecutionAttestation) { a.EvidenceRootSHA256 = rootB },
+	} {
+		tampered := base
+		cp := *base.Attestation
+		mutate(&cp)
+		tampered.Attestation = &cp
+		if err := VerifyExecutionAttestation(tampered); err == nil {
+			t.Fatal("tampered binding field accepted")
+		}
+	}
+}
+
 func TestTestReportSuiteDigestBindsCases(t *testing.T) {
 	rep := model.TestReport{ID: "r1", Cases: []model.TestResult{
 		{Name: "a", Passed: true, Duration: 1.5},

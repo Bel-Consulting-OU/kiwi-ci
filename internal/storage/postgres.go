@@ -2324,23 +2324,54 @@ func pruneCompletionReceiptsTx(ctx context.Context, tx pgx.Tx) error {
 	return nil
 }
 
-// completionReceiptHashTx reads the stored result_hash of the live receipt
-// for (jobID, generation, runnerID). The TTL predicate is the same shared
-// retention filter HasCompletionReceipt applies: an aged-out receipt reads as
-// absent. It returns ("", false, nil) when no live receipt exists. The
-// caller must be inside the completion transaction so the read observes the
-// same snapshot as the insert/update it guards.
-func completionReceiptHashTx(ctx context.Context, tx pgx.Tx, jobID string, generation int64, runnerID string) (string, bool, error) {
-	var hash string
-	err := tx.QueryRow(ctx, `SELECT result_hash FROM completion_receipts WHERE job_id=$1 AND generation=$2 AND runner_id=$3 AND created_at >= clock_timestamp() - make_interval(secs => $4)`,
-		jobID, generation, runnerID, completionReceiptTTLSeconds).Scan(&hash)
+// completionReceiptTx reads the stored result_hash and result_hash_version of
+// the live receipt for (jobID, generation, runnerID). The TTL predicate is
+// the same shared retention filter HasCompletionReceipt applies: an aged-out
+// receipt reads as absent. It returns ("", 0, false, nil) when no live
+// receipt exists. The caller must be inside the completion transaction so the
+// read observes the same snapshot as the insert/update it guards.
+func completionReceiptTx(ctx context.Context, tx pgx.Tx, jobID string, generation int64, runnerID string) (string, int, bool, error) {
+	var (
+		hash    string
+		version int
+	)
+	err := tx.QueryRow(ctx, `SELECT result_hash, result_hash_version FROM completion_receipts WHERE job_id=$1 AND generation=$2 AND runner_id=$3 AND created_at >= clock_timestamp() - make_interval(secs => $4)`,
+		jobID, generation, runnerID, completionReceiptTTLSeconds).Scan(&hash, &version)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", false, nil
+		return "", 0, false, nil
 	}
 	if err != nil {
-		return "", false, err
+		return "", 0, false, err
 	}
-	return hash, true, nil
+	return hash, version, true, nil
+}
+
+// storedCompletionObservedRuntime returns the runtime evidence the stored
+// completion left on the job payload, but only when it is needed to resolve a
+// LEGACY (v1) receipt against a request that carries runtime evidence. A v2
+// receipt already binds the runtime in its digest, and a request with no
+// runtime evidence cannot contradict the legacy identity, so neither case
+// reads the payload (nil is the correct "no comparable stored evidence").
+//
+// The attempt test is the CALLER-verified (job_id, lease_generation) equality
+// (storedGen == requestGen, read from the jobs column, which is the lease
+// authority) plus a terminal stored status. The payload's own
+// lease_generation must NOT be used: the atomic claim advances the column
+// without rewriting the payload, so a completed payload can still carry
+// generation 0 even though the completion belongs to the claimed generation.
+// A re-leased job fails storedGen == requestGen before the payload is read.
+func storedCompletionObservedRuntime(payload []byte, storedVersion int, storedGen, requestGen int64, storedStatus string, requestObserved *model.ObservedRuntime) *model.ObservedRuntime {
+	if storedVersion >= CompletionResultHashVersionV2 || requestObserved == nil || storedGen != requestGen {
+		return nil
+	}
+	if !model.Status(storedStatus).Terminal() {
+		return nil
+	}
+	var j model.Job
+	if err := json.Unmarshal(payload, &j); err != nil {
+		return nil
+	}
+	return j.ObservedRuntime
 }
 
 // CompleteJob implements the audit item 5 transaction: lock the job FOR
@@ -2359,6 +2390,13 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 	// would break replay detection instead of failing closed.
 	if receipt.JobID != jobID || receipt.Generation != generation || receipt.RunnerID != runnerID {
 		return fmt.Errorf("storage: completion receipt identity mismatch")
+	}
+	// Incoming receipt version: every production caller computes the v2
+	// digest, so a version-less receipt means "current". Explicit v1 callers
+	// (legacy compatibility tests and repair tooling) keep legacy semantics.
+	receiptVersion := receipt.ResultHashVersion
+	if receiptVersion <= 0 {
+		receiptVersion = CompletionResultHashVersionV2
 	}
 	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
@@ -2385,21 +2423,26 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 	}
 
 	// Idempotent replay: the exact completion (job, generation, runner) was
-	// already applied and its receipt persisted with the SAME result_hash and
-	// still within the shared retention TTL; acknowledge it again. An
-	// existing receipt with a DIFFERENT result_hash is a conflicting
-	// completion of the same lease (two racers, one success and one failure)
-	// and fails closed with ErrCompletionConflict instead of letting the
-	// loser be acked as a replay. An aged-out receipt is treated as absent
-	// (live false) and falls through to the stale-lease errors, matching fs
-	// mode.
+	// already applied and its receipt persisted with a MATCHING identity and
+	// still within the shared retention TTL; acknowledge it again. Matching
+	// is versioned (see CompletionReceiptReplayMatches): a v2 receipt binds
+	// the runtime evidence in its digest, while a legacy v1 receipt may replay
+	// only when the retry's legacy digest matches AND its runtime evidence is
+	// nil-or-equal, so a v2-evidence-bearing retry can never masquerade as the
+	// legacy identity. An existing receipt with a contradictory identity is a
+	// conflicting completion of the same lease (two racers, one success and
+	// one failure) and fails closed with ErrCompletionConflict instead of
+	// letting the loser be acked as a replay. An aged-out receipt is treated
+	// as absent (live false) and falls through to the stale-lease errors,
+	// matching fs mode.
 	if curGen != generation || curRunner != runnerID || curStatus != string(model.StatusRunning) {
-		storedHash, live, err := completionReceiptHashTx(ctx, tx, jobID, generation, runnerID)
+		storedHash, storedVersion, live, err := completionReceiptTx(ctx, tx, jobID, generation, runnerID)
 		if err != nil {
 			return err
 		}
 		if live {
-			if storedHash == receipt.ResultHash {
+			storedObserved := storedCompletionObservedRuntime(payload, storedVersion, curGen, generation, curStatus, observed)
+			if CompletionReceiptReplayMatches(model.CompletionReceipt{JobID: jobID, Generation: generation, RunnerID: runnerID, ResultHash: storedHash, ResultHashVersion: storedVersion}, receipt.ResultHash, receipt.ResultHashVersion, status, errMsg, outputs, observed, storedObserved) {
 				return tx.Commit(ctx)
 			}
 			return ErrCompletionConflict
@@ -2483,23 +2526,26 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 	if err := releaseResourcesTx(ctx, tx, jobID); err != nil {
 		return err
 	}
-	tag, err := tx.Exec(ctx, `INSERT INTO completion_receipts (job_id, generation, runner_id, result_hash) VALUES ($1, $2, $3, $4) ON CONFLICT (job_id, generation, runner_id) DO NOTHING`,
-		receipt.JobID, receipt.Generation, receipt.RunnerID, receipt.ResultHash)
+	tag, err := tx.Exec(ctx, `INSERT INTO completion_receipts (job_id, generation, runner_id, result_hash, result_hash_version) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (job_id, generation, runner_id) DO NOTHING`,
+		receipt.JobID, receipt.Generation, receipt.RunnerID, receipt.ResultHash, receiptVersion)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
 		// The receipt identity already exists. Losing the ON CONFLICT race is
-		// only an idempotent success when the STORED result_hash equals the
-		// incoming one; a different hash means two completions of the same
-		// lease disagree, so the whole transaction rolls back with
-		// ErrCompletionConflict instead of acking a conflicting result.
-		storedHash, live, err := completionReceiptHashTx(ctx, tx, receipt.JobID, receipt.Generation, receipt.RunnerID)
+		// only an idempotent success when the stored identity MATCHES the
+		// incoming one under the versioned replay contract; a contradictory
+		// hash means two completions of the same lease disagree, so the whole
+		// transaction rolls back with ErrCompletionConflict instead of acking
+		// a conflicting result. The job is still RUNNING under this lease on
+		// this path, so the stored attempt has no persisted runtime evidence
+		// to compare a legacy receipt against (nil).
+		storedHash, storedVersion, live, err := completionReceiptTx(ctx, tx, receipt.JobID, receipt.Generation, receipt.RunnerID)
 		if err != nil {
 			return err
 		}
 		if live {
-			if storedHash == receipt.ResultHash {
+			if CompletionReceiptReplayMatches(model.CompletionReceipt{JobID: receipt.JobID, Generation: receipt.Generation, RunnerID: receipt.RunnerID, ResultHash: storedHash, ResultHashVersion: storedVersion}, receipt.ResultHash, receiptVersion, st, errMsg, outputs, observed, nil) {
 				// Exact replay: the previous completion (and all its effects)
 				// already committed; discard this transaction's partial
 				// updates and acknowledge.
@@ -2514,8 +2560,8 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 			receipt.JobID, receipt.Generation, receipt.RunnerID, completionReceiptTTLSeconds); err != nil {
 			return err
 		}
-		tag, err = tx.Exec(ctx, `INSERT INTO completion_receipts (job_id, generation, runner_id, result_hash) VALUES ($1, $2, $3, $4) ON CONFLICT (job_id, generation, runner_id) DO NOTHING`,
-			receipt.JobID, receipt.Generation, receipt.RunnerID, receipt.ResultHash)
+		tag, err = tx.Exec(ctx, `INSERT INTO completion_receipts (job_id, generation, runner_id, result_hash, result_hash_version) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (job_id, generation, runner_id) DO NOTHING`,
+			receipt.JobID, receipt.Generation, receipt.RunnerID, receipt.ResultHash, receiptVersion)
 		if err != nil {
 			return err
 		}
@@ -3757,22 +3803,56 @@ func (s *PostgresStore) listTestReports(ctx context.Context, query string, args 
 	return out, rows.Err()
 }
 
-// AppendLog inserts one log line into the identity-sequenced log_entries
-// table. The caller-supplied e.Seq is ignored: the sequence is allocated by
-// Postgres inside the insert transaction (INSERT ... RETURNING seq), so
-// appends stay strictly increasing regardless of clock ordering across
-// replicas or restarts. e.LeaseGeneration is the attempt identity the lease
+// AppendLog inserts one log line under the run's commit-ordered cursor
+// (migration 0052). The caller-supplied e.Seq is ignored: the sequence is
+// allocated from log_cursors inside the SAME schema-fenced transaction as the
+// insert, and the cursor row lock is held to commit. A later append for the
+// same run BLOCKS until this transaction commits or rolls back, so allocation
+// order is exactly the visible order and a rollback frees the range instead
+// of leaving a hole. e.LeaseGeneration is the attempt identity the lease
 // delivered the line under and is persisted with it (migration 0051), so DB
 // reads can attribute a line to an attempt exactly like the fs/memory paths.
 func (s *PostgresStore) AppendLog(ctx context.Context, e model.LogEntry) error {
 	if err := ValidateRunID(e.RunID); err != nil {
 		return err
 	}
-	err := s.queryRowSchemaCompatible(ctx, `INSERT INTO log_entries (run_id, job_id, job_key, step, line, lease_generation, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING seq`,
-		[]any{e.RunID, nullText(e.JobID), nullText(e.JobKey), nullText(e.Step), e.Line, e.LeaseGeneration, e.CreatedAt}, func(row pgx.Row) error {
-			return row.Scan(&e.Seq)
-		})
-	return err
+	tx, err := s.beginSchemaCompatibleTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var seq int64
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO log_cursors (run_id, value) VALUES ($1, 1)
+		ON CONFLICT (run_id) DO UPDATE SET value = log_cursors.value + 1
+		RETURNING value`, e.RunID).Scan(&seq); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO log_entries (seq, run_id, job_id, job_key, step, line, lease_generation, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		seq, e.RunID, nullText(e.JobID), nullText(e.JobKey), nullText(e.Step), e.Line, e.LeaseGeneration, e.CreatedAt); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	e.Seq = seq
+	return nil
+}
+
+// LatestLogSeq returns the run's monotonic log high-water from log_cursors
+// (0 when the run has no committed lines), never MAX(seq) over the surviving
+// log_entries rows: the cursor only ever advances, so a stream that reports
+// it as a bootstrap reference can never go backwards. It is a read-only raw
+// SELECT and carries no schema fence.
+func (s *PostgresStore) LatestLogSeq(ctx context.Context, runID string) (int64, error) {
+	if err := ValidateRunID(runID); err != nil {
+		return 0, err
+	}
+	var latest int64
+	if err := s.pool.QueryRow(ctx, `SELECT COALESCE((SELECT value FROM log_cursors WHERE run_id = $1), 0)`, runID).Scan(&latest); err != nil {
+		return 0, err
+	}
+	return latest, nil
 }
 
 func (s *PostgresStore) ReadLogs(ctx context.Context, runID string, after int64, limit int) ([]model.LogEntry, error) {
@@ -3851,20 +3931,27 @@ func (s *PostgresStore) ReadAudit(ctx context.Context, limit int) ([]model.Audit
 // authoritative and a later insert never overwrites it (ON CONFLICT DO
 // NOTHING), matching the in-memory store. The receipt records what the lease's
 // completion actually was, so a second, conflicting insert must not silently
-// rewrite it; callers that must detect the conflict compare the stored
-// ResultHash. A prune failure rolls the whole transaction back, leaving the
-// receipt absent; a retry re-applies both.
+// rewrite it; callers that must detect the conflict resolve it through
+// CompletionReceiptReplayMatches. A version-less receipt is written as the
+// legacy v1 identity (the column default): planted/repair rows keep the
+// historical semantics unless the caller explicitly labels them. A prune
+// failure rolls the whole transaction back, leaving the receipt absent; a
+// retry re-applies both.
 func (s *PostgresStore) InsertCompletionReceipt(ctx context.Context, r model.CompletionReceipt) error {
 	if err := ValidateJobID(r.JobID); err != nil {
 		return err
+	}
+	version := r.ResultHashVersion
+	if version <= 0 {
+		version = CompletionResultHashVersionLegacy
 	}
 	tx, err := s.beginSchemaCompatibleTx(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `INSERT INTO completion_receipts (job_id, generation, runner_id, result_hash) VALUES ($1, $2, $3, $4) ON CONFLICT (job_id, generation, runner_id) DO NOTHING`,
-		r.JobID, r.Generation, r.RunnerID, r.ResultHash); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO completion_receipts (job_id, generation, runner_id, result_hash, result_hash_version) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (job_id, generation, runner_id) DO NOTHING`,
+		r.JobID, r.Generation, r.RunnerID, r.ResultHash, version); err != nil {
 		return err
 	}
 	if err := pruneCompletionReceiptsTx(ctx, tx); err != nil {
@@ -3882,17 +3969,18 @@ func (s *PostgresStore) HasCompletionReceipt(ctx context.Context, jobID string, 
 		return model.CompletionReceipt{}, false, err
 	}
 	var (
-		rec  model.CompletionReceipt
-		hash string
+		rec     model.CompletionReceipt
+		hash    string
+		version int
 	)
-	err := s.pool.QueryRow(ctx, `SELECT result_hash FROM completion_receipts WHERE job_id=$1 AND generation=$2 AND runner_id=$3 AND created_at >= clock_timestamp() - make_interval(secs => $4)`, jobID, generation, runnerID, completionReceiptTTLSeconds).Scan(&hash)
+	err := s.pool.QueryRow(ctx, `SELECT result_hash, result_hash_version FROM completion_receipts WHERE job_id=$1 AND generation=$2 AND runner_id=$3 AND created_at >= clock_timestamp() - make_interval(secs => $4)`, jobID, generation, runnerID, completionReceiptTTLSeconds).Scan(&hash, &version)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return model.CompletionReceipt{}, false, nil
 	}
 	if err != nil {
 		return model.CompletionReceipt{}, false, err
 	}
-	rec = model.CompletionReceipt{JobID: jobID, Generation: generation, RunnerID: runnerID, ResultHash: hash}
+	rec = model.CompletionReceipt{JobID: jobID, Generation: generation, RunnerID: runnerID, ResultHash: hash, ResultHashVersion: version}
 	return rec, true, nil
 }
 
@@ -4764,8 +4852,8 @@ func (s *PostgresStore) InsertSnapshotRecord(ctx context.Context, rec model.Snap
 	if err != nil {
 		return err
 	}
-	_, err = s.execSchemaFenced(ctx, `INSERT INTO workspace_snapshots (id, run_id, job_id, created_at, payload) VALUES ($1, $2, $3, $4, $5)`,
-		rec.ID, rec.RunID, nullText(rec.JobID), rec.CreatedAt, payload)
+	_, err = s.execSchemaFenced(ctx, `INSERT INTO workspace_snapshots (id, run_id, job_id, created_at, lease_generation, payload) VALUES ($1, $2, $3, $4, $5, $6)`,
+		rec.ID, rec.RunID, nullText(rec.JobID), rec.CreatedAt, rec.LeaseGeneration, payload)
 	return err
 }
 
@@ -6292,6 +6380,23 @@ func (s *PostgresStore) SchemaCompatibilityFloor(ctx context.Context) (int, erro
 		return 0, err
 	}
 	return floor, nil
+}
+
+// RunKeyIndexPresent reports whether the migration 0048 run-scoped logical
+// job key uniqueness index (jobs_run_key_idx) exists. Migration 0048 creates
+// it CONDITIONALLY — a database with duplicate (run_id, key) rows is left
+// without the index and its version row is recorded anyway — so an operator
+// repair (cancel/remove the duplicates) must be followed by migration 0053
+// (or a manual CREATE UNIQUE INDEX) to install the backstop. Readiness
+// surfaces false as not-ready until then; an error means the presence could
+// not be proven and must not be treated as present. It is a read-only raw
+// SELECT and carries no schema fence.
+func (s *PostgresStore) RunKeyIndexPresent(ctx context.Context) (bool, error) {
+	var present bool
+	if err := s.pool.QueryRow(ctx, `SELECT to_regclass('jobs_run_key_idx') IS NOT NULL`).Scan(&present); err != nil {
+		return false, err
+	}
+	return present, nil
 }
 
 func (s *PostgresStore) SchemaVersion(ctx context.Context) (int, error) {

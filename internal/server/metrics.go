@@ -103,6 +103,7 @@ func NewMetrics() *Metrics {
 	m.declare("kiwi_downstream_skips_total", "Cross-repo downstream dispatches skipped (already launched)", "counter", nil)
 	m.declare("kiwi_idempotency_receipts_pruned_total", "Durable run-idempotency receipts aged out by maintenance", "counter", nil)
 	m.declare("kiwi_execution_events_pruned_total", "Execution events aged out by windowed retention", "counter", nil)
+	m.declare("kiwi_run_key_index_present", "Whether the run/key identity unique index (jobs_run_key_idx) is present (1) or missing (0)", "gauge", nil)
 	m.declare("kiwi_scheduler_boost_promotions_total", "Queued jobs whose materialized scheduling-key boost was promoted", "counter", nil)
 	return m
 }

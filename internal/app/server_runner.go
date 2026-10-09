@@ -68,11 +68,19 @@ type productionConfig struct {
 	UntrustedMemoryCeiling float64
 	UntrustedDiskCeiling   float64
 	// WebSessionSecret is the shared dashboard session/CSRF HMAC key
-	// (64 hex chars) from KIWI_WEB_SESSION_SECRET. Production requires it:
-	// without a shared key every replica mints its own and a session created
-	// on one replica fails on the next (random logout/CSRF failures after
-	// scaling or a restart).
+	// (64 hex chars) from KIWI_WEB_SESSION_SECRET. Production requires a
+	// shared session key, but it may come from either this explicit value or
+	// a shared cluster key store (SharedClusterKeyStore below), which
+	// derives and persists the key across replicas. Without either, every
+	// replica mints its own and a session created on one replica fails on
+	// the next (random logout/CSRF failures after scaling or a restart).
 	WebSessionSecret string
+	// SharedClusterKeyStore reports that the deployment has a shared cluster
+	// key store (DB-backed when the SQL store supports ClusterKeyBlobStore,
+	// or an explicit --cluster-key-dir on shared storage). In production the
+	// web session key is loaded from (and persisted to) that store, so the
+	// env secret is not required.
+	SharedClusterKeyStore bool
 }
 
 // validateProductionConfig enforces the STATIC half of the production-mode
@@ -568,13 +576,16 @@ func validateProductionConfig(cfg productionConfig) error {
 	}
 	// Dashboard sessions must be HA-stable: every replica has to share the
 	// session/CSRF HMAC key, otherwise a cookie minted on one replica fails on
-	// the next. A process-local random key is only acceptable in dev.
+	// the next. The shared key comes from KIWI_WEB_SESSION_SECRET or from the
+	// shared cluster key store (DB-backed or an explicit shared
+	// --cluster-key-dir), which derives and persists it; a process-local
+	// random key is only acceptable in dev.
 	if secret := strings.TrimSpace(cfg.WebSessionSecret); secret != "" {
 		if b, err := hex.DecodeString(secret); err != nil || len(b) != 32 {
 			return fmt.Errorf("KIWI_WEB_SESSION_SECRET must be 64 hex characters (a 32-byte shared key)")
 		}
-	} else {
-		return fmt.Errorf("production mode requires KIWI_WEB_SESSION_SECRET (a shared 32-byte hex key; HA replicas must share it so dashboard sessions survive failover)")
+	} else if !cfg.SharedClusterKeyStore {
+		return fmt.Errorf("production mode requires KIWI_WEB_SESSION_SECRET (a shared 32-byte hex key) or a shared cluster key store (the database-backed store, or --cluster-key-dir on shared storage): dashboard sessions must survive failover and restart")
 	}
 	// Runner credentials are a POST-DB decision (per-runner tokens may
 	// already live in the runner_bearer_tokens table), so the static
@@ -903,11 +914,21 @@ func Server(ctx context.Context, args []string) error {
 		StagingMaxBytes:        cfg.Staging.MaxBytes,
 		StagingInstanceID:      cfg.Staging.InstanceID,
 		WebSessionSecret:       strings.TrimSpace(os.Getenv("KIWI_WEB_SESSION_SECRET")),
+		SharedClusterKeyStore:  *clusterKeyDir != "" || databaseURLV != "",
 		UntrustedCPUCeiling:    cfg.Quota.UntrustedCPUCeiling,
 		UntrustedMemoryCeiling: cfg.Quota.UntrustedMemoryCeiling,
 		UntrustedDiskCeiling:   cfg.Quota.UntrustedDiskCeiling,
 	}); err != nil {
 		return err
+	}
+	// A configured-but-malformed session secret is a startup error in EVERY
+	// mode, not just production: the server loaders reject it too, but the
+	// in-memory constructor has no load phase, so the check must also happen
+	// before it is built (see server.webSessionSecretFromEnv).
+	if raw := strings.TrimSpace(os.Getenv("KIWI_WEB_SESSION_SECRET")); raw != "" {
+		if b, derr := hex.DecodeString(raw); derr != nil || len(b) != 32 {
+			return fmt.Errorf("KIWI_WEB_SESSION_SECRET must be 64 hex characters (a 32-byte shared session key), got %d characters", len(raw))
+		}
 	}
 	// Shared staging budget: large uploads spool into this replica's
 	// directory under the configured root (<staging.dir>/<staging.instance_id>,

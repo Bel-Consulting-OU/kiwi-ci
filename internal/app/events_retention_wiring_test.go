@@ -42,4 +42,16 @@ func TestApplyEventsRetentionWiring(t *testing.T) {
 	if srv.EventsRetention != 168*time.Hour {
 		t.Fatalf("empty events_retention wired to %v, want the built-in default", srv.EventsRetention)
 	}
+
+	// The two-phase prune gate is wired independently of the window.
+	if srv.EventsRetentionPrune {
+		t.Fatal("events_retention_prune default wired to true, want false")
+	}
+	cfg.Server.EventsRetention = "24h"
+	cfg.Server.EventsRetentionPrune = true
+	srv = server.New("r")
+	applyQuotaConfig(srv, cfg)
+	if srv.EventsRetention != 24*time.Hour || !srv.EventsRetentionPrune {
+		t.Fatalf("wired retention/prune = %v/%v, want 24h/true", srv.EventsRetention, srv.EventsRetentionPrune)
+	}
 }

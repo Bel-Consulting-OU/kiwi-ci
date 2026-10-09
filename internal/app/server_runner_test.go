@@ -96,7 +96,8 @@ func TestValidateProductionConfig(t *testing.T) {
 		t.Fatalf("valid production config rejected: %v", err)
 	}
 
-	// Missing or malformed session secrets are refused in production.
+	// Missing or malformed session secrets are refused in production unless a
+	// shared cluster key store supplies the key.
 	for name, mutate := range map[string]func(*productionConfig){
 		"missing session secret":   func(c *productionConfig) { c.WebSessionSecret = "" },
 		"malformed session secret": func(c *productionConfig) { c.WebSessionSecret = "not-hex" },
@@ -107,6 +108,20 @@ func TestValidateProductionConfig(t *testing.T) {
 		if err := validateProductionConfig(cfg); err == nil || !strings.Contains(err.Error(), "KIWI_WEB_SESSION_SECRET") {
 			t.Fatalf("%s = %v, want a KIWI_WEB_SESSION_SECRET refusal", name, err)
 		}
+	}
+	// A shared cluster key store (DB-backed or --cluster-key-dir) derives and
+	// persists the session key, so the env secret is optional; a malformed
+	// configured value is still a startup error even then.
+	sharedStore := valid
+	sharedStore.WebSessionSecret = ""
+	sharedStore.SharedClusterKeyStore = true
+	if err := validateProductionConfig(sharedStore); err != nil {
+		t.Fatalf("shared cluster key store must satisfy the production session-key check: %v", err)
+	}
+	sharedStoreMalformed := sharedStore
+	sharedStoreMalformed.WebSessionSecret = "not-hex"
+	if err := validateProductionConfig(sharedStoreMalformed); err == nil || !strings.Contains(err.Error(), "KIWI_WEB_SESSION_SECRET") {
+		t.Fatalf("malformed secret with a shared store = %v, want the malformed-value refusal", err)
 	}
 
 	// --runner-token alone is NOT rejected statically: the per-runner

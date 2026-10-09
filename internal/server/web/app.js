@@ -19,6 +19,15 @@
     nextCursor: "",
     loadedRuns: [],
     paged: false,
+    // Monotonic request epochs: every fetch captures the value it observed
+    // and must re-check it before rendering. A slow response for run A can
+    // never repaint the pane after the user selected run B, and an older
+    // newest-page refresh can never overwrite a newer one.
+    runsEpoch: 0,
+    jobsEpoch: 0,
+    // jobsAbort cancels the in-flight jobs fetch when the selection changes
+    // (belt and braces on top of the epoch guard).
+    jobsAbort: null,
   };
 
   const $ = (sel) => document.querySelector(sel);
@@ -88,6 +97,15 @@
     state.authed = false;
     state.csrf = "";
     state.selectedRun = null;
+    // Invalidate every in-flight render and cancel the pending jobs fetch:
+    // the signed-out UI must not be repainted by a response to a request
+    // issued while a session existed.
+    state.runsEpoch++;
+    state.jobsEpoch++;
+    if (state.jobsAbort) {
+      state.jobsAbort.abort();
+      state.jobsAbort = null;
+    }
     setPaged(false);
     state.loadedRuns = [];
     setNextCursor("");
@@ -265,9 +283,14 @@
   async function loadOlderRuns() {
     if (!state.nextCursor || loadOlderBtn.disabled) return;
     const cursor = state.nextCursor;
+    const epoch = state.runsEpoch;
     loadOlderBtn.disabled = true;
     try {
       const page = await runsPage(cursor);
+      // A newest-page refresh (manual or periodic) may have replaced the
+      // table while this page was in flight; appending then would splice
+      // history rows into the newest page.
+      if (epoch !== state.runsEpoch) return;
       setConn(true);
       showError("");
       // Appending preserves the collection's newest-first order, and the stats
@@ -280,6 +303,7 @@
       renderStats(state.loadedRuns);
       setNextCursor(page.nextCursor);
     } catch (err) {
+      if (epoch !== state.runsEpoch) return;
       if (String(err.message).indexOf("401") >= 0) setSignedOut();
       else showError("Could not load older runs: " + err.message);
     } finally {
@@ -289,16 +313,28 @@
 
   async function selectRun(runID) {
     state.selectedRun = runID;
+    // A new selection supersedes every in-flight jobs fetch: bump the epoch
+    // and abort the previous request so a slow response for the previous run
+    // can neither render nor surface its error over the current pane.
+    const epoch = ++state.jobsEpoch;
+    if (state.jobsAbort) state.jobsAbort.abort();
+    const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+    state.jobsAbort = controller;
     detail.classList.remove("hidden");
     runNote.classList.add("hidden");
     runNote.textContent = "";
     jobsBody.replaceChildren(el("tr", null, "loading"));
     try {
-      const jobs = await api("/api/v1/runs/" + encodeURIComponent(runID) + "/jobs");
+      const options = controller ? { signal: controller.signal } : undefined;
+      const jobs = await api("/api/v1/runs/" + encodeURIComponent(runID) + "/jobs", options);
+      if (epoch !== state.jobsEpoch || state.selectedRun !== runID) return; // stale response discarded
       renderJobs(jobs);
     } catch (err) {
+      if (epoch !== state.jobsEpoch || state.selectedRun !== runID) return; // stale failure discarded
       jobsBody.replaceChildren();
       showError("Could not load jobs: " + err.message);
+    } finally {
+      if (state.jobsAbort === controller) state.jobsAbort = null;
     }
   }
 
@@ -309,19 +345,19 @@
   async function refreshSelectedQuiet() {
     const runID = state.selectedRun;
     if (!runID) return;
+    const epoch = state.jobsEpoch;
     try {
       const jobs = await api("/api/v1/runs/" + encodeURIComponent(runID) + "/jobs");
-      if (state.selectedRun !== runID) return; // selection changed mid-flight
+      if (epoch !== state.jobsEpoch || state.selectedRun !== runID) return; // selection changed mid-flight
       runNote.classList.add("hidden");
       runNote.textContent = "";
       renderJobs(jobs);
       setConn(true);
     } catch (err) {
+      if (epoch !== state.jobsEpoch || state.selectedRun !== runID) return;
       if (String(err.message).indexOf("404") >= 0) {
-        if (state.selectedRun === runID) {
-          runNote.textContent = "run unavailable";
-          runNote.classList.remove("hidden");
-        }
+        runNote.textContent = "run unavailable";
+        runNote.classList.remove("hidden");
       }
     }
   }
@@ -342,8 +378,13 @@
   }
 
   async function refresh() {
+    // Only the newest refresh may render: a periodic tick and a manual click
+    // can overlap, and an older response finishing last must not regress the
+    // table (and the next cursor/page state) to stale data.
+    const epoch = ++state.runsEpoch;
     try {
       const page = await runsPage("");
+      if (epoch !== state.runsEpoch) return; // superseded by a newer refresh
       setConn(true);
       showError("");
       setPaged(false);
@@ -352,6 +393,7 @@
       setNextCursor(page.nextCursor);
       if (state.selectedRun) selectRun(state.selectedRun);
     } catch (err) {
+      if (epoch !== state.runsEpoch) return;
       setConn(false);
       if (String(err.message).indexOf("401") >= 0) setSignedOut();
     }

@@ -33,10 +33,18 @@ listen = ":8080"
 # max_cache_manifest_bytes_per_repo = 68719476736
 
 # Durable execution event stream retention. The oldest events are pruned as
-# a contiguous prefix; a consumer cursor below the retained_from watermark
-# is answered with HTTP 410 cursor_expired and must re-bootstrap via
-# latest_cursor. Unset uses 7 days (168h); "0" disables retention.
+# a contiguous prefix; a consumer cursor strictly below the retained_from
+# watermark is answered with HTTP 410 cursor_expired and must re-bootstrap
+# via latest_cursor (after == retained_from stays valid). Unset uses 7 days
+# (168h); "0" disables retention.
+#
+# events_retention_prune is the TWO-PHASE activation gate and defaults to
+# false: setting the window alone only records the intent and logs a warning.
+# Upgrade EVERY replica to a build that understands retained_from first, then
+# set this to true. A replica that predates the watermark would serve an
+# expired cursor as a silently truncated 200 while pruning is active.
 # events_retention = "168h"
+# events_retention_prune = false
 
 # CIDR ranges of reverse proxies in front of Kiwi. Only when the direct peer
 # is inside one of these ranges is X-Forwarded-For honored (rightmost

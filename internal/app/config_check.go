@@ -49,6 +49,7 @@ func ConfigCheck(ctx context.Context, args []string) error {
 			StagingMaxBytes:        cfg.Staging.MaxBytes,
 			StagingInstanceID:      cfg.Staging.InstanceID,
 			WebSessionSecret:       strings.TrimSpace(os.Getenv("KIWI_WEB_SESSION_SECRET")),
+			SharedClusterKeyStore:  cfg.Database.URL != "",
 			UntrustedCPUCeiling:    cfg.Quota.UntrustedCPUCeiling,
 			UntrustedMemoryCeiling: cfg.Quota.UntrustedMemoryCeiling,
 			UntrustedDiskCeiling:   cfg.Quota.UntrustedDiskCeiling,

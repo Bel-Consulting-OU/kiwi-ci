@@ -165,3 +165,79 @@ func TestRepositoryExecutionEventsCreatedAtAndSchemaDefaulted(t *testing.T) {
 		t.Fatalf("created_at not stamped: %v", events[0].CreatedAt)
 	}
 }
+
+// TestRepositoryExecutionEventsRetentionAtomicRead proves the fs atomic
+// retention read and the monotonic latest watermark: the page, watermark and
+// latest cursor are returned from one lock critical section, pruning the
+// whole journal does not regress latest (the seq watermark is recovered from
+// the durable retained file on restart), and the expiry boundary is exactly
+// after < retainedFrom.
+func TestRepositoryExecutionEventsRetentionAtomicRead(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	repo := New(dir)
+	now := time.Now().UTC()
+	for i := 0; i < 4; i++ {
+		if err := repo.AppendExecutionEvent(ctx, model.ExecutionEvent{RunID: "run-a", Type: "job.queued", CreatedAt: now.Add(-48 * time.Hour)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, cursor, retained, latest, err := repo.ReadExecutionEventsRetention(ctx, 0, 100, "")
+	if err != nil || len(page) != 4 || cursor != 4 || retained != 0 || latest != 4 {
+		t.Fatalf("initial atomic read = %d cursor %d retained %d latest %d err %v", len(page), cursor, retained, latest, err)
+	}
+	pruned, retained, err := repo.PruneExecutionEvents(ctx, now.Add(time.Hour), 100)
+	if err != nil || pruned != 4 || retained != 4 {
+		t.Fatalf("prune all = %d/%d err %v, want 4/4", pruned, retained, err)
+	}
+	// after == retainedFrom stays valid; the page is empty and latest does
+	// not regress.
+	page, cursor, retained, latest, err = repo.ReadExecutionEventsRetention(ctx, 4, 100, "")
+	if err != nil || len(page) != 0 || cursor != 4 || retained != 4 || latest != 4 {
+		t.Fatalf("all-pruned atomic read = %d cursor %d retained %d latest %d err %v", len(page), cursor, retained, latest, err)
+	}
+	if !ExecutionEventCursorExpired(3, retained) || ExecutionEventCursorExpired(4, retained) {
+		t.Fatalf("fs expiry boundary at retained %d disagrees", retained)
+	}
+	// A restart recovers the watermark from the retained file (the journal is
+	// empty), so the next append continues at 5 and never reuses a seq.
+	repo2 := New(dir)
+	if _, err := repo2.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if latest, err := repo2.LatestExecutionEventSeq(ctx); err != nil || latest != 4 {
+		t.Fatalf("reloaded latest = %d err %v, want 4", latest, err)
+	}
+	if err := repo2.AppendExecutionEvent(ctx, model.ExecutionEvent{RunID: "run-a", Type: "run.succeeded"}); err != nil {
+		t.Fatal(err)
+	}
+	page, _, _, latest, err = repo2.ReadExecutionEventsRetention(ctx, 4, 100, "")
+	if err != nil || len(page) != 1 || page[0].Seq != 5 || latest != 5 {
+		t.Fatalf("post-restart page = %+v latest %d err %v, want seq 5", page, latest, err)
+	}
+}
+
+// TestRepositoryLatestLogSeqParity proves the fs LatestLogSeq exposes the
+// same monotonic high-water as MaxLogSeq (including batch lines), so the log
+// stream's advisory latest header has one contract across storage modes.
+func TestRepositoryLatestLogSeqParity(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	repo := New(dir)
+	if err := repo.AppendLog(model.LogEntry{Seq: 7, RunID: "run-a", Line: "line"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.AppendLogBatch(LogBatchIdentity{JobID: "job-a", Generation: 1, BatchID: "b1"}, []model.LogEntry{
+		{Seq: 8, RunID: "run-a", JobID: "job-a", Line: "batch-1"},
+		{Seq: 9, RunID: "run-a", JobID: "job-a", Line: "batch-2"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	latest, err := repo.LatestLogSeq(ctx, "run-a")
+	if err != nil || latest != 9 {
+		t.Fatalf("LatestLogSeq = %d err %v, want 9", latest, err)
+	}
+	if max, err := repo.MaxLogSeq(); err != nil || max != latest {
+		t.Fatalf("MaxLogSeq = %d err %v, want LatestLogSeq %d", max, err, latest)
+	}
+}

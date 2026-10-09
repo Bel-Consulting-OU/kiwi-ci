@@ -169,6 +169,7 @@ var expectedRouteTiers = map[string]routeTier{
 	"GET /api/v1/audit":                         tierCapability,
 	"GET /api/v1/events":                        tierCapability,
 	"GET /api/v1/events/stream":                 tierCapability,
+	"GET /api/v1/execution-snapshot":            tierCapability,
 	// Admin: blanket admin gate.
 	"GET /metrics":                       tierAdmin,
 	"POST /api/v1/jobs/{id}/deployments": tierAdmin,
@@ -522,6 +523,7 @@ func TestCapabilityRouteTableExactInventory(t *testing.T) {
 	}{
 		{"/api/v1/events", auth.CapExecutionEventsRead, capabilityScopeRun, true},
 		{"/api/v1/events/stream", auth.CapExecutionEventsRead, capabilityScopeRun, true},
+		{"/api/v1/execution-snapshot", auth.CapExecutionEventsRead, capabilityScopeGlobal, false},
 		{"/api/v1/audit", auth.CapEvidenceRead, capabilityScopeGlobal, false},
 		{"/api/v1/runs/{id}/snapshots", auth.CapCheckpointsRead, capabilityScopeRun, false},
 		{"/api/v1/runs/{id}/snapshots/{sid}", auth.CapCheckpointsRead, capabilityScopeRun, false},
@@ -566,6 +568,8 @@ func TestCapabilityRouteTableExactInventory(t *testing.T) {
 		{http.MethodGet, "/api/v1/events/stream", true},
 		{http.MethodGet, "/api/v1/events/stream/extra", false},
 		{http.MethodGet, "/api/v1/events/other", false},
+		{http.MethodGet, "/api/v1/execution-snapshot", true},
+		{http.MethodPost, "/api/v1/execution-snapshot", false},
 		{http.MethodGet, "/api/v1/audit", true},
 		{http.MethodGet, "/api/v1/runs/probe/snapshots", true},
 		{http.MethodGet, "/api/v1/runs//snapshots", false},

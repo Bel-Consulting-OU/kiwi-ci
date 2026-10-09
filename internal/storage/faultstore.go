@@ -723,6 +723,52 @@ func (f *FaultyStore) ListExecutionEvents(ctx context.Context, afterSeq int64, l
 	return inner.ListExecutionEvents(ctx, afterSeq, limit, runID)
 }
 
+// ReadExecutionEventsRetention forwards the atomic retention read untouched:
+// it is a read, so a fault-injecting outer store still answers it.
+func (f *FaultyStore) ReadExecutionEventsRetention(ctx context.Context, afterSeq int64, limit int, runID string) ([]model.ExecutionEvent, int64, int64, int64, error) {
+	inner, ok := f.Inner.(ExecutionEventRetentionReadStore)
+	if !ok {
+		return nil, afterSeq, 0, 0, errMissingInnerInterface("ExecutionEventRetentionReadStore")
+	}
+	return inner.ReadExecutionEventsRetention(ctx, afterSeq, limit, runID)
+}
+
+// LatestExecutionEventSeq forwards the monotonic cursor read untouched.
+func (f *FaultyStore) LatestExecutionEventSeq(ctx context.Context) (int64, error) {
+	inner, ok := f.Inner.(ExecutionEventCursorStore)
+	if !ok {
+		return 0, errMissingInnerInterface("ExecutionEventCursorStore")
+	}
+	return inner.LatestExecutionEventSeq(ctx)
+}
+
+// LatestLogSeq forwards the monotonic log high-water read untouched.
+func (f *FaultyStore) LatestLogSeq(ctx context.Context, runID string) (int64, error) {
+	inner, ok := f.Inner.(LogCursorStore)
+	if !ok {
+		return 0, errMissingInnerInterface("LogCursorStore")
+	}
+	return inner.LatestLogSeq(ctx, runID)
+}
+
+// RunKeyIndexPresent forwards the run/key index probe untouched.
+func (f *FaultyStore) RunKeyIndexPresent(ctx context.Context) (bool, error) {
+	inner, ok := f.Inner.(RunKeyIndexStore)
+	if !ok {
+		return false, errMissingInnerInterface("RunKeyIndexStore")
+	}
+	return inner.RunKeyIndexPresent(ctx)
+}
+
+// ExecutionSnapshot forwards the atomic bootstrap read untouched.
+func (f *FaultyStore) ExecutionSnapshot(ctx context.Context, runLimit int) (ExecutionSnapshot, error) {
+	inner, ok := f.Inner.(ExecutionSnapshotStore)
+	if !ok {
+		return ExecutionSnapshot{}, errMissingInnerInterface("ExecutionSnapshotStore")
+	}
+	return inner.ExecutionSnapshot(ctx, runLimit)
+}
+
 func (f *FaultyStore) InsertCompletionReceipt(ctx context.Context, r model.CompletionReceipt) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -2606,11 +2652,15 @@ func (m *memStore) CompleteJob(ctx context.Context, jobID string, generation int
 	}
 	key := m.receiptKey(jobID, generation, runnerID)
 	if j.Status != model.StatusRunning || j.LeaseRunnerID != runnerID || j.LeaseGeneration != generation {
-		// Idempotent replay only for the IDENTICAL result: a stored receipt
-		// with a different ResultHash is a conflicting completion of the
-		// same lease and fails closed, mirroring the SQL path.
+		// Idempotent replay only for the IDENTICAL identity under the
+		// versioned contract (CompletionReceiptReplayMatches): a stored v2
+		// receipt binds the runtime evidence in its digest, while a legacy v1
+		// receipt replays only when the retry's legacy digest matches AND its
+		// runtime evidence is nil-or-equal against the stored attempt
+		// evidence. A contradictory receipt is a conflicting completion of
+		// the same lease and fails closed, mirroring the SQL path.
 		if rec, dup := m.receipts[key]; dup {
-			if rec.ResultHash == receipt.ResultHash {
+			if CompletionReceiptReplayMatches(rec, receipt.ResultHash, receipt.ResultHashVersion, status, errMsg, outputs, observed, StoredAttemptObservedRuntime(j, generation)) {
 				return nil
 			}
 			return ErrCompletionConflict
@@ -2619,9 +2669,10 @@ func (m *memStore) CompleteJob(ctx context.Context, jobID string, generation int
 	}
 	// The job is still running under the matching lease but a receipt key
 	// already exists: validate payload identity instead of overwriting a
-	// different result (the SQL ON CONFLICT DO NOTHING path).
+	// different result (the SQL ON CONFLICT DO NOTHING path). The running
+	// row carries no persisted evidence for a legacy comparison.
 	if rec, dup := m.receipts[key]; dup {
-		if rec.ResultHash != receipt.ResultHash {
+		if !CompletionReceiptReplayMatches(rec, receipt.ResultHash, receipt.ResultHashVersion, status, errMsg, outputs, observed, nil) {
 			return ErrCompletionConflict
 		}
 		return nil
@@ -2652,6 +2703,13 @@ func (m *memStore) CompleteJob(ctx context.Context, jobID string, generation int
 	// stores nothing.
 	j.ObservedRuntime = observed
 	m.jobs[jobID] = j
+	// The written receipt records the identity semantic it was computed
+	// with: a version-less incoming receipt is the current v2 digest (every
+	// production caller computes it), unless the caller explicitly labeled
+	// it legacy.
+	if receipt.ResultHashVersion <= 0 {
+		receipt.ResultHashVersion = CompletionResultHashVersionV2
+	}
 	m.receipts[key] = receipt
 	m.adjustQuotaLocked(RepoIDForJob(j), -1, 0)
 	// The completion releases the job's resource reservation in the same
@@ -3597,6 +3655,12 @@ func (f *FaultyStore) ExecutionEventRetainedFrom(ctx context.Context) (int64, er
 func (m *memStore) ListExecutionEvents(_ context.Context, afterSeq int64, limit int, runID string) ([]model.ExecutionEvent, int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.listExecutionEventsLocked(afterSeq, limit, runID)
+}
+
+// listExecutionEventsLocked is ListExecutionEvents for callers already
+// holding m.mu.
+func (m *memStore) listExecutionEventsLocked(afterSeq int64, limit int, runID string) ([]model.ExecutionEvent, int64, error) {
 	limit = ClampExecutionEventLimit(limit)
 	out := []model.ExecutionEvent{}
 	cursor := afterSeq
@@ -3616,6 +3680,43 @@ func (m *memStore) ListExecutionEvents(_ context.Context, afterSeq int64, limit 
 	return out, cursor, nil
 }
 
+// ReadExecutionEventsRetention mirrors the atomic retention read of the SQL
+// and fs stores: the page, the retained_from watermark and the monotonic
+// event watermark are read under one m.mu critical section, so the memStore
+// prune cannot interleave. latestCursor is the monotonic allocated watermark
+// (eventSeq), never the highest surviving row.
+func (m *memStore) ReadExecutionEventsRetention(_ context.Context, afterSeq int64, limit int, runID string) ([]model.ExecutionEvent, int64, int64, int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	page, cursor, err := m.listExecutionEventsLocked(afterSeq, limit, runID)
+	if err != nil {
+		return nil, afterSeq, 0, 0, err
+	}
+	return page, cursor, m.eventRetainedFrom, m.eventSeq, nil
+}
+
+// LatestExecutionEventSeq mirrors the monotonic event watermark.
+func (m *memStore) LatestExecutionEventSeq(_ context.Context) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.eventSeq, nil
+}
+
+// LatestLogSeq returns the highest Seq stored for the run (the memStore
+// never removes log rows, so the stored maximum is also the monotonic
+// high-water the SQL log_cursors row and the fs journal watermark report).
+func (m *memStore) LatestLogSeq(_ context.Context, runID string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var latest int64
+	for _, e := range m.logs {
+		if e.RunID == runID && e.Seq > latest {
+			latest = e.Seq
+		}
+	}
+	return latest, nil
+}
+
 // InsertCompletionReceipt persists one completion idempotency receipt with
 // the SAME first-wins semantics as the SQL store's ON CONFLICT DO NOTHING: the
 // first receipt for a (job, generation, runner) identity is authoritative and
@@ -3629,6 +3730,11 @@ func (m *memStore) InsertCompletionReceipt(ctx context.Context, r model.Completi
 	key := m.receiptKey(r.JobID, r.Generation, r.RunnerID)
 	if _, exists := m.receipts[key]; exists {
 		return nil
+	}
+	// A version-less planted/repair receipt keeps the historical legacy
+	// semantics (mirror of the column default), exactly like PostgreSQL.
+	if r.ResultHashVersion <= 0 {
+		r.ResultHashVersion = CompletionResultHashVersionLegacy
 	}
 	m.receipts[key] = r
 	return nil

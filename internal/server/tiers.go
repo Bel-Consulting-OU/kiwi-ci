@@ -77,6 +77,10 @@ var capabilityRoutes = []capabilityRoute{
 	// access to it; the unscoped cursor read requires a GLOBAL capability.
 	{method: http.MethodGet, pattern: "/api/v1/events", capability: auth.CapExecutionEventsRead, scope: capabilityScopeRun, readFallback: true},
 	{method: http.MethodGet, pattern: "/api/v1/events/stream", capability: auth.CapExecutionEventsRead, scope: capabilityScopeRun, readFallback: true},
+	// The atomic bootstrap snapshot addresses no run: the cursor and the
+	// state summary span every repository, so only a GLOBAL
+	// execution.events:read (or admin) may read it.
+	{method: http.MethodGet, pattern: "/api/v1/execution-snapshot", capability: auth.CapExecutionEventsRead, scope: capabilityScopeGlobal},
 	// The audit trail is repository-less: evidence:read must be global.
 	{method: http.MethodGet, pattern: "/api/v1/audit", capability: auth.CapEvidenceRead, scope: capabilityScopeGlobal},
 	// Workspace snapshot listing and archive download: the record carries the

@@ -180,6 +180,11 @@ func (s *Server) ensureCacheSigner() *cacheSigner {
 // and finally generating and persisting a fresh key on first use. It runs
 // at NewPersistent time so restarts keep existing sessions valid.
 //
+// A configured-but-malformed KIWI_WEB_SESSION_SECRET is a startup error, even
+// when a persisted key exists: the operator clearly meant to configure the
+// session key, so silently ignoring the value (and using a different key)
+// would split or invalidate sessions with no signal.
+//
 // The first-use write is a startup gate: a pre-rename failure leaves the
 // previous (here: absent) file intact and a post-rename directory-fsync
 // failure leaves the new secret visible but not certified durable
@@ -188,6 +193,10 @@ func (s *Server) ensureCacheSigner() *cacheSigner {
 // to reuse after a crash — and a later start loads the visible file, so the
 // published-uncertain case converges instead of forking the secret.
 func (s *Server) loadWebSessionSecret(dataDir string) error {
+	envKey, envSet, envErr := webSessionSecretFromEnv()
+	if envErr != nil {
+		return envErr
+	}
 	path := ""
 	if dataDir != "" {
 		path = filepath.Join(dataDir, webSessionKeyFile)
@@ -205,11 +214,9 @@ func (s *Server) loadWebSessionSecret(dataDir string) error {
 			return err
 		}
 	}
-	if raw := strings.TrimSpace(os.Getenv("KIWI_WEB_SESSION_SECRET")); raw != "" {
-		if b, err := hex.DecodeString(raw); err == nil && len(b) == 32 {
-			s.WebSessionSecret = b
-			return nil
-		}
+	if envSet {
+		s.WebSessionSecret = envKey
+		return nil
 	}
 	b := make([]byte, 32)
 	if _, err := io.ReadFull(randReader, b); err != nil {

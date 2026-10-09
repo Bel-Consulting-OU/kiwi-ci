@@ -266,9 +266,15 @@ func (p *parser) parseAnd(depth int) (Expr, error) {
 }
 
 func (p *parser) parseUnary(depth int) (Expr, error) {
+	if depth > maxDepth {
+		return nil, fmt.Errorf("expression exceeds maximum depth %d", maxDepth)
+	}
 	if p.peek().kind == tokNot {
 		p.next()
-		inner, err := p.parseUnary(depth)
+		// A '!' is a nesting level: pass depth+1 so a chain of unary
+		// operators cannot bypass the advertised maxDepth (parsePrimary
+		// enforces the same bound for parenthesized/call nesting).
+		inner, err := p.parseUnary(depth + 1)
 		if err != nil {
 			return nil, err
 		}

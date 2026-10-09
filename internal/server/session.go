@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -40,28 +41,54 @@ const (
 	webSessionNonceSz = 16
 )
 
+// webSessionSecretFromEnv resolves the KIWI_WEB_SESSION_SECRET override. It
+// reports (nil, false, nil) when the variable is unset, the decoded key when
+// it is set validly, and a startup error when it is set but malformed:
+// silently falling back to a random per-process key on a typo would split
+// dashboard sessions across replicas (or invalidate every session on a
+// restart) with no signal to the operator.
+func webSessionSecretFromEnv() ([]byte, bool, error) {
+	raw := strings.TrimSpace(os.Getenv("KIWI_WEB_SESSION_SECRET"))
+	if raw == "" {
+		return nil, false, nil
+	}
+	b, err := hex.DecodeString(raw)
+	if err != nil || len(b) != 32 {
+		return nil, false, fmt.Errorf("KIWI_WEB_SESSION_SECRET must be 64 hex characters (a 32-byte shared key)")
+	}
+	return b, true, nil
+}
+
 // webSessionSecret returns the web session HMAC key: the
-// KIWI_WEB_SESSION_SECRET env var (64 hex characters) when set, otherwise
-// a fresh random 32-byte key.
-func webSessionSecret() []byte {
-	if raw := strings.TrimSpace(os.Getenv("KIWI_WEB_SESSION_SECRET")); raw != "" {
-		if b, err := hex.DecodeString(raw); err == nil && len(b) == 32 {
-			return b
-		}
+// KIWI_WEB_SESSION_SECRET env var (64 hex characters) when set, otherwise a
+// fresh random 32-byte key. A malformed configured value is an error, never a
+// silent random fallback. The random key is the documented dev/fs behavior
+// for a server with no shared cluster key store; when a store is configured
+// the key is derived from it instead (see loadWebSessionCluster).
+func webSessionSecret() ([]byte, error) {
+	if b, ok, err := webSessionSecretFromEnv(); err != nil {
+		return nil, err
+	} else if ok {
+		return b, nil
 	}
 	b := make([]byte, 32)
 	if _, err := io.ReadFull(randReader, b); err != nil {
-		panic("kiwi server: failed to generate web session secret: " + err.Error())
+		return nil, fmt.Errorf("generate web session secret: %w", err)
 	}
-	return b
+	return b, nil
 }
 
 // ensureWebSessionSecret initializes the session key on first use.
-func (s *Server) ensureWebSessionSecret() {
+func (s *Server) ensureWebSessionSecret() error {
 	if len(s.WebSessionSecret) == 32 {
-		return
+		return nil
 	}
-	s.WebSessionSecret = webSessionSecret()
+	b, err := webSessionSecret()
+	if err != nil {
+		return err
+	}
+	s.WebSessionSecret = b
+	return nil
 }
 
 // webMAC returns hex(hmac-sha256(secret, tag+":"+payload)).
@@ -125,7 +152,10 @@ func webTokenOK(secret []byte, tag, v, fingerprint string) bool {
 // against the admin token (constant time) and issues the session cookie
 // plus the CSRF token, both bound to the same fresh random nonce.
 func (s *Server) webLogin(w http.ResponseWriter, r *http.Request) {
-	s.ensureWebSessionSecret()
+	if err := s.ensureWebSessionSecret(); err != nil {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
 	var in struct {
 		Token string `json:"token"`
 	}

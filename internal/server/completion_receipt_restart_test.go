@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 // TestCompletionReceiptsSurviveRestartReplay proves the fs-mode completion
@@ -52,7 +53,7 @@ func TestCompletionReceiptsSurviveRestartReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantHash := completionResultHash(model.StatusSuccess, "", nil)
+	wantHash := storage.CompletionResultDigestV2(model.StatusSuccess, "", nil, nil)
 	key := completionReceiptKey(task.Job.ID, task.LeaseGeneration, runnerID)
 	s2.mu.Lock()
 	rec, has := s2.completions[key]
@@ -67,6 +68,9 @@ func TestCompletionReceiptsSurviveRestartReplay(t *testing.T) {
 	}
 	if rec.ResultHash != wantHash {
 		t.Fatalf("restored receipt hash = %q, want %q", rec.ResultHash, wantHash)
+	}
+	if rec.ResultHashVersion != storage.CompletionResultHashVersionV2 {
+		t.Fatalf("restored receipt version = %d, want v2", rec.ResultHashVersion)
 	}
 	if recAt.IsZero() {
 		t.Fatal("restored receipt lost its recorded-at timestamp")

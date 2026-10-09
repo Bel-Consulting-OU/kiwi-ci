@@ -1,6 +1,7 @@
 package blob
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -54,6 +55,102 @@ const (
 	s3PutTimeout    = 30 * time.Minute
 	s3DeleteTimeout = 2 * time.Minute
 )
+
+// Multipart upload limits. AWS caps one PUT at 5 GiB while the Kiwi blob
+// contract admits 8 GiB objects, so oversized objects must use the S3
+// multipart protocol instead of a single request.
+const (
+	// s3MultipartThreshold is the object size above which Put switches from a
+	// single PUT to a multipart upload. 256 MiB keeps ordinary artifacts on
+	// the simple single-request path while leaving a wide margin below the
+	// 5 GiB single-PUT cap.
+	s3MultipartThreshold = 256 << 20
+
+	// s3MultipartPartSize is the size of every multipart part except the last
+	// (which may be smaller). It is far above the 5 MiB S3 minimum for
+	// non-final parts and far below the 5 GiB ceiling for one part; Kiwi's
+	// maximum 8 GiB object needs 128 parts at this size, well inside the
+	// 10000-part limit.
+	s3MultipartPartSize = 64 << 20
+
+	// s3MaxMultipartParts is S3's ceiling on the number of parts in one
+	// multipart upload. A declared size that would need more parts is
+	// rejected before the upload is created, so an impossible upload never
+	// leaves an incomplete multipart upload behind.
+	s3MaxMultipartParts = 10000
+)
+
+// Multipart request bounds. Like s3PutTimeout these only apply when the
+// caller's context carries no deadline of its own; the caller's deadline
+// always wins. Every part upload is bounded and retried on its own, so one
+// slow or failed part never consumes the budget of the parts around it.
+const (
+	// s3MultipartPartTimeout bounds one UploadPart request.
+	s3MultipartPartTimeout = 15 * time.Minute
+	// s3MultipartPartAttempts is the number of tries one part gets before the
+	// whole upload fails and is aborted.
+	s3MultipartPartAttempts = 2
+	// s3MultipartCreateTimeout bounds CreateMultipartUpload.
+	s3MultipartCreateTimeout = 2 * time.Minute
+	// s3MultipartCompleteTimeout bounds CompleteMultipartUpload: S3 may spend
+	// a while assembling every part of a large object.
+	s3MultipartCompleteTimeout = 15 * time.Minute
+	// s3MultipartAbortTimeout bounds the best-effort AbortMultipartUpload
+	// cleanup of a failed upload.
+	s3MultipartAbortTimeout = 2 * time.Minute
+	// s3MultipartResponseBytes bounds a create/complete XML response read.
+	s3MultipartResponseBytes = 1 << 20
+)
+
+// errS3MultipartPartsExceeded reports a declared object size that needs more
+// than s3MaxMultipartParts parts: the upload is rejected before Create, so no
+// incomplete upload is ever started for it.
+var errS3MultipartPartsExceeded = errors.New("blob: s3 multipart part limit exceeded")
+
+// errS3MultipartAbort marks a failure to clean up an incomplete multipart
+// upload. It is joined with (never substituted for) the primary failure that
+// triggered the abort, so callers can detect both.
+var errS3MultipartAbort = errors.New("blob: s3 multipart abort failed")
+
+// s3InitiateMultipartUploadResult is the subset of the
+// InitiateMultipartUpload XML response Put needs.
+type s3InitiateMultipartUploadResult struct {
+	UploadID string `xml:"UploadId"`
+}
+
+// s3CompletePart is one <Part> entry of the CompleteMultipartUpload request.
+type s3CompletePart struct {
+	PartNumber int    `xml:"PartNumber"`
+	ETag       string `xml:"ETag"`
+}
+
+// s3CompleteMultipartUpload is the CompleteMultipartUpload request body.
+type s3CompleteMultipartUpload struct {
+	XMLName xml.Name         `xml:"CompleteMultipartUpload"`
+	Parts   []s3CompletePart `xml:"Part"`
+}
+
+// s3CompleteMultipartUploadResult is the subset of the
+// CompleteMultipartUpload XML response Put inspects. S3 may answer HTTP 200
+// with an embedded <Error> element instead of a completed upload, so that
+// element is decoded and treated as a failure rather than acknowledged.
+type s3CompleteMultipartUploadResult struct {
+	Error *s3MultipartEmbeddedError `xml:"Error"`
+}
+
+type s3MultipartEmbeddedError struct {
+	Code    string `xml:"Code"`
+	Message string `xml:"Message"`
+}
+
+// s3MultipartTransportError marks a multipart control request that failed at
+// the transport level: the request may have reached S3 even though its
+// response was lost. Only CompleteMultipartUpload treats such an error as a
+// recovery candidate (a bounded HEAD can prove the upload completed).
+type s3MultipartTransportError struct{ err error }
+
+func (e *s3MultipartTransportError) Error() string { return e.err.Error() }
+func (e *s3MultipartTransportError) Unwrap() error { return e.err }
 
 // DefaultBodyInactivityTimeout is the default sliding inactivity window for a
 // streamed S3 response body (S3.BodyInactivityTimeout): when no byte arrives
@@ -279,6 +376,17 @@ type S3 struct {
 	// deadline. Zero means DefaultListPageTimeout.
 	ListPageTimeout time.Duration
 
+	// MultipartThreshold is the object size above which Put uses a multipart
+	// upload instead of a single PUT. Zero means s3MultipartThreshold. A
+	// declared size that would need more than s3MaxMultipartParts parts at
+	// MultipartPartSize is rejected before the upload starts.
+	MultipartThreshold int64
+
+	// MultipartPartSize is the size of every multipart part except the last.
+	// Zero means s3MultipartPartSize. The value exists as an advanced/test
+	// seam: the production default is the vetted 64 MiB constant.
+	MultipartPartSize int64
+
 	// endpointOnce caches the endpoint resolution: endpointURL is the parsed
 	// endpoint and endpointErr is the sticky validation error.
 	endpointOnce sync.Once
@@ -300,6 +408,22 @@ func (s *S3) listPageTimeout() time.Duration {
 		return s.ListPageTimeout
 	}
 	return DefaultListPageTimeout
+}
+
+// multipartThreshold resolves the effective multipart switchover size.
+func (s *S3) multipartThreshold() int64 {
+	if s.MultipartThreshold > 0 {
+		return s.MultipartThreshold
+	}
+	return s3MultipartThreshold
+}
+
+// multipartPartSize resolves the effective per-part size.
+func (s *S3) multipartPartSize() int64 {
+	if s.MultipartPartSize > 0 {
+		return s.MultipartPartSize
+	}
+	return s3MultipartPartSize
 }
 
 func (s *S3) client() *http.Client {
@@ -577,7 +701,27 @@ func hmacSHA256(key []byte, data string) []byte {
 	return h.Sum(nil)
 }
 
+// Put stores one object. Objects whose declared size is at most
+// multipartThreshold are written with a single streaming PUT request (see
+// putSingle); larger objects use a multipart upload (see putMultipart),
+// because AWS caps one PUT at 5 GiB while the Kiwi blob contract admits 8 GiB
+// objects. Both paths hash exactly the bytes streamed, return that digest,
+// and reject a source that does not deliver exactly the declared size.
 func (s *S3) Put(ctx context.Context, key string, r io.Reader, size int64) (Object, error) {
+	if !keyRE.MatchString(key) {
+		return Object{}, fmt.Errorf("blob: invalid key %q", key)
+	}
+	if size < 0 {
+		return Object{}, fmt.Errorf("blob: negative size")
+	}
+	if size > s.multipartThreshold() {
+		return s.putMultipart(ctx, key, r, size)
+	}
+	return s.putSingle(ctx, key, r, size)
+}
+
+// putSingle is the small-object path: one streaming PUT.
+func (s *S3) putSingle(ctx context.Context, key string, r io.Reader, size int64) (Object, error) {
 	if !keyRE.MatchString(key) {
 		return Object{}, fmt.Errorf("blob: invalid key %q", key)
 	}
@@ -627,6 +771,285 @@ func (s *S3) Put(ctx context.Context, key string, r io.Reader, size int64) (Obje
 		return Object{}, fmt.Errorf("blob: s3 put size mismatch: stream longer than the declared %d bytes", size)
 	}
 	return Object{Key: key, SHA256: hex.EncodeToString(h.Sum(nil)), Size: size}, nil
+}
+
+// putMultipart uploads one oversized object with the S3 multipart protocol:
+// create the upload for the same key the single PUT would use (no extra
+// object headers, matching putSingle), upload each part sequentially at
+// partNumber 1..n with exactly partSize bytes except the last, collect the
+// ETags, and complete the upload with them. Every failure after a successful
+// Create aborts the incomplete upload with a bounded best-effort request
+// derived from the caller's context; an abort that fails too is joined into
+// the returned error without masking the primary failure.
+//
+// A declared size that would need more than s3MaxMultipartParts parts is
+// rejected before Create, so an impossible upload never starts.
+func (s *S3) putMultipart(ctx context.Context, key string, r io.Reader, size int64) (Object, error) {
+	partSize := s.multipartPartSize()
+	parts := s3MultipartPartCount(size, partSize)
+	if parts > s3MaxMultipartParts {
+		return Object{}, fmt.Errorf("%w: size %d needs %d parts of %d bytes, limit is %d",
+			errS3MultipartPartsExceeded, size, parts, partSize, s3MaxMultipartParts)
+	}
+	rawURL, err := s.objectURL(key)
+	if err != nil {
+		return Object{}, err
+	}
+	uploadID, err := s.createMultipartUpload(ctx, rawURL)
+	if err != nil {
+		return Object{}, err
+	}
+	obj, err := s.streamMultipartParts(ctx, key, rawURL, uploadID, r, size, partSize, parts)
+	if err == nil {
+		return obj, nil
+	}
+	if abortErr := s.abortMultipartUpload(ctx, rawURL, uploadID); abortErr != nil {
+		return Object{}, errors.Join(err, fmt.Errorf("%w: %w", errS3MultipartAbort, abortErr))
+	}
+	return Object{}, err
+}
+
+// s3MultipartPartCount returns how many parts a size of size bytes needs at
+// partSize bytes per part (the last part may be smaller).
+func s3MultipartPartCount(size, partSize int64) int64 {
+	if size <= 0 {
+		return 0
+	}
+	return 1 + (size-1)/partSize
+}
+
+// streamMultipartParts reads the source sequentially, hashing the exact bytes
+// it buffers, and uploads one part per read. A part is fully buffered before
+// it is sent, so the source is consumed exactly once even when a part upload
+// is retried; the buffer is bounded by one part (64 MiB in production). The
+// running SHA-256 over the streamed bytes is the returned object digest.
+//
+// If CompleteMultipartUpload fails at the transport level, a bounded HEAD
+// disambiguates a lost response from a failed request: a visible object of
+// exactly the declared size is the completed upload and is reported as
+// success (with the streamed digest) instead of being aborted, while a missing
+// or differently sized object returns the transport error for the caller to
+// abort. A non-transport Complete error is returned as-is.
+func (s *S3) streamMultipartParts(ctx context.Context, key, rawURL, uploadID string, r io.Reader, size, partSize, parts int64) (Object, error) {
+	h := sha256.New()
+	bufferSize := partSize
+	if size < bufferSize {
+		bufferSize = size
+	}
+	buf := make([]byte, bufferSize)
+	collected := make([]s3CompletePart, 0, parts)
+	remaining := size
+	for part := int64(1); part <= parts; part++ {
+		n := partSize
+		if remaining < n {
+			n = remaining
+		}
+		nRead, err := io.ReadFull(r, buf[:n])
+		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return Object{}, fmt.Errorf("blob: s3 multipart size mismatch: stream ended after %d bytes, advertised %d",
+					size-remaining+int64(nRead), size)
+			}
+			return Object{}, fmt.Errorf("blob: s3 multipart read part %d: %w", part, err)
+		}
+		h.Write(buf[:n])
+		etag, err := s.uploadMultipartPart(ctx, rawURL, uploadID, int(part), buf[:n])
+		if err != nil {
+			return Object{}, err
+		}
+		collected = append(collected, s3CompletePart{PartNumber: int(part), ETag: etag})
+		remaining -= n
+	}
+	// The endpoint received exactly size bytes. A source with more is a
+	// declared-size violation and must fail closed, exactly like putSingle.
+	var extra [1]byte
+	if n, _ := r.Read(extra[:]); n > 0 {
+		return Object{}, fmt.Errorf("blob: s3 multipart size mismatch: stream longer than the declared %d bytes", size)
+	}
+	digest := hex.EncodeToString(h.Sum(nil))
+	if err := s.completeMultipartUpload(ctx, rawURL, uploadID, collected); err != nil {
+		var lost *s3MultipartTransportError
+		if !errors.As(err, &lost) {
+			return Object{}, err
+		}
+		// The Complete request may have been executed although its response
+		// was lost. A bounded HEAD decides: an object of exactly the declared
+		// size is this completed upload and must NOT be aborted; anything
+		// else returns the error so the caller aborts the incomplete upload.
+		if stat, statErr := s.Stat(ctx, key); statErr == nil && stat.Size == size {
+			return Object{Key: key, SHA256: digest, Size: size}, nil
+		}
+		return Object{}, err
+	}
+	return Object{Key: key, SHA256: digest, Size: size}, nil
+}
+
+// createMultipartUpload starts the upload and returns its upload ID. Like the
+// single PUT it carries no extra object headers (Content-Type, tags), because
+// putSingle sets none.
+func (s *S3) createMultipartUpload(ctx context.Context, rawURL string) (string, error) {
+	cctx, cancel := withDeadline(ctx, s3MultipartCreateTimeout)
+	defer cancel()
+	q := url.Values{}
+	q.Set("uploads", "")
+	req, err := http.NewRequestWithContext(cctx, http.MethodPost, rawURL+"?"+q.Encode(), nil)
+	if err != nil {
+		return "", err
+	}
+	req.ContentLength = 0
+	s.sign(req, emptyPayloadHash, time.Now().UTC())
+	resp, err := s.client().Do(req)
+	if err != nil {
+		return "", fmt.Errorf("blob: s3 multipart create: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", fmt.Errorf("blob: s3 multipart create %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	var out s3InitiateMultipartUploadResult
+	if err := xml.NewDecoder(io.LimitReader(resp.Body, s3MultipartResponseBytes)).Decode(&out); err != nil {
+		return "", fmt.Errorf("blob: s3 multipart create decode: %w", err)
+	}
+	if out.UploadID == "" {
+		return "", fmt.Errorf("blob: s3 multipart create: response carried no upload id")
+	}
+	return out.UploadID, nil
+}
+
+// uploadMultipartPart uploads one buffered part, retrying a retryable failure
+// (transport error, 408/429 or 5xx status) at most once. The buffer is stable
+// across attempts, so a retry sends the identical bytes and never re-reads
+// the source.
+func (s *S3) uploadMultipartPart(ctx context.Context, rawURL, uploadID string, part int, data []byte) (string, error) {
+	var lastErr error
+	for attempt := 1; attempt <= s3MultipartPartAttempts; attempt++ {
+		etag, retryable, err := s.uploadMultipartPartOnce(ctx, rawURL, uploadID, part, data)
+		if err == nil {
+			return etag, nil
+		}
+		lastErr = err
+		if !retryable {
+			break
+		}
+	}
+	return "", fmt.Errorf("blob: s3 multipart part %d: %w", part, lastErr)
+}
+
+// uploadMultipartPartOnce performs one UploadPart attempt with its own
+// bounded context. The buffered part is signed with its real SHA-256 payload
+// hash (unlike the streamed single PUT, the bytes are already known).
+func (s *S3) uploadMultipartPartOnce(ctx context.Context, rawURL, uploadID string, part int, data []byte) (string, bool, error) {
+	pctx, cancel := withDeadline(ctx, s3MultipartPartTimeout)
+	defer cancel()
+	q := url.Values{}
+	q.Set("partNumber", strconv.Itoa(part))
+	q.Set("uploadId", uploadID)
+	sum := sha256.Sum256(data)
+	req, err := http.NewRequestWithContext(pctx, http.MethodPut, rawURL+"?"+q.Encode(), bytes.NewReader(data))
+	if err != nil {
+		return "", false, err
+	}
+	req.ContentLength = int64(len(data))
+	s.sign(req, hex.EncodeToString(sum[:]), time.Now().UTC())
+	resp, err := s.client().Do(req)
+	if err != nil {
+		return "", true, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		etag := strings.TrimSpace(resp.Header.Get("ETag"))
+		if etag == "" {
+			return "", false, fmt.Errorf("blob: s3 multipart part %d: response carried no ETag", part)
+		}
+		return etag, false, nil
+	}
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	return "", s3RetryableStatus(resp.StatusCode),
+		fmt.Errorf("blob: s3 multipart part %d status %d: %s", part, resp.StatusCode, strings.TrimSpace(string(b)))
+}
+
+// s3RetryableStatus reports whether a part-upload status may succeed on a
+// second attempt: request timeout, throttling, or a server-side error.
+func s3RetryableStatus(code int) bool {
+	switch {
+	case code == http.StatusRequestTimeout, code == http.StatusTooManyRequests:
+		return true
+	case code >= 500 && code <= 599:
+		return true
+	default:
+		return false
+	}
+}
+
+// completeMultipartUpload finishes the upload with the collected part ETags.
+// A transport-level failure is reported as *s3MultipartTransportError so the
+// caller can attempt lost-response recovery; every other failure (a non-2xx
+// status or an embedded <Error> in a 200 response) is a definitive S3 error.
+func (s *S3) completeMultipartUpload(ctx context.Context, rawURL, uploadID string, parts []s3CompletePart) error {
+	body, err := xml.Marshal(s3CompleteMultipartUpload{Parts: parts})
+	if err != nil {
+		return fmt.Errorf("blob: s3 multipart complete encode: %w", err)
+	}
+	sum := sha256.Sum256(body)
+	cctx, cancel := withDeadline(ctx, s3MultipartCompleteTimeout)
+	defer cancel()
+	q := url.Values{}
+	q.Set("uploadId", uploadID)
+	req, err := http.NewRequestWithContext(cctx, http.MethodPost, rawURL+"?"+q.Encode(), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.ContentLength = int64(len(body))
+	req.Header.Set("Content-Type", "application/xml")
+	s.sign(req, hex.EncodeToString(sum[:]), time.Now().UTC())
+	resp, err := s.client().Do(req)
+	if err != nil {
+		return &s3MultipartTransportError{err: fmt.Errorf("blob: s3 multipart complete: %w", err)}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("blob: s3 multipart complete %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, s3MultipartResponseBytes))
+	if err != nil {
+		return &s3MultipartTransportError{err: fmt.Errorf("blob: s3 multipart complete response: %w", err)}
+	}
+	var out s3CompleteMultipartUploadResult
+	if len(bytes.TrimSpace(data)) > 0 {
+		if err := xml.Unmarshal(data, &out); err == nil && out.Error != nil {
+			return fmt.Errorf("blob: s3 multipart complete rejected: %s: %s", out.Error.Code, out.Error.Message)
+		}
+	}
+	return nil
+}
+
+// abortMultipartUpload cleans up an incomplete upload with a bounded,
+// best-effort request. The cleanup is deliberately detached from the caller's
+// cancellation (context.WithoutCancel) so a cancelled Put still releases the
+// upload's parts, but it keeps the caller's values.
+func (s *S3) abortMultipartUpload(ctx context.Context, rawURL, uploadID string) error {
+	actx, cancel := withDeadline(context.WithoutCancel(ctx), s3MultipartAbortTimeout)
+	defer cancel()
+	q := url.Values{}
+	q.Set("uploadId", uploadID)
+	req, err := http.NewRequestWithContext(actx, http.MethodDelete, rawURL+"?"+q.Encode(), nil)
+	if err != nil {
+		return err
+	}
+	req.ContentLength = 0
+	s.sign(req, emptyPayloadHash, time.Now().UTC())
+	resp, err := s.client().Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("blob: s3 multipart abort %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	return nil
 }
 
 // Open returns a stream for the object addressed by key. There is no

@@ -39,11 +39,14 @@ import (
 //
 //     Retention (migration 0049 / RetentionExecutionEventStore) prunes a
 //     bounded contiguous PREFIX of the oldest events and advances the
-//     retained_from watermark; the surviving stream keeps the same
-//     "seq > after" addressing. A consumer whose after cursor is below
-//     retainedFrom-1 has lost events: the API answers 410 cursor_expired
-//     with the watermark so it can re-bootstrap via latest_cursor. after ==
-//     retainedFrom-1 and after == retainedFrom stay valid.
+//     retained_from watermark (the HIGHEST removed seq; 0 = none removed);
+//     the surviving stream keeps the same "seq > after" addressing. A
+//     consumer whose after cursor is strictly BELOW retainedFrom has lost
+//     events: the API answers 410 cursor_expired with the watermark so it
+//     can re-bootstrap via latest_cursor. after == retainedFrom stays valid
+//     (the consumer has already consumed the removed prefix's last seq);
+//     after == retainedFrom-1 is EXPIRED (seq retainedFrom was removed
+//     unobserved).
 //
 //   - AppendExecutionEvent persists one manually constructed event. It
 //     exists for the filesystem/memory modes and tests; PostgreSQL
@@ -55,27 +58,103 @@ type ExecutionEventStore interface {
 	AppendExecutionEvent(ctx context.Context, e model.ExecutionEvent) error
 }
 
+// ExecutionEventRetentionReadStore is the ATOMIC retention read contract: it
+// returns the page, the retention watermark and the latest monotonic cursor
+// from ONE consistency point, so a concurrent prune can never produce a
+// silently truncated page (rows missing while the watermark still reads old)
+// or a regressed latest cursor.
+//
+// Readers MUST treat any error as unreadable state (fail closed, never
+// default a watermark or cursor to 0): an unproven watermark could hide lost
+// events. Expiry is decided by the caller from the returned retainedFrom
+// with ExecutionEventCursorExpired; because the page and the watermark share
+// one snapshot, a returned non-expired cursor guarantees every event above
+// it that existed at the snapshot is returned or is beyond the page bound.
+//
+// The PostgreSQL implementation is one CTE statement (one snapshot);
+// the filesystem implementation is one repository-lock read.
+type ExecutionEventRetentionReadStore interface {
+	ReadExecutionEventsRetention(ctx context.Context, afterSeq int64, limit int, runID string) (events []model.ExecutionEvent, nextCursor int64, retainedFrom int64, latestCursor int64, err error)
+}
+
 // ExecutionEventCursorStore is the optional companion contract for reading
-// the stream's latest committed cursor: MAX(seq) in PostgreSQL, the durable
-// journal watermark for the filesystem repository. The list response's
-// latest_cursor lets a consumer snapshot state, read the cursor, then poll
-// after=latest without a bootstrap gap.
+// the stream's latest committed cursor: the monotonic commit-ordered cursor
+// value in PostgreSQL, the durable journal watermark for the filesystem
+// repository. The list response's latest_cursor lets a consumer snapshot
+// state, read the cursor, then poll after=latest without a bootstrap gap.
 type ExecutionEventCursorStore interface {
 	LatestExecutionEventSeq(ctx context.Context) (int64, error)
+}
+
+// ExecutionSnapshotRun is one ACTIVE run in an execution bootstrap snapshot.
+// Only the small identity/status fields a controller needs to start browsing
+// are carried: the full run record is fetched per run through the existing
+// routes.
+type ExecutionSnapshotRun struct {
+	ID        string       `json:"id"`
+	RepoID    string       `json:"repo_id,omitempty"`
+	Ref       string       `json:"ref,omitempty"`
+	Status    model.Status `json:"status"`
+	CreatedAt time.Time    `json:"created_at"`
+}
+
+// ExecutionSnapshot is the atomic bootstrap point of the execution event
+// stream: one cursor, one generated_at and one active-run summary taken from
+// ONE consistency point.
+//
+// Ordering contract: implementations read the event cursor FIRST and the
+// state summary SECOND (PostgreSQL: the cursor SELECT before the state
+// SELECTs inside one transaction, so under READ COMMITTED each statement has
+// its own snapshot and a transition committed in between is visible to the
+// state read). A transition that commits between the two reads is therefore
+// ALWAYS included in state AND carries an event seq strictly greater than
+// Cursor, so a consumer that starts from this snapshot and pages
+// GET /api/v1/events?after=Cursor can never miss it. The reverse interleave
+// (state read first, cursor second) would let such a transition appear in
+// state with its event seq at or below the cursor, silently skipping it.
+//
+// Queued/Running count JOBS (not runs) in those statuses across all runs;
+// Runs lists at most runLimit active (non-terminal) runs, newest first.
+type ExecutionSnapshot struct {
+	Cursor      int64                  `json:"cursor"`
+	GeneratedAt time.Time              `json:"generated_at"`
+	Runs        []ExecutionSnapshotRun `json:"runs"`
+	Queued      int                    `json:"queued"`
+	Running     int                    `json:"running"`
+}
+
+// Execution snapshot bounds: a bootstrap response carries at most this many
+// active runs; the counts cover every job regardless of the bound.
+const (
+	DefaultExecutionSnapshotRuns = 1000
+	MaxExecutionSnapshotRuns     = 1000
+)
+
+// ExecutionSnapshotStore is the atomic bootstrap contract implemented by
+// PostgreSQL (one transaction, cursor first). The server builds the same
+// snapshot under its state lock for fs/memory mode.
+type ExecutionSnapshotStore interface {
+	ExecutionSnapshot(ctx context.Context, runLimit int) (ExecutionSnapshot, error)
 }
 
 // RetentionExecutionEventStore is the optional windowed-retention contract.
 // Events are pruned oldest-first as a contiguous prefix (see
 // PruneExecutionEvents), and ExecutionEventRetainedFrom reports the highest
 // pruned seq: 0 means nothing was ever pruned (the whole stream is
-// retained). A consumer whose after cursor is below retainedFrom-1 has lost
-// events and must re-bootstrap via latest_cursor; after == retainedFrom-1
-// and after == retainedFrom stay valid (see ExecutionEventCursorExpired).
+// retained). A consumer whose after cursor is strictly below retainedFrom
+// has lost events and must re-bootstrap via latest_cursor; after ==
+// retainedFrom stays valid (see ExecutionEventCursorExpired).
 //
 // Retention never rewrites seq or fills holes: the surviving stream is
 // still an ascending subset addressed by "seq > after", so the cursor
 // contract is unchanged for cursors at or above the retained prefix.
+//
+// The contract embeds ExecutionEventRetentionReadStore: the atomic page +
+// watermark + latest read is the ONE read every list/stream consumer must
+// use, so retention can never interleave between the watermark check and
+// the page read.
 type RetentionExecutionEventStore interface {
+	ExecutionEventRetentionReadStore
 	// PruneExecutionEvents deletes up to limit events older than olderThan
 	// FROM THE OLDEST END, never crossing the first event at or after the
 	// cutoff, and advances retained_from to the highest deleted seq in the
@@ -88,13 +167,15 @@ type RetentionExecutionEventStore interface {
 }
 
 // ExecutionEventCursorExpired reports whether a list/stream consumer at
-// after has lost events to retention. retainedFrom is the highest pruned
-// seq: after == retainedFrom-1 (the last cursor position that could still
-// name the pruned prefix without having consumed past it) and after ==
-// retainedFrom (the prefix itself) remain valid; anything below is expired.
-// A zero watermark (nothing pruned) can never expire a cursor.
+// after has lost events to retention. retainedFrom is the HIGHEST removed
+// seq: the removed prefix is exactly the seqs at or below retainedFrom
+// (contiguous, commit-ordered), so after == retainedFrom means the consumer
+// already consumed the last removed seq and stays VALID, while after <
+// retainedFrom means at least seq retainedFrom (and everything above it up
+// to retainedFrom) was removed unobserved and the cursor is expired. A zero
+// watermark (nothing pruned) can never expire a cursor.
 func ExecutionEventCursorExpired(after, retainedFrom int64) bool {
-	return retainedFrom > 0 && after < retainedFrom-1
+	return retainedFrom > 0 && after < retainedFrom
 }
 
 // DefaultExecutionEventPruneLimit bounds one PruneExecutionEvents batch when
@@ -172,11 +253,16 @@ func ExecutionEventTimingPayload(startedAt, finishedAt *time.Time) map[string]st
 }
 
 var (
-	_ ExecutionEventStore          = (*PostgresStore)(nil)
-	_ ExecutionEventStore          = (*Repository)(nil)
-	_ RetentionExecutionEventStore = (*PostgresStore)(nil)
-	_ RetentionExecutionEventStore = (*Repository)(nil)
-	_ RetentionExecutionEventStore = (*memStore)(nil)
+	_ ExecutionEventStore              = (*PostgresStore)(nil)
+	_ ExecutionEventStore              = (*Repository)(nil)
+	_ ExecutionEventRetentionReadStore = (*PostgresStore)(nil)
+	_ ExecutionEventRetentionReadStore = (*Repository)(nil)
+	_ RetentionExecutionEventStore     = (*PostgresStore)(nil)
+	_ RetentionExecutionEventStore     = (*Repository)(nil)
+	_ RetentionExecutionEventStore     = (*memStore)(nil)
+	_ ExecutionSnapshotStore           = (*PostgresStore)(nil)
+	_ ExecutionEventCursorStore        = (*PostgresStore)(nil)
+	_ ExecutionEventCursorStore        = (*Repository)(nil)
 )
 
 // ListExecutionEvents implements ExecutionEventStore for PostgreSQL with a
@@ -220,6 +306,61 @@ func (s *PostgresStore) ListExecutionEvents(ctx context.Context, afterSeq int64,
 		return nil, afterSeq, err
 	}
 	return out, cursor, nil
+}
+
+// ReadExecutionEventsRetention implements ExecutionEventRetentionReadStore
+// for PostgreSQL as ONE CTE statement: the cursor row (value, retained_from),
+// the bounded page and the run filter are read from a single snapshot, so a
+// concurrent prune transaction either commits entirely before the snapshot
+// (page lacks the removed rows AND retained_from is already advanced: the
+// caller sees a truthful expired cursor) or entirely after it (page still
+// contains the rows AND the watermark is still old). The interleaving that
+// produced the P1 (watermark read, then prune commits, then page read) is
+// impossible.
+//
+// latestCursor comes from execution_event_cursor.value — the monotonic
+// commit-ordered high-water written by every event transaction — never from
+// MAX(seq) over retained rows, so pruning every row cannot make it regress.
+// Any read/scan error is returned (fail closed): the caller must never
+// treat an unreadable watermark as 0.
+func (s *PostgresStore) ReadExecutionEventsRetention(ctx context.Context, afterSeq int64, limit int, runID string) ([]model.ExecutionEvent, int64, int64, int64, error) {
+	limit = ClampExecutionEventLimit(limit)
+	row := s.pool.QueryRow(ctx, `
+		WITH cursor_state AS (
+			SELECT COALESCE((SELECT value FROM execution_event_cursor WHERE id = TRUE), 0) AS value,
+			       COALESCE((SELECT retained_from FROM execution_event_cursor WHERE id = TRUE), 0) AS retained_from
+		), page AS (
+			SELECT seq, schema_version, COALESCE(run_id, '') AS run_id, COALESCE(job_id, '') AS job_id,
+			       attempt, event_type AS type, COALESCE(from_status, '') AS from_status, COALESCE(to_status, '') AS to_status,
+			       COALESCE(actor, '') AS actor, COALESCE(payload, '{}'::jsonb) AS payload, created_at
+			FROM execution_events
+			WHERE seq > $1 AND ($2 = '' OR run_id = $2)
+			ORDER BY seq ASC
+			LIMIT $3
+		)
+		SELECT c.value, c.retained_from,
+		       COALESCE(jsonb_agg(to_jsonb(p) ORDER BY p.seq) FILTER (WHERE p.seq IS NOT NULL), '[]'::jsonb)
+		FROM cursor_state c
+		LEFT JOIN page p ON TRUE
+		GROUP BY c.value, c.retained_from`, afterSeq, runID, limit)
+	var (
+		latest, retained int64
+		raw              []byte
+	)
+	if err := row.Scan(&latest, &retained, &raw); err != nil {
+		return nil, afterSeq, 0, 0, err
+	}
+	out := []model.ExecutionEvent{}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return nil, afterSeq, 0, 0, err
+		}
+	}
+	cursor := afterSeq
+	if len(out) > 0 {
+		cursor = out[len(out)-1].Seq
+	}
+	return out, cursor, retained, latest, nil
 }
 
 // AppendExecutionEvent implements ExecutionEventStore for PostgreSQL. It is
@@ -367,16 +508,18 @@ func (s *PostgresStore) ExecutionEventRetainedFrom(ctx context.Context) (int64, 
 	return retainedFrom, err
 }
 
-// LatestExecutionEventSeq returns MAX(seq) of the committed stream (0 when
-// empty): the latest committed cursor, so a consumer can snapshot state,
-// read this cursor, and poll after=latest without a bootstrap gap. It is a
-// read-only raw SELECT and carries no schema fence.
+// LatestExecutionEventSeq returns the monotonic commit-ordered cursor value
+// from execution_event_cursor.value (0 when the row is absent), NOT MAX(seq)
+// over the surviving rows: retention prunes rows but never rewinds the
+// cursor, so a consumer can snapshot state, read this cursor, and poll
+// after=latest without a bootstrap gap even when every event in the window
+// was pruned. It is a read-only raw SELECT and carries no schema fence.
 func (s *PostgresStore) LatestExecutionEventSeq(ctx context.Context) (int64, error) {
-	var max int64
-	if err := s.pool.QueryRow(ctx, `SELECT COALESCE(MAX(seq), 0) FROM execution_events`).Scan(&max); err != nil {
+	var latest int64
+	if err := s.pool.QueryRow(ctx, `SELECT COALESCE((SELECT value FROM execution_event_cursor WHERE id = TRUE), 0)`).Scan(&latest); err != nil {
 		return 0, err
 	}
-	return max, nil
+	return latest, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -535,14 +678,63 @@ func ExecutionEventDeploymentCompleted(d model.Deployment) model.ExecutionEvent 
 
 func deploymentExecutionEvent(typ string, d model.Deployment) model.ExecutionEvent {
 	return model.ExecutionEvent{
-		RunID: d.RunID,
-		JobID: d.JobID,
-		Type:  typ,
-		Actor: "scheduler",
+		RunID:   d.RunID,
+		JobID:   d.JobID,
+		Attempt: d.LeaseGeneration,
+		Type:    typ,
+		Actor:   "scheduler",
 		Payload: map[string]string{
 			"deployment":  d.ID,
 			"environment": d.Environment,
 			"status":      string(d.Status),
 		},
 	}
+}
+
+// ExecutionSnapshot implements ExecutionSnapshotStore for PostgreSQL in ONE
+// schema-compatible transaction, reading the event cursor FIRST and the run
+// summary SECOND (see the ExecutionSnapshot ordering contract). The
+// transaction holds the shared schema lock, so a migration cannot commit
+// between the reads and change the shape of the state being summarized.
+func (s *PostgresStore) ExecutionSnapshot(ctx context.Context, runLimit int) (ExecutionSnapshot, error) {
+	if runLimit <= 0 || runLimit > MaxExecutionSnapshotRuns {
+		runLimit = DefaultExecutionSnapshotRuns
+	}
+	snap := ExecutionSnapshot{Runs: []ExecutionSnapshotRun{}}
+	err := s.withSchemaCompatibleTx(ctx, func(tx pgx.Tx) error {
+		// Cursor FIRST: every transition that commits after this read has a
+		// seq strictly greater than snap.Cursor and is visible to the state
+		// reads below, so a consumer starting at snap.Cursor cannot skip it.
+		if err := tx.QueryRow(ctx, `SELECT COALESCE((SELECT value FROM execution_event_cursor WHERE id = TRUE), 0)`).Scan(&snap.Cursor); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&snap.GeneratedAt); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT id, COALESCE(payload->>'repo_id', ''), COALESCE(payload->>'ref', ''), status, created_at
+			FROM runs
+			WHERE status NOT IN ('success', 'failure', 'cancelled', 'skipped', 'blocked')
+			ORDER BY created_at DESC, id ASC
+			LIMIT $1`, runLimit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var r ExecutionSnapshotRun
+			if err := rows.Scan(&r.ID, &r.RepoID, &r.Ref, &r.Status, &r.CreatedAt); err != nil {
+				return err
+			}
+			snap.Runs = append(snap.Runs, r)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT count(*) FILTER (WHERE status = 'queued'), count(*) FILTER (WHERE status = 'running') FROM jobs`).Scan(&snap.Queued, &snap.Running)
+	})
+	if err != nil {
+		return ExecutionSnapshot{}, err
+	}
+	return snap, nil
 }

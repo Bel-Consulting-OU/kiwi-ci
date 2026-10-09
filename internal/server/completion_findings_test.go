@@ -336,8 +336,9 @@ func TestCompletionReceiptRecordsPrunesExpired(t *testing.T) {
 		s.mu.Unlock()
 		t.Fatalf("cache expiry = %v, want earliest live expiry %v", s.completionReceiptsCacheExpiry, wantExpiry)
 	}
-	expiredMatched, expiredErr := s.completionReplayReadyLocked("expired-job", 1, "r", "h")
-	freshMatched, freshErr := s.completionReplayReadyLocked("fresh-job", 1, "r", "h")
+	replayIn := Complete{Status: model.StatusSuccess}
+	expiredMatched, expiredErr := s.completionReplayReadyLocked("expired-job", 1, "r", replayIn, "h")
+	freshMatched, freshErr := s.completionReplayReadyLocked("fresh-job", 1, "r", replayIn, "h")
 	// Crossing the earliest expiry forces a re-render even with an unchanged
 	// table version (the slice must be re-allocated) so aging is enforced
 	// over wall-clock time, not only on mutation.

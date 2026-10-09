@@ -330,7 +330,7 @@ Usage:
   kiwi runner list|drain|disable|enable --server URL --token ADMIN_TOKEN [RUNNER_ID]
   kiwi dispatch --repo owner/name --ref main --input k=v --pipeline FILE
   kiwi import   github-actions|gitlab|circleci|woodpecker [--file PATH] [--out PATH] [--list-unsupported]
-  kiwi replay   RUN JOB [STEP] --server URL --token TOKEN [--attempt N] [--debug-rerun] [--pipeline FILE]
+  kiwi replay   RUN JOB [STEP] --server URL --token TOKEN [--attempt N] [--debug-rerun] [--allow-unbounded-workspace] [--pipeline FILE]
   kiwi verify   [--server URL] [--token TOKEN] [--trusted-key PATH] ARTIFACT_ID
                 (or) --attestation JOB [--generation N] | --attestation-file PATH
   kiwi runs [--server URL] [--token ADMIN_TOKEN]

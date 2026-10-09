@@ -24,7 +24,11 @@ import (
 // recorded. The timestamp lets a restarted control plane prune receipts past
 // the retention window and bound the restored set to the newest entries; a
 // receipt itself carries no wall-clock field (the key is the idempotency
-// identity: job + lease generation + runner).
+// identity: job + lease generation + runner). The receipt's ResultHashVersion
+// is persisted additively with the rest of model.CompletionReceipt: a record
+// written before the field existed decodes as version 0, which replay
+// resolution treats as the legacy v1 semantic it was written with (see
+// CompletionReceiptReplayMatches).
 type CompletionReceiptRecord struct {
 	Receipt   model.CompletionReceipt `json:"receipt"`
 	CreatedAt time.Time               `json:"created_at"`
@@ -835,13 +839,15 @@ func (r *Repository) ListExecutionEvents(ctx context.Context, afterSeq int64, li
 }
 
 // LatestExecutionEventSeq implements ExecutionEventCursorStore for the
-// filesystem journal: the in-memory watermark, initialized once from the
-// durable journal. It is the fs-mode "latest committable cursor" the events
-// list reports as latest_cursor: fs append and mutation share the server
-// lock, so a consumer can snapshot state, read this watermark, then poll
-// after=watermark without a bootstrap gap. Best-effort/non-canonical
-// (canonical=false in the response): a concurrent writer may have advanced
-// the file since the last read.
+// filesystem journal: the in-memory monotonic watermark (the highest seq
+// ever allocated, recovered from the journal AND the durable retention
+// watermark), NOT the highest surviving row. Pruning the whole journal can
+// therefore never make latest_cursor regress. It is the fs-mode "latest
+// committable cursor" the events list reports: fs append and mutation share
+// the server lock, so a consumer can snapshot state, read this watermark,
+// then poll after=watermark without a bootstrap gap.
+// Best-effort/non-canonical (canonical=false in the response): a concurrent
+// writer may have advanced the file since the last read.
 func (r *Repository) LatestExecutionEventSeq(ctx context.Context) (int64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -854,6 +860,33 @@ func (r *Repository) LatestExecutionEventSeq(ctx context.Context) (int64, error)
 	return r.executionEventSeq, nil
 }
 
+// ReadExecutionEventsRetention implements ExecutionEventRetentionReadStore
+// for the filesystem journal: the watermark (execution-events.retained), the
+// page and the monotonic latest watermark are read under ONE repository-lock
+// critical section, so a concurrent PruneExecutionEvents cannot interleave
+// between the checks. latestCursor is the monotonic seq watermark, never the
+// highest surviving row, so compaction of the whole journal cannot regress
+// it. A corrupt/unreadable journal or watermark fails closed.
+func (r *Repository) ReadExecutionEventsRetention(ctx context.Context, afterSeq int64, limit int, runID string) ([]model.ExecutionEvent, int64, int64, int64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, afterSeq, 0, 0, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.initExecutionEventSeqLocked(); err != nil {
+		return nil, afterSeq, 0, 0, err
+	}
+	retainedFrom, err := readExecutionEventRetainedFrom(r.Root)
+	if err != nil {
+		return nil, afterSeq, 0, 0, err
+	}
+	page, cursor, err := r.readExecutionEventsLocked(afterSeq, limit, runID)
+	if err != nil {
+		return nil, afterSeq, 0, 0, err
+	}
+	return page, cursor, retainedFrom, r.executionEventSeq, nil
+}
+
 // ReadExecutionEvents streams the journal in append order and returns the
 // FIRST limit events with seq > afterSeq (optionally filtered to one run),
 // ascending, plus the cursor for the next call. Unlike readJSONL it keeps
@@ -862,6 +895,13 @@ func (r *Repository) LatestExecutionEventSeq(ctx context.Context) (int64, error)
 func (r *Repository) ReadExecutionEvents(afterSeq int64, limit int, runID string) ([]model.ExecutionEvent, int64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.readExecutionEventsLocked(afterSeq, limit, runID)
+}
+
+// readExecutionEventsLocked is ReadExecutionEvents for callers already
+// holding r.mu (the atomic retention read shares one critical section for
+// the watermark and the page).
+func (r *Repository) readExecutionEventsLocked(afterSeq int64, limit int, runID string) ([]model.ExecutionEvent, int64, error) {
 	limit = ClampExecutionEventLimit(limit)
 	f, err := os.Open(filepath.Join(r.Root, executionEventsFile))
 	if errors.Is(err, os.ErrNotExist) {
@@ -897,9 +937,13 @@ func (r *Repository) ReadExecutionEvents(afterSeq int64, limit int, runID string
 }
 
 // initExecutionEventSeqLocked initializes the in-memory seq watermark from
-// the durable journal once. A corrupt record fails closed (the store cannot
-// prove which seq values are already published, so continuing could reuse a
-// cursor); a missing journal simply starts at zero.
+// the durable journal AND the durable retention watermark, whichever is
+// higher, once. Compaction removes rows but never rewinds the cursor, and a
+// prune of the WHOLE journal leaves max seq < retainedFrom; taking the max
+// with retainedFrom means a restart can never reuse a pruned seq. A corrupt
+// record fails closed (the store cannot prove which seq values are already
+// published, so continuing could reuse a cursor); a missing journal simply
+// starts at zero.
 func (r *Repository) initExecutionEventSeqLocked() error {
 	if r.executionEventSeqLoaded {
 		return nil
@@ -907,6 +951,13 @@ func (r *Repository) initExecutionEventSeqLocked() error {
 	maxSeq, err := maxExecutionEventSeqLocked(r.Root)
 	if err != nil {
 		return err
+	}
+	retainedFrom, err := readExecutionEventRetainedFrom(r.Root)
+	if err != nil {
+		return err
+	}
+	if retainedFrom > maxSeq {
+		maxSeq = retainedFrom
 	}
 	r.executionEventSeq = maxSeq
 	r.executionEventSeqLoaded = true
@@ -1136,6 +1187,19 @@ func (r *Repository) MaxLogSeq() (int64, error) {
 		maxSeq = batched
 	}
 	return maxSeq, nil
+}
+
+// LatestLogSeq exposes the same monotonic high-water semantics for the fs
+// log store as the PostgreSQL log cursor table: the highest durable log
+// sequence ever allocated, never a MAX over the surviving rows. The fs store
+// keeps one global watermark (there is no per-run cursor), so runID is
+// accepted for contract parity and deliberately ignored. Errors fail closed:
+// an unreadable watermark is never reported as 0.
+func (r *Repository) LatestLogSeq(ctx context.Context, runID string) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.MaxLogSeq()
 }
 
 // readMaxLogSeqIndexLocked reads the durable max-seq checkpoint. ok=false

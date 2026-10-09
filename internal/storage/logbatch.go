@@ -95,6 +95,11 @@ var _ LogBatchStore = (*PostgresStore)(nil)
 // the same payload_sha256 is a retry of an already-persisted batch; a
 // different digest is a conflicting reuse of the identity and fails closed
 // with ErrLogBatchConflict (the whole transaction rolls back).
+//
+// The lines must belong to ONE run. They get ONE contiguous seq range
+// allocated from that run's commit-ordered log cursor (migration 0052),
+// whose row lock is held to commit; caller-supplied Seq values are ignored
+// and a rollback frees the whole range.
 func (s *PostgresStore) AppendLogBatch(ctx context.Context, entries []model.LogEntry, r LogBatchIdentity) (bool, error) {
 	if r.JobID == "" || r.BatchID == "" {
 		return false, fmt.Errorf("storage: log batch requires job id and batch id")
@@ -125,9 +130,29 @@ func (s *PostgresStore) AppendLogBatch(ctx context.Context, entries []model.LogE
 		}
 		return false, nil
 	}
+	// Allocate ONE contiguous seq range for the whole batch from the run's
+	// commit-ordered cursor (migration 0052): the upsert's row lock is held
+	// to commit, so a concurrent append to the same run blocks until this
+	// transaction commits or rolls back and the range can never interleave
+	// with another batch's. The caller-supplied Seq values are ignored.
+	runID := entries[0].RunID
 	for _, e := range entries {
-		if _, err := tx.Exec(ctx, `INSERT INTO log_entries (run_id, job_id, job_key, step, line, lease_generation, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-			e.RunID, e.JobID, e.JobKey, e.Step, e.Line, e.LeaseGeneration, e.CreatedAt); err != nil {
+		if e.RunID != runID {
+			return false, fmt.Errorf("storage: log batch entries must share one run")
+		}
+	}
+	n := int64(len(entries))
+	var end int64
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO log_cursors (run_id, value) VALUES ($1, $2)
+		ON CONFLICT (run_id) DO UPDATE SET value = log_cursors.value + $2
+		RETURNING value`, runID, n).Scan(&end); err != nil {
+		return false, err
+	}
+	start := end - n + 1
+	for i, e := range entries {
+		if _, err := tx.Exec(ctx, `INSERT INTO log_entries (seq, run_id, job_id, job_key, step, line, lease_generation, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			start+int64(i), e.RunID, e.JobID, e.JobKey, e.Step, e.Line, e.LeaseGeneration, e.CreatedAt); err != nil {
 			return false, err
 		}
 	}

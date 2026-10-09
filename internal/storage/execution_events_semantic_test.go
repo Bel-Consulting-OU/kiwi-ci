@@ -275,7 +275,7 @@ func TestMemStoreSemanticDeployments(t *testing.T) {
 }
 
 // TestRepositoryExecutionEventRetentionCompaction proves the fs prefix prune,
-// the durable watermark across reloads, the after=retainedFrom-1 continuity
+// the durable watermark across reloads, the after=retainedFrom continuity
 // and that a semantic event survives the compaction.
 func TestRepositoryExecutionEventRetentionCompaction(t *testing.T) {
 	ctx := ctx()
@@ -302,9 +302,9 @@ func TestRepositoryExecutionEventRetentionCompaction(t *testing.T) {
 	if err != nil || pruned != 2 || retained != 2 {
 		t.Fatalf("prune 1 = %d/%d err %v, want 2/2", pruned, retained, err)
 	}
-	page, cursor, err := repo.ListExecutionEvents(ctx, retained-1, 100, "")
+	page, cursor, err := repo.ListExecutionEvents(ctx, retained, 100, "")
 	if err != nil || len(page) != 3 || page[0].Seq != 3 || cursor != 5 {
-		t.Fatalf("after=retainedFrom-1 page = %+v cursor %d err %v, want seqs 3..5", page, cursor, err)
+		t.Fatalf("after=retainedFrom page = %+v cursor %d err %v, want seqs 3..5", page, cursor, err)
 	}
 	// A second prune finishes the old prefix and stops at the first fresh
 	// event; the semantic event and its payload survive.
@@ -312,7 +312,7 @@ func TestRepositoryExecutionEventRetentionCompaction(t *testing.T) {
 	if err != nil || pruned != 1 || retained != 3 {
 		t.Fatalf("prune 2 = %d/%d err %v, want 1/3", pruned, retained, err)
 	}
-	page, _, err = repo.ListExecutionEvents(ctx, retained-1, 100, "")
+	page, _, err = repo.ListExecutionEvents(ctx, retained, 100, "")
 	if err != nil || len(page) != 2 || page[0].Type != model.EventGraphMutationCommitted {
 		t.Fatalf("post-prune page = %+v err %v, want the semantic event first", page, err)
 	}
@@ -335,7 +335,9 @@ func TestRepositoryExecutionEventRetentionCompaction(t *testing.T) {
 		t.Fatalf("post-restart page = %+v err %v, want seq 6 appended", page, err)
 	}
 
-	// Cursor-expiry boundaries: only after < retainedFrom-1 is expired.
+	// Cursor-expiry boundaries: after == retainedFrom is VALID (the consumer
+	// consumed the removed prefix's last seq); only after < retainedFrom is
+	// expired.
 	for _, tc := range []struct {
 		after    int64
 		retained int64
@@ -344,7 +346,7 @@ func TestRepositoryExecutionEventRetentionCompaction(t *testing.T) {
 		{0, 0, false},
 		{0, 3, true},
 		{1, 3, true},
-		{2, 3, false},
+		{2, 3, true},
 		{3, 3, false},
 		{4, 3, false},
 	} {

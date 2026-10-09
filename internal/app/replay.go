@@ -68,6 +68,14 @@ func (r recordedPersistedJob) persistedJob() model.Job {
 // (test-only; production leaves it nil).
 var replayOptionsSeam func(executor.Options)
 
+// replayWorkspaceDiskQuotaSetup is the OS-level hard workspace-bound probe
+// exact replay uses for an untrusted recorded job. It defaults to the
+// executor's capability probe — the same mechanism the distributed runner
+// installs before checkout (WorkspaceDiskQuotaSetup, an XFS project quota) —
+// and is a variable so tests can drive the supported/unsupported outcomes
+// deterministically.
+var replayWorkspaceDiskQuotaSetup = executor.WorkspaceDiskQuotaSetup
+
 // Replay reconstructs the workspace state a run's job executed in and
 // re-runs that job locally.
 //
@@ -84,9 +92,16 @@ var replayOptionsSeam func(executor.Options)
 // executed. Execution semantics therefore come from the local checkout and
 // may differ from the recorded run.
 //
+// An untrusted recorded job (exact mode) additionally requires the same
+// OS-level hard workspace quota the distributed runner installs: the quota is
+// applied to the replay workspace BEFORE the snapshot is restored, and when
+// the host cannot establish one the replay refuses to run untrusted code
+// unless --allow-unbounded-workspace is passed explicitly (with a loud
+// warning). Trusted jobs and --debug-rerun keep their previous behavior.
+//
 // Secrets are freshly authorized from the local provider — never captured.
 //
-// Usage: kiwi replay RUN JOB [STEP] --server URL --token TOKEN [--attempt N] [--debug-rerun] [--allow-post-job-snapshot] [--pipeline FILE]
+// Usage: kiwi replay RUN JOB [STEP] --server URL --token TOKEN [--attempt N] [--debug-rerun] [--allow-unbounded-workspace] [--allow-post-job-snapshot] [--pipeline FILE]
 func Replay(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("replay", flag.ContinueOnError)
 	server := fs.String("server", os.Getenv("KIWI_SERVER"), "control plane URL")
@@ -94,13 +109,14 @@ func Replay(ctx context.Context, args []string) error {
 	pipelineFile := fs.String("pipeline", ".kiwi/pipeline.yaml", "pipeline file for --debug-rerun")
 	attempt := fs.Int64("attempt", 0, "lease generation (attempt) of the snapshot to replay; default: newest generation for the job")
 	debugRerun := fs.Bool("debug-rerun", false, "run against the CURRENT local pipeline file instead of the recorded pipeline (execution semantics may differ)")
+	allowUnbounded := fs.Bool("allow-unbounded-workspace", false, "replay an untrusted recorded job even when no OS-level hard workspace quota can be established (hostile recorded code can then fill the operator filesystem; prints a warning)")
 	allowPostJob := fs.Bool("allow-post-job-snapshot", false, "replay from the post-execution (post_job) snapshot when the attempt has no pre-execution checkpoint (execution starts from post-execution workspace state)")
 	rest, err := parseFlagsAndPositionals(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(rest) != 2 && len(rest) != 3 {
-		return fmt.Errorf("usage: kiwi replay RUN JOB [STEP] --server URL --token TOKEN [--attempt N] [--debug-rerun] [--allow-post-job-snapshot] [--pipeline FILE]")
+		return fmt.Errorf("usage: kiwi replay RUN JOB [STEP] --server URL --token TOKEN [--attempt N] [--debug-rerun] [--allow-unbounded-workspace] [--allow-post-job-snapshot] [--pipeline FILE]")
 	}
 	if *server == "" {
 		return fmt.Errorf("--server (or KIWI_SERVER) is required")
@@ -243,6 +259,40 @@ func Replay(ctx context.Context, args []string) error {
 	}
 	fmt.Printf("using %s snapshot %s (lease generation %d)\n", snapshotPhaseOf(match), match.ID, match.LeaseGeneration)
 
+	// The replay workspace is created NOW, before the snapshot is downloaded
+	// and restored, so the hard quota for an untrusted recorded job can be
+	// installed on the empty directory exactly like the distributed runner
+	// installs it before checkout. Without it a hostile historical job could
+	// fill the operator filesystem during execution (the step-boundary
+	// resources.disk check is not a security boundary).
+	ws, err := os.MkdirTemp("", "kiwi-replay-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(ws)
+	var replayQuota *executor.DiskQuotaStatus
+	if materialized != nil && materialized.Untrusted {
+		if *allowUnbounded {
+			fmt.Fprintf(os.Stderr, "warning: --allow-unbounded-workspace: replaying UNTRUSTED recorded code without an OS-level hard workspace quota; workspace writes are only checked at step boundaries and hostile code can fill the operator filesystem\n")
+		} else {
+			// The same capability probe (and XFS project-quota install) the
+			// distributed runner runs before checkout. Replay has no
+			// crash-recovery ledger, so a hard crash mid-replay can leave the
+			// project quota assigned; normal return always cleans it up.
+			status, cleanup := replayWorkspaceDiskQuotaSetup(ws, materialized.WorkspaceQuotaLimit)
+			if !status.Hard {
+				if cleanup != nil {
+					_ = cleanup()
+				}
+				return fmt.Errorf("refusing to replay untrusted job %q without an OS-level hard workspace quota: %s; the replay workspace would be bounded only at step boundaries, so hostile recorded code could fill the operator filesystem — re-run with --allow-unbounded-workspace to accept that risk", jobKey, status.Detail)
+			}
+			if cleanup != nil {
+				defer cleanup()
+			}
+			replayQuota = &status
+		}
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, *server+"/api/v1/runs/"+url.PathEscape(runID)+"/snapshots/"+url.PathEscape(match.ID), nil)
 	if err != nil {
 		return err
@@ -257,11 +307,6 @@ func Replay(ctx context.Context, args []string) error {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("download snapshot: %s: %s", resp.Status, string(b))
 	}
-	ws, err := os.MkdirTemp("", "kiwi-replay-*")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(ws)
 	if _, err := snapshot.Restore(resp.Body, ws); err != nil {
 		return fmt.Errorf("restore snapshot: %w", err)
 	}
@@ -285,9 +330,16 @@ func Replay(ctx context.Context, args []string) error {
 		// floor, workspace bound, immutable images) through the ONE shared
 		// mapping the distributed runner uses. Deliberate local-only
 		// differences: the ephemeral local workspace, no artifact/cache
-		// upload, the step selector, and no OS-level workspace quota (the
-		// host capability and its operator escape hatch are runner-local).
+		// upload, and the step selector. For an untrusted record the hard
+		// OS-level workspace quota was installed on the empty workspace
+		// before the snapshot was restored (replayQuota); its outcome is
+		// passed through so the container backend accepts it as already
+		// bounded instead of re-probing (or running unbounded).
 		opts = executor.OptionsFromExecution(opts, *materialized)
+		if replayQuota != nil {
+			opts.WorkspaceQuota = replayQuota
+			opts.RequireUntrustedDiskQuota = true
+		}
 	} else {
 		// --debug-rerun executes the local file with historical local
 		// semantics; no recorded effective execution exists to derive from.

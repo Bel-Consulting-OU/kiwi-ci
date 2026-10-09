@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"time"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 // statePersistenceDegradedBody is the fixed /readiness body for a control
@@ -12,6 +14,14 @@ import (
 // and store internals. The diagnostic stays in the structured logs emitted
 // by persistCheckedErrLocked for the failing mutation.
 const statePersistenceDegradedBody = "state persistence degraded"
+
+// run-key identity index readiness bodies. Also fixed and internal-detail
+// free: the probe is unauthenticated, so it must not leak SQL object names
+// or duplicate row counts beyond the operator log line.
+const (
+	runKeyIndexMissingBody = "database is missing the run key identity index"
+	runKeyIndexUnknownBody = "database run key identity index not verifiable"
+)
 
 // liveness reports that the process is up. It never checks dependencies:
 // a live control plane that cannot reach its store must still report
@@ -61,6 +71,28 @@ func (s *Server) readiness(w http.ResponseWriter, r *http.Request) {
 		// readiness must not report 200.
 		http.Error(w, "database schema requires a newer binary", http.StatusServiceUnavailable)
 		return
+	}
+	// Migration 0048 creates jobs_run_key_idx CONDITIONALLY: a database that
+	// held duplicate (run_id, key) rows at 0048 time never got the index, and
+	// migration 0053 re-runs the creation so an operator repair (cancel or
+	// remove the duplicates, re-migrate) installs it. Until then readiness
+	// reports not-ready and kiwi_run_key_index_present stays 0, so the index
+	// cannot silently stay missing. A probe error also fails readiness:
+	// presence is unproven, never assumed.
+	if rk, ok := s.DB.(storage.RunKeyIndexStore); ok {
+		present, err := rk.RunKeyIndexPresent(ctx)
+		if err != nil {
+			w.Header().Set("X-Kiwi-State", "run-key-index-unproven")
+			http.Error(w, runKeyIndexUnknownBody, http.StatusServiceUnavailable)
+			return
+		}
+		if !present {
+			s.metricSet("kiwi_run_key_index_present", 0, nil)
+			w.Header().Set("X-Kiwi-State", "run-key-index-missing")
+			http.Error(w, runKeyIndexMissingBody, http.StatusServiceUnavailable)
+			return
+		}
+		s.metricSet("kiwi_run_key_index_present", 1, nil)
 	}
 	w.WriteHeader(http.StatusOK)
 }

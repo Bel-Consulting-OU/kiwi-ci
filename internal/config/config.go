@@ -52,7 +52,15 @@ type ServerConfig struct {
 	// retained_from watermark is answered with HTTP 410 cursor_expired
 	// (re-bootstrap via latest_cursor). Unset uses the built-in default of
 	// 7 days; "0" disables retention.
-	EventsRetention string `toml:"events_retention"`
+	//
+	// EventsRetentionPrune is the TWO-PHASE activation gate for the prune
+	// itself and defaults to FALSE. Setting a window alone only records the
+	// intent; operators must first upgrade EVERY replica to a build that
+	// understands retained_from, and only then set this to true. Otherwise a
+	// replica that predates the watermark would serve an expired cursor as a
+	// truncated 200 (a silently truncated history).
+	EventsRetention      string `toml:"events_retention"`
+	EventsRetentionPrune bool   `toml:"events_retention_prune"`
 	// MaxRetainedRuns bounds the fs-mode run count; the oldest terminal runs
 	// are pruned first. 0 uses the built-in default (10000); -1 disables the
 	// bound.
@@ -521,6 +529,9 @@ func (c *Config) Validate() error {
 		}
 		if d < 0 {
 			return fmt.Errorf("server.events_retention must not be negative, got %q", raw)
+		}
+		if c.Server.EventsRetentionPrune && d == 0 {
+			return fmt.Errorf("server.events_retention_prune cannot be enabled with server.events_retention = \"0\" (nothing to prune)")
 		}
 	}
 	if c.Server.ExternalURL != "" {

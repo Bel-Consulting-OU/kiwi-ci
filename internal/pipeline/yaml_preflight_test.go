@@ -84,3 +84,89 @@ func TestYAMLCommentOnlyLineDoesNotPanic(t *testing.T) {
 		}
 	}
 }
+
+// yamlBlockScalarDoc builds a one-step pipeline whose run value is a block
+// scalar with the given header and bodyLines "::" content lines (each line
+// carries two structural ':' characters, so a body the preflight counts
+// instead of skipping blows the structural-token budget). bodyBlankAt >= 0
+// inserts one blank line after that many body lines.
+func yamlBlockScalarDoc(header string, bodyLines, bodyBlankAt int) []byte {
+	var b strings.Builder
+	b.WriteString("version: 1\njobs:\n  a:\n    steps:\n      - run: " + header + "\n")
+	for i := 0; i < bodyLines; i++ {
+		if bodyBlankAt >= 0 && i == bodyBlankAt {
+			b.WriteString("\n")
+		}
+		b.WriteString("          ::\n")
+	}
+	return []byte(b.String())
+}
+
+// TestYAMLPreflightBlockScalarHeaderForms pins the header scanner for the
+// forms the old last-character heuristic got wrong: chomping and indentation
+// indicators in either order, indicators followed by a trailing comment, and
+// sequence-item headers. A plain scalar that merely ends in a spaced '>' or
+// '|' must NOT be treated as a header.
+func TestYAMLPreflightBlockScalarHeaderForms(t *testing.T) {
+	for _, line := range []string{
+		"run: |",
+		"run: |+",
+		"run: |-2",
+		"run: |2-",
+		"run: >-",
+		"run: |2 # explicit indent",
+		"run: |+ # keep trailing newlines",
+		"run: >-2 # strip",
+		"- |",
+		"key:\t|+",
+	} {
+		if !yamlOpensBlockScalar([]byte(line)) {
+			t.Errorf("yamlOpensBlockScalar(%q) = false, want true", line)
+		}
+	}
+	for _, line := range []string{
+		"",
+		" # comment-only",
+		"key: value # trailing",
+		"run: echo x >",
+		"run: echo x > # redirect",
+		"run: a|b",
+		"run: |0",
+	} {
+		if yamlOpensBlockScalar([]byte(line)) {
+			t.Errorf("yamlOpensBlockScalar(%q) = true, want false", line)
+		}
+	}
+}
+
+// TestYAMLPreflightSkipsBlockScalarBodiesWithIndicatorsAndComments is the
+// adversarial regression for the mis-parse where a block-scalar header with
+// indicators and/or a trailing comment was not recognized, so the body was
+// scanned as YAML and a legitimate single-scalar document was rejected with
+// the complexity-budget error. It also pins that blank lines inside a block
+// scalar do not terminate the body.
+func TestYAMLPreflightSkipsBlockScalarBodiesWithIndicatorsAndComments(t *testing.T) {
+	// More than maxYAMLStructuralTokens/2 body lines, each contributing two
+	// ':' indicators if (and only if) the preflight fails to skip the body.
+	bodyLines := maxYAMLStructuralTokens/2 + 10
+	docs := map[string][]byte{
+		"chomping+comment": yamlBlockScalarDoc("|+ # keep trailing newlines", bodyLines, -1),
+		"indent+comment":   yamlBlockScalarDoc("|-2 # strip", bodyLines, -1),
+		"indent only":      yamlBlockScalarDoc("|2", bodyLines, -1),
+		"folded":           yamlBlockScalarDoc(">- # fold", bodyLines, -1),
+		"blank line body":  yamlBlockScalarDoc("|", bodyLines, 5),
+	}
+	for name, doc := range docs {
+		if err := preflightYAMLStructure(doc); err != nil {
+			t.Errorf("%s: preflight rejected a block-scalar body it must skip: %v", name, err)
+		}
+	}
+	// End to end: the document is one huge scalar, not a structural flood,
+	// so the parser must accept it (the body stays under maxScalarBytes).
+	if _, err := Parse(docs["chomping+comment"]); err != nil {
+		t.Fatalf("Parse of a large block scalar failed: %v", err)
+	}
+	if _, err := Parse(docs["blank line body"]); err != nil {
+		t.Fatalf("Parse of a block scalar with a blank line failed: %v", err)
+	}
+}

@@ -363,6 +363,15 @@ func TestLimits(t *testing.T) {
 	if _, err := Parse(strings.Repeat("(", 64) + "'x'" + strings.Repeat(")", 64)); err != nil {
 		t.Fatalf("64 nested parens must be accepted, got %v", err)
 	}
+	// Unary '!' chains are nesting levels too: a chain longer than maxDepth
+	// must hit the depth limit, and a chain at the limit must parse.
+	if _, err := Parse(strings.Repeat("!", maxDepth+1) + "'x'"); err == nil ||
+		!strings.Contains(err.Error(), "maximum depth") {
+		t.Fatalf("a %d-deep '!' chain must hit the depth limit, got %v", maxDepth+1, err)
+	}
+	if _, err := Parse(strings.Repeat("!", maxDepth) + "'x'"); err != nil {
+		t.Fatalf("a %d-deep '!' chain must be accepted, got %v", maxDepth, err)
+	}
 	if _, err := Parse(strings.Repeat("'a' ", 4097)); err == nil ||
 		!strings.Contains(err.Error(), "token limit") {
 		t.Fatalf("4097 tokens must hit the token limit, got %v", err)

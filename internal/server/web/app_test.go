@@ -116,3 +116,57 @@ func TestDashboardPausedHistoryMode(t *testing.T) {
 		t.Error("app.js assigns innerHTML/outerHTML; the dashboard renders via textContent/createElement")
 	}
 }
+
+// TestDashboardStaleResponseGuards pins the finding-7 client contract at the
+// asset level: request epochs (and an AbortController) make a slow response
+// for run A unable to repaint the jobs pane after B was selected, and make an
+// older newest-page refresh unable to overwrite a newer one.
+func TestDashboardStaleResponseGuards(t *testing.T) {
+	raw, err := Assets.ReadFile("app.js")
+	if err != nil {
+		t.Fatalf("read embedded app.js: %v", err)
+	}
+	js := string(raw)
+	for _, want := range []string{
+		"runsEpoch: 0",
+		"jobsEpoch: 0",
+		"++state.runsEpoch",
+		"++state.jobsEpoch",
+		"if (epoch !== state.runsEpoch) return;",
+		"if (epoch !== state.jobsEpoch || state.selectedRun !== runID) return;",
+		"new AbortController()",
+		"signal: controller.signal",
+		"state.jobsAbort.abort()",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js does not contain %q", want)
+		}
+	}
+	// selectRun: the epoch/selection guard must run before renderJobs, so a
+	// stale response cannot render at all.
+	selectSlice := js[strings.Index(js, "async function selectRun"):]
+	selectSlice = selectSlice[:strings.Index(selectSlice, "// refreshSelectedQuiet")]
+	guardAt := strings.Index(selectSlice, "if (epoch !== state.jobsEpoch || state.selectedRun !== runID) return;")
+	renderAt := strings.Index(selectSlice, "renderJobs(jobs);")
+	if guardAt < 0 || renderAt < 0 || guardAt > renderAt {
+		t.Error("selectRun must check the jobs epoch/selection before rendering the fetched jobs")
+	}
+	// refresh: the runs-epoch guard must run before the table is replaced, so
+	// newest-page refreshes cannot finish out of order.
+	refreshSlice := js[strings.Index(js, "async function refresh()"):]
+	refreshSlice = refreshSlice[:strings.Index(refreshSlice, `$("#refresh")`)]
+	runsGuardAt := strings.Index(refreshSlice, "if (epoch !== state.runsEpoch) return;")
+	renderRunsAt := strings.Index(refreshSlice, "renderRuns(page.runs);")
+	if runsGuardAt < 0 || renderRunsAt < 0 || runsGuardAt > renderRunsAt {
+		t.Error("refresh must check the runs epoch before replacing the newest page")
+	}
+	// Sign-out invalidates every in-flight render.
+	signOutSlice := js[strings.Index(js, "function setSignedOut"):]
+	signOutSlice = signOutSlice[:strings.Index(signOutSlice, "loginForm.addEventListener")]
+	if !strings.Contains(signOutSlice, "state.runsEpoch++;") || !strings.Contains(signOutSlice, "state.jobsEpoch++;") {
+		t.Error("setSignedOut must invalidate the in-flight request epochs")
+	}
+	if strings.Contains(js, ".innerHTML") || strings.Contains(js, "outerHTML") {
+		t.Error("app.js assigns innerHTML/outerHTML; the dashboard renders via textContent/createElement")
+	}
+}

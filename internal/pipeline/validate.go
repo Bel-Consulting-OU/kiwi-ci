@@ -118,6 +118,27 @@ var (
 	}
 )
 
+// validateCronTriggers rejects schedule declarations the scheduler cannot
+// execute faithfully. on.schedule.cron is a LIST in the schema, but the
+// scheduler admits exactly one cron entry with exactly one branch and
+// silently used to execute only Cron[0] and Branches[0]; a document with more
+// was silently truncated. Admission now refuses the ambiguity instead of
+// running a subset of the declared schedules.
+func validateCronTriggers(s *Spec) error {
+	for name, tr := range s.On {
+		if len(tr.Cron) == 0 {
+			continue
+		}
+		if len(tr.Cron) != 1 {
+			return fmt.Errorf("on.%s: multiple cron entries are not supported (declare exactly one cron entry)", name)
+		}
+		if len(tr.Cron[0].Branches) > 1 {
+			return fmt.Errorf("on.%s: multiple cron branches are not supported (declare at most one branch per cron entry)", name)
+		}
+	}
+	return nil
+}
+
 // Validate performs full admission validation: hard resource limits, ID and
 // reference checks, runtime/network/shell constraints, matrix shape checks,
 // path confinement, duration and retry policy checks, and interpolation
@@ -167,6 +188,9 @@ func validateSpec(s *Spec, relaxComponentJobs bool) error {
 		}
 	}
 	if err := validateInputs(s); err != nil {
+		return err
+	}
+	if err := validateCronTriggers(s); err != nil {
 		return err
 	}
 	for id, j := range s.Jobs {

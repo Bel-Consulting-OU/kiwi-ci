@@ -64,11 +64,25 @@ type attestationEvidence struct {
 	artifacts []model.ArtifactRecord
 	reports   []model.TestReport
 	snapshots []model.SnapshotRecord
+	// completionResultDigest is the job's durable v2 completion identity
+	// digest (storage.CompletionResultDigestV2), present only when the
+	// completion receipt was written under the v2 encoding. It binds the
+	// terminal status/error/outputs/runtime by digest only; a legacy (v1)
+	// receipt has no v2 digest to bind and leaves this empty.
+	completionResultDigest string
 }
 
 // gatherAttestationEvidenceDB loads the attempt's durable evidence through
 // the store interfaces. A missing job is reported with ok=false; a missing
 // run is a hard error (the job's own evidence cannot be scoped).
+//
+// Evidence reads are ATTEMPT-SCOPED when the store implements the optional
+// storage.AttemptEvidenceStore contract (PostgresStore, memStore and
+// FaultyStore all do): one small indexed query per evidence kind by
+// (job_id, lease_generation), instead of loading every row of the run and
+// filtering in Go — an O(n^2) walk over a run with n completed jobs. A store
+// that lacks the optional contract falls back to the run-scoped lists plus
+// the Go-side attempt filter.
 func (s *Server) gatherAttestationEvidenceDB(ctx context.Context, jobID string, generation int64) (attestationEvidence, bool, error) {
 	j, err := s.DB.GetJob(ctx, jobID)
 	if errors.Is(err, storage.ErrNotFound) {
@@ -83,33 +97,59 @@ func (s *Server) gatherAttestationEvidenceDB(ctx context.Context, jobID string, 
 	}
 	var ev attestationEvidence
 	ev.job, ev.run = j, run
-	arts, err := s.DB.ListArtifacts(ctx, j.RunID)
-	if err != nil {
-		return attestationEvidence{}, false, err
-	}
-	for _, a := range arts {
-		if a.JobID == jobID && a.LeaseGeneration == generation {
-			ev.artifacts = append(ev.artifacts, a)
+	if es, ok := s.DB.(storage.AttemptEvidenceStore); ok {
+		if ev.artifacts, err = es.ListArtifactsByJobGeneration(ctx, jobID, generation); err != nil {
+			return attestationEvidence{}, false, err
 		}
-	}
-	reports, err := s.DB.ListTestReports(ctx, j.RunID)
-	if err != nil {
-		return attestationEvidence{}, false, err
-	}
-	for _, r := range reports {
-		if r.JobID == jobID && r.LeaseGeneration == generation {
-			ev.reports = append(ev.reports, r)
+		if ev.reports, err = es.ListTestReportsByJobGeneration(ctx, jobID, generation); err != nil {
+			return attestationEvidence{}, false, err
 		}
-	}
-	if ss, ok := s.DB.(storage.SnapshotStore); ok {
-		snaps, err := ss.ListSnapshotsByRun(ctx, j.RunID)
+		if ev.snapshots, err = es.ListSnapshotsByJobGeneration(ctx, jobID, generation); err != nil {
+			return attestationEvidence{}, false, err
+		}
+	} else {
+		// Fallback for stores without the optional attempt-scoped contract.
+		arts, err := s.DB.ListArtifacts(ctx, j.RunID)
 		if err != nil {
 			return attestationEvidence{}, false, err
 		}
-		for _, rec := range snaps {
-			if rec.JobID == jobID && rec.LeaseGeneration == generation {
-				ev.snapshots = append(ev.snapshots, rec)
+		for _, a := range arts {
+			if a.JobID == jobID && a.LeaseGeneration == generation {
+				ev.artifacts = append(ev.artifacts, a)
 			}
+		}
+		reports, err := s.DB.ListTestReports(ctx, j.RunID)
+		if err != nil {
+			return attestationEvidence{}, false, err
+		}
+		for _, r := range reports {
+			if r.JobID == jobID && r.LeaseGeneration == generation {
+				ev.reports = append(ev.reports, r)
+			}
+		}
+		if ss, ok := s.DB.(storage.SnapshotStore); ok {
+			snaps, err := ss.ListSnapshotsByRun(ctx, j.RunID)
+			if err != nil {
+				return attestationEvidence{}, false, err
+			}
+			for _, rec := range snaps {
+				if rec.JobID == jobID && rec.LeaseGeneration == generation {
+					ev.snapshots = append(ev.snapshots, rec)
+				}
+			}
+		}
+	}
+	// The completion identity the attestation binds: the durable receipt's
+	// digest, only when it was written under the v2 encoding. The receipt is
+	// keyed by the completing runner identity the completion transaction
+	// preserved in AttemptRunnerID.
+	if j.AttemptRunnerID != "" {
+		rec, has, rerr := s.DB.HasCompletionReceipt(ctx, jobID, generation, j.AttemptRunnerID)
+		if rerr != nil {
+			return attestationEvidence{}, false, rerr
+		}
+		if has && rec.ResultHashVersion >= storage.CompletionResultHashVersionV2 {
+			ev.completionResultDigest = rec.ResultHash
 		}
 	}
 	return ev, true, nil
@@ -140,25 +180,34 @@ func (s *Server) gatherAttestationEvidenceLocal(jobID string, generation int64) 
 			ev.snapshots = append(ev.snapshots, rec)
 		}
 	}
+	if j.AttemptRunnerID != "" {
+		if rec, ok := s.completions[completionReceiptKey(jobID, generation, j.AttemptRunnerID)]; ok && rec.ResultHashVersion >= storage.CompletionResultHashVersionV2 {
+			ev.completionResultDigest = rec.ResultHash
+		}
+	}
 	return ev, true
 }
 
 // attestationInput assembles the signed statement's input from durable
 // evidence. Capsule digests are recomputed from the PERSISTED payload with
 // the same shared helpers the artifact provenance path uses; unresolvable
-// optional identity is omitted, never fabricated.
+// optional identity is omitted, never fabricated. The evidence root binds the
+// full artifact-side graph (sidecars included); the per-item lists stay the
+// human-readable detail, and the completion identity is the durable receipt
+// digest. No raw output or error value is ever embedded in the envelope.
 func attestationInput(ev attestationEvidence, generation int64) provenance.ExecutionAttestationInput {
 	j := ev.job
 	in := provenance.ExecutionAttestationInput{
-		RunID:           j.RunID,
-		JobID:           j.ID,
-		JobKey:          j.Key,
-		Generation:      generation,
-		Status:          string(j.Status),
-		StartedAt:       j.StartedAt,
-		FinishedAt:      j.FinishedAt,
-		RunnerIdentity:  j.AttemptRunnerID,
-		ObservedRuntime: j.ObservedRuntime,
+		RunID:                  j.RunID,
+		JobID:                  j.ID,
+		JobKey:                 j.Key,
+		Generation:             generation,
+		Status:                 string(j.Status),
+		StartedAt:              j.StartedAt,
+		FinishedAt:             j.FinishedAt,
+		RunnerIdentity:         j.AttemptRunnerID,
+		ObservedRuntime:        j.ObservedRuntime,
+		CompletionResultDigest: ev.completionResultDigest,
 	}
 	if p := j.CompiledJobPayload; p != nil {
 		if d, err := provenance.CapsuleDigest(p); err == nil {
@@ -166,12 +215,24 @@ func attestationInput(ev attestationEvidence, generation int64) provenance.Execu
 		}
 		in.ExecutionCapsuleDigest = executionCapsuleDigestForJob(j)
 	}
+	rootArtifacts := make([]provenance.ExecutionEvidenceArtifact, 0, len(ev.artifacts))
 	for _, a := range ev.artifacts {
 		in.Artifacts = append(in.Artifacts, provenance.ExecutionAttestationArtifact{
 			Name:             a.Name,
 			SHA256:           a.SHA256,
 			Size:             a.Size,
 			ProvenanceSHA256: a.ProvenanceSHA256,
+		})
+		rootArtifacts = append(rootArtifacts, provenance.ExecutionEvidenceArtifact{
+			Name:             a.Name,
+			SHA256:           a.SHA256,
+			Size:             a.Size,
+			Generation:       a.LeaseGeneration,
+			ProvenanceSHA256: a.ProvenanceSHA256,
+			SBOMPath:         a.SBOMPath,
+			SBOMSHA256:       a.SBOMSHA256,
+			SigstorePath:     a.SigstorePath,
+			SigstoreSHA256:   a.SigstoreSHA256,
 		})
 	}
 	for _, r := range ev.reports {
@@ -203,6 +264,11 @@ func attestationInput(ev attestationEvidence, generation int64) provenance.Execu
 			}
 		}
 	}
+	in.EvidenceRootSHA256 = provenance.ExecutionEvidenceRoot(provenance.ExecutionEvidenceGraph{
+		Artifacts:   rootArtifacts,
+		TestReports: in.TestReports,
+		Snapshots:   in.Snapshots,
+	})
 	return in
 }
 

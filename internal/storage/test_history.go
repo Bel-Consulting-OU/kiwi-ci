@@ -82,7 +82,17 @@ func insertTestReportRowsTx(ctx context.Context, tx pgx.Tx, rep model.TestReport
 	if err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO test_results (id, run_id, job_id, job_key, path, tests, failures, duration, created_at, payload) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+	// lease_generation (migration 0055) is written only when the report
+	// carries a verified attempt. The plain/legacy insert path leaves the
+	// column to its default: that keeps pre-0055 upgrade-bridge fixtures
+	// (which insert at historically accurate schema versions) working, and
+	// the lease-fenced path always stamps a non-zero generation.
+	if rep.LeaseGeneration != 0 {
+		if _, err := tx.Exec(ctx, `INSERT INTO test_results (id, run_id, job_id, job_key, path, tests, failures, duration, created_at, lease_generation, payload) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+			rep.ID, rep.RunID, nullText(rep.JobID), nullText(rep.JobKey), nullText(rep.Path), rep.Tests, rep.Failures, rep.Duration, rep.CreatedAt, rep.LeaseGeneration, payload); err != nil {
+			return err
+		}
+	} else if _, err := tx.Exec(ctx, `INSERT INTO test_results (id, run_id, job_id, job_key, path, tests, failures, duration, created_at, payload) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 		rep.ID, rep.RunID, nullText(rep.JobID), nullText(rep.JobKey), nullText(rep.Path), rep.Tests, rep.Failures, rep.Duration, rep.CreatedAt, payload); err != nil {
 		return err
 	}

@@ -2776,6 +2776,45 @@ func (f *dbFakeStore) ListSnapshotsByRun(ctx context.Context, runID string) ([]m
 	return out, nil
 }
 
+// The dbFakeStore implements the optional storage.AttemptEvidenceStore
+// contract so the attestation emitter exercises the attempt-scoped path in
+// server tests.
+func (f *dbFakeStore) ListArtifactsByJobGeneration(ctx context.Context, jobID string, generation int64) ([]model.ArtifactRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []model.ArtifactRecord{}
+	for _, a := range f.artifacts {
+		if a.JobID == jobID && a.LeaseGeneration == generation {
+			out = append(out, a)
+		}
+	}
+	return out, nil
+}
+
+func (f *dbFakeStore) ListTestReportsByJobGeneration(ctx context.Context, jobID string, generation int64) ([]model.TestReport, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []model.TestReport{}
+	for _, rep := range f.reports {
+		if rep.JobID == jobID && rep.LeaseGeneration == generation {
+			out = append(out, rep)
+		}
+	}
+	return out, nil
+}
+
+func (f *dbFakeStore) ListSnapshotsByJobGeneration(ctx context.Context, jobID string, generation int64) ([]model.SnapshotRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []model.SnapshotRecord{}
+	for _, rec := range f.snapshots {
+		if rec.JobID == jobID && rec.LeaseGeneration == generation {
+			out = append(out, rec)
+		}
+	}
+	return out, nil
+}
+
 // GetSnapshot is the single-record lookup of the fake: one (run_id, id) scan
 // with the shared store contract (a record of another run is missing), plus
 // the same error injection the record writes use.

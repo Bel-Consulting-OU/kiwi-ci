@@ -305,7 +305,7 @@ func TestPostgresIntegrationSemanticEventAppendFailureRollsBack(t *testing.T) {
 // TestPostgresIntegrationExecutionEventRetention proves the prefix prune on
 // real PostgreSQL: only the contiguous oldest prefix is deleted, newer (and
 // hole-guarding) events survive, retained_from advances in the same
-// transaction, after=retainedFrom-1 stays a valid cursor, and a later append
+// transaction, after=retainedFrom stays a valid cursor, and a later append
 // keeps allocating monotonic seqs.
 func TestPostgresIntegrationExecutionEventRetention(t *testing.T) {
 	st := pgITStore(t)
@@ -341,9 +341,9 @@ func TestPostgresIntegrationExecutionEventRetention(t *testing.T) {
 	if rf, err := st.ExecutionEventRetainedFrom(ctx); err != nil || rf != seqs[1] {
 		t.Fatalf("watermark A = %d err %v, want %d", rf, err, seqs[1])
 	}
-	page, cursor, err := st.ListExecutionEvents(ctx, retained-1, 100, "")
+	page, cursor, err := st.ListExecutionEvents(ctx, retained, 100, "")
 	if err != nil || len(page) != 3 || page[0].Seq != seqs[2] || cursor != seqs[4] {
-		t.Fatalf("after=retainedFrom-1 page = %+v cursor %d err %v, want the survivors %d..%d", page, cursor, err, seqs[2], seqs[4])
+		t.Fatalf("after=retainedFrom page = %+v cursor %d err %v, want the survivors %d..%d", page, cursor, err, seqs[2], seqs[4])
 	}
 	if latest, err := st.LatestExecutionEventSeq(ctx); err != nil || latest != seqs[4] {
 		t.Fatalf("latest after prefix prune = %d err %v, want %d", latest, err, seqs[4])
@@ -371,14 +371,15 @@ func TestPostgresIntegrationExecutionEventRetention(t *testing.T) {
 	if err != nil || len(page) != 2 || page[0].Seq != seqs[4] || page[1].Seq != seqs[4]+1 {
 		t.Fatalf("after=retainedFrom page = %+v err %v, want the survivor and the fresh append", page, err)
 	}
-	// Cursor-expiry truth table against the real watermark.
+	// Cursor-expiry truth table against the real watermark: after ==
+	// retainedFrom is valid, strictly below is expired.
 	expiredCases := []struct {
 		after             int64
 		wantExpired       bool
 		wantFirstSurvivor int64
 	}{
 		{0, true, 0},
-		{retained - 1, false, seqs[4]},
+		{retained - 1, true, 0},
 		{retained, false, seqs[4]},
 		{seqs[4], false, seqs[4] + 1},
 	}
