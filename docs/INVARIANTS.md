@@ -364,6 +364,20 @@ record produced under a different execution-engine semantics: see
 
 ---
 
+## Checkpoint terminology
+
+Kiwi checkpoints are **durable workflow checkpoints** (also: execution-graph
+checkpoints): a content-addressed workspace archive plus the attempt identity
+(lease generation), phase (`pre_job`/`post_job`) and the evidence bindings
+described above. Resuming from one means the orchestration re-derives the
+authorized execution and starts it against that workspace state.
+
+Kiwi does **not** implement executable-process checkpoints (CRIU/VM-class
+freezing of memory, file descriptors, CPU state or open network connections),
+and no API or document should imply it. The `checkpoints:read` capability
+gates the durable-workflow-checkpoint surfaces (workspace snapshots and the
+replay pipeline export), not process suspension.
+
 ## Reproducibility boundary — execution semantics vs wire schema
 
 **Statement.** Every run and job Kiwi creates carries an explicit
