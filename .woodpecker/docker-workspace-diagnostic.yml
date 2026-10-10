@@ -104,7 +104,7 @@ steps:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
       KIWI_TEST_DOCKER: "1"
     commands:
       # This is the first Go-capable step: build-ci-image runs in docker:cli,

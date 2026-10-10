@@ -487,9 +487,12 @@ claims themselves.
   there is no `github-actions` ecosystem to upgrade.
 - CI tooling versions are pinned in `.woodpecker/linux-amd64.yml`, not
   floating:
-  - `staticcheck` `honnef.co/go/tools/cmd/staticcheck@v0.8.1`: bump the
-    pin in the `staticcheck` step when the toolchain moves forward and
-    re-run the pipeline baseline.
+  - `staticcheck` `honnef.co/go/tools/cmd/staticcheck@v0.8.1`: pinned in
+    `tools/go.mod` (built into `dist/` by `make staticcheck`) together with
+    an explicit `golang.org/x/tools` override, because the version
+    staticcheck v0.8.1 normally pins cannot decode newer compiler export
+    data. Bump both pins together when upstream releases a staticcheck that
+    carries the fix, and re-run the pipeline baseline.
   - `govulncheck` `golang.org/x/vuln/cmd/govulncheck@v1.8.0`: the
     release gate; it needs network access to the vulnerability
     database.

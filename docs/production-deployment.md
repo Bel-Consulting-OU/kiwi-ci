@@ -305,6 +305,12 @@ The Woodpecker instance hosting it must be configured so CI reflects reality:
   operator can require them instead for direct pushes (`KIWI_PUSH_CONTEXTS`),
   and does not install them as required checks.
 - The clone plugin and every workflow image are pinned by OCI digest.
+- The self-hosted dogfood pipeline (`.kiwi/pipeline.yaml`) runs in Kiwi
+  itself, not Woodpecker: it needs a container-capable Kiwi runner that can
+  pull the digest-pinned `golang:1.27` and `postgres:16-alpine` images the
+  Woodpecker workflows pin. Its coverage job reaches its PostgreSQL service
+  over `sandbox.network: services-only`; every other job runs with
+  `sandbox.network: none`.
 
 ### Required-check governance
 
@@ -379,8 +385,9 @@ trusted build boundary; provision them on that basis:
   `backend=local` for macOS and `platform=windows/amd64` + `backend=local`
   for Windows. On the local backend `image` names the shell (`bash`,
   `pwsh`) rather than a container image, so the shell must exist on the
-  worker's `PATH`, as must Go 1.27.x (`GOTOOLCHAIN=local` prevents Go from
-  downloading a toolchain and masking a stale worker).
+  worker's `PATH`, as must the Go version `go.mod` requires (currently
+  1.27.2 or later). Container CI jobs set `GOTOOLCHAIN=auto` so the pinned
+  `golang:1.27` image fetches the exact `go.mod` toolchain.
 
 ## CI test image
 

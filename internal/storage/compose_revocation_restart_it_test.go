@@ -65,13 +65,13 @@ func composeStorageFreshDB(t *testing.T) string {
 	return freshCfg.ConnString()
 }
 
-// TestComposeRevocationAndGrantStateSurvivePoolRestart commits a runner
+// TestIntegrationComposeRevocationAndGrantStateSurvivePoolRestart commits a runner
 // disable (certificate revocation included) and an enrollment-grant
 // consumption on one pool, closes it, and proves a restarted replica pool sees
 // and enforces exactly that state: the serial stays revoked, the runner stays
 // disabled, the consumed grant stays consumed and an unused grant is still
 // single-use.
-func TestComposeRevocationAndGrantStateSurvivePoolRestart(t *testing.T) {
+func TestIntegrationComposeRevocationAndGrantStateSurvivePoolRestart(t *testing.T) {
 	composeStorageFreshDB(t)
 	env := pgITSetup(t)
 	stA := env.open(t)

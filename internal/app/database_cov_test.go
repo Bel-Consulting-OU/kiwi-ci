@@ -15,7 +15,7 @@ func testPostgresDSN() string {
 	return strings.TrimSpace(os.Getenv("KIWI_TEST_POSTGRES_URL"))
 }
 
-func TestDatabaseMigrateAndStatusAgainstPostgres(t *testing.T) {
+func TestIntegrationDatabaseMigrateAndStatusAgainstPostgres(t *testing.T) {
 	dsn := testPostgresDSN()
 	if dsn == "" {
 		t.Skip("KIWI_TEST_POSTGRES_URL not set; skipping PostgreSQL integration test")
@@ -69,7 +69,7 @@ func TestDatabaseMigrateAndStatusErrors(t *testing.T) {
 	}
 }
 
-func TestDatabaseMigrateEnvFallback(t *testing.T) {
+func TestIntegrationDatabaseMigrateEnvFallback(t *testing.T) {
 	dsn := testPostgresDSN()
 	if dsn == "" {
 		t.Skip("KIWI_TEST_POSTGRES_URL not set; skipping PostgreSQL integration test")

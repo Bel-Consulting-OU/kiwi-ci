@@ -32,12 +32,12 @@ func TestStorageReconcileReservationsFlagErrors(t *testing.T) {
 	}
 }
 
-// TestStorageReconcileReservationsRepairsLedger drives the operator command
+// TestIntegrationStorageReconcileReservationsRepairsLedger drives the operator command
 // end to end against real PostgreSQL: a job that an OLD replica completed
 // (finished row, cleared lease) but whose reservation row survived is swept,
 // a running job that an OLD leader leased without a row is charged, and the
 // command reports the operator-facing counters.
-func TestStorageReconcileReservationsRepairsLedger(t *testing.T) {
+func TestIntegrationStorageReconcileReservationsRepairsLedger(t *testing.T) {
 	dsn := scratchPostgresDSN(t)
 	ctx := context.Background()
 	st, err := storage.NewPostgres(ctx, dsn)

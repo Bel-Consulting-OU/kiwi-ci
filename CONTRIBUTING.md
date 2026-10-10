@@ -32,7 +32,7 @@ go build ./cmd/kiwi
 ./kiwi doctor
 ```
 
-Go 1.27.1 or later is required.
+Go 1.27.2 or later is required.
 
 ## Workflow
 
@@ -55,7 +55,7 @@ Go 1.27.1 or later is required.
    make docs-check
    make license-check
    make repro-build
-   make staticcheck    # staticcheck v0.8.1
+   make staticcheck    # staticcheck v0.8.1 (pin in tools/go.mod)
    make govulncheck    # govulncheck v1.8.0, needs network
    make coverage       # writes coverage.out and prints the total
    make coverage-floor # unit-only profile; fails under KC_MIN_COVERAGE (default 95)

@@ -285,13 +285,13 @@ func fragITRunJobIDs(t *testing.T, st *PostgresStore, runID string) map[string]b
 	return out
 }
 
-// TestGeneratedFragmentReplaysAcrossInfrastructureRetry is the P1 regression
+// TestIntegrationGeneratedFragmentReplaysAcrossInfrastructureRetry is the P1 regression
 // on real PostgreSQL: parent gen1 admits fragment F (children A/B/C); an
 // infrastructure retry requeues the same logical parent and claims gen2;
 // re-submitting the identical F must replay A/B/C — not insert a duplicate
 // graph with fresh random child IDs — and a CHANGED fragment under gen2 must
 // still insert new children.
-func TestGeneratedFragmentReplaysAcrossInfrastructureRetry(t *testing.T) {
+func TestIntegrationGeneratedFragmentReplaysAcrossInfrastructureRetry(t *testing.T) {
 	st := pgITStore(t)
 	ctx := context.Background()
 	runID, jobID, runner1, parent1 := fragITLeasedRetryJob(t, st, 200*time.Millisecond)
@@ -394,13 +394,13 @@ func TestGeneratedFragmentReplaysAcrossInfrastructureRetry(t *testing.T) {
 	}
 }
 
-// TestGeneratedFragmentNondeterministicRetryConflict is the finding-4
+// TestIntegrationGeneratedFragmentNondeterministicRetryConflict is the finding-4
 // regression on real PostgreSQL: a generator retry that re-emits a DIFFERENT
 // fragment digest under the same logical parent (same mutation slot, new
 // lease generation) is refused with ErrGeneratedMutationConflict, inserts no
 // job rows, leaves the first children intact, and keeps the run job count
 // unchanged.
-func TestGeneratedFragmentNondeterministicRetryConflict(t *testing.T) {
+func TestIntegrationGeneratedFragmentNondeterministicRetryConflict(t *testing.T) {
 	st := pgITStore(t)
 	ctx := context.Background()
 	runID, jobID, runner1, parent1 := fragITLeasedRetryJob(t, st, 200*time.Millisecond)
@@ -464,11 +464,11 @@ func TestGeneratedFragmentNondeterministicRetryConflict(t *testing.T) {
 	}
 }
 
-// TestGeneratedFragmentStaleGenerationCannotReplay: after gen2 is leased, a
+// TestIntegrationGeneratedFragmentStaleGenerationCannotReplay: after gen2 is leased, a
 // request presenting the STALE gen1 identity (even with the old token) is
 // rejected by authorization and never observes the receipt children, while
 // the current gen2 identity replays the original children.
-func TestGeneratedFragmentStaleGenerationCannotReplay(t *testing.T) {
+func TestIntegrationGeneratedFragmentStaleGenerationCannotReplay(t *testing.T) {
 	st := pgITStore(t)
 	ctx := context.Background()
 	runID, jobID, runner1, parent1 := fragITLeasedRetryJob(t, st, 200*time.Millisecond)
@@ -523,10 +523,10 @@ func TestGeneratedFragmentStaleGenerationCannotReplay(t *testing.T) {
 	}
 }
 
-// TestGeneratedFragmentConcurrentReplayParity: concurrent uploads of the SAME
+// TestIntegrationGeneratedFragmentConcurrentReplayParity: concurrent uploads of the SAME
 // fragment id (distinct random child IDs) under the SAME lease commit exactly
 // one graph; every loser returns the winner's receipt and inserts nothing.
-func TestGeneratedFragmentConcurrentReplayParity(t *testing.T) {
+func TestIntegrationGeneratedFragmentConcurrentReplayParity(t *testing.T) {
 	st := pgITStore(t)
 	ctx := context.Background()
 	_, _, parent := fragITLeasedJob(t, st, time.Hour)

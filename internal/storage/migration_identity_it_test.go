@@ -123,13 +123,13 @@ func TestPostgresIntegrationLeaseFenceRejectsIncompatibleFloor(t *testing.T) {
 // fence share.
 const schemaLockKeySQL = `hashtext('kiwi_schema_migrations')`
 
-// TestLeaseSchemaFloorFenceSerializesAgainstMigration is a REAL two-
+// TestIntegrationLeaseSchemaFloorFenceSerializesAgainstMigration is a REAL two-
 // transaction interleaving test, not a sequential one: while a migration
 // transaction holds the exclusive schema lock (uncommitted), a lease claim
 // must BLOCK on the shared lock; committing the migration first makes the
 // claim observe the new incompatible floor and refuse without touching the
 // job row.
-func TestLeaseSchemaFloorFenceSerializesAgainstMigration(t *testing.T) {
+func TestIntegrationLeaseSchemaFloorFenceSerializesAgainstMigration(t *testing.T) {
 	st := pgITStore(t)
 	st.EnableSchemaFence()
 	ctx := context.Background()
@@ -203,10 +203,10 @@ func TestLeaseSchemaFloorFenceSerializesAgainstMigration(t *testing.T) {
 	}
 }
 
-// TestMigrationWaitsForLeaseSharedLock is the inverse ordering: a lease
+// TestIntegrationMigrationWaitsForLeaseSharedLock is the inverse ordering: a lease
 // transaction holding the shared lock keeps a migration's exclusive lock
 // waiting until the lease commits.
-func TestMigrationWaitsForLeaseSharedLock(t *testing.T) {
+func TestIntegrationMigrationWaitsForLeaseSharedLock(t *testing.T) {
 	st := pgITStore(t)
 	st.EnableSchemaFence()
 	ctx := context.Background()
@@ -334,10 +334,10 @@ func TestPostgresIntegrationNonLeaseMutationFencedAgainstMigration(t *testing.T)
 	}
 }
 
-// TestHeartbeatCannotCrossIncompatibleMigration: after a newer replica
+// TestIntegrationHeartbeatCannotCrossIncompatibleMigration: after a newer replica
 // commits an incompatible floor, both heartbeat paths refuse and the stored
 // expiry is untouched (the floor read and the mutation are one statement).
-func TestHeartbeatCannotCrossIncompatibleMigration(t *testing.T) {
+func TestIntegrationHeartbeatCannotCrossIncompatibleMigration(t *testing.T) {
 	st := pgITStore(t)
 	st.EnableSchemaFence()
 	ctx := context.Background()
@@ -379,11 +379,11 @@ func TestHeartbeatCannotCrossIncompatibleMigration(t *testing.T) {
 	}
 }
 
-// TestInsertCompiledRunCannotCrossIncompatibleMigration: the compiled-run
+// TestIntegrationInsertCompiledRunCannotCrossIncompatibleMigration: the compiled-run
 // enqueue transaction (the production enqueue path, also used by schedules
 // and internal enqueue) refuses and writes nothing once a newer replica has
 // committed an incompatible floor.
-func TestInsertCompiledRunCannotCrossIncompatibleMigration(t *testing.T) {
+func TestIntegrationInsertCompiledRunCannotCrossIncompatibleMigration(t *testing.T) {
 	st := pgITStore(t)
 	st.EnableSchemaFence()
 	ctx := context.Background()
@@ -414,12 +414,12 @@ func TestInsertCompiledRunCannotCrossIncompatibleMigration(t *testing.T) {
 	}
 }
 
-// TestHeartbeatSchemaFenceSerializesAgainstMigration is the true
+// TestIntegrationHeartbeatSchemaFenceSerializesAgainstMigration is the true
 // two-connection interleaving: a migration holds the exclusive schema lock
 // (uncommitted floor change) while a heartbeat runs; the heartbeat must
 // BLOCK on the shared lock, and after the migration commits it must observe
 // the new floor and refuse without touching the lease.
-func TestHeartbeatSchemaFenceSerializesAgainstMigration(t *testing.T) {
+func TestIntegrationHeartbeatSchemaFenceSerializesAgainstMigration(t *testing.T) {
 	st := pgITStore(t)
 	st.EnableSchemaFence()
 	ctx := context.Background()
@@ -506,7 +506,7 @@ func pgITSchemaFenceBarrier(t *testing.T, st *PostgresStore, call func(context.C
 		t.Fatal(err)
 	}
 	// The migration transaction: exclusive lock + floor advance, NOT
-	// committed (verbatim from TestLeaseSchemaFloorFenceSerializesAgainstMigration).
+	// committed (verbatim from TestIntegrationLeaseSchemaFloorFenceSerializesAgainstMigration).
 	migConn, err := st.pool.Acquire(ctx)
 	if err != nil {
 		t.Fatal(err)

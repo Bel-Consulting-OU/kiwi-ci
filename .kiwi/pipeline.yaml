@@ -1,9 +1,24 @@
-# Kiwi CI's own self-hosted pipeline.
+# Kiwi CI's own self-hosted dogfooding pipeline: Kiwi runs the whole
+# verification matrix on itself through the same engine users run.
 #
-# IMPORTANT: the golang image below is pinned to a placeholder digest and
-# MUST be replaced with a real golang@sha256:... digest before this pipeline
-# is used (pin before use), so that jobs cannot be swapped by mutable image
-# tags.
+# Both images are pinned by REAL OCI digests, reused verbatim from the
+# Woodpecker workflows so the dogfood run and the merge-gating CI verify the
+# same bytes:
+#   golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+#     (see .woodpecker/linux-amd64.yml)
+#   postgres:16-alpine@sha256:3c5c8892d184f738f4fe282d14ddaa613a38f00f4189d2d94725ebe6f2909ddb
+#     (see .woodpecker/integration-coverage.yml)
+# Bump them deliberately (docker buildx imagetools inspect) and keep them in
+# sync with the Woodpecker workflows.
+#
+# Gates (run texts mirror the Makefile targets exactly):
+#   quality      gofmt, go vet, go build, make surface-check, make schema-check
+#   unit         make test-unit, make test-race
+#   coverage     make coverage-ci against a real pinned PostgreSQL service
+#   staticcheck  make staticcheck
+#   govulncheck  make govulncheck
+#   release      make docs-check, make license-check, make cross, make repro-build
+#   fuzz         make fuzz (bounded smoke; 10s per target in the Makefile)
 version: 1
 name: kiwi-ci-self-host
 
@@ -11,7 +26,10 @@ defaults:
   shell: bash
 
 env:
-  GOCACHE: /kiwi/cache
+  # The image tag and go.mod must match; never download a toolchain (the
+  # sandbox has egress for Go module/tool downloads; the pipeline is trusted
+  # (this repository) and every image is digest-pinned).
+  GOTOOLCHAIN: local
 
 concurrency:
   group: "${{ repo.full_name }}:${{ git.branch }}"
@@ -20,29 +38,200 @@ concurrency:
 jobs:
   quality:
     runtime: container
-    image: golang@sha256:0000000000000000000000000000000000000000000000000000000000000000 # pin before use
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    timeout: 30m
+    infra_retries: 2
+    env:
+      # Go requires an absolute GOCACHE; the container workspace is always
+      # mounted at /workspace, which is where cache.paths is restored.
+      GOCACHE: /workspace/.kiwi/cache/quality
+      GOMODCACHE: /workspace/.kiwi/cache/quality/gomod
     sandbox:
       rootless: true
-      network: none
+      network: internet
+    cache:
+      - name: go-build-quality
+        key: go-build-quality
+        hash_files: [go.sum]
+        paths: [.kiwi/cache/quality]
     steps:
       - name: gofmt
         run: test -z "$(gofmt -l .)"
-      - name: vet
+      - name: go-vet
         run: go vet ./...
+      - name: go-build
+        run: go build ./...
+      - name: surface-check
+        run: make surface-check
+      - name: schema-check
+        run: make schema-check
 
-  test:
+  unit:
     needs: [quality]
     runtime: container
-    image: golang@sha256:0000000000000000000000000000000000000000000000000000000000000000 # pin before use
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    timeout: 45m
+    infra_retries: 2
+    env:
+      GOCACHE: /workspace/.kiwi/cache/unit
+      GOMODCACHE: /workspace/.kiwi/cache/unit/gomod
     sandbox:
       rootless: true
-      network: none
+      network: internet
     cache:
-      - name: go-cache
-        paths: [.kiwi/cache]
+      - name: go-build-unit
+        key: go-build-unit
         hash_files: [go.sum]
+        paths: [.kiwi/cache/unit]
     steps:
-      - name: build
-        run: go build ./...
-      - name: test
-        run: go test -race ./...
+      - name: test-unit
+        run: make test-unit
+      - name: test-race
+        run: make test-race
+
+  coverage:
+    needs: [quality]
+    runtime: container
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    timeout: 45m
+    infra_retries: 1
+    env:
+      GOCACHE: /workspace/.kiwi/cache/coverage
+      GOMODCACHE: /workspace/.kiwi/cache/coverage/gomod
+      KIWI_TEST_POSTGRES_URL: "postgres://postgres:pass@postgres:5432/postgres?sslmode=disable"
+      # PostgreSQL's LLVM JIT can crash a backend mid-query under the
+      # concurrent clone/DROP DATABASE workload (same stability pin as the
+      # Woodpecker integration lane); PGOPTIONS is honored by pgx.
+      PGOPTIONS: "-c jit=off"
+    sandbox:
+      # Services run only for runtime: container; the executor verifies the
+      # rootless daemon BEFORE starting any service container, so this
+      # combination is valid (internal/executor/executor.go runJob).
+      rootless: true
+      network: internet
+    services:
+      - name: postgres
+        image: postgres:16-alpine@sha256:3c5c8892d184f738f4fe282d14ddaa613a38f00f4189d2d94725ebe6f2909ddb
+        env:
+          POSTGRES_PASSWORD: pass
+          # Services run hardened (uid 65534, read-only rootfs, tmpfs /tmp),
+          # so the data directory lives on the writable tmpfs.
+          PGDATA: /tmp/pgdata
+        healthcheck: pg_isready -h 127.0.0.1 -p 5432 -U postgres
+        interval: 5s
+        timeout: 5s
+        retries: 24
+    cache:
+      - name: go-build-coverage
+        key: go-build-coverage
+        hash_files: [go.sum]
+        paths: [.kiwi/cache/coverage]
+    steps:
+      - name: coverage-ci
+        run: make coverage-ci
+        timeout: 45m
+    artifacts:
+      # Best-effort diagnostics: the profiles may be absent when the step is
+      # skipped or fails early, so they must never fail the dogfood run.
+      - name: coverage-profiles
+        paths:
+          - coverage.out
+          - integration-coverage.out
+          - merged-coverage.out
+        if: always()
+        required: false
+        retention: 168h
+    test_reports:
+      - "*.junit.xml"
+      - "junit*.xml"
+      - "test-reports/*.xml"
+
+  staticcheck:
+    needs: [quality]
+    runtime: container
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    timeout: 30m
+    infra_retries: 1
+    env:
+      GOCACHE: /workspace/.kiwi/cache/staticcheck
+      GOMODCACHE: /workspace/.kiwi/cache/staticcheck/gomod
+    sandbox:
+      rootless: true
+      network: internet
+    cache:
+      - name: go-build-staticcheck
+        key: go-build-staticcheck
+        hash_files: [go.sum]
+        paths: [.kiwi/cache/staticcheck]
+    steps:
+      - name: staticcheck
+        run: make staticcheck
+
+  govulncheck:
+    needs: [quality]
+    runtime: container
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    timeout: 30m
+    infra_retries: 1
+    env:
+      GOCACHE: /workspace/.kiwi/cache/govulncheck
+      GOMODCACHE: /workspace/.kiwi/cache/govulncheck/gomod
+    sandbox:
+      rootless: true
+      network: internet
+    cache:
+      - name: go-build-govulncheck
+        key: go-build-govulncheck
+        hash_files: [go.sum]
+        paths: [.kiwi/cache/govulncheck]
+    steps:
+      - name: govulncheck
+        run: make govulncheck
+
+  release:
+    needs: [quality]
+    runtime: container
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    timeout: 30m
+    infra_retries: 1
+    env:
+      GOCACHE: /workspace/.kiwi/cache/release
+      GOMODCACHE: /workspace/.kiwi/cache/release/gomod
+    sandbox:
+      rootless: true
+      network: internet
+    cache:
+      - name: go-build-release
+        key: go-build-release
+        hash_files: [go.sum]
+        paths: [.kiwi/cache/release]
+    steps:
+      - name: docs-check
+        run: make docs-check
+      - name: license-check
+        run: make license-check
+      - name: cross
+        run: make cross
+      - name: repro-build
+        run: make repro-build
+
+  fuzz:
+    needs: [quality]
+    runtime: container
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    timeout: 30m
+    infra_retries: 1
+    env:
+      GOCACHE: /workspace/.kiwi/cache/fuzz
+      GOMODCACHE: /workspace/.kiwi/cache/fuzz/gomod
+    sandbox:
+      rootless: true
+      network: internet
+    cache:
+      - name: go-build-fuzz
+        key: go-build-fuzz
+        hash_files: [go.sum]
+        paths: [.kiwi/cache/fuzz]
+    steps:
+      - name: fuzz
+        run: make fuzz

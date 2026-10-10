@@ -14,7 +14,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
-func TestPostgresClosedPoolErrorPaths(t *testing.T) {
+func TestIntegrationPostgresClosedPoolErrorPaths(t *testing.T) {
 	dsn := pgITDSN(t)
 	st, err := NewPostgres(context.Background(), dsn)
 	if err != nil {

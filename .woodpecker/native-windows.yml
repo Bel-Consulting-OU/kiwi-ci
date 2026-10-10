@@ -68,7 +68,7 @@ steps:
   checkout:
     image: pwsh
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
     commands:
       - |
         git -C $env:CI_WORKSPACE init -q
@@ -82,7 +82,7 @@ steps:
     image: pwsh
     depends_on: [checkout]
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
     commands:
       # Exact toolchain assertion (go.mod vs README.md vs running `go`).
       - sh ./scripts/toolchain-check.sh
@@ -91,7 +91,7 @@ steps:
     image: pwsh
     depends_on: [toolchain]
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
     commands:
       - go vet ./...
       - go test -shuffle=on -timeout=20m ./...
@@ -100,7 +100,7 @@ steps:
     image: pwsh
     depends_on: [unit]
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
     commands:
       # The packages whose behavior differs most on Windows: filesystem,
       # terminal, path handling, process supervision and secrets key files.

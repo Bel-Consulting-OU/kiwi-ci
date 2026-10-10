@@ -1,0 +1,5 @@
+# Per-package coverage floor exceptions for scripts/coverage-package-floor.sh.
+# Format: pkg<TAB>floor<TAB>reason (tabs, one entry per line).
+internal/testutil	10	unit-profile exception: the PostgreSQL template helpers (pg_template.go) execute only in the integration lane; the merged coverage-ci profile is the authoritative gate
+internal/storage	50	unit-profile exception: the PostgreSQL-backed paths execute only in the integration lane; the merged coverage-ci profile measures them
+internal/model	66	unit-profile exception: package helpers are exercised through other packages, which the unit lane does not instrument (-coverpkg=./... in the integration lane does)

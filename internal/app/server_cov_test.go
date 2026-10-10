@@ -304,8 +304,8 @@ func TestServerProductionRunnerTokenDecisionIsPostDB(t *testing.T) {
 	// provisioned in runner_bearer_tokens), so an unreachable database must
 	// surface the connection error first, not a runner-token refusal. The
 	// DB-backed pass/fail paths are covered by the PostgreSQL tests
-	// (TestServerDBModeProductionRunnerTokenOnlyWithProvisionedTokens and
-	// TestServerDBModeProductionNoRunnerMechanismFailsPostDB).
+	// (TestIntegrationServerDBModeProductionRunnerTokenOnlyWithProvisionedTokens
+	// and TestIntegrationServerDBModeProductionNoRunnerMechanismFailsPostDB).
 	err := Server(context.Background(), []string{
 		"--mode", "production",
 		"--database-url", "postgres://postgres@127.0.0.1:1/postgres?sslmode=disable",

@@ -1,9 +1,11 @@
 # yaml-language-server: $schema=../.kiwi/schema.json
 #
 # Kiwi self-test pipeline. Both jobs run in the golang container image,
-# sandboxed (rootless, no network). The image digest below is a PLACEHOLDER:
-# pin before use — replace it with a real golang@sha256:... digest so jobs
-# cannot be swapped by mutable image tags.
+# sandboxed (rootless, no network). The digest below is REAL: it is the exact
+# golang:1.27 digest this project's CI pins and its self-hosted dogfooding
+# pipeline (.kiwi/pipeline.yaml) uses, so jobs cannot be swapped by mutable
+# image tags. Pin your own digest the same way before running against
+# untrusted code.
 version: 1
 name: kiwi-self-test
 
@@ -25,7 +27,7 @@ concurrency:
 jobs:
   quality:
     runtime: container
-    image: golang@sha256:0000000000000000000000000000000000000000000000000000000000000000 # pin before use
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
     sandbox:
       rootless: true
       network: none
@@ -38,7 +40,7 @@ jobs:
   test:
     needs: [quality]
     runtime: container
-    image: golang@sha256:0000000000000000000000000000000000000000000000000000000000000000 # pin before use
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
     sandbox:
       rootless: true
       network: none

@@ -23,7 +23,7 @@ func pgITRun(runID string, status model.Status) model.Run {
 	return model.Run{ID: runID, Repo: pgITRepo, RepoFullName: "kiwi-it/repo", RepoID: pgITRepoID, Status: status, CreatedAt: time.Now().UTC()}
 }
 
-func TestPostgresNewStoreOptions(t *testing.T) {
+func TestIntegrationPostgresNewStoreOptions(t *testing.T) {
 	dsn := pgITDSN(t)
 	st, err := NewPostgres(context.Background(), dsn)
 	if err != nil {

@@ -24,7 +24,7 @@ steps:
   vet:
     image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
     commands:
       - go vet ./...
 
@@ -32,7 +32,7 @@ steps:
     image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
     depends_on: [vet]
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
     commands:
       # -vet=all runs every vet analyzer over the test sources too;
       # shuffle rotates test order so order-dependent state leaks surface.
@@ -56,7 +56,7 @@ steps:
       docker:
         user: "65534:65534"
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
       HOME: /tmp
       GOCACHE: /tmp/gocache
       GOPATH: /tmp/gopath
@@ -69,7 +69,7 @@ steps:
     image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
     depends_on: [unit]
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
     commands:
       - go test -race -shuffle=on -timeout=25m ./...
 
@@ -77,7 +77,7 @@ steps:
     image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
     depends_on: [race]
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
     commands:
       - go test -race -count=2 -shuffle=on -timeout=25m ./internal/server ./internal/storage ./internal/scheduler ./internal/executor ./internal/runner ./internal/secretbroker ./internal/blob ./internal/safefs ./internal/cas
 
@@ -85,7 +85,7 @@ steps:
     image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
     depends_on: [unit]
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
       GOMAXPROCS: "1"
     commands:
       # One OS thread: goroutine interleavings collapse. This found the
@@ -96,7 +96,7 @@ steps:
     image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
     depends_on: [unit]
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
     commands:
       - go test -gcflags=all=-d=checkptr=2 -race -count=1 -timeout=40m ./...
 
@@ -104,7 +104,7 @@ steps:
     image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
     depends_on: [unit]
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
     commands:
       - go test -run 'Concurrent|Property|Fault|HA|Parity|Adversarial' -count=10 -shuffle=on -timeout=30m ./internal/server ./internal/storage ./internal/scheduler ./internal/executor ./internal/runner
 
@@ -112,7 +112,7 @@ steps:
     image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
     depends_on: [vet]
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
     commands:
       - go test -run 'Adversarial|Security|Property|Fault|Symlink|Traversal|Tamper|Reject|Evil|Bomb' -shuffle=on ./...
 
@@ -120,7 +120,7 @@ steps:
     image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
     depends_on: [vet]
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
     commands:
       # make schema-check is the single wiring point: pipeline schema tests,
       # FILE_MAP, the Dockerfile build-arg check and toolchain-drift check.
@@ -130,14 +130,14 @@ steps:
     image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
     depends_on: [vet]
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
     commands:
       - make cross
 
   license:
     image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
     commands:
       - make license-check
       # NOTICE is generated from the same scan; a diff means it is stale.
@@ -152,7 +152,7 @@ steps:
   repro:
     image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
     commands:
       - ./scripts/repro-build.sh
       - make release-formula-test
@@ -161,16 +161,16 @@ steps:
   staticcheck:
     image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
     commands:
       # -checks=all with only the stylistic comment/initialism checks
       # excluded; everything else must be clean.
-      - go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 -checks=all,-ST1000,-ST1020,-ST1021,-ST1003 ./...
+      - make staticcheck
 
   govulncheck:
     image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
     commands:
       # -test scans test dependencies too.
       - go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 -test ./...
@@ -179,6 +179,6 @@ steps:
     image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
     depends_on: [unit]
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
     commands:
       - ./scripts/fuzz-smoke.sh 30s

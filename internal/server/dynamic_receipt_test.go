@@ -689,7 +689,7 @@ func TestGeneratedFragmentReplaysAcrossInfrastructureRetry(t *testing.T) {
 // lease generation) is refused with 409 GENERATED_MUTATION_CONFLICT, inserts
 // nothing, leaves the first children intact, and keeps the run job count
 // unchanged. The PostgreSQL twin lives in
-// TestGeneratedFragmentNondeterministicRetryConflict (storage IT).
+// TestIntegrationGeneratedFragmentNondeterministicRetryConflict (storage IT).
 func TestGeneratedFragmentNondeterministicRetryConflict(t *testing.T) {
 	s, _ := trustedGenerateServer(t)
 	runnerID, task := leaseRunJob(t, s)

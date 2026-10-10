@@ -84,7 +84,7 @@ func TestMemStoreRunnerUpsertPreservesLeaseOwnedFields(t *testing.T) {
 	}
 }
 
-func TestPostgresRunnerUpsertDoesNotClobberLeaseRegression(t *testing.T) {
+func TestIntegrationPostgresRunnerUpsertDoesNotClobberLeaseRegression(t *testing.T) {
 	st := pgITStore(t)
 	ctx := context.Background()
 	runnerID := pgITNewID(t)
@@ -213,7 +213,7 @@ func assertApprovalStateConsistent(t *testing.T, st *PostgresStore, runnerID, jo
 	t.Fatalf("unexpected job status %s", j.Status)
 }
 
-func TestPostgresApproveJobDoesNotClobberLeaseRegression(t *testing.T) {
+func TestIntegrationPostgresApproveJobDoesNotClobberLeaseRegression(t *testing.T) {
 	st := pgITStore(t)
 	ctx := context.Background()
 	runnerID := pgITNewID(t)
@@ -255,10 +255,10 @@ func TestPostgresApproveJobDoesNotClobberLeaseRegression(t *testing.T) {
 	}
 }
 
-// TestPostgresApproveVsClaimRaceConsistency races an approval against a claim
+// TestIntegrationPostgresApproveVsClaimRaceConsistency races an approval against a claim
 // and proves the runner slot, quota counter and resource reservation always
 // agree with the final job status.
-func TestPostgresApproveVsClaimRaceConsistency(t *testing.T) {
+func TestIntegrationPostgresApproveVsClaimRaceConsistency(t *testing.T) {
 	st := pgITStore(t)
 	ctx := context.Background()
 	runnerID := pgITNewID(t)
@@ -399,11 +399,11 @@ func assertClaimCaseParity(t *testing.T, tc claimCase) {
 	}
 }
 
-// TestClaimParityCrossForge: a LINKED profile allowlist entry for dotless
+// TestIntegrationClaimParityCrossForge: a LINKED profile allowlist entry for dotless
 // host "gitlab" plus nested name must not admit a job that merely presents
 // the same nested name on another forge. The old SQL raw-string compare did;
 // the typed RepoAllowed (memory) already refused.
-func TestClaimParityCrossForge(t *testing.T) {
+func TestIntegrationClaimParityCrossForge(t *testing.T) {
 	serial := "serial-" + pgITNewID(t)
 	runnerID := pgITNewID(t)
 	runID, jobID := pgITNewID(t), pgITNewID(t)
@@ -426,10 +426,10 @@ func TestClaimParityCrossForge(t *testing.T) {
 	})
 }
 
-// TestClaimParityR1Identity: an "r1:" identity allowlist entry must admit the
+// TestIntegrationClaimParityR1Identity: an "r1:" identity allowlist entry must admit the
 // same canonical repository. The old SQL compared it to the unprefixed
 // identity and denied.
-func TestClaimParityR1Identity(t *testing.T) {
+func TestIntegrationClaimParityR1Identity(t *testing.T) {
 	serial := "serial-" + pgITNewID(t)
 	runnerID := pgITNewID(t)
 	runID, jobID := pgITNewID(t), pgITNewID(t)
@@ -454,10 +454,10 @@ func TestClaimParityR1Identity(t *testing.T) {
 	})
 }
 
-// TestClaimParityUnlinkedSnapshot: an UNLINKED runner's registration snapshot
+// TestIntegrationClaimParityUnlinkedSnapshot: an UNLINKED runner's registration snapshot
 // must bind the SQL claim exactly as it binds memory. The old SQL skipped
 // every predicate when no profile was linked.
-func TestClaimParityUnlinkedSnapshot(t *testing.T) {
+func TestIntegrationClaimParityUnlinkedSnapshot(t *testing.T) {
 	canonical := "github.com/acme/widget"
 	baseRunner := func(runnerID string) model.Runner {
 		return model.Runner{
@@ -518,7 +518,7 @@ func TestClaimParityUnlinkedSnapshot(t *testing.T) {
 // required-artifact generation scoping and receipt first-wins
 // ---------------------------------------------------------------------------
 
-func TestPostgresRequiredArtifactScopedToGeneration(t *testing.T) {
+func TestIntegrationPostgresRequiredArtifactScopedToGeneration(t *testing.T) {
 	st := pgITStore(t)
 	ctx := context.Background()
 	runnerID := pgITNewID(t)
@@ -580,9 +580,9 @@ func TestMemStoreRequiredArtifactScopedToGeneration(t *testing.T) {
 	}
 }
 
-// TestCompletionReceiptFirstWinsParity pins the shared first-wins semantic:
+// TestIntegrationCompletionReceiptFirstWinsParity pins the shared first-wins semantic:
 // the first receipt for an identity is never overwritten by a later one.
-func TestCompletionReceiptFirstWinsParity(t *testing.T) {
+func TestIntegrationCompletionReceiptFirstWinsParity(t *testing.T) {
 	ctx := context.Background()
 	const jobID = "ddddddddddddddddddddddddddddddd0"
 	const runnerID = "ddddddddddddddddddddddddddddddd1"

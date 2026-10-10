@@ -83,11 +83,11 @@ func composePGVisibleRuns(total int) []string {
 	return out
 }
 
-// TestComposeRotationPairPaginationSharedGrantsPG re-verifies the rotation
+// TestIntegrationComposeRotationPairPaginationSharedGrantsPG re-verifies the rotation
 // pair's pagination contract against real Postgres: identical pages for both
 // credentials, only the granted repository visible, every cursor decoded to
 // the last visible run of its page.
-func TestComposeRotationPairPaginationSharedGrantsPG(t *testing.T) {
+func TestIntegrationComposeRotationPairPaginationSharedGrantsPG(t *testing.T) {
 	composeFreshPGDatabase(t)
 	env := pgITServerSetup(t)
 	st := env.open(t)
@@ -151,12 +151,12 @@ func TestComposeRotationPairPaginationSharedGrantsPG(t *testing.T) {
 	}
 }
 
-// TestComposeConflictingSubjectTokenFileFailsClosedPG is the live-store half
+// TestIntegrationComposeConflictingSubjectTokenFileFailsClosedPG is the live-store half
 // of the ambiguity composition: the conflicting token file fails the startup
 // load, neither ambiguous credential reaches the paginated collection (401,
 // not a filtered or empty page), and the valid credentials still page exactly
 // their granted repositories.
-func TestComposeConflictingSubjectTokenFileFailsClosedPG(t *testing.T) {
+func TestIntegrationComposeConflictingSubjectTokenFileFailsClosedPG(t *testing.T) {
 	composeFreshPGDatabase(t)
 	env := pgITServerSetup(t)
 	st := env.open(t)

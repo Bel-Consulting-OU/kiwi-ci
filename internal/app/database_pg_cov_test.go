@@ -60,7 +60,7 @@ func writeRunnerTokensFile(t *testing.T) string {
 	return path
 }
 
-func TestDatabaseMigrateAndStatusSchemaConflicts(t *testing.T) {
+func TestIntegrationDatabaseMigrateAndStatusSchemaConflicts(t *testing.T) {
 	dsn := scratchPostgresDSN(t)
 	ctx := context.Background()
 	admin, err := pgx.Connect(ctx, dsn)
@@ -81,7 +81,7 @@ func TestDatabaseMigrateAndStatusSchemaConflicts(t *testing.T) {
 	}
 }
 
-func TestServerDBModeProvisioning(t *testing.T) {
+func TestIntegrationServerDBModeProvisioning(t *testing.T) {
 	dsn := scratchPostgresDSN(t)
 	dataDir := t.TempDir()
 	clusterDir := filepath.Join(t.TempDir(), "cluster")
@@ -105,7 +105,7 @@ func TestServerDBModeProvisioning(t *testing.T) {
 	}
 }
 
-func TestServerDBModeWithoutDataDir(t *testing.T) {
+func TestIntegrationServerDBModeWithoutDataDir(t *testing.T) {
 	dsn := scratchPostgresDSN(t)
 	addr := freeTCPAddr(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -116,7 +116,7 @@ func TestServerDBModeWithoutDataDir(t *testing.T) {
 	}
 }
 
-func TestServerDBModeProductionUsesDBClusterKeyStore(t *testing.T) {
+func TestIntegrationServerDBModeProductionUsesDBClusterKeyStore(t *testing.T) {
 	// D3-C: production DB mode no longer accepts a node-local data-dir key
 	// store, and no longer needs --cluster-key-dir either: the DB-backed
 	// cluster key store is the preferred shared provider, so replicas share
@@ -153,7 +153,7 @@ func TestServerDBModeProductionUsesDBClusterKeyStore(t *testing.T) {
 	}
 }
 
-func TestServerDBModeProductionRunnerTokenOnlyWithProvisionedTokens(t *testing.T) {
+func TestIntegrationServerDBModeProductionRunnerTokenOnlyWithProvisionedTokens(t *testing.T) {
 	dsn := scratchPostgresDSN(t)
 	// Seed per-runner credentials into runner_bearer_tokens through a dev
 	// server (the provisioning path).
@@ -183,7 +183,7 @@ func TestServerDBModeProductionRunnerTokenOnlyWithProvisionedTokens(t *testing.T
 	}
 }
 
-func TestServerDBModeProductionNoRunnerMechanismFailsPostDB(t *testing.T) {
+func TestIntegrationServerDBModeProductionNoRunnerMechanismFailsPostDB(t *testing.T) {
 	// D3-D: production with a shared token but no per-runner mechanism at
 	// all fails the POST-DB credential check (not the static one) with a
 	// clear message.
@@ -199,7 +199,7 @@ func TestServerDBModeProductionNoRunnerMechanismFailsPostDB(t *testing.T) {
 	}
 }
 
-func TestServerDBModeAutoMigrateFailure(t *testing.T) {
+func TestIntegrationServerDBModeAutoMigrateFailure(t *testing.T) {
 	// A conflicting schema_migrations table makes the startup auto-migration
 	// fail before the listener opens.
 	dsn := scratchPostgresDSN(t)
@@ -218,7 +218,7 @@ func TestServerDBModeAutoMigrateFailure(t *testing.T) {
 	}
 }
 
-func TestServerDBModeDataDirIsFile(t *testing.T) {
+func TestIntegrationServerDBModeDataDirIsFile(t *testing.T) {
 	dsn := scratchPostgresDSN(t)
 	fileAsDir := filepath.Join(t.TempDir(), "data")
 	if err := os.WriteFile(fileAsDir, []byte("x"), 0o644); err != nil {
@@ -237,7 +237,7 @@ func TestServerAuthTokensFileFailure(t *testing.T) {
 	}
 }
 
-func TestServerDBModeProductionWithCluster(t *testing.T) {
+func TestIntegrationServerDBModeProductionWithCluster(t *testing.T) {
 	dsn := scratchPostgresDSN(t)
 	addr := freeTCPAddr(t)
 	certFile, keyFile := writeSelfSignedTLS(t)
@@ -256,18 +256,20 @@ func TestServerDBModeProductionWithCluster(t *testing.T) {
 	}
 }
 
-func TestServerDBModeProductionChecksProvisionedTokens(t *testing.T) {
+func TestIntegrationServerDBModeProductionChecksProvisionedTokens(t *testing.T) {
 	dsn := scratchPostgresDSN(t)
 	addr := freeTCPAddr(t)
 	certFile, keyFile := writeSelfSignedTLS(t)
 	dataDir := t.TempDir()
 	clusterDir := filepath.Join(t.TempDir(), "cluster")
 	// No credentials at all: --allow-shared-token satisfies the static
-	// validation, then the DB probe finds no provisioned token rows and
-	// refuses to start.
+	// validation (the admin token is required too, so pass a long one and
+	// keep phase 1 on the intended POST-DB credential-probe path), then the
+	// DB probe finds no provisioned token rows and refuses to start.
 	err := Server(context.Background(), []string{"--listen", addr, "--database-url", dsn,
 		"--mode", "production", "--external-url", "https://ci.example.com",
 		"--tls-cert", certFile, "--tls-key", keyFile, "--allow-shared-token",
+		"--admin-token", "admin-token-long-enough",
 		"--staging-dir", t.TempDir(), "--staging-max-bytes", "67108864",
 		"--data-dir", dataDir, "--cluster-key-dir", clusterDir})
 	if err == nil || !strings.Contains(err.Error(), "production requires runner mTLS or per-runner credentials") {
@@ -288,6 +290,7 @@ func TestServerDBModeProductionChecksProvisionedTokens(t *testing.T) {
 	errCh := startServer(t, ctx2, "--listen", addr, "--database-url", dsn,
 		"--mode", "production", "--external-url", "https://ci.example.com",
 		"--tls-cert", certFile, "--tls-key", keyFile, "--allow-shared-token",
+		"--admin-token", "admin-token-long-enough",
 		"--data-dir", dataDir, "--cluster-key-dir", clusterDir, "--staging-dir", t.TempDir(), "--staging-max-bytes", "67108864")
 	waitTCPUp(t, addr, errCh, 15*time.Second)
 	if err := stopServer(t, cancel2, errCh); err != nil {

@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"bytes"
+	"strings"
+	"testing"
+)
 
 func TestCheckAcceptsCanonicalUTC(t *testing.T) {
 	values := []string{
@@ -42,6 +46,36 @@ func TestCheckRejects(t *testing.T) {
 	for _, value := range values {
 		if err := check(value); err == nil {
 			t.Errorf("check(%q) = nil, want error", value)
+		}
+	}
+}
+
+// TestRunExitCodes pins the CLI contract: 0 for a canonical value, 1 for a
+// rejected value (with a one-line reason), 2 for wrong usage.
+func TestRunExitCodes(t *testing.T) {
+	var stderr bytes.Buffer
+	if got := run([]string{"2026-09-18T12:39:10Z"}, &stderr); got != 0 {
+		t.Fatalf("run(canonical) = %d, want 0", got)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("run(canonical) stderr = %q, want empty", stderr.String())
+	}
+
+	stderr.Reset()
+	if got := run([]string{"2006-02-30T00:00:00Z"}, &stderr); got != 1 {
+		t.Fatalf("run(impossible date) = %d, want 1", got)
+	}
+	if !strings.Contains(stderr.String(), "rfc3339check:") {
+		t.Fatalf("stderr = %q, want the rfc3339check reason line", stderr.String())
+	}
+
+	for _, args := range [][]string{nil, {"a", "b"}} {
+		stderr.Reset()
+		if got := run(args, &stderr); got != 2 {
+			t.Fatalf("run(%v) = %d, want 2", args, got)
+		}
+		if !strings.Contains(stderr.String(), "usage: rfc3339check") {
+			t.Fatalf("stderr = %q, want the usage line", stderr.String())
 		}
 	}
 }

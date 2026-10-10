@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -36,14 +37,20 @@ const s3UnsignedPayload = "UNSIGNED-PAYLOAD"
 // enforce the advertised size exactly without buffering the payload.
 type byteCounter struct {
 	r io.Reader
-	n int64
+	n atomic.Int64
 }
 
 func (c *byteCounter) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
-	c.n += int64(n)
+	c.n.Add(int64(n))
 	return n, err
 }
+
+// count reads the byte total race-free: the HTTP transport may still be
+// writing the request body when client.Do returns (a server can answer
+// before consuming it), so the counter is written from the transport's
+// write goroutine and read from the caller's.
+func (c *byteCounter) count() int64 { return c.n.Load() }
 
 // s3RequestDeadlines bound requests whose caller context carries no
 // deadline, so a stalled S3 endpoint can never hang a request forever.
@@ -792,8 +799,8 @@ func (s *S3) putSingle(ctx context.Context, key string, r io.Reader, size int64)
 	s.sign(req, s3UnsignedPayload, time.Now().UTC())
 	resp, err := s.client().Do(req)
 	if err != nil {
-		if src.n < size {
-			return Object{}, fmt.Errorf("blob: s3 put size mismatch: read %d bytes, expected %d: %w", src.n, size, err)
+		if src.count() < size {
+			return Object{}, fmt.Errorf("blob: s3 put size mismatch: read %d bytes, expected %d: %w", src.count(), size, err)
 		}
 		return Object{}, err
 	}
@@ -802,8 +809,8 @@ func (s *S3) putSingle(ctx context.Context, key string, r io.Reader, size int64)
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return Object{}, fmt.Errorf("blob: s3 put %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
-	if src.n != size {
-		return Object{}, fmt.Errorf("blob: s3 put size mismatch: read %d bytes, expected %d", src.n, size)
+	if src.count() != size {
+		return Object{}, fmt.Errorf("blob: s3 put size mismatch: read %d bytes, expected %d", src.count(), size)
 	}
 	// The endpoint only received `size` bytes. A source with more is a
 	// declared-size violation and must fail closed.

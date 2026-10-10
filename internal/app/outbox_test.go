@@ -60,11 +60,11 @@ func TestOutboxDeadLettersUsageErrors(t *testing.T) {
 	}
 }
 
-// TestOutboxDeadLettersPostgresRoundTrip drives the CLI command layer against
+// TestIntegrationOutboxDeadLettersPostgresRoundTrip drives the CLI command layer against
 // a real PostgreSQL store: a retired intent appears in the listing, requeue
 // re-arms it for claiming, and delete removes it. Gated on
 // KIWI_TEST_POSTGRES_URL.
-func TestOutboxDeadLettersPostgresRoundTrip(t *testing.T) {
+func TestIntegrationOutboxDeadLettersPostgresRoundTrip(t *testing.T) {
 	dsn := strings.TrimSpace(os.Getenv("KIWI_TEST_POSTGRES_URL"))
 	if dsn == "" {
 		t.Skip("KIWI_TEST_POSTGRES_URL not set; skipping PostgreSQL CLI round trip")

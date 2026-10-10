@@ -63,7 +63,7 @@ steps:
   checkout:
     image: bash
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
     commands:
       - |
         set -eu
@@ -77,7 +77,7 @@ steps:
     image: bash
     depends_on: [checkout]
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
     commands:
       # Exact toolchain assertion (go.mod vs README.md vs running `go`).
       - ./scripts/toolchain-check.sh
@@ -86,7 +86,7 @@ steps:
     image: bash
     depends_on: [toolchain]
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
     commands:
       - go test -shuffle=on -timeout=20m ./...
 
@@ -94,7 +94,7 @@ steps:
     image: bash
     depends_on: [unit]
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
     commands:
       - go test -race -shuffle=on -timeout=30m ./internal/tui ./internal/executor ./internal/safefs ./internal/server ./internal/storage
 
@@ -102,6 +102,6 @@ steps:
     image: bash
     depends_on: [unit]
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
     commands:
       - go test -count=1 -v -timeout=30m ./internal/tui ./internal/safefs ./internal/workspace ./internal/executor

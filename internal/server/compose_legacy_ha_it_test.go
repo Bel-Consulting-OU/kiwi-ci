@@ -88,12 +88,12 @@ func composeLegacyMakeServiceJob(t *testing.T, env *pgITServerEnv, runnerID, job
 	composeLegacyExec(t, env, `UPDATE jobs SET payload = jsonb_set(payload #- '{service_envelope_request}', '{compiled_job_payload,effective_job,job,services}', '[{"name":"db","image":"postgres:16"}]'::jsonb, true) WHERE id=$1`, jobID)
 }
 
-// TestComposeLegacyWorldLeaderPromotionPG is the rolling-version over-charge
+// TestIntegrationComposeLegacyWorldLeaderPromotionPG is the rolling-version over-charge
 // and under-charge proof: after promotion, the legacy services-without-
 // envelope job is charged its own request a second time (conservative
 // envelope) while the legacy service-less job is charged exactly its request,
 // and a re-run is idempotent.
-func TestComposeLegacyWorldLeaderPromotionPG(t *testing.T) {
+func TestIntegrationComposeLegacyWorldLeaderPromotionPG(t *testing.T) {
 	env := pgITServerSetup(t)
 	s, st := pgITServerWithEnv(t, env, t.TempDir())
 	pgITServerAwaitLeadership(t, s)
@@ -180,13 +180,13 @@ jobs:
       - run: echo hi
 `
 
-// TestComposeLegacyWorldCertSerialRunnerLeasePG pins the cert-serial-only
+// TestIntegrationComposeLegacyWorldCertSerialRunnerLeasePG pins the cert-serial-only
 // profile world: a runner row written by the old binary (self-reported
 // labels/capacity, no resource_capacity, no runner-ID link) still leases
 // through its LIVE certificate-serial profile, so a gpu job is admitted even
 // though the stored snapshot never mentions gpu — and the profile's capacity
 // bound (1), not the stored 8, applies.
-func TestComposeLegacyWorldCertSerialRunnerLeasePG(t *testing.T) {
+func TestIntegrationComposeLegacyWorldCertSerialRunnerLeasePG(t *testing.T) {
 	env := pgITServerSetup(t)
 	s, _ := pgITServerWithEnv(t, env, t.TempDir())
 	pgITServerAwaitLeadership(t, s)
@@ -253,14 +253,14 @@ func TestComposeLegacyWorldCertSerialRunnerLeasePG(t *testing.T) {
 	}
 }
 
-// TestComposeLegacyWorldReportResendPG composes the pre-receipt report world
+// TestIntegrationComposeLegacyWorldReportResendPG composes the pre-receipt report world
 // with the legacy resend convergence: a report row that predates migration
 // 0029 (no delivery receipt) plus a legacy client that resends without a
 // delivery_id. The first resend claims a synthesized receipt; every later
 // resend of the same bytes is an idempotent replay — exactly one NEW report
 // and one fold per delivery — and the pre-existing row is never lost or
 // rewritten.
-func TestComposeLegacyWorldReportResendPG(t *testing.T) {
+func TestIntegrationComposeLegacyWorldReportResendPG(t *testing.T) {
 	env := pgITServerSetup(t)
 	s, _ := pgITServerWithEnv(t, env, t.TempDir())
 	pgITServerAwaitLeadership(t, s)
@@ -318,12 +318,12 @@ func TestComposeLegacyWorldReportResendPG(t *testing.T) {
 	}
 }
 
-// TestComposeLegacyWorldSnapshotPaginationPG seeds snapshot rows the way a
+// TestIntegrationComposeLegacyWorldSnapshotPaginationPG seeds snapshot rows the way a
 // pre-paging binary wrote them (minimal JSON payloads with no entries and
 // sometimes no id/run_id inside the payload) and walks the admin page
 // surface: every row is returned exactly once in oldest-first keyset order,
 // empty runs answer an empty page, and nothing 500s on the absent fields.
-func TestComposeLegacyWorldSnapshotPaginationPG(t *testing.T) {
+func TestIntegrationComposeLegacyWorldSnapshotPaginationPG(t *testing.T) {
 	env := pgITServerSetup(t)
 	s, st := pgITServerWithEnv(t, env, t.TempDir())
 	pgITServerAwaitLeadership(t, s)

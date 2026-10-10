@@ -17,10 +17,10 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runnerpki"
 )
 
-// TestComposeRevocationAndGrantStateSurviveReplicaRestartDB drives the same
+// TestIntegrationComposeRevocationAndGrantStateSurviveReplicaRestartDB drives the same
 // enroll -> consume -> disable flow as the FS test, then restarts the
 // control plane as a fresh replica over the same database.
-func TestComposeRevocationAndGrantStateSurviveReplicaRestartDB(t *testing.T) {
+func TestIntegrationComposeRevocationAndGrantStateSurviveReplicaRestartDB(t *testing.T) {
 	composeFreshPGDatabase(t)
 	env := pgITServerSetup(t)
 	stA := env.open(t)

@@ -21,7 +21,7 @@ steps:
   integration-postgres:
     image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
       # PostgreSQL's LLVM JIT segfaults a backend mid-query under this workload
       # on some hosts/kernels: a backend running the test-history identity
       # query dies while concurrent DROP DATABASE ... WITH (FORCE) barriers
@@ -69,24 +69,30 @@ steps:
       docker:
         user: "65534:65534"
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
       HOME: /tmp
       GOCACHE: /tmp/gocache
       GOPATH: /tmp/gopath
       GOMODCACHE: /tmp/gopath/pkg/mod
       GOTMPDIR: /tmp
     commands:
-      - go test -count=1 -shuffle=on -timeout=45m -coverprofile=unit-nonroot.out -covermode=atomic ./...
+      - env -u KIWI_TEST_POSTGRES_URL go test -count=1 -shuffle=on -timeout=45m -coverprofile=unit-nonroot.out -covermode=atomic ./...
 
   coverage:
     image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
     depends_on: [integration-postgres, unit-nonroot]
     environment:
-      GOTOOLCHAIN: local
+      GOTOOLCHAIN: auto
       KC_MIN_COVERAGE: "95"
     commands:
-      - go test -timeout=45m -coverprofile=coverage.out -covermode=atomic ./...
+      # Unit profile: KIWI_TEST_POSTGRES_URL is explicitly unset so every
+      # PostgreSQL-gated test skips here and lands in integration-coverage.out
+      # (produced by the integration-postgres step, which sets the DSN) where
+      # -coverpkg=./... instruments it. An inherited job/agent DSN would
+      # silently split the integration suite across both profiles.
+      - env -u KIWI_TEST_POSTGRES_URL go test -timeout=45m -coverprofile=coverage.out -covermode=atomic ./...
       - ./scripts/ci-coverage-selftest.sh coverage.out integration-coverage.out unit-nonroot.out
       - ./scripts/merge-coverage.sh merged-coverage.out coverage.out integration-coverage.out unit-nonroot.out
       - ./scripts/coverage-report.sh merged-coverage.out
       - ./scripts/coverage-floor.sh merged-coverage.out
+      - ./scripts/coverage-package-floor.sh merged-coverage.out

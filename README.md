@@ -35,7 +35,7 @@ untrusted code.
 
 ## Requirements
 
-- Go 1.27.1 or later.
+- Go 1.27.2 or later.
 - `git` on the PATH.
 - Docker (for `runtime: container`) and Tart (for `runtime: tart`)
   only where those runtimes are used.
@@ -256,9 +256,11 @@ reproducible builds.
 
 ## CI status
 
-CI is **Woodpecker-only** (`.woodpecker/` multi-workflow layout; agent
-selection is by workflow-level labels). There is no GitHub Actions workflow
-and no other CI system in this repository.
+Merge gating is **Woodpecker-only** (`.woodpecker/` multi-workflow layout;
+agent selection is by workflow-level labels). There is no GitHub Actions
+workflow. The repository also dogfoods Kiwi itself: `.kiwi/pipeline.yaml` is
+a Kiwi pipeline run by Kiwi runners (see
+[Dogfooding pipeline](#dogfooding-pipeline)).
 
 | Workflow | Agent label | What it runs |
 |---|---|---|
@@ -339,4 +341,30 @@ Server older than 3.9 needs the legacy
 Go modules current with weekly PRs (`.github/dependabot.yml`); tool versions
 are pinned in the workflow files and upgraded deliberately (see
 [docs/upgrades.md](docs/upgrades.md)).
+
+## Dogfooding pipeline
+
+[`.kiwi/pipeline.yaml`](.kiwi/pipeline.yaml) is Kiwi's own self-hosted
+verification matrix, executed by Kiwi itself, so the compiler, executor,
+scheduler, cache, artifact and service paths users depend on are exercised
+by this repository's own gates:
+
+| Job | Gates |
+|---|---|
+| `quality` | `gofmt`, `go vet ./...`, `go build ./...`, `make surface-check`, `make schema-check` |
+| `unit` | `make test-unit`, `make test-race` |
+| `coverage` | `make coverage-ci` against a pinned PostgreSQL service: whole-repo unit + integration coverage merged and checked against the total (and per-package) floors |
+| `staticcheck` | `make staticcheck` |
+| `govulncheck` | `make govulncheck` |
+| `release` | `make docs-check`, `make license-check`, `make cross`, `make repro-build` |
+| `fuzz` | `make fuzz` (bounded smoke; 10s per target) |
+
+The pipeline deliberately invokes the same Makefile gates Woodpecker runs,
+over the WHOLE repository: a package subset cannot pass unnoticed, and
+`make coverage-ci` gates the merged repository-wide coverage (unit plus
+real-PostgreSQL integration) rather than a per-lane slice. Images are
+pinned by OCI digest, reused verbatim from the Woodpecker workflows
+(`golang:1.27` and `postgres:16-alpine`); every job runs rootless with
+`sandbox.network: none`, except the coverage job, which runs
+`sandbox.network: services-only` to reach its PostgreSQL service.
 

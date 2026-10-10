@@ -34,10 +34,10 @@ func parityEnvJob(id, runID, repoID, repoURL, fullName, environment string, conc
 	}
 }
 
-// TestEnvironmentCapacityMemoryPostgresParity runs one table of identical
+// TestIntegrationEnvironmentCapacityMemoryPostgresParity runs one table of identical
 // job sets through both decision paths and requires the same answer (and the
 // table's expected answer) for every row.
-func TestEnvironmentCapacityMemoryPostgresParity(t *testing.T) {
+func TestIntegrationEnvironmentCapacityMemoryPostgresParity(t *testing.T) {
 	ctx := context.Background()
 	type parityCase struct {
 		name      string

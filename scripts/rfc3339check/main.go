@@ -21,6 +21,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"time"
 )
@@ -44,12 +45,19 @@ func check(value string) error {
 }
 
 func main() {
-	if len(os.Args) != 2 {
-		fmt.Fprintln(os.Stderr, "usage: rfc3339check YYYY-MM-DDTHH:MM:SSZ")
-		os.Exit(2)
+	os.Exit(run(os.Args[1:], os.Stderr))
+}
+
+// run executes one validation and returns the process exit code: 0 for a
+// canonical value, 1 for a bad value, 2 for wrong usage.
+func run(args []string, stderr io.Writer) int {
+	if len(args) != 1 {
+		fmt.Fprintln(stderr, "usage: rfc3339check YYYY-MM-DDTHH:MM:SSZ")
+		return 2
 	}
-	if err := check(os.Args[1]); err != nil {
-		fmt.Fprintf(os.Stderr, "rfc3339check: %v\n", err)
-		os.Exit(1)
+	if err := check(args[0]); err != nil {
+		fmt.Fprintf(stderr, "rfc3339check: %v\n", err)
+		return 1
 	}
+	return 0
 }

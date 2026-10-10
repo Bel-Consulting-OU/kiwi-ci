@@ -100,11 +100,17 @@ func compatibleFromOf(raw string, version int) (int, error) {
 	floor := version
 	for _, line := range strings.Split(raw, "\n") {
 		line = strings.TrimSpace(line)
-		const prefix = "-- kiwi:compatible-from "
+		const prefix = "-- kiwi:compatible-from"
 		if !strings.HasPrefix(line, prefix) {
 			continue
 		}
-		v, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, prefix)))
+		rest := strings.TrimPrefix(line, prefix)
+		if rest != "" && rest[0] != ' ' && rest[0] != '\t' {
+			// A word continuing the marker is an ordinary comment, not a
+			// directive (e.g. "-- kiwi:compatible-from-notes").
+			continue
+		}
+		v, err := strconv.Atoi(strings.TrimSpace(rest))
 		if err != nil || v <= 0 {
 			return 0, fmt.Errorf("invalid compatible-from directive %q", line)
 		}
@@ -143,8 +149,9 @@ func versionOf(name string) (int, error) {
 }
 
 // SplitStatements splits raw SQL on semicolons that appear OUTSIDE string
-// literals, quoted identifiers, line comments, block comments and
-// dollar-quoted bodies, then drops comment-only lines and trims whitespace.
+// literals, quoted identifiers, line comments, block comments (which nest,
+// per PostgreSQL) and dollar-quoted bodies, then drops comment-only lines and
+// trims whitespace.
 // The dollar-quote awareness is what lets a migration carry a PL/pgSQL
 // trigger function whose body contains semicolons: the body is one
 // statement, exactly as PostgreSQL sees it. Comment-only lines are stripped
@@ -173,13 +180,7 @@ func SplitStatements(sql string) []string {
 			b.WriteString(sql[i : i+j])
 			i += j
 		case c == '/' && i+1 < n && sql[i+1] == '*':
-			end := strings.Index(sql[i+2:], "*/")
-			if end < 0 {
-				b.WriteString(sql[i:])
-				i = n
-				break
-			}
-			j := i + 2 + end + 2
+			j := scanBlockComment(sql, i)
 			b.WriteString(sql[i:j])
 			i = j
 		case c == '$':
@@ -213,6 +214,34 @@ func SplitStatements(sql string) []string {
 		out = append(out, stmt)
 	}
 	return out
+}
+
+// scanBlockComment returns the index just past the closing */ of the block
+// comment starting at i. PostgreSQL block comments NEST: an inner /* ... */
+// pair is part of the outer comment (its semicolons must not split a
+// statement), so the scan tracks depth instead of stopping at the first */.
+// An unterminated comment consumes the rest of the input, exactly like an
+// unterminated quote: PostgreSQL reports the syntax error when it executes
+// the statement.
+func scanBlockComment(sql string, i int) int {
+	depth := 0
+	j := i
+	for j < len(sql) {
+		switch {
+		case j+1 < len(sql) && sql[j] == '/' && sql[j+1] == '*':
+			depth++
+			j += 2
+		case j+1 < len(sql) && sql[j] == '*' && sql[j+1] == '/':
+			depth--
+			j += 2
+			if depth == 0 {
+				return j
+			}
+		default:
+			j++
+		}
+	}
+	return len(sql)
 }
 
 // scanQuoted returns the index just past the closing quote of the literal or

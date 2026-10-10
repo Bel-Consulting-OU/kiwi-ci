@@ -1068,8 +1068,8 @@ func TestWorkflowGuardDoctoredLocalFailures(t *testing.T) {
 	}{
 		{
 			name: "env from_secret in a local step", kind: "local-secret", step: "", wantMsg: "RELEASE_TOKEN",
-			old: "    environment:\n      GOTOOLCHAIN: local\n",
-			new: "    environment:\n      GOTOOLCHAIN: local\n      RELEASE_TOKEN:\n        from_secret: release-token\n",
+			old: "    environment:\n      GOTOOLCHAIN: auto\n",
+			new: "    environment:\n      GOTOOLCHAIN: auto\n      RELEASE_TOKEN:\n        from_secret: release-token\n",
 		},
 		{
 			name: "curl piped to sh", kind: "local-unsafe", step: "", wantMsg: "remote-shell-pipe",
