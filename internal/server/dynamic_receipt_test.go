@@ -939,3 +939,96 @@ func TestGeneratedFragmentReplaysAcrossFSRestart(t *testing.T) {
 		t.Fatalf("post-restart dynamic children = %d, want exactly the original 3", children)
 	}
 }
+
+// TestGeneratedFragmentInheritsExecutionSemantics: generated children belong
+// to the parent's run and must inherit its stamped execution semantics, so a
+// graph mutation can never produce a run whose jobs carry mixed versions. The
+// test covers memory and dbFake and proves the parent's stamp propagates even
+// when it is not the current constant (as after a rolling upgrade).
+func TestGeneratedFragmentInheritsExecutionSemantics(t *testing.T) {
+	for _, db := range []bool{false, true} {
+		name := "memory"
+		if db {
+			name = "db"
+		}
+		t.Run(name, func(t *testing.T) {
+			s, f, runnerID, task := generatedFragmentSetup(t, db)
+			const stamped = "kiwi.execution.v-pinned"
+			set := func(j model.Job) model.Job {
+				j.ExecutionSemantics = stamped
+				return j
+			}
+			if f != nil {
+				f.mu.Lock()
+				run, ok := f.runs[task.Job.RunID]
+				if !ok {
+					f.mu.Unlock()
+					t.Fatalf("run %s missing from the fake store", task.Job.RunID)
+				}
+				run.ExecutionSemantics = stamped
+				f.runs[run.ID] = run
+				parent, ok := f.jobs[task.Job.ID]
+				if !ok {
+					f.mu.Unlock()
+					t.Fatalf("parent %s missing from the fake store", task.Job.ID)
+				}
+				f.jobs[task.Job.ID] = set(parent)
+				f.mu.Unlock()
+			} else {
+				s.mu.Lock()
+				run, ok := s.runs[task.Job.RunID]
+				if !ok {
+					s.mu.Unlock()
+					t.Fatalf("run %s missing from memory", task.Job.RunID)
+				}
+				run.ExecutionSemantics = stamped
+				s.runs[run.ID] = run
+				parent, ok := s.jobs[task.Job.ID]
+				if !ok {
+					s.mu.Unlock()
+					t.Fatalf("parent %s missing from memory", task.Job.ID)
+				}
+				s.jobs[task.Job.ID] = set(parent)
+				s.mu.Unlock()
+			}
+
+			path := "/api/v1/jobs/" + task.Job.ID + "/generated"
+			w := doJSONHeaders(t, s, http.MethodPost, path, "token", fragmentBody(t, retryFragmentABC), leaseHeaders(task, runnerID))
+			if w.Code != http.StatusCreated {
+				t.Fatalf("fragment upload = %d: %s", w.Code, w.Body.String())
+			}
+			check := func(yield []model.Job) {
+				children := 0
+				for _, j := range yield {
+					if j.RunID != task.Job.RunID || j.DynamicDepth != 1 {
+						continue
+					}
+					children++
+					if j.ExecutionSemantics != stamped {
+						t.Fatalf("generated child %s semantics = %q, want the parent run's %q", j.ID, j.ExecutionSemantics, stamped)
+					}
+				}
+				if children != 3 {
+					t.Fatalf("generated children = %d, want 3", children)
+				}
+			}
+			if f != nil {
+				f.mu.Lock()
+				jobs := make([]model.Job, 0, len(f.jobs))
+				for _, j := range f.jobs {
+					jobs = append(jobs, j)
+				}
+				f.mu.Unlock()
+				check(jobs)
+			} else {
+				s.mu.Lock()
+				jobs := make([]model.Job, 0, len(s.jobs))
+				for _, j := range s.jobs {
+					jobs = append(jobs, j)
+				}
+				s.mu.Unlock()
+				check(jobs)
+			}
+		})
+	}
+}

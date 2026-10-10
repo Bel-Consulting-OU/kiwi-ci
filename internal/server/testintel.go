@@ -341,18 +341,12 @@ func sameTestReportContent(a, b model.TestReport) bool {
 
 func (s *Server) listTestReports(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
+	// Existence masking (same primitive as every run-scoped read): a missing
+	// run and another repository's run are the same masked 404.
+	if _, ok := s.requireRunVisible(w, r, runID); !ok {
+		return
+	}
 	if s.DB != nil {
-		run, err := s.DB.GetRun(r.Context(), runID)
-		if errors.Is(err, storage.ErrNotFound) {
-			http.NotFound(w, r)
-			return
-		} else if err != nil {
-			s.internalError(w, r, err, "")
-			return
-		}
-		if !s.requireRunRead(w, r, run) {
-			return
-		}
 		out, err := s.DB.ListTestReports(r.Context(), runID)
 		if err != nil {
 			s.internalError(w, r, err, "")
@@ -363,14 +357,6 @@ func (s *Server) listTestReports(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	run, ok := s.runs[runID]
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
-	if !s.requireRunRead(w, r, run) {
-		return
-	}
 	out := []model.TestReport{}
 	for _, rep := range s.reports {
 		if rep.RunID == runID {

@@ -70,15 +70,21 @@ type Statement struct {
 	// payload); a v1 capsule digest that is present but v2 that is absent
 	// means the runtime overlay could not be recomputed, not that there was
 	// none.
-	ExecutionCapsuleDigest string          `json:"executionCapsuleDigest,omitempty"`
-	Runtime                string          `json:"runtime,omitempty"`
-	ImageDigest            string          `json:"imageDigest,omitempty"`
-	Issuer                 string          `json:"issuer,omitempty"`
-	Materials              []MaterialEntry `json:"materials,omitempty"`
-	EffectivePolicyDigest  string          `json:"effectivePolicyDigest,omitempty"`
-	StartTime              *time.Time      `json:"startTime,omitempty"`
-	EndTime                *time.Time      `json:"endTime,omitempty"`
-	ArtifactSize           int64           `json:"artifactSize,omitempty"`
+	ExecutionCapsuleDigest string `json:"executionCapsuleDigest,omitempty"`
+	// ExecutionSemantics is the execution-engine semantic version
+	// (model.ExecutionSemanticsVersion) the producing attempt ran under. It
+	// is part of the signed statement, so evidence can be refused when it
+	// was produced by a different engine semantics. Omitted for records that
+	// predate semantics stamping.
+	ExecutionSemantics    string          `json:"executionSemantics,omitempty"`
+	Runtime               string          `json:"runtime,omitempty"`
+	ImageDigest           string          `json:"imageDigest,omitempty"`
+	Issuer                string          `json:"issuer,omitempty"`
+	Materials             []MaterialEntry `json:"materials,omitempty"`
+	EffectivePolicyDigest string          `json:"effectivePolicyDigest,omitempty"`
+	StartTime             *time.Time      `json:"startTime,omitempty"`
+	EndTime               *time.Time      `json:"endTime,omitempty"`
+	ArtifactSize          int64           `json:"artifactSize,omitempty"`
 	// ArtifactPublishedAt records when the artifact bytes were published. It
 	// is explicitly NOT the build completion time: FinishedOn is only set
 	// from a real terminal job timestamp.
@@ -193,6 +199,11 @@ type ArtifactInput struct {
 	// ResolvedPipelineSHA256 is populated only when it is already available
 	// to the caller; no lookup is performed here.
 	ResolvedPipelineSHA256 string
+	// ExecutionSemantics is the execution-engine semantic version
+	// (model.ExecutionSemanticsVersion) of the run that produced the
+	// artifact. It is copied into the signed statement; empty for records
+	// that predate semantics stamping.
+	ExecutionSemantics string
 }
 
 // InvocationID shapes the SLSA RunDetails.Metadata.InvocationID from the run
@@ -217,6 +228,7 @@ func ArtifactStatement(in ArtifactInput) Statement {
 		AttemptID:              in.AttemptID,
 		CapsuleDigest:          in.CapsuleDigest,
 		ExecutionCapsuleDigest: in.ExecutionCapsuleDigest,
+		ExecutionSemantics:     in.ExecutionSemantics,
 		PipelineDigest:         in.PipelineDigest,
 		CompilerVersion:        in.CompilerVersion,
 		RunnerIdentity:         in.RunnerIdentity,
@@ -361,7 +373,10 @@ type VerifyOptions struct {
 	// ExecutionCapsuleDigest, when non-empty, must equal the statement's
 	// materialized effective-execution capsule digest.
 	ExecutionCapsuleDigest string
-	TrustedKey             ed25519.PublicKey
+	// ExecutionSemantics, when non-empty, must equal the statement's
+	// execution-engine semantic version (model.ExecutionSemanticsVersion).
+	ExecutionSemantics string
+	TrustedKey         ed25519.PublicKey
 }
 
 // VerifyWith parses, verifies and constraint-checks a serialized DSSE
@@ -441,6 +456,7 @@ func VerifyWith(envelope []byte, jwksOrKey func(kid string) (ed25519.PublicKey, 
 		{opts.AttemptID, st.AttemptID, "attempt id"},
 		{opts.CapsuleDigest, st.CapsuleDigest, "capsule digest"},
 		{opts.ExecutionCapsuleDigest, st.ExecutionCapsuleDigest, "execution capsule digest"},
+		{opts.ExecutionSemantics, st.ExecutionSemantics, "execution semantics"},
 	} {
 		if c.want != "" && c.got != c.want {
 			return Statement{}, fmt.Errorf("provenance: %s mismatch: want %q, got %q", c.label, c.want, c.got)

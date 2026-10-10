@@ -31,7 +31,7 @@ func TestCRLRevocationRejectsPeerCert(t *testing.T) {
 	// Register the runner with its certificate serial and disable it
 	// through the admin endpoint: the serial lands in the CRL.
 	s.mu.Lock()
-	s.runners["runner-a"] = model.Runner{ID: "runner-a", Name: "runner-a", CertSerial: serial, Capacity: 1}
+	s.runners["runner-a"] = model.Runner{ProtocolVersion: 2, ID: "runner-a", Name: "runner-a", CertSerial: serial, Capacity: 1}
 	s.mu.Unlock()
 	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/runner-a/disable", "token", "")
 	if w.Code != http.StatusOK {
@@ -61,7 +61,7 @@ func TestCRLPersistsAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.mu.Lock()
-	s.runners["runner-a"] = model.Runner{ID: "runner-a", Name: "runner-a", CertSerial: "0c0ffee", Capacity: 1}
+	s.runners["runner-a"] = model.Runner{ProtocolVersion: 2, ID: "runner-a", Name: "runner-a", CertSerial: "0c0ffee", Capacity: 1}
 	s.mu.Unlock()
 	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/runner-a/disable", "token", ""); w.Code != http.StatusOK {
 		t.Fatalf("disable = %d", w.Code)

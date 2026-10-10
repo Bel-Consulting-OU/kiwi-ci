@@ -53,14 +53,14 @@ func TestIDCovNextDBLeaseRunnerLookup(t *testing.T) {
 			f := newDBFakeStore()
 			f.setLeader(true)
 			f.mu.Lock()
-			f.runners["r1"] = model.Runner{ID: "r1", Name: "r1", Capacity: 1}
+			f.runners["r1"] = model.Runner{ProtocolVersion: 2, ID: "r1", Name: "r1", Capacity: 1}
 			f.mu.Unlock()
 			store := &idcovRunnerScriptStore{dbFakeStore: f}
 			store.fn = func(n int) (model.Runner, error) {
 				if n >= 2 {
-					return model.Runner{}, c.second
+					return model.Runner{ProtocolVersion: 2}, c.second
 				}
-				return model.Runner{}, nil
+				return model.Runner{ProtocolVersion: 2}, nil
 			}
 			s := New("secret")
 			if err := s.SwitchToDB(store); err != nil {

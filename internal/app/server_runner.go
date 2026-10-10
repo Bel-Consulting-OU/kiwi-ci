@@ -1169,6 +1169,12 @@ func Server(ctx context.Context, args []string) error {
 		return err
 	}
 	applyQuotaConfig(srv, cfg)
+	// Wire-semantic runner protocol floor (server.min_runner_protocol):
+	// config.Default() and Validate() carry the fail-closed default (the
+	// current model.RunnerProtocolVersion); an operator lowers it to 1 only
+	// for a controlled upgrade window in which legacy runners may drain but
+	// receive no new leases.
+	srv.MinRunnerProtocol = cfg.Server.MinRunnerProtocol
 	// Downstream authorization and Sigstore trust roots are repeatable map
 	// flags (not config-merged: the TOML schema does not model them).
 	if allowlist, perr := parseDownstreamAllowlist(downstreamAllow.values()); perr != nil {

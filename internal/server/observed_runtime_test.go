@@ -176,7 +176,7 @@ func TestCompleteDBPersistsObservedRuntime(t *testing.T) {
 		t.Fatalf("submit = %d: %s", w.Code, w.Body.String())
 	}
 	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
-		`{"name":"runner1","labels":["container"],"protocol_min":3,"protocol_max":3}`); w.Code != http.StatusOK {
+		`{"name":"runner1","labels":["container"],"protocol_version": 2, "protocol_min":3,"protocol_max":3}`); w.Code != http.StatusOK {
 		t.Fatalf("register = %d: %s", w.Code, w.Body.String())
 	}
 	f.mu.Lock()

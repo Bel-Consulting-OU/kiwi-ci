@@ -114,3 +114,59 @@ func TestRerunDBModeTrustDowngrade(t *testing.T) {
 		t.Fatal("DB-mode rerun with trusted_run must preserve trust")
 	}
 }
+
+// TestRerunStampsExecutionSemantics: a rerun is a NEW execution and is
+// stamped with the execution-engine semantics in effect when it is created
+// (the enqueue path), with every job of the rerun inheriting the run's stamp.
+// Covered in memory and dbFake.
+func TestRerunStampsExecutionSemantics(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		db   bool
+	}{{"memory", false}, {"db", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			var s *Server
+			var f *dbFakeStore
+			var run model.Run
+			var err error
+			if tc.db {
+				f = newDBFakeStore()
+				s = storeServer(t, "", map[string]auth.Principal{
+					"trusted-token": {Subject: "trusted-bot", Roles: []auth.Role{auth.RoleRerun, auth.RoleTrustedRun}},
+				})
+				if err := s.SwitchToDB(f); err != nil {
+					t.Fatal(err)
+				}
+				run, err = s.enqueue(context.Background(), SubmitRun{
+					RepoURL: "https://github.com/kiwi/repo.git", RepoFullName: "kiwi/repo",
+					Ref: "main", SHA: "abc", Event: "push",
+					Pipeline: testPipeline, Trusted: true,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				s, run = rerunServer(t)
+			}
+			out := rerunAs(t, s, "trusted-token", run.ID)
+			if out.ExecutionSemantics != model.ExecutionSemanticsVersion {
+				t.Fatalf("rerun semantics = %q, want %q", out.ExecutionSemantics, model.ExecutionSemanticsVersion)
+			}
+			var jobs []model.Job
+			if f != nil {
+				f.mu.Lock()
+				for _, j := range f.jobs {
+					jobs = append(jobs, j)
+				}
+				f.mu.Unlock()
+			} else {
+				s.mu.Lock()
+				for _, j := range s.jobs {
+					jobs = append(jobs, j)
+				}
+				s.mu.Unlock()
+			}
+			assertJobsStampedWithCurrentSemantics(t, out.ID, jobs)
+		})
+	}
+}

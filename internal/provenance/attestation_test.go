@@ -45,6 +45,9 @@ func attestationTestInput() ExecutionAttestationInput {
 		},
 		WorkspaceRootSHA256: strings.Repeat("6", 64),
 		MaterialRootSHA256:  strings.Repeat("7", 64),
+		// The execution-engine semantics the attempt ran under is part of the
+		// signed block and its canonical digest.
+		ExecutionSemantics: model.ExecutionSemanticsVersion,
 	}
 }
 
@@ -129,6 +132,7 @@ func TestExecutionAttestationDigestOrderIndependentAndTamperEvident(t *testing.T
 		func(a *ExecutionAttestation) { a.Artifacts[0].ProvenanceSHA256 = "" },
 		func(a *ExecutionAttestation) { a.TestReports[0].SuiteDigest = strings.Repeat("f", 64) },
 		func(a *ExecutionAttestation) { a.Snapshots[0].Phase = model.SnapshotPhasePostJob },
+		func(a *ExecutionAttestation) { a.ExecutionSemantics = "kiwi.execution.v-future" },
 	}
 	for i, mutate := range mutations {
 		cp := *base.Attestation
@@ -213,7 +217,7 @@ func TestExecutionAttestationConstraints(t *testing.T) {
 	}
 	pub := priv.Public().(ed25519.PublicKey)
 	envBytes, _ := json.Marshal(env)
-	ok := VerifyOptions{TrustedKey: pub, AttemptID: "job-1:7", CapsuleDigest: in.CapsuleDigest, ExecutionCapsuleDigest: in.ExecutionCapsuleDigest}
+	ok := VerifyOptions{TrustedKey: pub, AttemptID: "job-1:7", CapsuleDigest: in.CapsuleDigest, ExecutionCapsuleDigest: in.ExecutionCapsuleDigest, ExecutionSemantics: in.ExecutionSemantics}
 	if _, err := VerifyWith(envBytes, nil, ok); err != nil {
 		t.Fatalf("matching constraints failed: %v", err)
 	}
@@ -221,6 +225,7 @@ func TestExecutionAttestationConstraints(t *testing.T) {
 		{TrustedKey: pub, AttemptID: "job-1:8"},
 		{TrustedKey: pub, CapsuleDigest: strings.Repeat("0", 64)},
 		{TrustedKey: pub, ExecutionCapsuleDigest: strings.Repeat("0", 64)},
+		{TrustedKey: pub, ExecutionSemantics: "kiwi.execution.v-future"},
 	} {
 		if _, err := VerifyWith(envBytes, nil, bad); err == nil {
 			t.Fatalf("constraint %+v not enforced", bad)
@@ -346,6 +351,61 @@ func TestExecutionAttestationDigestBindsCompletionResultAndEvidenceRoot(t *testi
 		if err := VerifyExecutionAttestation(tampered); err == nil {
 			t.Fatal("tampered binding field accepted")
 		}
+	}
+}
+
+// TestExecutionAttestationBindsExecutionSemantics proves the execution-engine
+// semantic version (model.ExecutionSemanticsVersion) is part of the signed
+// block and its canonical digest: mutating it flips the digest, a tampered
+// block fails consistency verification, a validly signed statement whose
+// top-level mirror disagrees with the block is refused, and a legacy (empty)
+// stamp round-trips unchanged.
+func TestExecutionAttestationBindsExecutionSemantics(t *testing.T) {
+	base, err := ExecutionAttestationStatement(attestationTestInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if base.Attestation.ExecutionSemantics != model.ExecutionSemanticsVersion || base.ExecutionSemantics != model.ExecutionSemanticsVersion {
+		t.Fatalf("semantics = block %q / statement %q, want %q", base.Attestation.ExecutionSemantics, base.ExecutionSemantics, model.ExecutionSemanticsVersion)
+	}
+	if err := VerifyExecutionAttestation(base); err != nil {
+		t.Fatalf("intact statement does not verify: %v", err)
+	}
+	d0, _ := ExecutionAttestationDigest(*base.Attestation)
+	mutated := *base.Attestation
+	mutated.ExecutionSemantics = "kiwi.execution.v-future"
+	d1, _ := ExecutionAttestationDigest(mutated)
+	if d1 == d0 {
+		t.Fatal("changing executionSemantics did not change the attestation digest")
+	}
+	tampered := base
+	cp := *base.Attestation
+	cp.ExecutionSemantics = "kiwi.execution.v-future"
+	tampered.Attestation = &cp
+	if err := VerifyExecutionAttestation(tampered); err == nil {
+		t.Fatal("tampered execution semantics accepted")
+	}
+	// A validly signed statement whose mirror field disagrees with its own
+	// (digest-bound) block is inconsistent by construction.
+	mirror := base
+	mirror.ExecutionSemantics = "kiwi.execution.v-future"
+	if err := VerifyExecutionAttestation(mirror); err == nil {
+		t.Fatal("mirror/block execution-semantics disagreement accepted")
+	}
+	// A record that predates stamping carries the empty string in BOTH
+	// places and verifies: the empty value is preserved verbatim, never
+	// guessed.
+	in := attestationTestInput()
+	in.ExecutionSemantics = ""
+	legacy, err := ExecutionAttestationStatement(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.Attestation.ExecutionSemantics != "" || legacy.ExecutionSemantics != "" {
+		t.Fatalf("legacy semantics guessed: block %q statement %q", legacy.Attestation.ExecutionSemantics, legacy.ExecutionSemantics)
+	}
+	if err := VerifyExecutionAttestation(legacy); err != nil {
+		t.Fatalf("legacy (unstamped) statement does not verify: %v", err)
 	}
 }
 

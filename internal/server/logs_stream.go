@@ -79,20 +79,14 @@ func (s *Server) latestLogSeq(ctx context.Context, runID string) (int64, bool) {
 // Streaming requires a persistent store; in-memory servers answer 503.
 func (s *Server) streamLogs(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// Existence masking runs before any byte of the stream: an unauthorized
+	// or unknown run answers the masked 404 with no headers, no frame and no
+	// high-water metadata, identical for both cases.
+	if _, ok := s.requireRunVisible(w, r, id); !ok {
+		return
+	}
 	if s.DB == nil && s.store == nil {
 		http.Error(w, "log streaming requires a persistent server", http.StatusServiceUnavailable)
-		return
-	}
-	run, err := s.runForAuth(r.Context(), id)
-	if errors.Is(err, storage.ErrNotFound) {
-		http.NotFound(w, r)
-		return
-	}
-	if err != nil {
-		s.internalError(w, r, err, "")
-		return
-	}
-	if !s.requireRunRead(w, r, run) {
 		return
 	}
 	after, ok := parseLogCursor(w, r)

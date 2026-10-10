@@ -86,8 +86,17 @@ func TestStreamLogsIdleTimeout(t *testing.T) {
 
 func TestStreamLogsRequiresPersistentStore(t *testing.T) {
 	s := New("token")
-	w := doJSON(t, s, http.MethodGet, "/api/v1/runs/r1/logs/stream", "token", "")
-	if w.Code != http.StatusServiceUnavailable {
+	// Existence masking precedes the storage-mode gate: an unknown run is the
+	// masked 404 even on an in-memory server.
+	if w := doJSON(t, s, http.MethodGet, "/api/v1/runs/r1/logs/stream", "token", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("in-memory unknown-run stream = %d, want masked 404", w.Code)
+	}
+	// An existing at least visible run on an in-memory server reaches the
+	// persistent-store gate.
+	s.mu.Lock()
+	s.runs["r1"] = model.Run{ID: "r1", Repo: "https://github.com/kiwi/repo.git", RepoFullName: "kiwi/repo", Status: model.StatusRunning}
+	s.mu.Unlock()
+	if w := doJSON(t, s, http.MethodGet, "/api/v1/runs/r1/logs/stream", "token", ""); w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("in-memory stream = %d, want 503", w.Code)
 	}
 }

@@ -404,7 +404,7 @@ func TestFlowQueueReasonsDBPaths(t *testing.T) {
 	s1.applyQueueReasonsDB(ctx, model.Runner{ID: "r1"})
 
 	base := model.Job{ID: "job-q", RunID: "run-c", Key: "build", Status: model.StatusQueued, RepoURL: "https://github.com/o/repo-a.git", RepoFullName: "o/repo-a", RequiredLabels: []string{"container"}}
-	runner := model.Runner{ID: "r1", Labels: []string{"container"}}
+	runner := model.Runner{ProtocolVersion: 2, ID: "r1", Labels: []string{"container"}}
 
 	// Non-queued rows are skipped.
 	s2, f2, _, _ := cacheFixture(t)

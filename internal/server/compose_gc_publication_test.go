@@ -71,7 +71,7 @@ func composeSeedLeasedJob(t *testing.T, s *Server, f *dbFakeStore, jobID, runner
 	f.runs["run-c"] = model.Run{ID: "run-c", Repo: "https://github.com/o/repo-a.git", RepoFullName: "o/repo-a", Status: model.StatusRunning}
 	f.jobs[jobID] = model.Job{ID: jobID, RunID: "run-c", Key: "build", RepoURL: "https://github.com/o/repo-a.git", RepoFullName: "o/repo-a",
 		Status: model.StatusRunning, Trusted: true, LeaseRunnerID: runnerID, LeaseTokenHash: hashLeaseToken(s.leaseKey, raw), LeaseGeneration: 5, LeaseExpiresAt: &exp}
-	f.runners[runnerID] = model.Runner{ID: runnerID, Name: runnerID, Capacity: 1}
+	f.runners[runnerID] = model.Runner{ProtocolVersion: 2, ID: runnerID, Name: runnerID, Capacity: 1}
 	f.mu.Unlock()
 	return hdrs
 }

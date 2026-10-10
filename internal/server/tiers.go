@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -291,6 +292,131 @@ func (s *Server) requireRunRead(w http.ResponseWriter, r *http.Request, run mode
 	return true
 }
 
+// maskedRunNotFound is the SINGLE tenancy existence-masking response: the same
+// status, headers and body bytes answer "no such run" and "a run the caller
+// may not see", so a principal that cannot read a run's repository can never
+// distinguish another repository's run from an unknown id through the
+// run-scoped endpoints. The body deliberately carries no id, repository,
+// reason or timing hint.
+var maskedRunNotFound = map[string]string{"error": "not found"}
+
+// writeMaskedRunNotFound writes the shared existence-masking 404. Every
+// pre-visibility not-found answer on a run-scoped endpoint must use it (also
+// when the address is a job or artifact id whose run has not been resolved),
+// so the masked case and the genuinely-missing case are byte-identical.
+func (s *Server) writeMaskedRunNotFound(w http.ResponseWriter) {
+	writeJSON(w, http.StatusNotFound, maskedRunNotFound)
+}
+
+// visibilityGrant is one positive endpoint grant that keeps a run's existence
+// visible in ADDITION to repository READ access (the baseline every
+// run-scoped route shares). A principal holding the grant the addressed
+// endpoint consumes is authorized on the run's repository, so masking the run
+// from it would refuse a legitimate caller; exactly one field is set.
+type visibilityGrant struct {
+	capability auth.Capability
+	action     auth.Action
+}
+
+// endpointVisibilityGrants returns the endpoint-specific grants whose holders
+// must keep seeing the addressed run. The table mirrors the handler
+// decisions: a controller capability route (snapshots/pipeline/attestation/
+// events) contributes its capability, the artifact surfaces contribute
+// artifact_read, and cancel/rerun contribute the capability (cancel) or
+// action the handler accepts. Paths without an entry are read-only endpoints:
+// repository read access alone decides visibility.
+//
+// The returned set is a visibility SUPERSET of the endpoint's final decision
+// on purpose: a principal that reaches visibility but fails the narrower
+// capability check is answered the existing 403 (capability denial is not an
+// existence leak once the caller provably holds SOME grant on that
+// repository). A principal holding no grant for the repository at all never
+// reaches the final decision — it gets the masked 404.
+func endpointVisibilityGrants(method, path string) []visibilityGrant {
+	segs := strings.Split(strings.Trim(path, "/"), "/")
+	if len(segs) < 3 || segs[0] != "api" || segs[1] != "v1" {
+		return nil
+	}
+	if rt, ok := capabilityRouteFor(method, path); ok && rt.scope == capabilityScopeRun {
+		return []visibilityGrant{{capability: rt.capability}}
+	}
+	switch segs[2] {
+	case "runs":
+		if len(segs) == 5 && method == http.MethodPost {
+			switch segs[4] {
+			case "cancel":
+				return []visibilityGrant{{capability: auth.CapRunsCancel}, {action: auth.ActionCancel}}
+			case "rerun":
+				return []visibilityGrant{{action: auth.ActionRerun}}
+			}
+		}
+		if len(segs) == 5 && segs[4] == "artifacts" && method == http.MethodGet {
+			return []visibilityGrant{{action: auth.ActionArtifactRead}}
+		}
+	case "artifacts":
+		if method == http.MethodGet && (len(segs) == 4 || (len(segs) == 5 && segs[4] == "provenance")) {
+			return []visibilityGrant{{action: auth.ActionArtifactRead}}
+		}
+	}
+	return nil
+}
+
+// runVisibleTo reports whether the request's principal may learn that run
+// exists through the addressed endpoint: no principal (legacy/web-session,
+// already tier-gated) and the admin role see every run, repository read
+// access (auth.CanReadRepo, the same single repository-grant entry point
+// every read route resolves through) sees its repositories' runs, and the
+// endpoint's own positive grants (endpointVisibilityGrants) see the runs they
+// are authorized on.
+func (s *Server) runVisibleTo(r *http.Request, run model.Run) bool {
+	p, ok := auth.PrincipalFrom(r)
+	if !ok {
+		return true
+	}
+	repo := repoIDForRun(run)
+	if auth.Authorize(p, auth.ActionAdmin, repo, false) || auth.CanReadRepo(p, repo) {
+		return true
+	}
+	for _, g := range endpointVisibilityGrants(r.Method, r.URL.Path) {
+		if g.capability != "" && auth.AuthorizeCapability(p, g.capability, repo) {
+			return true
+		}
+		if g.action != "" && auth.Authorize(p, g.action, repo, false) {
+			return true
+		}
+	}
+	return false
+}
+
+// requireRunVisible is THE existence-masking primitive of the run-scoped
+// endpoints. It loads the addressed run and, when it does not exist OR the
+// principal cannot see its repository, writes the SAME masked 404
+// (writeMaskedRunNotFound) and returns false, so "exists in another
+// repository" and "does not exist" are indistinguishable through status,
+// body or headers. A visible run is returned so the caller can run its
+// narrower decision (capability/artifact/action) AFTER visibility; a
+// capability denial for a visible run keeps the existing 403.
+//
+// A store failure that is not ErrNotFound stays a 500: it is not an
+// attacker-controllable existence oracle and operators must keep seeing real
+// backend failures.
+func (s *Server) requireRunVisible(w http.ResponseWriter, r *http.Request, runID string) (model.Run, bool) {
+	run, err := s.runForAuth(r.Context(), runID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			s.writeMaskedRunNotFound(w)
+		} else {
+			s.internalError(w, r, err, "")
+		}
+		return model.Run{}, false
+	}
+	if !s.runVisibleTo(r, run) {
+		s.writeMaskedRunNotFound(w)
+		return model.Run{}, false
+	}
+	return run, true
+}
+
 // requireRunArtifactRead enforces the artifact-read action for a per-run
 // artifact route, scoped by the run's canonical policy identity. The
 // repository-scoped permission set resolves inside auth.Authorize: a
@@ -322,6 +448,10 @@ func (s *Server) requireArtifactRead(w http.ResponseWriter, r *http.Request, rec
 // either grant is answered 403 with the standard body. An unresolved run
 // fails closed (403): the repository scope cannot be established, so no
 // repository-scoped grant may be guessed.
+//
+// Handlers call requireRunVisible FIRST: an unknown or invisible run is the
+// masked 404, so this helper only decides for runs whose existence the caller
+// may already know; its 403 is the capability denial of a visible run.
 func (s *Server) requireRunCapability(w http.ResponseWriter, r *http.Request, capability auth.Capability, runID string) bool {
 	p, ok := auth.PrincipalFrom(r)
 	if !ok {

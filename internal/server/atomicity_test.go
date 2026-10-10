@@ -412,7 +412,7 @@ func TestNextDBBudgetUnavailableFailClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.mu.Lock()
-	f.runners["runner1"] = model.Runner{ID: "runner1", Name: "r1", Capacity: 1}
+	f.runners["runner1"] = model.Runner{ProtocolVersion: 2, ID: "runner1", Name: "r1", Capacity: 1}
 	f.jobs["job1"] = model.Job{ID: "job1", RunID: "run1", Key: "build", Status: model.StatusQueued}
 	f.runs["run1"] = model.Run{ID: "run1", Status: model.StatusQueued}
 	f.mu.Unlock()
@@ -949,7 +949,7 @@ func TestCacheCASRoundTripTwoReplicas(t *testing.T) {
 		Status: model.StatusRunning, Trusted: true, LeaseRunnerID: "runner-a", LeaseGeneration: 5, LeaseExpiresAt: &exp}
 	job.LeaseTokenHash = hashLeaseToken(s1.leaseKey, raw)
 	f.jobs["job-a"] = job
-	f.runners["runner-a"] = model.Runner{ID: "runner-a", Name: "runner-a", Capacity: 1}
+	f.runners["runner-a"] = model.Runner{ProtocolVersion: 2, ID: "runner-a", Name: "runner-a", Capacity: 1}
 	f.mu.Unlock()
 	hdrs := map[string]string{"X-Kiwi-Runner-ID": "runner-a", "X-Kiwi-Lease-Token": raw, "X-Kiwi-Lease-Generation": "5"}
 	key := strings.Repeat("a", 64)

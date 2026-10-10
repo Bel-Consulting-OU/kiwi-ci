@@ -223,6 +223,43 @@ runner-tier routes demand a valid runner certificate
 (`--runner-require-client-certs`, default on); admin, forge and
 enrollment traffic stays reachable on the same listener.
 
+### Rolling upgrades and the runner protocol floor
+
+Registration and leasing negotiate a WIRE-SEMANTIC protocol
+(`model.RunnerProtocolVersion`, currently 2) in addition to the runner API
+version range. Current runners send `protocol_version`; the server stores
+the negotiated value on the runner row, and a registration that omits the
+field is a legacy v1 runner. `server.min_runner_protocol` (default: the
+current protocol, 2) is the floor the server accepts at registration, and
+`/next` refuses to lease to any registered runner whose negotiated version
+is below `model.JobRequiresProtocol` with HTTP 409
+`RUNNER_PROTOCOL_UNSUPPORTED` before any claim or reservation mutation.
+
+Two-phase procedure:
+
+1. **Upgrade the control plane first, keeping the default floor.** New
+   runners register and execute normally; a legacy runner that tries to
+   register is refused 400 (body names the required minimum and its
+   version), and a legacy runner row that predates the upgrade is answered
+   409 for every new lease. Heartbeat, logs and completion for work it
+   already claimed keep working under the existing generation-based
+   fencing, so in-flight jobs drain safely.
+2. **Controlled legacy window (only if needed).** If a legacy runner that
+   was mid-job before the upgrade must re-register (for example after a
+   runner process restart) before it can be upgraded, set
+   `min_runner_protocol = 1` for the window. Legacy runners then register
+   and drain, but never receive new work: every `/next` answers 409
+   `RUNNER_PROTOCOL_UNSUPPORTED`. Raise the setting back to the default
+   once every runner runs a current binary.
+
+Never lower the server's advertised `protocol_version` (it is not
+configurable), and never raise `min_runner_protocol` above the running
+binary's `model.RunnerProtocolVersion` — startup validation refuses it.
+The runner side is symmetric and fail closed: a runner refuses to start
+when the registration response requires or advertises a newer protocol,
+and it refuses a leased task whose `protocol_version` exceeds what it
+implements.
+
 ## Health and metrics
 
 - `GET /readiness` — ready to serve traffic. DB mode checks the store. In

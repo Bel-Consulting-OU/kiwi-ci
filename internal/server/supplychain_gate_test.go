@@ -137,7 +137,7 @@ func seedLeasedArtifactJob(t *testing.T, s *Server, pipelineText string) (runner
 	now := time.Now().UTC()
 	exp := now.Add(time.Hour)
 	s.mu.Lock()
-	s.runners[runnerID] = model.Runner{ID: runnerID, Name: runnerID, Capacity: 1}
+	s.runners[runnerID] = model.Runner{ProtocolVersion: 2, ID: runnerID, Name: runnerID, Capacity: 1}
 	s.runs["run-seed"] = model.Run{ID: "run-seed", Repo: "https://example.com/o/r.git", RepoFullName: "o/r", Ref: "refs/heads/main", SHA: "abc", CreatedAt: now, Status: model.StatusRunning}
 	s.jobs[jobID] = model.Job{ID: jobID, RunID: "run-seed", Key: "build", BaseKey: "build", Pipeline: pipelineText, Status: model.StatusRunning, LeaseRunnerID: runnerID, LeaseTokenHash: hashLeaseToken(s.leaseKey, rawToken), LeaseGeneration: 1, LeaseExpiresAt: &exp, StartedAt: &now, CreatedAt: now}
 	s.mu.Unlock()

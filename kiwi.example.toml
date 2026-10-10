@@ -52,6 +52,18 @@ listen = ":8080"
 # Empty means X-Forwarded-For is never trusted.
 # trusted_proxies = ["10.0.0.0/8", "192.168.0.0/16"]
 
+# Minimum WIRE-SEMANTIC runner protocol version accepted at registration
+# (model.RunnerProtocolVersion). Unset uses the current version (2), so a
+# legacy runner that omits protocol_version is refused 400 and never stored;
+# values above the running binary's protocol are refused at startup and
+# negatives are invalid. Lower it to 1 ONLY for a controlled upgrade window:
+# legacy runners may then register and finish already-claimed jobs
+# (heartbeat/logs/completion stay generation fenced), but every /next answers
+# 409 RUNNER_PROTOCOL_UNSUPPORTED, so no legacy runner receives new work.
+# Raise it back to the default once every runner is upgraded. The server's
+# advertised protocol_version is not configurable and is never lowered.
+# min_runner_protocol = 2
+
 [database]
 # PostgreSQL connection URL; enables the durable SQL control plane.
 url = "postgres://kiwi:secret@db:5432/kiwi"

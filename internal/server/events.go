@@ -789,19 +789,28 @@ func (s *Server) requireExecutionEventsRead(w http.ResponseWriter, r *http.Reque
 		return s.executionRequestScope(r, runID, repoID), true
 	}
 	if runID != "" {
-		run, err := s.runForAuth(r.Context(), runID)
-		if err != nil {
-			if auth.AuthorizeCapability(p, auth.CapExecutionEventsRead, "") {
-				return storage.ExecutionEventScope{Kind: storage.ExecutionEventScopeRun, RunID: runID}, true
+		// A global execution.events:read capability keeps the existing
+		// tolerant behavior, including the unknown-run empty read: it already
+		// sees every repository's stream, so no existence can be leaked.
+		if auth.AuthorizeCapability(p, auth.CapExecutionEventsRead, "") {
+			scope := storage.ExecutionEventScope{Kind: storage.ExecutionEventScopeRun, RunID: runID}
+			if run, err := s.runForAuth(r.Context(), runID); err == nil {
+				scope.RepoID = repoIDForRun(run)
 			}
-			http.Error(w, "forbidden", http.StatusForbidden)
+			return scope, true
+		}
+		// Otherwise an unknown run_id and a run the caller cannot see are the
+		// SAME masked 404 (never the old fail-closed 403, which let a caller
+		// distinguish another repository's run from a missing id).
+		run, ok := s.requireRunVisible(w, r, runID)
+		if !ok {
 			return storage.ExecutionEventScope{}, false
 		}
 		repo := repoIDForRun(run)
 		if auth.AuthorizeCapability(p, auth.CapExecutionEventsRead, repo) || auth.CanReadRepo(p, repo) {
 			return storage.ExecutionEventScope{Kind: storage.ExecutionEventScopeRun, RepoID: repo, RunID: runID}, true
 		}
-		http.Error(w, "forbidden", http.StatusForbidden)
+		s.writeMaskedRunNotFound(w)
 		return storage.ExecutionEventScope{}, false
 	}
 	if repoID != "" {

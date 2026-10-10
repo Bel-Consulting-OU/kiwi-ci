@@ -50,8 +50,8 @@ func scopedStoreServer(t *testing.T) *Server {
 	s.artifacts["art-b"] = model.ArtifactRecord{ID: "art-b", RunID: "run-b", JobID: "job-b", Name: "bin", SHA256: "a", CreatedAt: now}
 	s.snapshots["snap-a"] = model.SnapshotRecord{ID: "snap-a", RunID: "run-a", CreatedAt: now}
 	s.snapshots["snap-b"] = model.SnapshotRecord{ID: "snap-b", RunID: "run-b", CreatedAt: now}
-	s.runners["r-a"] = model.Runner{ID: "r-a", Name: "r-a", Capacity: 1, ActiveJobs: []string{"job-a"}}
-	s.runners["r-b"] = model.Runner{ID: "r-b", Name: "r-b", Capacity: 1, ActiveJobs: []string{"job-b"}}
+	s.runners["r-a"] = model.Runner{ProtocolVersion: 2, ID: "r-a", Name: "r-a", Capacity: 1, ActiveJobs: []string{"job-a"}}
+	s.runners["r-b"] = model.Runner{ProtocolVersion: 2, ID: "r-b", Name: "r-b", Capacity: 1, ActiveJobs: []string{"job-b"}}
 	s.mu.Unlock()
 	return s
 }
@@ -101,16 +101,21 @@ func TestScopedRunReadDeniesForeignRepo(t *testing.T) {
 	if w := doJSON(t, s, http.MethodGet, "/api/v1/runs/run-a/jobs", "reader", ""); w.Code != http.StatusOK {
 		t.Fatalf("read own repo jobs: %d: %s", w.Code, w.Body.String())
 	}
-	// Foreign-repo reads are forbidden.
-	for _, path := range []string{
-		"/api/v1/runs/run-b",
-		"/api/v1/runs/run-b/jobs",
-		"/api/v1/runs/run-b/snapshots",
-		"/api/v1/runs/run-b/deployments",
-		"/api/v1/runs/run-b/artifacts",
+	// Foreign-repo reads are existence-masked (the snapshot route is a
+	// capability route, whose tier gate refuses the credential before the
+	// handler resolves the run, so it stays a uniform 403).
+	for _, tc := range []struct {
+		path string
+		want int
+	}{
+		{"/api/v1/runs/run-b", http.StatusNotFound},
+		{"/api/v1/runs/run-b/jobs", http.StatusNotFound},
+		{"/api/v1/runs/run-b/snapshots", http.StatusForbidden},
+		{"/api/v1/runs/run-b/deployments", http.StatusNotFound},
+		{"/api/v1/runs/run-b/artifacts", http.StatusNotFound},
 	} {
-		if w := doJSON(t, s, http.MethodGet, path, "reader", ""); w.Code != http.StatusForbidden {
-			t.Fatalf("reader on %s: want 403 got %d: %s", path, w.Code, w.Body.String())
+		if w := doJSON(t, s, http.MethodGet, tc.path, "reader", ""); w.Code != tc.want {
+			t.Fatalf("reader on %s: want %d got %d: %s", tc.path, tc.want, w.Code, w.Body.String())
 		}
 	}
 	// A repository read grant without artifact_read cannot list artifacts
@@ -122,8 +127,8 @@ func TestScopedRunReadDeniesForeignRepo(t *testing.T) {
 	if w := doJSON(t, s, http.MethodGet, "/api/v1/runs/run-a/artifacts", "artifact-reader", ""); w.Code != http.StatusOK {
 		t.Fatalf("artifact-reader list: %d: %s", w.Code, w.Body.String())
 	}
-	if w := doJSON(t, s, http.MethodGet, "/api/v1/artifacts/art-b", "artifact-reader", ""); w.Code != http.StatusForbidden {
-		t.Fatalf("artifact-reader on foreign artifact: want 403 got %d", w.Code)
+	if w := doJSON(t, s, http.MethodGet, "/api/v1/artifacts/art-b", "artifact-reader", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("artifact-reader on foreign artifact: want masked 404 got %d", w.Code)
 	}
 }
 

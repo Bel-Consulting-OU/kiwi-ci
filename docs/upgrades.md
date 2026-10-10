@@ -8,6 +8,7 @@ upgrade a deployment safely.
 | Surface | Version | Source |
 |---|---|---|
 | Runner API protocol | 3 | `internal/version` (`ProtocolVersion`), negotiated `ProtocolMin`/`ProtocolMax` per runner |
+| Runner wire-semantic protocol | 2 | `internal/model` (`RunnerProtocolVersion`), negotiated `protocol_version` per runner; floor `server.min_runner_protocol` |
 | Pipeline language | 1 | `PipelineSchemaVersion`; `version:` field in pipeline YAML |
 | Storage snapshot (fs dev store) | 1 | `StorageSchemaVersion`; `Snapshot.Version` |
 | PostgreSQL schema | sequential migration numbers | `internal/storage/migrations/*.sql` |
@@ -25,6 +26,16 @@ Upgrade order for protocol changes:
    overlaps);
 2. Upgrade runners;
 3. Raise the minimum when the fleet has converged.
+
+Separate from the runner API range, every registration and lease carries a
+WIRE-SEMANTIC protocol version (`model.RunnerProtocolVersion`, currently 2)
+with a configurable registration floor (`server.min_runner_protocol`,
+default: the current version). A legacy registration without
+`protocol_version` is v1 and is refused by the default floor; a registered
+legacy runner is refused new leases with `409
+RUNNER_PROTOCOL_UNSUPPORTED` but can still drain already-claimed work. See
+[production-deployment.md](production-deployment.md#rolling-upgrades-and-the-runner-protocol-floor)
+for the two-phase rolling-upgrade procedure.
 
 ## Pipeline schema (v1)
 

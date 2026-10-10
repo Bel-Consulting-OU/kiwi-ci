@@ -19,7 +19,7 @@ func TestQueueReasonsPersistedViaStoreDBMode(t *testing.T) {
 	// Seed a runner and two queued jobs: one waiting on a dependency, one
 	// needing a label the runner lacks.
 	f.mu.Lock()
-	f.runners["runner1"] = model.Runner{ID: "runner1", Name: "runner1", Labels: []string{"container"}, Capacity: 1}
+	f.runners["runner1"] = model.Runner{ProtocolVersion: 2, ID: "runner1", Name: "runner1", Labels: []string{"container"}, Capacity: 1}
 	f.runs["run1"] = model.Run{ID: "run1", Status: model.StatusQueued}
 	f.jobs["job-dep"] = model.Job{ID: "job-dep", RunID: "run1", Key: "waits", Status: model.StatusQueued, Needs: []string{"job-done"}, CreatedAt: time.Now().UTC()}
 	f.jobs["job-done"] = model.Job{ID: "job-done", RunID: "run1", Key: "done", Status: model.StatusRunning, CreatedAt: time.Now().UTC()}

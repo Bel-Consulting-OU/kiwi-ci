@@ -76,7 +76,7 @@ func cacheFixture(t *testing.T, opts ...Option) (*Server, *dbFakeStore, *memBlob
 	f.runs["run-c"] = model.Run{ID: "run-c", Repo: "https://github.com/o/repo-a.git", RepoFullName: "o/repo-a", Status: model.StatusRunning}
 	f.jobs["job-a"] = model.Job{ID: "job-a", RunID: "run-c", Key: "build", RepoURL: "https://github.com/o/repo-a.git", RepoFullName: "o/repo-a",
 		Status: model.StatusRunning, Trusted: true, LeaseRunnerID: "runner-a", LeaseTokenHash: hashLeaseToken(s.leaseKey, "cache-lease-token"), LeaseGeneration: 5, LeaseExpiresAt: &exp}
-	f.runners["runner-a"] = model.Runner{ID: "runner-a", Name: "runner-a", Capacity: 1}
+	f.runners["runner-a"] = model.Runner{ProtocolVersion: 2, ID: "runner-a", Name: "runner-a", Capacity: 1}
 	f.mu.Unlock()
 	return s, f, mb, hdrs
 }
@@ -105,7 +105,7 @@ func TestCacheManifestFailureKeepsSharedCASBlobAndFails(t *testing.T) {
 	f.mu.Lock()
 	f.jobs["job-b"] = model.Job{ID: "job-b", RunID: "run-c", Key: "build", RepoURL: "https://github.com/o/repo-a.git", RepoFullName: "o/repo-a",
 		Status: model.StatusRunning, Trusted: true, LeaseRunnerID: "runner-b", LeaseTokenHash: hashLeaseToken(s.leaseKey, "cache-lease-token"), LeaseGeneration: 5, LeaseExpiresAt: &exp}
-	f.runners["runner-b"] = model.Runner{ID: "runner-b", Name: "runner-b", Capacity: 1}
+	f.runners["runner-b"] = model.Runner{ProtocolVersion: 2, ID: "runner-b", Name: "runner-b", Capacity: 1}
 	f.cacheManErr = fmt.Errorf("manifest table down")
 	f.mu.Unlock()
 

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,6 +15,90 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
+
+// executionSemanticsTestPipeline is a minimal admitted pipeline for the
+// enqueue-stamping tests: a pinned container image (the default policy
+// forbids native host execution).
+const executionSemanticsTestPipeline = "version: 1\njobs:\n  build:\n    runtime: container\n    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n    steps:\n      - run: echo semantics\n"
+
+// assertJobsStampedWithCurrentSemantics checks that every job of runID in
+// jobs carries the current execution semantics, and that at least one job was
+// seen.
+func assertJobsStampedWithCurrentSemantics(t *testing.T, runID string, jobs []model.Job) {
+	t.Helper()
+	seen := 0
+	for _, j := range jobs {
+		if j.RunID != runID {
+			continue
+		}
+		seen++
+		if j.ExecutionSemantics != model.ExecutionSemanticsVersion {
+			t.Fatalf("job %s semantics = %q, want %q", j.ID, j.ExecutionSemantics, model.ExecutionSemanticsVersion)
+		}
+	}
+	if seen == 0 {
+		t.Fatalf("run %s has no jobs to check", runID)
+	}
+}
+
+// TestEnqueueStampsExecutionSemanticsMemory proves the reproducibility
+// boundary is stamped at enqueue in memory mode: the run and every one of its
+// jobs carry model.ExecutionSemanticsVersion.
+func TestEnqueueStampsExecutionSemanticsMemory(t *testing.T) {
+	s := New("token")
+	run, err := s.enqueue(context.Background(), SubmitRun{
+		RepoURL: "https://github.com/kiwi/repo.git", RepoFullName: "kiwi/repo",
+		Ref: "main", SHA: "abc", Event: "push", Pipeline: executionSemanticsTestPipeline,
+	})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if run.ExecutionSemantics != model.ExecutionSemanticsVersion {
+		t.Fatalf("run semantics = %q, want %q", run.ExecutionSemantics, model.ExecutionSemanticsVersion)
+	}
+	s.mu.Lock()
+	stored := s.runs[run.ID]
+	jobs := make([]model.Job, 0, len(s.jobs))
+	for _, j := range s.jobs {
+		jobs = append(jobs, j)
+	}
+	s.mu.Unlock()
+	if stored.ExecutionSemantics != model.ExecutionSemanticsVersion {
+		t.Fatalf("stored run semantics = %q, want %q", stored.ExecutionSemantics, model.ExecutionSemanticsVersion)
+	}
+	assertJobsStampedWithCurrentSemantics(t, run.ID, jobs)
+}
+
+// TestEnqueueStampsExecutionSemanticsDBFake is the DB-mode counterpart: the
+// run and jobs persisted through InsertCompiledRun carry the stamp.
+func TestEnqueueStampsExecutionSemanticsDBFake(t *testing.T) {
+	s := New("token")
+	f := newDBFakeStore()
+	if err := s.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	run, err := s.enqueue(context.Background(), SubmitRun{
+		RepoURL: "https://github.com/kiwi/repo.git", RepoFullName: "kiwi/repo",
+		Ref: "main", SHA: "abc", Event: "push", Pipeline: executionSemanticsTestPipeline,
+	})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if run.ExecutionSemantics != model.ExecutionSemanticsVersion {
+		t.Fatalf("run semantics = %q, want %q", run.ExecutionSemantics, model.ExecutionSemanticsVersion)
+	}
+	f.mu.Lock()
+	stored := f.runs[run.ID]
+	jobs := make([]model.Job, 0, len(f.jobs))
+	for _, j := range f.jobs {
+		jobs = append(jobs, j)
+	}
+	f.mu.Unlock()
+	if stored.ExecutionSemantics != model.ExecutionSemanticsVersion {
+		t.Fatalf("stored run semantics = %q, want %q", stored.ExecutionSemantics, model.ExecutionSemanticsVersion)
+	}
+	assertJobsStampedWithCurrentSemantics(t, run.ID, jobs)
+}
 
 // TestEnqueueInterpolatesInputsIntoStoredPipeline covers the CompileWithInputs
 // adoption at enqueue: submitting validated inputs interpolates ${{ inputs.x }}

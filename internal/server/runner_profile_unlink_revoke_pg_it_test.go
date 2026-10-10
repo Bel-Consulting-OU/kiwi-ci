@@ -70,7 +70,7 @@ func TestIntegrationRunnerProfileUnlinkRevokesCapacityPostgres(t *testing.T) {
 	// all ignored in favor of the profile, and the profile's ResourceCapacity
 	// reaches the registration response.
 	ri := pgITRegisterBearer(t, s, "token-a",
-		`{"id":"`+runnerID+`","name":"ra","protocol_min":3,"protocol_max":3,"labels":["self"],"capacity":9,"capabilities":["native","container"],`+
+		`{"id":"`+runnerID+`","name":"ra","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["self"],"capacity":9,"capabilities":["native","container"],`+
 			`"resource_capacity":{"cpu":999,"memory":4611686018427387904,"disk":4611686018427387904,"pids":1000000}}`)
 	want := model.ResourceCapacity{CPU: 4, Memory: 8 << 30, Disk: 16 << 30, PIDs: 512}
 	if ri.Capacity != 4 || ri.ResourceCapacity != want || ri.ProfileID != "revoke-pg" {

@@ -54,7 +54,7 @@ func newHACluster(t *testing.T) *haCluster {
 // through replica 0's HTTP surface.
 func haRegisterRunner(t *testing.T, s *Server, capacity int) model.Runner {
 	t.Helper()
-	body := fmt.Sprintf(`{"name":"ha-runner","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":%d}`, capacity)
+	body := fmt.Sprintf(`{"name":"ha-runner","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":%d}`, capacity)
 	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token", body)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d %s", w.Code, w.Body.String())

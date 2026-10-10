@@ -93,6 +93,12 @@ type recordedJobPipeline struct {
 	Pipeline           string                    `json:"pipeline"`
 	CompiledJobPayload *model.CompiledJobPayload `json:"compiled_job_payload,omitempty"`
 	PersistedJob       *recordedPersistedJob     `json:"persisted_job,omitempty"`
+	// ExecutionSemantics is the execution-engine semantic version
+	// (model.ExecutionSemanticsVersion) the recorded job was stamped with at
+	// enqueue. Exact replay refuses to reinterpret a record produced under
+	// different semantics; empty means the control plane predates semantics
+	// stamping and replay proceeds under a warning.
+	ExecutionSemantics string `json:"execution_semantics,omitempty"`
 }
 
 // recordedPersistedJob is the persisted execution state the materializer
@@ -118,6 +124,37 @@ func (r recordedPersistedJob) persistedJob() model.Job {
 		DiskRequest:            r.DiskRequest,
 		PIDsRequest:            r.PIDsRequest,
 		ServiceEnvelopeRequest: r.ServiceEnvelopeRequest,
+	}
+}
+
+// replayExecutionSemanticsCheck applies the exact-replay decision table for
+// the recorded execution-engine semantics (model.ExecutionSemanticsVersion).
+// Exact replay reinterprets recorded history with the CURRENT engine, so the
+// recorded stamp decides whether that is legitimate:
+//
+//   - equal to the current version: proceed silently;
+//   - EMPTY (a record persisted before semantics stamping): print a clear
+//     warning that the record predates the boundary and replay assumes the
+//     CURRENT semantics, then proceed;
+//   - any OTHER value (a record produced by a different engine semantics):
+//     refuse, naming the recorded and current versions. The
+//     --allow-unknown-semantics escape hatch proceeds with a loud warning
+//     that the replay is FORENSICS ONLY and may not reproduce the recorded
+//     execution. --debug-rerun never reaches this check (it is explicitly
+//     current-local semantics).
+func replayExecutionSemanticsCheck(recorded string, allowUnknown bool, runID, jobRef string) error {
+	current := model.ExecutionSemanticsVersion
+	switch {
+	case recorded == current:
+		return nil
+	case recorded == "":
+		fmt.Fprintf(os.Stderr, "warning: recorded job %q in run %s predates execution-semantics stamping (empty execution_semantics); exact replay assumes the CURRENT semantics %s and may reinterpret the record differently than the engine that produced it\n", jobRef, runID, current)
+		return nil
+	case !allowUnknown:
+		return fmt.Errorf("refusing exact replay of job %q in run %s: the record was produced under execution semantics %q but this binary implements %q; replaying would reinterpret recorded history under different semantics — re-run with --allow-unknown-semantics to proceed (FORENSICS ONLY) or use --debug-rerun for current local semantics", jobRef, runID, recorded, current)
+	default:
+		fmt.Fprintf(os.Stderr, "warning: --allow-unknown-semantics: recorded job %q in run %s was produced under execution semantics %q, not the current %q; this replay is FORENSICS ONLY and may not reproduce the recorded execution\n", jobRef, runID, recorded, current)
+		return nil
 	}
 }
 
@@ -149,6 +186,15 @@ var replayWorkspaceDiskQuotaSetup = executor.WorkspaceDiskQuotaSetup
 // executed. Execution semantics therefore come from the local checkout and
 // may differ from the recorded run.
 //
+// Exact mode additionally enforces the REPRODUCIBILITY BOUNDARY: the recorded
+// job's execution-engine semantic version (model.ExecutionSemanticsVersion)
+// must equal this binary's, because exact replay reinterprets recorded
+// history with the current engine. A record that predates semantics stamping
+// (empty value) proceeds under a warning; any other value is refused with
+// both versions named unless the forensic --allow-unknown-semantics escape
+// hatch is passed. --debug-rerun is exempt by definition: it never claims to
+// reproduce the recorded execution.
+//
 // An untrusted recorded job (exact mode) additionally requires the same
 // OS-level hard workspace quota the distributed runner installs: the quota is
 // applied to the replay workspace BEFORE the snapshot is restored, and when
@@ -167,7 +213,7 @@ var replayWorkspaceDiskQuotaSetup = executor.WorkspaceDiskQuotaSetup
 // always prints the residual-risk warning that a step can perform effects
 // Kiwi cannot see.
 //
-// Usage: kiwi replay RUN JOB [STEP] --server URL --token TOKEN [--attempt N] [--debug-rerun] [--allow-unbounded-workspace] [--allow-post-job-snapshot] [--allow-external-effects] [--pipeline FILE]
+// Usage: kiwi replay RUN JOB [STEP] --server URL --token TOKEN [--attempt N] [--debug-rerun] [--allow-unbounded-workspace] [--allow-post-job-snapshot] [--allow-external-effects] [--allow-unknown-semantics] [--pipeline FILE]
 func Replay(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("replay", flag.ContinueOnError)
 	server := fs.String("server", os.Getenv("KIWI_SERVER"), "control plane URL")
@@ -178,12 +224,13 @@ func Replay(ctx context.Context, args []string) error {
 	allowUnbounded := fs.Bool("allow-unbounded-workspace", false, "replay an untrusted recorded job even when no OS-level hard workspace quota can be established (hostile recorded code can then fill the operator filesystem; prints a warning)")
 	allowPostJob := fs.Bool("allow-post-job-snapshot", false, "replay from the post-execution (post_job) snapshot when the attempt has no pre-execution checkpoint (execution starts from post-execution workspace state)")
 	allowExternalEffects := fs.Bool("allow-external-effects", false, "exact replay may re-execute the recorded job's DECLARED external effects (deployment phases, secret injection, OIDC issuance) with your CURRENT credentials and network; without it replay refuses a job declaring any of them")
+	allowUnknownSemantics := fs.Bool("allow-unknown-semantics", false, "exact replay may proceed when the recorded job was produced under a DIFFERENT execution-engine semantics version than this binary (FORENSICS ONLY: the replay may not reproduce the recorded execution; prints a loud warning)")
 	rest, err := parseFlagsAndPositionals(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(rest) != 2 && len(rest) != 3 {
-		return fmt.Errorf("usage: kiwi replay RUN JOB [STEP] --server URL --token TOKEN [--attempt N] [--debug-rerun] [--allow-unbounded-workspace] [--allow-post-job-snapshot] [--allow-external-effects] [--pipeline FILE]")
+		return fmt.Errorf("usage: kiwi replay RUN JOB [STEP] --server URL --token TOKEN [--attempt N] [--debug-rerun] [--allow-unbounded-workspace] [--allow-post-job-snapshot] [--allow-external-effects] [--allow-unknown-semantics] [--pipeline FILE]")
 	}
 	if *server == "" {
 		return fmt.Errorf("--server (or KIWI_SERVER) is required")
@@ -265,6 +312,12 @@ func Replay(ctx context.Context, args []string) error {
 		}
 		if rec.Pipeline == "" {
 			return fmt.Errorf("run %s job %q has no recorded pipeline", runID, jobKey)
+		}
+		// The reproducibility boundary: exact replay reinterprets recorded
+		// history under the CURRENT engine semantics, so a record produced
+		// under a different semantics may not be silently reinterpreted.
+		if err := replayExecutionSemanticsCheck(rec.ExecutionSemantics, *allowUnknownSemantics, runID, rec.Key); err != nil {
+			return err
 		}
 		spec, err = pipeline.Parse([]byte(rec.Pipeline))
 		if err != nil {

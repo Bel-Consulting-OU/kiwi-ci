@@ -31,8 +31,18 @@ func recordedExport(t *testing.T, text, key string, mutate func(*model.CompiledJ
 
 // recordedExportWithPersisted is recordedExport with an explicit persisted
 // job state (trust, resource requests, legacy network) so tests can exercise
-// the shared materializer's trust/resource overlays.
+// the shared materializer's trust/resource overlays. The recorded execution
+// semantics is the CURRENT version; recordedExportFull overrides it.
 func recordedExportWithPersisted(t *testing.T, text, key string, mutate func(*model.CompiledJobPayload), persisted map[string]any) string {
+	t.Helper()
+	return recordedExportFull(t, text, key, mutate, persisted, model.ExecutionSemanticsVersion)
+}
+
+// recordedExportFull is recordedExportWithPersisted with an explicit recorded
+// execution-semantics stamp. An empty semantics simulates a record persisted
+// before semantics stamping existed; any other value simulates a record from
+// a different engine semantics.
+func recordedExportFull(t *testing.T, text, key string, mutate func(*model.CompiledJobPayload), persisted map[string]any, semantics string) string {
 	t.Helper()
 	spec, err := pipeline.Parse([]byte(text))
 	if err != nil {
@@ -72,6 +82,7 @@ func recordedExportWithPersisted(t *testing.T, text, key string, mutate func(*mo
 		"pipeline":             text,
 		"compiled_job_payload": payload,
 		"persisted_job":        persisted,
+		"execution_semantics":  semantics,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -184,6 +195,96 @@ func TestReplayExactRefusesMismatchedPayload(t *testing.T) {
 	if len(env.downloads) != 0 {
 		t.Fatalf("downloaded %v despite the refusal", env.downloads)
 	}
+}
+
+// TestReplayExactExecutionSemanticsDecisionTable pins the reproducibility
+// boundary: replay proceeds when the recorded execution semantics equals the
+// current one, warns and proceeds for a record that predates stamping
+// (empty), refuses a different non-empty value naming both versions, and
+// proceeds under a loud FORENSICS-ONLY warning with
+// --allow-unknown-semantics.
+func TestReplayExactExecutionSemanticsDecisionTable(t *testing.T) {
+	historical := "version: 1\njobs:\n  build:\n    steps:\n      - run: echo historical\n"
+	newEnv := func(semantics string) *exactReplayEnv {
+		return newExactReplayEnv(t,
+			recordedExportFull(t, historical, "build", nil, map[string]any{"trusted": true}, semantics),
+			[][]model.SnapshotRecord{exactPage(model.SnapshotRecord{ID: "snap1", JobKey: "build", LeaseGeneration: 1, Phase: model.SnapshotPhasePreJob, CreatedAt: time.Now().UTC()})},
+			nil,
+			map[string][]byte{"snap1": snapshotArchive(t)},
+		)
+	}
+
+	t.Run("current proceeds", func(t *testing.T) {
+		env := newEnv(model.ExecutionSemanticsVersion)
+		if err := Replay(context.Background(), []string{"--server", env.srv.URL, "run1", "build"}); err != nil {
+			t.Fatalf("current-semantics replay: %v", err)
+		}
+		if len(env.downloads) != 1 {
+			t.Fatalf("downloads = %v, want the snapshot restored", env.downloads)
+		}
+	})
+
+	t.Run("future refuses", func(t *testing.T) {
+		env := newEnv("kiwi.execution.v-future")
+		err := Replay(context.Background(), []string{"--server", env.srv.URL, "run1", "build"})
+		if err == nil ||
+			!strings.Contains(err.Error(), "kiwi.execution.v-future") ||
+			!strings.Contains(err.Error(), model.ExecutionSemanticsVersion) ||
+			!strings.Contains(err.Error(), "--allow-unknown-semantics") {
+			t.Fatalf("future-semantics replay = %v, want a refusal naming both versions and the escape hatch", err)
+		}
+		if len(env.downloads) != 0 {
+			t.Fatalf("downloaded %v despite the refusal", env.downloads)
+		}
+	})
+
+	t.Run("empty warns and proceeds", func(t *testing.T) {
+		env := newEnv("")
+		origStderr := os.Stderr
+		pipeR, pipeW, perr := os.Pipe()
+		if perr != nil {
+			t.Fatal(perr)
+		}
+		os.Stderr = pipeW
+		replayErr := Replay(context.Background(), []string{"--server", env.srv.URL, "run1", "build"})
+		_ = pipeW.Close()
+		os.Stderr = origStderr
+		warned, _ := io.ReadAll(pipeR)
+		if replayErr != nil {
+			t.Fatalf("unstamped replay: %v", replayErr)
+		}
+		if !strings.Contains(string(warned), "predates execution-semantics stamping") || !strings.Contains(string(warned), model.ExecutionSemanticsVersion) {
+			t.Fatalf("missing/unclear legacy-semantics warning: %q", string(warned))
+		}
+		if len(env.downloads) != 1 {
+			t.Fatalf("downloads = %v, want the snapshot restored", env.downloads)
+		}
+	})
+
+	t.Run("escape hatch proceeds with warning", func(t *testing.T) {
+		env := newEnv("kiwi.execution.v-future")
+		origStderr := os.Stderr
+		pipeR, pipeW, perr := os.Pipe()
+		if perr != nil {
+			t.Fatal(perr)
+		}
+		os.Stderr = pipeW
+		replayErr := Replay(context.Background(), []string{"--server", env.srv.URL, "--allow-unknown-semantics", "run1", "build"})
+		_ = pipeW.Close()
+		os.Stderr = origStderr
+		warned, _ := io.ReadAll(pipeR)
+		if replayErr != nil {
+			t.Fatalf("escape-hatch replay: %v", replayErr)
+		}
+		if !strings.Contains(string(warned), "FORENSICS ONLY") ||
+			!strings.Contains(string(warned), "kiwi.execution.v-future") ||
+			!strings.Contains(string(warned), model.ExecutionSemanticsVersion) {
+			t.Fatalf("missing/unclear unknown-semantics warning: %q", string(warned))
+		}
+		if len(env.downloads) != 1 {
+			t.Fatalf("downloads = %v, want the snapshot restored", env.downloads)
+		}
+	})
 }
 
 // TestReplayExactSelectsRequestedAttempt: with several snapshots for the same

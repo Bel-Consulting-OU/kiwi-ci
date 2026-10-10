@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/blob"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/quotas"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/ratelimit"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secretbroker"
@@ -88,6 +89,19 @@ type ServerConfig struct {
 	// is walked from the right and the first untrusted hop is the client; a
 	// malformed or entirely trusted chain falls back to the direct peer.
 	TrustedProxies []string `toml:"trusted_proxies"`
+	// MinRunnerProtocol is the minimum WIRE-SEMANTIC runner protocol
+	// version accepted at registration (see model.RunnerProtocolVersion;
+	// currently 2). Unset/0 uses the built-in default: the current version,
+	// so a legacy runner that omits protocol_version is refused 400 and
+	// never stored. Operators lower it to 1 ONLY for a controlled upgrade
+	// window in which legacy runners must not be leased new work: those
+	// runners may re-register and drain already-claimed jobs
+	// (heartbeat/logs/completion stay generation fenced), but every /next
+	// answers 409 RUNNER_PROTOCOL_UNSUPPORTED. Values above the running
+	// binary's model.RunnerProtocolVersion are rejected: a lower-version
+	// server cannot promise a higher version's semantics. Never configure
+	// this below 1.
+	MinRunnerProtocol int `toml:"min_runner_protocol"`
 }
 
 type DatabaseConfig struct {
@@ -386,6 +400,10 @@ func Default() *Config {
 			// enough that the commit-ordered table cannot grow without
 			// bound. "0" disables retention (unbounded stream).
 			EventsRetention: "168h",
+			// Registration defaults fail closed: a runner below the current
+			// wire-semantic protocol is refused unless the operator
+			// explicitly lowers the minimum for an upgrade window.
+			MinRunnerProtocol: model.RunnerProtocolVersion,
 		},
 		Blob: BlobConfig{Backend: "fs"},
 		Quota: QuotaConfig{
@@ -500,6 +518,20 @@ func (c *Config) Validate() error {
 	}
 	if c.Server.MaxRetainedRuns < -1 {
 		return fmt.Errorf("server.max_retained_runs must be >= -1 (0 = default, -1 = disabled), got %d", c.Server.MaxRetainedRuns)
+	}
+	// Wire-semantic runner protocol floor: unset (0) takes the built-in
+	// default (the current version) so the zero-value Config keeps
+	// validating; negative values are refused, and a value above the
+	// running binary's protocol is refused because this binary cannot
+	// promise semantics it does not implement.
+	if c.Server.MinRunnerProtocol == 0 {
+		c.Server.MinRunnerProtocol = model.RunnerProtocolVersion
+	}
+	if c.Server.MinRunnerProtocol < 0 {
+		return fmt.Errorf("server.min_runner_protocol must be >= 1 (0 = default), got %d", c.Server.MinRunnerProtocol)
+	}
+	if c.Server.MinRunnerProtocol > model.RunnerProtocolVersion {
+		return fmt.Errorf("server.min_runner_protocol %d exceeds this binary's runner protocol version %d", c.Server.MinRunnerProtocol, model.RunnerProtocolVersion)
 	}
 	// Trusted proxies gate whether X-Forwarded-For may identify a client, so
 	// a malformed entry must fail startup instead of silently trusting

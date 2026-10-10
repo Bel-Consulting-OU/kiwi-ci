@@ -60,7 +60,7 @@ func seedRunningJob(t *testing.T, s *Server, jobKey, runnerID, rawToken string) 
 		t.Fatalf("no job with key %q", jobKey)
 	}
 	if _, ok := s.runners[runnerID]; !ok {
-		s.runners[runnerID] = model.Runner{ID: runnerID, Name: runnerID, Capacity: 1, Labels: []string{"container"}}
+		s.runners[runnerID] = model.Runner{ProtocolVersion: 2, ID: runnerID, Name: runnerID, Capacity: 1, Labels: []string{"container"}}
 	}
 	return jobID, map[string]string{
 		"X-Kiwi-Runner-ID":        runnerID,

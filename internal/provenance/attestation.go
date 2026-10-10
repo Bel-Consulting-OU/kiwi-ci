@@ -27,9 +27,10 @@ const ExecutionAttestationPredicateType = "kiwi-ci/execution-attestation/v1"
 // version. It is part of the canonical digest preimage, so a future field
 // change must bump it. Version 2 added completionResultDigest (the durable v2
 // completion identity) and evidenceRootSha256 (the full artifact-side
-// evidence graph root); an envelope signed under schema 1 predates both
-// fields and no longer verifies under this digest.
-const executionAttestationSchemaVersion = 2
+// evidence graph root); version 3 added executionSemantics (the engine
+// semantics the attempt ran under). An envelope signed under an earlier
+// schema predates later fields and no longer verifies under this digest.
+const executionAttestationSchemaVersion = 3
 
 // executionAttestationDigestVersion tags the canonical hashing encoding.
 const executionAttestationDigestVersion = "kiwi-ci/execution-attestation-digest/v1"
@@ -110,6 +111,12 @@ type ExecutionAttestation struct {
 	// identities. The per-item lists above remain the human-readable detail;
 	// this root is the binding.
 	EvidenceRootSHA256 string `json:"evidenceRootSha256,omitempty"`
+	// ExecutionSemantics is the execution-engine semantic version
+	// (model.ExecutionSemanticsVersion) the attempt ran under, read from the
+	// durable stamped job/run at attestation time. It is part of the
+	// canonical digest, so a verifier detects any tampering with it. Empty
+	// for attempts that predate semantics stamping.
+	ExecutionSemantics string `json:"executionSemantics,omitempty"`
 }
 
 // ExecutionAttestationInput assembles the attestation statement's evidence.
@@ -143,6 +150,12 @@ type ExecutionAttestationInput struct {
 	// durable records; it is copied into the signed block and canonical
 	// digest like every other field.
 	EvidenceRootSHA256 string
+	// ExecutionSemantics is the execution-engine semantic version
+	// (model.ExecutionSemanticsVersion) the attempt ran under, read from the
+	// durable stamped records. It is copied into the signed block and
+	// canonical digest, so a consumer detects any tampering with it. Empty
+	// for attempts that predate semantics stamping; it is never guessed.
+	ExecutionSemantics string
 }
 
 // ExecutionAttestationStatement builds the signed statement of a final
@@ -174,6 +187,7 @@ func ExecutionAttestationStatement(in ExecutionAttestationInput) (Statement, err
 		MaterialRootSHA256:     in.MaterialRootSHA256,
 		CompletionResultDigest: in.CompletionResultDigest,
 		EvidenceRootSHA256:     in.EvidenceRootSHA256,
+		ExecutionSemantics:     in.ExecutionSemantics,
 	}
 	SortAttestationEvidence(&att)
 	digest, err := ExecutionAttestationDigest(att)
@@ -187,6 +201,7 @@ func ExecutionAttestationStatement(in ExecutionAttestationInput) (Statement, err
 		AttemptID:              att.AttemptID,
 		CapsuleDigest:          att.CapsuleDigest,
 		ExecutionCapsuleDigest: att.ExecutionCapsuleDigest,
+		ExecutionSemantics:     att.ExecutionSemantics,
 		RunnerIdentity:         att.RunnerIdentity,
 		StartTime:              att.StartedAt,
 		EndTime:                att.FinishedAt,
@@ -416,6 +431,7 @@ func ExecutionAttestationDigest(att ExecutionAttestation) (string, error) {
 	field("materialRootSha256", att.MaterialRootSHA256)
 	field("completionResultDigest", att.CompletionResultDigest)
 	field("evidenceRootSha256", att.EvidenceRootSHA256)
+	field("executionSemantics", att.ExecutionSemantics)
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
@@ -462,6 +478,9 @@ func VerifyExecutionAttestation(st Statement) error {
 	}
 	if st.Attestation.CapsuleDigest != st.CapsuleDigest || st.Attestation.ExecutionCapsuleDigest != st.ExecutionCapsuleDigest {
 		return fmt.Errorf("provenance: execution attestation capsule digests disagree with the statement")
+	}
+	if st.Attestation.ExecutionSemantics != st.ExecutionSemantics {
+		return fmt.Errorf("provenance: execution attestation execution semantics disagree with the statement")
 	}
 	return nil
 }

@@ -154,7 +154,7 @@ func TestLeaseFreezesRates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token", `{"name":"r1","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2,"cost_per_hour":2.5,"power_watts":100}`)
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token", `{"name":"r1","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2,"cost_per_hour":2.5,"power_watts":100}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d", w.Code)
 	}
@@ -192,7 +192,7 @@ func TestCompletionAggregatesUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token", `{"name":"r1","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2,"cost_per_hour":7200,"power_watts":500}`)
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token", `{"name":"r1","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2,"cost_per_hour":7200,"power_watts":500}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d", w.Code)
 	}
@@ -248,7 +248,7 @@ func TestDailyBudgetBlocksLeasesMemory(t *testing.T) {
 	s.usage = append(s.usage, usageEntry{FinishedAt: time.Now().UTC(), Cost: 5, EnergyWh: 50})
 	s.usageMu.Unlock()
 	s.DailyCostLimit = 1
-	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token", `{"name":"r1","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token", `{"name":"r1","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d", w.Code)
 	}
@@ -304,7 +304,7 @@ func TestDailyBudgetBlocksLeasesDB(t *testing.T) {
 	f.runs["run"] = model.Run{ID: "run", Status: model.StatusSuccess, CreatedAt: finished.Add(-time.Hour)}
 	f.mu.Unlock()
 	s.DailyCostLimit = 1
-	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token", `{"name":"r1","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token", `{"name":"r1","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d", w.Code)
 	}
@@ -334,7 +334,7 @@ func TestCompletionAggregatesUsageDB(t *testing.T) {
 	if err := s.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
-	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token", `{"name":"r1","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2,"cost_per_hour":7200,"power_watts":500}`)
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token", `{"name":"r1","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2,"cost_per_hour":7200,"power_watts":500}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d", w.Code)
 	}

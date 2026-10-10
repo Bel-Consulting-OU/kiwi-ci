@@ -114,7 +114,7 @@ func TestProfileEnforcedRegistrationIgnoresSelfReportedFields(t *testing.T) {
 	// capabilities are intersected with the profile (tart is dropped,
 	// native survives).
 	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "runner-tok",
-		`{"name":"r1","labels":["evil"],"region":"west","capacity":999,"cost_per_hour":9999,"power_watts":9999,"capabilities":["native","tart"],"cert_serial":"0cafe","protocol_min":3,"protocol_max":3}`)
+		`{"name":"r1","labels":["evil"],"region":"west","capacity":999,"cost_per_hour":9999,"power_watts":9999,"capabilities":["native","tart"],"cert_serial":"0cafe","protocol_version": 2, "protocol_min":3,"protocol_max":3}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d %s", w.Code, w.Body.String())
 	}
@@ -141,7 +141,7 @@ func TestProfileEnforcedRegistrationIgnoresSelfReportedFields(t *testing.T) {
 	// Without a linked profile the runner registers empty: no labels, no
 	// region, capacity 0, no rates.
 	w = doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "runner-tok",
-		`{"name":"r2","labels":["container"],"capacity":8,"cost_per_hour":3,"protocol_min":3,"protocol_max":3}`)
+		`{"name":"r2","labels":["container"],"capacity":8,"cost_per_hour":3,"protocol_version": 2, "protocol_min":3,"protocol_max":3}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register no-profile: %d %s", w.Code, w.Body.String())
 	}
@@ -176,7 +176,7 @@ jobs:
 	}
 	// The profile-less runner registers empty and never leases.
 	w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register",
-		map[string]any{"name": "r0", "protocol_min": 3, "protocol_max": 3}, "runner-tok", nil)
+		map[string]any{"name": "r0", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}, "runner-tok", nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d %s", w.Code, w.Body.String())
 	}
@@ -191,7 +191,7 @@ jobs:
 	createProfile(t, s, model.RunnerProfile{ID: "builders", Labels: []string{"container"}, Capabilities: []string{"container"}, MaxCapacity: 1})
 	bindSerial(t, s, "builders", "0x5e2")
 	w = pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register",
-		map[string]any{"name": "r1", "cert_serial": "0x5e2", "capabilities": []string{"container"}, "protocol_min": 3, "protocol_max": 3}, "runner-tok", nil)
+		map[string]any{"name": "r1", "cert_serial": "0x5e2", "capabilities": []string{"container"}, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}, "runner-tok", nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register profiled runner: %d %s", w.Code, w.Body.String())
 	}
@@ -222,7 +222,7 @@ func TestProfileBindingViaMTLSCert(t *testing.T) {
 	bindSerial(t, s, "ci", cert.SerialNumber.Text(16))
 
 	w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register",
-		map[string]any{"name": "ra", "labels": []string{"spoofed"}, "capacity": 50, "cost_per_hour": 99, "protocol_min": 3, "protocol_max": 3},
+		map[string]any{"name": "ra", "labels": []string{"spoofed"}, "capacity": 50, "cost_per_hour": 99, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3},
 		"runner-tok", cert)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register with cert: %d %s", w.Code, w.Body.String())
@@ -249,12 +249,12 @@ func TestPerRunnerBearerTokenBinding(t *testing.T) {
 
 	// Token A registers its own runner.
 	if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register",
-		map[string]any{"id": "runner-a", "name": "a", "capacity": 1, "protocol_min": 3, "protocol_max": 3}, "token-a", nil); w.Code != http.StatusOK {
+		map[string]any{"id": "runner-a", "name": "a", "capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}, "token-a", nil); w.Code != http.StatusOK {
 		t.Fatalf("register with own token: %d %s", w.Code, w.Body.String())
 	}
 	// Token A acting for runner-b is refused.
 	if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register",
-		map[string]any{"id": "runner-b", "name": "b", "capacity": 1, "protocol_min": 3, "protocol_max": 3}, "token-a", nil); w.Code != http.StatusForbidden {
+		map[string]any{"id": "runner-b", "name": "b", "capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}, "token-a", nil); w.Code != http.StatusForbidden {
 		t.Fatalf("register another runner with token-a: %d", w.Code)
 	}
 	// next() for another runner's ID is refused.
@@ -277,7 +277,7 @@ func TestPerRunnerBearerTokenBinding(t *testing.T) {
 	// Dev mode without per-runner tokens keeps the shared token working.
 	dev := New("global-tok")
 	if w := pkiRequest(t, dev.Handler(), http.MethodPost, "/api/v1/runners/register",
-		map[string]any{"name": "d", "capacity": 1, "protocol_min": 3, "protocol_max": 3}, "global-tok", nil); w.Code != http.StatusOK {
+		map[string]any{"name": "d", "capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}, "global-tok", nil); w.Code != http.StatusOK {
 		t.Fatalf("dev global token: %d %s", w.Code, w.Body.String())
 	}
 }
@@ -297,11 +297,11 @@ func TestPerRunnerTokensDBMode(t *testing.T) {
 	}
 	h := s.Handler()
 	if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register",
-		map[string]any{"id": "runner-a", "name": "a", "capacity": 1, "protocol_min": 3, "protocol_max": 3}, "token-a", nil); w.Code != http.StatusOK {
+		map[string]any{"id": "runner-a", "name": "a", "capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}, "token-a", nil); w.Code != http.StatusOK {
 		t.Fatalf("db per-runner register: %d %s", w.Code, w.Body.String())
 	}
 	if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register",
-		map[string]any{"id": "runner-a", "name": "a", "capacity": 1, "protocol_min": 3, "protocol_max": 3}, "token-b", nil); w.Code != http.StatusUnauthorized {
+		map[string]any{"id": "runner-a", "name": "a", "capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}, "token-b", nil); w.Code != http.StatusUnauthorized {
 		t.Fatalf("unknown db token: %d", w.Code)
 	}
 }
@@ -317,12 +317,12 @@ func TestUnifiedMiddlewareRunnerBearerWithPopulatedStore(t *testing.T) {
 	h := s.Handler()
 	// Runner bearer on a runner route reaches the handler.
 	if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register",
-		map[string]any{"name": "r1", "capacity": 1, "protocol_min": 3, "protocol_max": 3}, "runner-tok", nil); w.Code != http.StatusOK {
+		map[string]any{"name": "r1", "capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}, "runner-tok", nil); w.Code != http.StatusOK {
 		t.Fatalf("runner bearer with populated store: %d %s", w.Code, w.Body.String())
 	}
 	// A store principal cannot reach the runner tier.
 	if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register",
-		map[string]any{"name": "r2", "capacity": 1, "protocol_min": 3, "protocol_max": 3}, "ci-token", nil); w.Code != http.StatusUnauthorized {
+		map[string]any{"name": "r2", "capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}, "ci-token", nil); w.Code != http.StatusUnauthorized {
 		t.Fatalf("store principal on runner tier: %d", w.Code)
 	}
 	// The store principal still reaches its own RBAC routes.
@@ -347,12 +347,12 @@ func TestUnifiedMiddlewareMTLSOnlyWithPopulatedStore(t *testing.T) {
 	h := s.Handler()
 	_, cert := pkiSignRunner(t, ca, "runner-a")
 	if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register",
-		map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "protocol_min": 3, "protocol_max": 3}, "", cert); w.Code != http.StatusOK {
+		map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}, "", cert); w.Code != http.StatusOK {
 		t.Fatalf("mTLS-only runner with populated store: %d %s", w.Code, w.Body.String())
 	}
 	// Without a certificate the same route is refused.
 	if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register",
-		map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "protocol_min": 3, "protocol_max": 3}, "", nil); w.Code != http.StatusUnauthorized {
+		map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}, "", nil); w.Code != http.StatusUnauthorized {
 		t.Fatalf("cert-less runner route: %d", w.Code)
 	}
 }
@@ -382,7 +382,7 @@ func TestRevocationSharedAcrossReplicas(t *testing.T) {
 	// Register the runner on s1 (DB row), then disable it there: the
 	// revocation lands in the durable cert_revocations table.
 	if w := pkiRequest(t, s1.Handler(), http.MethodPost, "/api/v1/runners/register",
-		map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "protocol_min": 3, "protocol_max": 3}, "runner-tok", cert); w.Code != http.StatusOK {
+		map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}, "runner-tok", cert); w.Code != http.StatusOK {
 		t.Fatalf("register: %d %s", w.Code, w.Body.String())
 	}
 	if w := pkiRequest(t, s1.Handler(), http.MethodPost, "/api/v1/runners/runner-a/disable", map[string]any{}, "runner-tok", nil); w.Code != http.StatusOK {

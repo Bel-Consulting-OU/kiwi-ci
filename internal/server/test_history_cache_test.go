@@ -232,12 +232,12 @@ func historyStressServer(t *testing.T) (*Server, *slowHistoryStore, historyStres
 		st.mu.Lock()
 		st.runs[runID] = run
 		st.jobs[jobID] = job
-		st.runners[runnerID] = model.Runner{ID: runnerID, Name: runnerID, Capacity: 1}
+		st.runners[runnerID] = model.Runner{ProtocolVersion: 2, ID: runnerID, Name: runnerID, Capacity: 1}
 		st.mu.Unlock()
 		s.mu.Lock()
 		s.runs[runID] = run
 		s.jobs[jobID] = job
-		s.runners[runnerID] = model.Runner{ID: runnerID, Name: runnerID, Capacity: 1}
+		s.runners[runnerID] = model.Runner{ProtocolVersion: 2, ID: runnerID, Name: runnerID, Capacity: 1}
 		s.mu.Unlock()
 		seedTestHistoryRepo(t, ctx, st, repoID, runID, "build", names, tag+"-00")
 		return historyStressRepo{

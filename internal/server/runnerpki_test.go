@@ -176,13 +176,13 @@ func TestRegisterProtocolNegotiation(t *testing.T) {
 	if w := register(map[string]any{"name": "r1"}); w.Code != http.StatusBadRequest {
 		t.Fatalf("missing protocol: %d", w.Code)
 	}
-	if w := register(map[string]any{"name": "r1", "protocol_min": 1, "protocol_max": 2}); w.Code != http.StatusBadRequest {
+	if w := register(map[string]any{"name": "r1", "protocol_version": 2, "protocol_min": 1, "protocol_max": 2}); w.Code != http.StatusBadRequest {
 		t.Fatalf("non-overlapping range: %d", w.Code)
 	}
-	if w := register(map[string]any{"name": "r1", "protocol_min": 4, "protocol_max": 4}); w.Code != http.StatusBadRequest {
+	if w := register(map[string]any{"name": "r1", "protocol_version": 2, "protocol_min": 4, "protocol_max": 4}); w.Code != http.StatusBadRequest {
 		t.Fatalf("future protocol: %d", w.Code)
 	}
-	w := register(map[string]any{"name": "r1", "protocol_min": 2, "protocol_max": 5})
+	w := register(map[string]any{"name": "r1", "protocol_version": 2, "protocol_min": 2, "protocol_max": 5})
 	if w.Code != http.StatusOK {
 		t.Fatalf("overlapping range: %d %s", w.Code, w.Body.String())
 	}
@@ -208,13 +208,13 @@ func TestRegisterMTLSBindsIdentity(t *testing.T) {
 	h := s.Handler()
 	certAPEM, certA := pkiSignRunner(t, ca, "runner-a")
 
-	base := map[string]any{"name": "ra", "capacity": 1, "protocol_min": 3, "protocol_max": 3}
+	base := map[string]any{"name": "ra", "capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}
 
-	withID := map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "protocol_min": 3, "protocol_max": 3}
+	withID := map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}
 	if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register", withID, "secret", certA); w.Code != http.StatusOK {
 		t.Fatalf("matching cert: %d %s", w.Code, w.Body.String())
 	}
-	mismatch := map[string]any{"id": "runner-b", "name": "rb", "capacity": 1, "protocol_min": 3, "protocol_max": 3}
+	mismatch := map[string]any{"id": "runner-b", "name": "rb", "capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}
 	if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register", mismatch, "secret", certA); w.Code != http.StatusForbidden {
 		t.Fatalf("mismatched id: %d", w.Code)
 	}
@@ -281,7 +281,7 @@ func TestNextHeartbeatMTLSBinding(t *testing.T) {
 	_, certA := pkiSignRunner(t, ca, "runner-a")
 	_, certB := pkiSignRunner(t, ca, "runner-b")
 
-	reg := map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "labels": []string{"container"}, "protocol_min": 3, "protocol_max": 3}
+	reg := map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "labels": []string{"container"}, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}
 	if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register", reg, "secret", certA); w.Code != http.StatusOK {
 		t.Fatalf("register: %d %s", w.Code, w.Body.String())
 	}

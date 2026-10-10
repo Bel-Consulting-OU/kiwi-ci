@@ -486,6 +486,17 @@ type Server struct {
 	// this; dev mode keeps the legacy self-reported registration.
 	RequireProfiles bool
 
+	// MinRunnerProtocol is the minimum WIRE-SEMANTIC runner protocol
+	// version accepted at registration (server.min_runner_protocol; the
+	// zero value means the built-in default, model.RunnerProtocolVersion).
+	// A registration whose negotiated version is lower is refused 400 and
+	// never stored. Operators lower it to 1 ONLY for a controlled upgrade
+	// window: legacy runners may then re-register and drain
+	// already-claimed work (heartbeat/logs/completion stay generation
+	// fenced), but every /next answers 409 RUNNER_PROTOCOL_UNSUPPORTED, so
+	// no legacy runner is leased new v2 work.
+	MinRunnerProtocol int
+
 	// RequireRunnerIncarnation makes the registration-session header
 	// MANDATORY on polling/heartbeat/completion: dropping it cannot bypass
 	// supersession. Enabled in production; dev keeps the headerless
@@ -1985,7 +1996,13 @@ func (s *Server) enqueueID(ctx context.Context, in SubmitRun, preRunID string) (
 	run := model.Run{ID: runID, RepoID: in.RepoID, PolicyRepoID: policyID, CheckoutRepoURL: checkoutURL,
 		Repo: in.RepoURL, RepoFullName: in.RepoFullName, ForgeKind: in.ForgeKind, ForgeHost: in.ForgeHost,
 		Ref: in.Ref, SHA: in.SHA, Event: in.Event,
-		Status: model.StatusQueued, Trusted: in.Trusted, ConcurrencyGroup: group, CreatedAt: now, Metadata: cloneMap(in.Metadata)}
+		Status: model.StatusQueued, Trusted: in.Trusted, ConcurrencyGroup: group, CreatedAt: now, Metadata: cloneMap(in.Metadata),
+		// The reproducibility boundary is stamped at enqueue: every run the
+		// server creates records the execution-engine semantics its jobs will
+		// be interpreted under (see model.ExecutionSemanticsVersion), and
+		// every ingress (submit, webhook, rerun, schedule, downstream
+		// dispatch) enters through this one path.
+		ExecutionSemantics: model.ExecutionSemanticsVersion}
 
 	jobIDs := make(map[string]string, len(g.Jobs))
 	for key := range g.Jobs {
@@ -2053,6 +2070,9 @@ func (s *Server) enqueueID(ctx context.Context, in SubmitRun, preRunID string) (
 			Status:          model.StatusQueued, Priority: scheduler.DownstreamDepth(g, key), MaxInfraRetries: infraRetries, CreatedAt: now,
 			PlacementRegions: append([]string{}, cj.Job.Placement.Regions...),
 			ComponentDigest:  componentDigests[cj.BaseID],
+			// Every job inherits the run's stamped semantics, so a run's
+			// graph can never carry mixed versions.
+			ExecutionSemantics: run.ExecutionSemantics,
 			CompiledJobPayload: &model.CompiledJobPayload{
 				SchemaVersion:   1,
 				CompilerVersion: version.Version,
@@ -2745,48 +2765,18 @@ func listRunsPageAuthorized(ctx context.Context, store storage.Store, policy sto
 
 func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if s.DB != nil {
-		v, err := s.DB.GetRun(r.Context(), id)
-		if errors.Is(err, storage.ErrNotFound) {
-			http.NotFound(w, r)
-			return
-		}
-		if err != nil {
-			s.internalError(w, r, err, "")
-			return
-		}
-		if !s.requireRunRead(w, r, v) {
-			return
-		}
-		writeJSON(w, http.StatusOK, v1.RunDTOFrom(v))
-		return
-	}
-	s.mu.Lock()
-	v, ok := s.runs[id]
-	s.mu.Unlock()
+	v, ok := s.requireRunVisible(w, r, id)
 	if !ok {
-		http.NotFound(w, r)
-		return
-	}
-	if !s.requireRunRead(w, r, v) {
 		return
 	}
 	writeJSON(w, http.StatusOK, v1.RunDTOFrom(v))
 }
 func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
+	if _, ok := s.requireRunVisible(w, r, runID); !ok {
+		return
+	}
 	if s.DB != nil {
-		run, err := s.DB.GetRun(r.Context(), runID)
-		if errors.Is(err, storage.ErrNotFound) {
-			http.NotFound(w, r)
-			return
-		} else if err != nil {
-			s.internalError(w, r, err, "")
-			return
-		}
-		if !s.requireRunRead(w, r, run) {
-			return
-		}
 		jobs, err := s.DB.ListJobsByRun(r.Context(), runID)
 		if err != nil {
 			s.internalError(w, r, err, "")
@@ -2801,14 +2791,6 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	run, ok := s.runs[runID]
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
-	if !s.requireRunRead(w, r, run) {
-		return
-	}
 	out := make([]v1.JobDTO, 0)
 	for _, j := range s.jobs {
 		if j.RunID == runID {
@@ -2827,16 +2809,7 @@ func redactJob(j model.Job) model.Job { j.Pipeline = ""; j.LeaseTokenHash = nil;
 
 func (s *Server) getLogs(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	run, err := s.runForAuth(r.Context(), id)
-	if errors.Is(err, storage.ErrNotFound) {
-		http.NotFound(w, r)
-		return
-	}
-	if err != nil {
-		s.internalError(w, r, err, "")
-		return
-	}
-	if !s.requireRunRead(w, r, run) {
+	if _, ok := s.requireRunVisible(w, r, id); !ok {
 		return
 	}
 	after, ok := parseLogCursor(w, r)
@@ -2976,9 +2949,17 @@ type registerResponse struct {
 	model.Runner
 	Capabilities         []string `json:"capabilities"`
 	CapabilitiesEnforced bool     `json:"capabilities_enforced"`
+	// ProtocolVersion SHADOWS the embedded runner row's negotiated value
+	// with the server's CURRENT wire-semantic protocol version, and
+	// MinRunnerProtocol states the configured registration minimum.
+	// Together they are the fail-closed negotiation answer: a runner whose
+	// own protocol is below either value must refuse to start (an older
+	// server omits both, both decode as 0, and nothing changes).
+	ProtocolVersion   int `json:"protocol_version"`
+	MinRunnerProtocol int `json:"min_runner_protocol"`
 }
 
-func newRegisterResponse(in model.Runner, profileBound bool) registerResponse {
+func newRegisterResponse(in model.Runner, profileBound bool, serverProtocol, minRunnerProtocol int) registerResponse {
 	caps := in.Capabilities
 	if caps == nil {
 		caps = []string{}
@@ -2987,7 +2968,46 @@ func newRegisterResponse(in model.Runner, profileBound bool) registerResponse {
 		Runner:               in,
 		Capabilities:         caps,
 		CapabilitiesEnforced: profileBound,
+		ProtocolVersion:      serverProtocol,
+		MinRunnerProtocol:    minRunnerProtocol,
 	}
+}
+
+// minRunnerProtocol returns the effective registration minimum: the
+// configured value, or the current model.RunnerProtocolVersion when unset
+// (zero-value server and direct library constructions default fail closed).
+func (s *Server) minRunnerProtocol() int {
+	if s.MinRunnerProtocol > 0 {
+		return s.MinRunnerProtocol
+	}
+	return model.RunnerProtocolVersion
+}
+
+// effectiveRunnerProtocol maps a declared/persisted wire-semantic protocol
+// version to its semantics: absent (0) is a legacy v1 runner, so a row
+// persisted before the field existed is never treated as current.
+func effectiveRunnerProtocol(v int) int {
+	if v == 0 {
+		return 1
+	}
+	return v
+}
+
+// writeRunnerProtocolUnsupported refuses a NEW lease for a registered runner
+// whose negotiated wire-semantic protocol is below the version the task
+// requires. It is called before any claim or reservation mutation, so the
+// refusal leaves no lease, no attempt, no reservation and no event behind.
+// Heartbeat/logs/completion for already-claimed work are deliberately NOT
+// gated on this: their fencing is generation-based, so a legacy runner can
+// always drain what it already holds during an upgrade window.
+func writeRunnerProtocolUnsupported(w http.ResponseWriter, required, actual int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusConflict)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error":               fmt.Sprintf("runner protocol version %d is below the required %d for new leases", actual, required),
+		"reason":              "RUNNER_PROTOCOL_UNSUPPORTED",
+		"min_runner_protocol": required,
+	})
 }
 
 // writeRunnerProfileDB persists only a runner's profile/admin fields through
@@ -3138,9 +3158,10 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	// (a zero dimension is unconstrained, so an accepted value could only
 	// widen the runner's admission).
 	info := RunnerInfo{
-		ID:          in.ID,
-		ProtocolMin: in.ProtocolMin,
-		ProtocolMax: in.ProtocolMax,
+		ID:              in.ID,
+		ProtocolMin:     in.ProtocolMin,
+		ProtocolMax:     in.ProtocolMax,
+		ProtocolVersion: in.ProtocolVersion,
 	}
 	if !s.RequireProfiles {
 		// Legacy dev-mode registration keeps validating (and consuming)
@@ -3157,6 +3178,21 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	in.ProtocolMin, in.ProtocolMax = info.ProtocolMin, info.ProtocolMax
+	// Wire-semantic protocol negotiation, fail closed BEFORE any store or
+	// profile side effect: a registration below the configured minimum is
+	// refused 400 with a body naming both versions and nothing is stored. A
+	// declared version above what this binary implements is negotiated down
+	// to the server's current version (server-side min(runner, server));
+	// absent (0) is a legacy v1 runner.
+	declared := effectiveRunnerProtocol(in.ProtocolVersion)
+	if minimum := s.minRunnerProtocol(); declared < minimum {
+		http.Error(w, fmt.Sprintf("runner protocol version %d is below the minimum required %d; upgrade the runner", declared, minimum), http.StatusBadRequest)
+		return
+	}
+	if declared > model.RunnerProtocolVersion {
+		declared = model.RunnerProtocolVersion
+	}
+	in.ProtocolVersion = declared
 	// Identity binding: mTLS peer certificate and/or the per-runner bearer
 	// token must agree with the claimed ID (an empty ID adopts them).
 	if err := s.bindRunnerIdentity(r, in.ID); err != nil {
@@ -3305,7 +3341,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		in.Completed, in.Failed = old.Completed, old.Failed
 		s.auditLocked("runner.register", in.Name, "", "", "runner registered", nil)
 		s.recordRunnerRegistration(in.ID, in.ProtocolMax)
-		writeJSON(w, http.StatusOK, newRegisterResponse(in, s.RequireProfiles || hasProfile))
+		writeJSON(w, http.StatusOK, newRegisterResponse(in, s.RequireProfiles || hasProfile, model.RunnerProtocolVersion, s.minRunnerProtocol()))
 		return
 	}
 	s.mu.Lock()
@@ -3357,7 +3393,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	s.scheduleStateLocked()
 	s.mu.Unlock()
 	s.recordRunnerRegistration(in.ID, in.ProtocolMax)
-	writeJSON(w, http.StatusOK, newRegisterResponse(in, s.RequireProfiles || hasProfile))
+	writeJSON(w, http.StatusOK, newRegisterResponse(in, s.RequireProfiles || hasProfile, model.RunnerProtocolVersion, s.minRunnerProtocol()))
 }
 
 // listRunners is the FULL runner inventory: it requires runner_manage (or
@@ -4013,6 +4049,15 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "runner not registered", http.StatusNotFound)
 		return
 	}
+	// Wire-semantic protocol gate: a runner that registered below the
+	// version this task's semantics require is refused BEFORE any claim or
+	// reservation mutation (no lease, no attempt, no event). This is the
+	// upgrade-window lever: legacy runners can re-register (min=1) and
+	// drain already-claimed work, but never receive new v2 leases.
+	if proto := effectiveRunnerProtocol(ri.ProtocolVersion); proto < model.JobRequiresProtocol {
+		writeRunnerProtocolUnsupported(w, model.JobRequiresProtocol, proto)
+		return
+	}
 	ri.LastSeen = now
 	// Live profile resolution at lease time: a linked profile's current
 	// attributes (labels/region/repo ACL/capabilities/capacity/rates)
@@ -4274,7 +4319,7 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	// liveRunnerLocked just resolved, so its job-scoped cgroup capability is
 	// exactly what the relaxed/union admission assumed; advertise it so the
 	// executor can enforce the same bound at the kernel.
-	task := Task{Job: taskJob, LeaseToken: rawToken, LeaseGeneration: j.LeaseGeneration, LeaseExpiresAt: exp, JobCgroup: ri.JobCgroup}
+	task := Task{Job: taskJob, LeaseToken: rawToken, LeaseGeneration: j.LeaseGeneration, LeaseExpiresAt: exp, JobCgroup: ri.JobCgroup, ProtocolVersion: model.JobRequiresProtocol}
 	leaseSpan.End()
 	writeJSON(w, http.StatusOK, task)
 }
@@ -4325,6 +4370,14 @@ func (s *Server) nextDB(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	} else if err != nil {
 		s.internalError(w, r, err, "")
+		return
+	}
+	// Wire-semantic protocol gate: identical to the memory path, and placed
+	// before every scheduler/claim call so a legacy runner's poll mutates
+	// nothing (no lease, no reservation, no event). Heartbeat/logs/
+	// completion are deliberately not gated here.
+	if proto := effectiveRunnerProtocol(ri.ProtocolVersion); proto < model.JobRequiresProtocol {
+		writeRunnerProtocolUnsupported(w, model.JobRequiresProtocol, proto)
 		return
 	}
 	if ri.Disabled {
@@ -4400,7 +4453,7 @@ func (s *Server) nextDB(w http.ResponseWriter, r *http.Request, id string) {
 	if eff, ok := s.Sched.EffectiveRunnerChecked(ctx, ri); ok {
 		taskJobCgroup = eff.JobCgroup
 	}
-	task := Task{Job: taskJob, LeaseToken: rawToken, LeaseGeneration: j.LeaseGeneration, LeaseExpiresAt: exp, JobCgroup: taskJobCgroup}
+	task := Task{Job: taskJob, LeaseToken: rawToken, LeaseGeneration: j.LeaseGeneration, LeaseExpiresAt: exp, JobCgroup: taskJobCgroup, ProtocolVersion: model.JobRequiresProtocol}
 	if j.Environment != "" {
 		// The lease already committed; a failed deployment insert is
 		// surfaced (logged) here, never mirrored as a started deployment.
@@ -5917,19 +5970,22 @@ func (s *Server) rerunRun(w http.ResponseWriter, r *http.Request) {
 	if !keyOK {
 		return
 	}
+	// Existence masking precedes every authorization answer and the enqueue;
+	// an unknown id and another repository's run are the same masked 404.
+	old, ok := s.requireRunVisible(w, r, id)
+	if !ok {
+		return
+	}
 	s.mu.Lock()
-	old, ok := s.runs[id]
 	var pipelineText string
-	if ok {
-		for _, j := range s.jobs {
-			if j.RunID == id {
-				pipelineText = j.Pipeline
-				break
-			}
+	for _, j := range s.jobs {
+		if j.RunID == id {
+			pipelineText = j.Pipeline
+			break
 		}
 	}
 	s.mu.Unlock()
-	if !ok || pipelineText == "" {
+	if pipelineText == "" {
 		http.NotFound(w, r)
 		return
 	}
@@ -5991,13 +6047,11 @@ func (s *Server) rerunRunDB(w http.ResponseWriter, r *http.Request, id string) {
 	if !keyOK {
 		return
 	}
-	old, err := s.DB.GetRun(ctx, id)
-	if errors.Is(err, storage.ErrNotFound) {
-		http.NotFound(w, r)
-		return
-	}
-	if err != nil {
-		s.internalError(w, r, err, "")
+	// Existence masking precedes the store reads, the authorization answer and
+	// the enqueue; an unknown id and another repository's run are the same
+	// masked 404.
+	old, ok := s.requireRunVisible(w, r, id)
+	if !ok {
 		return
 	}
 	jobs, err := s.DB.ListJobsByRun(ctx, id)
@@ -6086,15 +6140,21 @@ func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 		s.cancelRunDB(w, r, id, actor)
 		return
 	}
-	s.mu.Lock()
-	run, ok := s.runs[id]
-	s.mu.Unlock()
-	if !ok {
-		http.NotFound(w, r)
+	// Existence masking runs BEFORE any authorization answer, audit write or
+	// mutation: a principal that cannot see the run's repository (or an
+	// unknown id) gets the masked 404 with no side effect.
+	if _, ok := s.requireRunVisible(w, r, id); !ok {
 		return
 	}
 	// Cancellation is the existing RBAC cancel action OR the runs:cancel
 	// controller capability, both scoped to the run's repository.
+	s.mu.Lock()
+	run, ok := s.runs[id]
+	s.mu.Unlock()
+	if !ok {
+		s.writeMaskedRunNotFound(w)
+		return
+	}
 	if !s.requireRunActionOrCapability(w, r, auth.ActionCancel, auth.CapRunsCancel, run) {
 		return
 	}
@@ -6102,7 +6162,7 @@ func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 	run, ok = s.runs[id]
 	if !ok {
 		s.mu.Unlock()
-		http.NotFound(w, r)
+		s.writeMaskedRunNotFound(w)
 		return
 	}
 	// Idempotent replay (docs/INVARIANTS.md I8): the run already reached a
@@ -6161,13 +6221,10 @@ func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 // emits the audit event through the DB audit funnel.
 func (s *Server) cancelRunDB(w http.ResponseWriter, r *http.Request, id, actor string) {
 	ctx := r.Context()
-	run, err := s.DB.GetRun(ctx, id)
-	if errors.Is(err, storage.ErrNotFound) {
-		http.NotFound(w, r)
-		return
-	}
-	if err != nil {
-		s.internalError(w, r, err, "")
+	// Existence masking first: no audit write, scheduler call or mutation for
+	// an id whose run is missing or not visible to the caller.
+	run, ok := s.requireRunVisible(w, r, id)
+	if !ok {
 		return
 	}
 	if !s.requireRunActionOrCapability(w, r, auth.ActionCancel, auth.CapRunsCancel, run) {

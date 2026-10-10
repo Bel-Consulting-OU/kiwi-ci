@@ -481,8 +481,8 @@ func TestFlowTestintelListReports(t *testing.T) {
 		Repositories: map[string]auth.RepositoryPermission{"github.com/o/repo-b": {Read: true}}}); err != nil {
 		t.Fatal(err)
 	}
-	if w := doJSON(t, s, http.MethodGet, "/api/v1/runs/run-c/tests", "outsider", ""); w.Code != http.StatusForbidden {
-		t.Fatalf("scoped report list = %d, want 403", w.Code)
+	if w := doJSON(t, s, http.MethodGet, "/api/v1/runs/run-c/tests", "outsider", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("scoped report list = %d, want masked 404", w.Code)
 	}
 
 	// DB: scoped denial, missing run, read failure, list failure, success.
@@ -491,8 +491,8 @@ func TestFlowTestintelListReports(t *testing.T) {
 		Repositories: map[string]auth.RepositoryPermission{"github.com/o/repo-b": {Read: true}}}); err != nil {
 		t.Fatal(err)
 	}
-	if w := doJSON(t, s2, http.MethodGet, "/api/v1/runs/run-c/tests", "outsider", ""); w.Code != http.StatusForbidden {
-		t.Fatalf("scoped db report list = %d, want 403", w.Code)
+	if w := doJSON(t, s2, http.MethodGet, "/api/v1/runs/run-c/tests", "outsider", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("scoped db report list = %d, want masked 404", w.Code)
 	}
 	if w := doJSON(t, s2, http.MethodGet, "/api/v1/runs/missing/tests", "admin-tok", ""); w.Code != http.StatusNotFound {
 		t.Fatalf("db missing run = %d, want 404", w.Code)

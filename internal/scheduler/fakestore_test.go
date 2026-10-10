@@ -283,12 +283,22 @@ func (f *fakeStore) supersededJobIDsLocked(p *storage.SupersedePolicy, newRunID 
 
 // recomputeDependentsLocked re-evaluates queued/waiting jobs that need a
 // cancelled job, blocking them when their condition does not allow the
-// outcome (caller holds f.mu).
+// outcome (caller holds f.mu). Dependents are visited in sorted id order, not
+// Go map order: the one-pass recompute reads statuses it may itself update
+// (a dependent that needs both the transitioned job and another dependent),
+// so map iteration would make the resulting blocked set nondeterministic.
+// Sorted order keeps the fake a deterministic oracle for property tests.
 func (f *fakeStore) recomputeDependentsLocked(cancelled map[string]bool, now time.Time) {
 	if len(cancelled) == 0 {
 		return
 	}
-	for id, j := range f.jobs {
+	ids := make([]string, 0, len(f.jobs))
+	for id := range f.jobs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		j := f.jobs[id]
 		if j.Status != model.StatusQueued && j.Status != model.StatusWaitingApproval {
 			continue
 		}

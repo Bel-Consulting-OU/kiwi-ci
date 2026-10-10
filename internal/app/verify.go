@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/provenance"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
 )
@@ -26,14 +27,17 @@ import (
 // server's Ed25519 signature (or the pinned --trusted-key), then binds the
 // attestation subject digest to the bytes that were actually downloaded.
 // Non-empty --repository/--commit/--ref/--job/--builder/--issuer/--attempt/
-// --capsule-digest/--execution-capsule-digest flags are enforced as statement
-// constraints via provenance.VerifyWith.
+// --capsule-digest/--execution-capsule-digest/--execution-semantics flags are
+// enforced as statement constraints via provenance.VerifyWith; the verified
+// execution-engine semantics is always printed.
 //
 // With --attestation JOB_ID (or --attestation-file PATH) it instead verifies
 // the job's FINAL EXECUTION ATTESTATION: the signed envelope is fetched from
 // the server (GET /api/v1/jobs/{id}/attestation) or read from disk, the
 // signature is verified with the same trust root, and the --attempt /
-// --capsule-digest / --execution-capsule-digest constraints are honored.
+// --capsule-digest / --execution-capsule-digest / --execution-semantics
+// constraints are honored (the verified execution-engine semantics is always
+// printed).
 func VerifyArtifact(args []string) error {
 	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
 	serverURL := fs.String("server", "http://127.0.0.1:8080", "Kiwi server URL")
@@ -47,6 +51,7 @@ func VerifyArtifact(args []string) error {
 	attempt := fs.String("attempt", "", "required provenance attempt ID (constraint, <jobID>:<leaseGeneration>)")
 	capsuleDigest := fs.String("capsule-digest", "", "required provenance capsule digest (constraint, sha256 of the persisted compiled job payload)")
 	executionCapsuleDigest := fs.String("execution-capsule-digest", "", "required provenance execution capsule digest (constraint, sha256 of the materialized effective execution)")
+	executionSemantics := fs.String("execution-semantics", "", "required execution-engine semantic version (constraint, e.g. "+model.ExecutionSemanticsVersion+")")
 	trustedKey := fs.String("trusted-key", "", "path to a PEM Ed25519 public key that pins the verification key")
 	attestation := fs.String("attestation", "", "job ID whose final execution attestation to fetch and verify (attestation mode)")
 	attestationFile := fs.String("attestation-file", "", "path to a saved execution attestation envelope (attestation mode)")
@@ -59,7 +64,7 @@ func VerifyArtifact(args []string) error {
 			return fmt.Errorf("--attestation and --attestation-file are mutually exclusive")
 		}
 		if fs.NArg() != 0 {
-			return fmt.Errorf("usage: kiwi verify --attestation JOB_ID [--server URL] [--token TOKEN] [--trusted-key PATH] [--generation N] [--attempt ID] [--capsule-digest D] [--execution-capsule-digest D]")
+			return fmt.Errorf("usage: kiwi verify --attestation JOB_ID [--server URL] [--token TOKEN] [--trusted-key PATH] [--generation N] [--attempt ID] [--capsule-digest D] [--execution-capsule-digest D] [--execution-semantics V]")
 		}
 		if *generation < 0 {
 			return fmt.Errorf("--generation must not be negative")
@@ -68,6 +73,7 @@ func VerifyArtifact(args []string) error {
 			AttemptID:              *attempt,
 			CapsuleDigest:          *capsuleDigest,
 			ExecutionCapsuleDigest: *executionCapsuleDigest,
+			ExecutionSemantics:     *executionSemantics,
 		})
 	}
 	if fs.NArg() != 1 {
@@ -119,6 +125,7 @@ func VerifyArtifact(args []string) error {
 		AttemptID:              *attempt,
 		CapsuleDigest:          *capsuleDigest,
 		ExecutionCapsuleDigest: *executionCapsuleDigest,
+		ExecutionSemantics:     *executionSemantics,
 	}
 	resolver, err := verifyKeyResolver(client, base, *trustedKey, &opts)
 	if err != nil {
@@ -143,7 +150,7 @@ func VerifyArtifact(args []string) error {
 	if json.Unmarshal(envBytes, &env) == nil && len(env.Signatures) > 0 {
 		signer = env.Signatures[0].KeyID
 	}
-	fmt.Printf("verified artifact %s\n  sha256: %s\n  signer: %s\n", id, artifactSHA, signer)
+	fmt.Printf("verified artifact %s\n  sha256: %s\n  execution semantics: %s\n  signer: %s\n", id, artifactSHA, displayExecutionSemantics(st.ExecutionSemantics), signer)
 	return nil
 }
 
@@ -230,9 +237,20 @@ func verifyExecutionAttestation(serverURL, token, jobID, file string, generation
 	if json.Unmarshal(envBytes, &env) == nil && len(env.Signatures) > 0 {
 		signer = env.Signatures[0].KeyID
 	}
-	fmt.Printf("verified execution attestation %s\n  status: %s\n  attempt: %s\n  capsule digest: %s\n  execution capsule digest: %s\n  artifacts: %d\n  signer: %s\n",
-		display, st.Attestation.Status, st.AttemptID, st.CapsuleDigest, st.ExecutionCapsuleDigest, artifacts, signer)
+	fmt.Printf("verified execution attestation %s\n  status: %s\n  attempt: %s\n  capsule digest: %s\n  execution capsule digest: %s\n  execution semantics: %s\n  artifacts: %d\n  signer: %s\n",
+		display, st.Attestation.Status, st.AttemptID, st.CapsuleDigest, st.ExecutionCapsuleDigest, displayExecutionSemantics(st.ExecutionSemantics), artifacts, signer)
 	return nil
+}
+
+// displayExecutionSemantics renders the verified statement's execution-engine
+// semantic version. The empty string means the statement was produced before
+// semantics stamping existed; it is reported explicitly instead of as a blank
+// field so a reader can tell "unknown/legacy" from "not printed".
+func displayExecutionSemantics(semantics string) string {
+	if semantics == "" {
+		return "(none: record predates execution-semantics stamping)"
+	}
+	return semantics
 }
 
 // loadTrustedPublicKey loads a PKIX "PUBLIC KEY" PEM holding an Ed25519

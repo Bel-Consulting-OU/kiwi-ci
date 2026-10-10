@@ -167,6 +167,7 @@ func TestArtifactUploadProvenanceCarriesFullIdentity(t *testing.T) {
 	j := f.jobs["job-a"]
 	j.StartedAt = &started
 	j.CompiledJobPayload = compiled
+	j.ExecutionSemantics = model.ExecutionSemanticsVersion
 	f.jobs["job-a"] = j
 	f.mu.Unlock()
 
@@ -193,6 +194,11 @@ func TestArtifactUploadProvenanceCarriesFullIdentity(t *testing.T) {
 	}
 	if len(st.Subject) != 1 || st.Subject[0].Digest["sha256"] != rec.SHA256 {
 		t.Fatalf("provenance subject = %+v, want artifact digest %s", st.Subject, rec.SHA256)
+	}
+	// The signed artifact statement binds the execution-engine semantics the
+	// producing job was stamped with.
+	if st.ExecutionSemantics != model.ExecutionSemanticsVersion {
+		t.Fatalf("provenance executionSemantics = %q, want %q", st.ExecutionSemantics, model.ExecutionSemanticsVersion)
 	}
 	// The invocation string carries the canonical attempt ID, and the
 	// dedicated field lets consumers match it without parsing.

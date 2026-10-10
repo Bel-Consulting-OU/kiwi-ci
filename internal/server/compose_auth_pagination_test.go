@@ -232,8 +232,8 @@ func TestComposeRotationPairPaginationSharedGrants(t *testing.T) {
 		if w := doJSON(t, s, http.MethodGet, "/api/v1/runs/run-0009", tok, ""); w.Code != http.StatusOK {
 			t.Fatalf("visible run with %s = %d", tok, w.Code)
 		}
-		if w := doJSON(t, s, http.MethodGet, "/api/v1/runs/run-0008", tok, ""); w.Code != http.StatusForbidden {
-			t.Fatalf("ungranted run with %s = %d, want 403", tok, w.Code)
+		if w := doJSON(t, s, http.MethodGet, "/api/v1/runs/run-0008", tok, ""); w.Code != http.StatusNotFound {
+			t.Fatalf("ungranted run with %s = %d, want masked 404", tok, w.Code)
 		}
 	}
 }

@@ -39,11 +39,11 @@ func TestComposeRotationIdenticalAuthorizationMatrixDB(t *testing.T) {
 		{"runs collection", http.MethodGet, "/api/v1/runs", "", http.StatusOK},
 		{"runs collection page", http.MethodGet, "/api/v1/runs?limit=1", "", http.StatusOK},
 		{"run visible", http.MethodGet, "/api/v1/runs/run-c", "", http.StatusOK},
-		{"run invisible", http.MethodGet, "/api/v1/runs/run-b", "", http.StatusForbidden},
+		{"run invisible", http.MethodGet, "/api/v1/runs/run-b", "", http.StatusNotFound},
 		{"snapshot listing visible", http.MethodGet, "/api/v1/runs/run-c/snapshots", "", http.StatusForbidden},
 		{"snapshot listing invisible", http.MethodGet, "/api/v1/runs/run-b/snapshots", "", http.StatusForbidden},
 		{"snapshot download visible", http.MethodGet, "/api/v1/runs/run-c/snapshots/" + recID, "", http.StatusForbidden},
-		{"runner registration", http.MethodPost, "/api/v1/runners/register", `{"name":"r","protocol_min":3,"protocol_max":3}`, http.StatusUnauthorized},
+		{"runner registration", http.MethodPost, "/api/v1/runners/register", `{"name":"r","protocol_version": 2, "protocol_min":3,"protocol_max":3}`, http.StatusUnauthorized},
 		{"test-intelligence visible", http.MethodGet, "/api/v1/test-intelligence?repo=o/repo-a", "", http.StatusOK},
 		{"test-intelligence invisible", http.MethodGet, "/api/v1/test-intelligence?repo=o/repo-b", "", http.StatusForbidden},
 	}
@@ -60,7 +60,7 @@ func TestComposeRotationIdenticalAuthorizationMatrixDB(t *testing.T) {
 	}
 	// Control: the runner token clears the runner-tier entry for the same
 	// store configuration.
-	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "runner-tok", `{"name":"r","protocol_min":3,"protocol_max":3}`); w.Code != http.StatusOK {
+	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "runner-tok", `{"name":"r","protocol_version": 2, "protocol_min":3,"protocol_max":3}`); w.Code != http.StatusOK {
 		t.Fatalf("runner-token registration in DB mode = %d: %s", w.Code, w.Body.String())
 	}
 }

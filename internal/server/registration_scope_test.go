@@ -112,7 +112,7 @@ func TestValidateRunnerRegistrationAdversarial(t *testing.T) {
 func TestRegisterRejectsHostileLabelsOverHTTP(t *testing.T) {
 	s := New("secret")
 	h := s.Handler()
-	base := `{"name":"r","protocol_min":3,"protocol_max":3`
+	base := `{"name":"r","protocol_version": 2, "protocol_min":3,"protocol_max":3`
 	cases := []struct {
 		name string
 		body string
@@ -147,7 +147,7 @@ func TestRegisterRejectsHostileLabelsOverHTTP(t *testing.T) {
 	// Duplicate labels are accepted and behave as a set: the runner still
 	// matches a job requiring the label once.
 	w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register",
-		[]byte(`{"name":"dup","protocol_min":3,"protocol_max":3,"labels":["container","container"],"capacity":1}`), "secret", nil)
+		[]byte(`{"name":"dup","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container","container"],"capacity":1}`), "secret", nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("duplicate labels rejected: %d %s", w.Code, w.Body.String())
 	}
@@ -204,5 +204,5 @@ func TestEnrollRunnerIDCharacterGrammar(t *testing.T) {
 	if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/enroll", uniBody, "enroll-tok", nil); w.Code != http.StatusOK {
 		t.Fatalf("printable unicode runner_id = %d, want 200: %s", w.Code, w.Body.String())
 	}
-	_ = model.Runner{}
+	_ = model.Runner{ProtocolVersion: 2}
 }

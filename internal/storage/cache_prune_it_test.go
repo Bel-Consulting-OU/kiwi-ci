@@ -72,28 +72,17 @@ func TestIntegrationPruneCacheManifestsFencesConcurrentRefreshPostgres(t *testin
 		close(done)
 	}()
 
-	// Deterministic barrier: wait until the prune's DELETE is blocked on the
-	// cache_manifests row lock this transaction holds.
-	deadline := time.Now().Add(15 * time.Second)
-	for {
-		select {
-		case <-done:
-			t.Fatalf("prune finished before blocking on the row lock: res=%+v err=%v", res, pruneErr)
-		default:
-		}
-		var blocked int
-		if err := st.pool.QueryRow(ctx, `
-SELECT count(*) FROM pg_stat_activity
-WHERE wait_event_type = 'Lock' AND state <> 'idle'`).Scan(&blocked); err != nil {
-			t.Fatal(err)
-		}
-		if blocked > 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("prune never blocked on the refreshed manifest's row lock")
-		}
-		time.Sleep(20 * time.Millisecond)
+	// Deterministic barrier: wait until THIS database's prune DELETE is
+	// blocked on the cache_manifests row lock this transaction holds. The
+	// shared helper scopes pg_stat_activity by datname + statement pattern,
+	// because the integration lane runs sibling packages against the same
+	// server and an unscoped "any Lock wait" probe can fire on a foreign
+	// database before this prune reaches its DELETE.
+	pgITWaitForLockBlockedQuery(t, st, ctx, "%DELETE FROM cache_manifests%")
+	select {
+	case <-done:
+		t.Fatalf("prune finished before blocking on the row lock: res=%+v err=%v", res, pruneErr)
+	default:
 	}
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)

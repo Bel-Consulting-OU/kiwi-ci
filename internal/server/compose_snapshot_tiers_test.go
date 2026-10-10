@@ -181,8 +181,10 @@ func composeSnapshotTiersAssert(t *testing.T, s *Server, rec model.SnapshotRecor
 		}
 		// The per-run read route documents whether the credential is a real
 		// repository reader: where it is, the 403 below is the snapshot tier,
-		// not a broken grant.
-		wantRunRead := http.StatusForbidden
+		// not a broken grant. A credential that cannot read the run's
+		// repository is existence-masked on the per-run read (404, the same
+		// answer as an unknown run).
+		wantRunRead := http.StatusNotFound
 		if shape.runRead {
 			wantRunRead = http.StatusOK
 		}

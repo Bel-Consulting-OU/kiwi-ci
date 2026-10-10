@@ -189,18 +189,12 @@ func (s *Server) recordDeployment(w http.ResponseWriter, r *http.Request) {
 // listDeployments is GET /api/v1/runs/{id}/deployments.
 func (s *Server) listDeployments(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
+	// Existence masking (same primitive as every run-scoped read): a missing
+	// run and another repository's run are the same masked 404.
+	if _, ok := s.requireRunVisible(w, r, runID); !ok {
+		return
+	}
 	if s.DB != nil {
-		run, err := s.DB.GetRun(r.Context(), runID)
-		if err == storage.ErrNotFound {
-			http.NotFound(w, r)
-			return
-		} else if err != nil {
-			s.internalError(w, r, err, "")
-			return
-		}
-		if !s.requireRunRead(w, r, run) {
-			return
-		}
 		out := []model.Deployment{}
 		if ds, ok := s.DB.(storage.DeploymentStore); ok {
 			recs, err := ds.ListDeploymentsByRun(r.Context(), runID)
@@ -227,14 +221,6 @@ func (s *Server) listDeployments(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	run, ok := s.runs[runID]
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
-	if !s.requireRunRead(w, r, run) {
-		return
-	}
 	out := []model.Deployment{}
 	for _, d := range s.deployments {
 		if d.RunID == runID {

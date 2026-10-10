@@ -544,6 +544,10 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 			Status:          model.StatusQueued, Priority: scheduler.DownstreamDepth(g, key), MaxInfraRetries: infraRetries, CreatedAt: now,
 			DynamicDepth:     childDepth,
 			PlacementRegions: append([]string{}, cj.Job.Placement.Regions...),
+			// Generated children belong to the parent's run and inherit its
+			// stamped execution semantics: a graph mutation can never change
+			// the semantics its run was created under.
+			ExecutionSemantics: parent.ExecutionSemantics,
 			CompiledJobPayload: &model.CompiledJobPayload{
 				SchemaVersion:   1,
 				CompilerVersion: version.Version,

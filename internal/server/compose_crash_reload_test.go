@@ -31,7 +31,7 @@ import (
 // act as that runner.
 func composeFSClaim(t *testing.T, s *Server) (runnerID string, task Task) {
 	t.Helper()
-	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token", `{"name":"compose-fs-runner","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2}`)
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token", `{"name":"compose-fs-runner","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d %s", w.Code, w.Body.String())
 	}
@@ -193,7 +193,7 @@ func TestComposeFSCrashReloadClaimAndRevocationNotResurrected(t *testing.T) {
 
 	// A second runner is registered and disabled by an operator before the
 	// crash: the revocation must be durable.
-	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token", `{"name":"compose-fs-disabled","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2}`)
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token", `{"name":"compose-fs-disabled","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register disabled runner: %d %s", w.Code, w.Body.String())
 	}

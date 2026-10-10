@@ -115,7 +115,7 @@ func TestIDCovMetricsMemoryState(t *testing.T) {
 	s.runs["run-1"] = model.Run{ID: "run-1", Status: model.StatusRunning}
 	s.runs["run-2"] = model.Run{ID: "run-2", Status: model.StatusSuccess}
 	s.jobs["job-1"] = model.Job{ID: "job-1", Status: model.StatusQueued, QueueReason: "no matching runner"}
-	s.runners["r1"] = model.Runner{ID: "r1", Capacity: 0, ActiveJobs: []string{"job-1"}}
+	s.runners["r1"] = model.Runner{ProtocolVersion: 2, ID: "r1", Capacity: 0, ActiveJobs: []string{"job-1"}}
 	s.mu.Unlock()
 	w := doJSON(t, s, http.MethodGet, "/metrics", "admin", "")
 	if w.Code != http.StatusOK {

@@ -131,7 +131,7 @@ func TestLeaseFenceChaosMatrixStaleGenerationRejected(t *testing.T) {
 	register := func() string {
 		t.Helper()
 		w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
-			`{"name":"chaos","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
+			`{"name":"chaos","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
 		if w.Code != http.StatusOK {
 			t.Fatalf("register: %d %s", w.Code, w.Body.String())
 		}

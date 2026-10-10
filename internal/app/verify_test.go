@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/provenance"
 )
 
@@ -39,6 +40,7 @@ func TestVerifyFlagsPlumbedToVerifyWith(t *testing.T) {
 		Commit: "abc123", Runner: "runner-1", Started: started, Finished: started.Add(time.Second),
 		AttemptID: "job-1:3", CapsuleDigest: strings.Repeat("e", 64),
 		ExecutionCapsuleDigest: strings.Repeat("c", 64),
+		ExecutionSemantics:     model.ExecutionSemanticsVersion,
 	})
 	st.Builder = provenance.BuilderPlaceholder
 	st.Issuer = "https://ci.acme.example"
@@ -78,7 +80,8 @@ func TestVerifyFlagsPlumbedToVerifyWith(t *testing.T) {
 		"--repository", "acme/app", "--commit", "abc123", "--ref", "refs/heads/main",
 		"--job", "build", "--builder", "https://kiwi-ci.dev/runner/runner-1", "--issuer", "https://ci.acme.example",
 		"--attempt", "job-1:3", "--capsule-digest", strings.Repeat("e", 64),
-		"--execution-capsule-digest", strings.Repeat("c", 64), "art-1"})
+		"--execution-capsule-digest", strings.Repeat("c", 64),
+		"--execution-semantics", model.ExecutionSemanticsVersion, "art-1"})
 	if err != nil {
 		t.Fatalf("verify with pinned key: %v", err)
 	}
@@ -101,6 +104,10 @@ func TestVerifyFlagsPlumbedToVerifyWith(t *testing.T) {
 	err = VerifyArtifact([]string{"--server", ts.URL, "--trusted-key", keyPath, "--execution-capsule-digest", strings.Repeat("d", 64), "art-1"})
 	if err == nil || !strings.Contains(err.Error(), "execution capsule digest mismatch") {
 		t.Fatalf("execution-capsule-digest constraint not enforced: %v", err)
+	}
+	err = VerifyArtifact([]string{"--server", ts.URL, "--trusted-key", keyPath, "--execution-semantics", "kiwi.execution.v-future", "art-1"})
+	if err == nil || !strings.Contains(err.Error(), "execution semantics mismatch") {
+		t.Fatalf("execution-semantics constraint not enforced: %v", err)
 	}
 
 	// A wrong pinned key must fail signature verification.

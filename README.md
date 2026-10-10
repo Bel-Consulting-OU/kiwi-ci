@@ -32,7 +32,9 @@ untrusted code.
   stability, cancellation monotonicity, credential scoping, cache namespaces)
   are mapped to their enforcing code and regression tests in
   [docs/INVARIANTS.md](docs/INVARIANTS.md). A core change that does not update
-  that mapping is treated as a broken invariant.
+  that mapping is treated as a broken invariant. The constrained dynamic-graph
+  mutation algebra (operations, legality rules, non-goals) is defined in
+  [docs/graph-mutations.md](docs/graph-mutations.md).
 - **Forge integrations**: GitHub (App auth, Checks API), GitLab, and
   Forgejo webhooks with verified signatures, trigger matching, and
   deduplicated deliveries.

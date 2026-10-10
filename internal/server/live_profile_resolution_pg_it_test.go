@@ -54,7 +54,7 @@ func TestIntegrationLeaseLiveRunnerIDProfileServerPostgres(t *testing.T) {
 	pgITBindingRunner(t, s, "live", runnerID)
 
 	ri := pgITRegisterBearer(t, s, "token-a",
-		`{"id":"`+runnerID+`","name":"ra","protocol_min":3,"protocol_max":3,"labels":["snapshot"],"capacity":8,"capabilities":["native","container"]}`)
+		`{"id":"`+runnerID+`","name":"ra","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["snapshot"],"capacity":8,"capabilities":["native","container"]}`)
 	if ri.Capacity != 1 || len(ri.Labels) != 1 || ri.Labels[0] != "container" {
 		t.Fatalf("registration did not apply the bound profile: %+v", ri)
 	}
@@ -63,7 +63,7 @@ func TestIntegrationLeaseLiveRunnerIDProfileServerPostgres(t *testing.T) {
 	}
 	// A second, unprofiled runner drives the fleet explainer misses.
 	rival := pgITRegisterBearer(t, s, "token-b",
-		`{"id":"`+rivalID+`","name":"rb","protocol_min":3,"protocol_max":3,"labels":["rival"],"capacity":1}`)
+		`{"id":"`+rivalID+`","name":"rb","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["rival"],"capacity":1}`)
 
 	pgITServerAwaitLeadership(t, s)
 	run1 := pgITSubmit(t, s, pgITServerPipeline)

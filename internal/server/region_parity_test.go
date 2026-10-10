@@ -64,7 +64,7 @@ jobs:
 		t.Fatalf("enqueue: %v", err)
 	}
 	register := func(region string) model.Runner {
-		body := `{"name":"r","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1`
+		body := `{"name":"r","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1`
 		if region != "" {
 			body += `,"region":"` + region + `"`
 		}

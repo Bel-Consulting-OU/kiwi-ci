@@ -58,7 +58,7 @@ func seedAttestationJob(t *testing.T, s *Server, jobID, runID string, generation
 	finish := start.Add(2 * time.Minute)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.runs[runID] = model.Run{ID: runID, RepoID: "github.com/acme/repo-a", Repo: "https://github.com/acme/repo-a.git", RepoFullName: "acme/repo-a", Ref: "refs/heads/main", SHA: "abc", Status: model.StatusSuccess}
+	s.runs[runID] = model.Run{ID: runID, RepoID: "github.com/acme/repo-a", Repo: "https://github.com/acme/repo-a.git", RepoFullName: "acme/repo-a", Ref: "refs/heads/main", SHA: "abc", Status: model.StatusSuccess, ExecutionSemantics: model.ExecutionSemanticsVersion}
 	s.jobs[jobID] = model.Job{
 		ID: jobID, RunID: runID, Key: "build", Status: model.StatusSuccess,
 		StartedAt: &start, FinishedAt: &finish, LeaseGeneration: generation,
@@ -66,6 +66,7 @@ func seedAttestationJob(t *testing.T, s *Server, jobID, runID string, generation
 		Pipeline:           attestationTestPipeline,
 		CompiledJobPayload: compiled,
 		ObservedRuntime:    &model.ObservedRuntime{OS: "linux", Arch: "amd64", RuntimeName: "docker", MainImage: "alpine:3.20"},
+		ExecutionSemantics: model.ExecutionSemanticsVersion,
 	}
 	s.artifacts["art-1"] = model.ArtifactRecord{ID: "art-1", RunID: runID, JobID: jobID, Name: "bin", SHA256: strings.Repeat("1", 64), Size: 11, LeaseGeneration: generation, ProvenanceSHA256: strings.Repeat("2", 64)}
 	s.artifacts["art-old"] = model.ArtifactRecord{ID: "art-old", RunID: runID, JobID: jobID, Name: "old", SHA256: strings.Repeat("3", 64), Size: 9, LeaseGeneration: generation - 1}
@@ -124,6 +125,11 @@ func TestAttestationEffectBindsDurableEvidence(t *testing.T) {
 	}
 	if att.CapsuleDigest == "" || att.ExecutionCapsuleDigest == "" {
 		t.Fatalf("capsule digests not bound: %+v", att)
+	}
+	// The signed evidence binds the execution-engine semantics of the durable
+	// attempt records.
+	if att.ExecutionSemantics != model.ExecutionSemanticsVersion || st.ExecutionSemantics != model.ExecutionSemanticsVersion {
+		t.Fatalf("execution semantics = block %q statement %q, want %q", att.ExecutionSemantics, st.ExecutionSemantics, model.ExecutionSemanticsVersion)
 	}
 	if att.ObservedRuntime == nil || att.ObservedRuntime.OS != "linux" || att.ObservedRuntime.MainImage != "alpine:3.20" {
 		t.Fatalf("observed runtime not bound: %+v", att.ObservedRuntime)
@@ -281,7 +287,7 @@ func TestControllerCapabilityAttestationScope(t *testing.T) {
 		{"repo-scoped evidence reaches its run (no attestation yet)", "repo-evidence", "/api/v1/jobs/" + jobA + "/attestation", http.StatusNotFound},
 		{"global evidence reaches any run", "global-evidence", "/api/v1/jobs/" + jobA + "/attestation", http.StatusNotFound},
 		{"admin token unchanged", "admin-tok", "/api/v1/jobs/" + jobA + "/attestation", http.StatusNotFound},
-		{"repo-scoped evidence denied another repo", "repo-evidence", "/api/v1/jobs/" + jobB + "/attestation", http.StatusForbidden},
+		{"repo-scoped evidence masked on another repo", "repo-evidence", "/api/v1/jobs/" + jobB + "/attestation", http.StatusNotFound},
 		{"checkpoints capability denied", "checkpoints-a", "/api/v1/jobs/" + jobA + "/attestation", http.StatusForbidden},
 		{"plain repo reader denied", "reader-a", "/api/v1/jobs/" + jobA + "/attestation", http.StatusForbidden},
 		{"runner bearer refused", "runner-tok", "/api/v1/jobs/" + jobA + "/attestation", http.StatusUnauthorized},

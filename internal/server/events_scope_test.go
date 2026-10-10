@@ -520,7 +520,7 @@ func TestEventsRepoAccessLossForbidden(t *testing.T) {
 		{"stream loses repo A", "/api/v1/events/stream?repo_id=" + scopeRepoA, http.StatusForbidden},
 		{"snapshot loses repo A", "/api/v1/execution-snapshot?repo_id=" + scopeRepoA, http.StatusForbidden},
 		{"unscoped snapshot still needs global", "/api/v1/execution-snapshot", http.StatusForbidden},
-		{"run-scoped list loses repo A", "/api/v1/events?run_id=run-a", http.StatusForbidden},
+		{"run-scoped list loses repo A", "/api/v1/events?run_id=run-a", http.StatusNotFound},
 	} {
 		if w := doJSON(t, s, http.MethodGet, tc.path, "events-a", ""); w.Code != tc.want {
 			t.Errorf("%s: GET %s = %d, want %d: %s", tc.name, tc.path, w.Code, tc.want, w.Body.String())

@@ -66,7 +66,7 @@ func TestRunnerTierMTLSEnforcedPassesToHandler(t *testing.T) {
 	h := s.Handler()
 	_, certA := pkiSignRunner(t, ca, "runner-a")
 
-	reg := map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "protocol_min": 3, "protocol_max": 3}
+	reg := map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}
 	// Valid bearer without a peer certificate: 401 at the tier gate.
 	if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register", reg, "runner-tok", nil); w.Code != http.StatusUnauthorized {
 		t.Fatalf("runner route without peer cert: got %d, want 401", w.Code)
@@ -77,7 +77,7 @@ func TestRunnerTierMTLSEnforcedPassesToHandler(t *testing.T) {
 		t.Fatalf("register with cert: %d %s", w.Code, w.Body.String())
 	}
 	_, certB := pkiSignRunner(t, ca, "runner-b")
-	bad := map[string]any{"id": "runner-b", "name": "rb", "capacity": 1, "protocol_min": 3, "protocol_max": 3}
+	bad := map[string]any{"id": "runner-b", "name": "rb", "capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}
 	if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register", bad, "runner-tok", certB); w.Code != http.StatusOK {
 		t.Fatalf("register runner-b: %d", w.Code)
 	}
@@ -140,7 +140,7 @@ func TestSharedListenerEnrollWithoutClientCert(t *testing.T) {
 	}
 
 	// The same cert-less client cannot reach runner-tier routes.
-	regReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/runners/register", stringsReader(`{"name":"r","protocol_min":3,"protocol_max":3}`))
+	regReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/runners/register", stringsReader(`{"name":"r","protocol_version": 2, "protocol_min":3,"protocol_max":3}`))
 	regReq.Header.Set("Authorization", "Bearer runner-tok")
 	regReq.Header.Set("Content-Type", "application/json")
 	regResp, err := client.Do(regReq)
@@ -362,18 +362,18 @@ func TestRegisterRejectsNaNCost(t *testing.T) {
 	s := New("secret")
 	h := s.Handler()
 	w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register",
-		[]byte(`{"name":"r","protocol_min":3,"protocol_max":3,"cost_per_hour":NaN}`), "secret", nil)
+		[]byte(`{"name":"r","protocol_version": 2, "protocol_min":3,"protocol_max":3,"cost_per_hour":NaN}`), "secret", nil)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("NaN cost_per_hour: got %d, want 400: %s", w.Code, w.Body.String())
 	}
 	w = pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register",
-		[]byte(`{"name":"r","protocol_min":3,"protocol_max":3,"power_watts":Infinity}`), "secret", nil)
+		[]byte(`{"name":"r","protocol_version": 2, "protocol_min":3,"protocol_max":3,"power_watts":Infinity}`), "secret", nil)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("Inf power_watts: got %d, want 400", w.Code)
 	}
 	// A sane registration still works.
 	w = pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register",
-		[]byte(`{"name":"r","protocol_min":3,"protocol_max":3,"cost_per_hour":1.5,"power_watts":120,"capacity":2}`), "secret", nil)
+		[]byte(`{"name":"r","protocol_version": 2, "protocol_min":3,"protocol_max":3,"cost_per_hour":1.5,"power_watts":120,"capacity":2}`), "secret", nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("sane registration: got %d: %s", w.Code, w.Body.String())
 	}

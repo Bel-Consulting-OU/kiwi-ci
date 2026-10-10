@@ -70,7 +70,7 @@ func TestPostgresIntegrationServerCompletionRaceDifferingResults(t *testing.T) {
 	sB, _ := pgITServerWithEnv(t, env, dir)
 
 	w := pgITDo(t, sA, http.MethodPost, "/api/v1/runners/register", "token",
-		`{"name":"race-runner","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2,"cost_per_hour":7200,"power_watts":500}`, nil)
+		`{"name":"race-runner","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2,"cost_per_hour":7200,"power_watts":500}`, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d %s", w.Code, w.Body.String())
 	}

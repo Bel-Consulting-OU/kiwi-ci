@@ -40,9 +40,9 @@ func rauthzSeed(s *Server) {
 	s.jobs["job-allowed"] = model.Job{ID: "job-allowed", RunID: "run-allowed", Key: "build", RepoID: rauthzAllowedRepoID, RepoURL: "https://github.com/bel/allowed.git", RepoFullName: "bel/allowed", Status: model.StatusRunning}
 	s.jobs["job-cloneurl"] = model.Job{ID: "job-cloneurl", RunID: "run-cloneurl", Key: "build", RepoURL: "https://GitHub.COM:443/bel/allowed.git", RepoFullName: "bel/allowed", Status: model.StatusRunning}
 	s.jobs["job-denied"] = model.Job{ID: "job-denied", RunID: "run-denied", Key: "build", RepoID: rauthzDeniedRepoID, RepoURL: "https://github.com/acme/private.git", RepoFullName: "acme/private", Status: model.StatusRunning}
-	s.runners["runner-mixed"] = model.Runner{ID: "runner-mixed", Name: "mixed", Capacity: 2, ActiveJobs: []string{"job-allowed", "job-denied"}}
-	s.runners["runner-cloneurl"] = model.Runner{ID: "runner-cloneurl", Name: "cloneurl", Capacity: 1, ActiveJobs: []string{"job-cloneurl"}}
-	s.runners["runner-denied"] = model.Runner{ID: "runner-denied", Name: "denied-only", Capacity: 1, ActiveJobs: []string{"job-denied"}}
+	s.runners["runner-mixed"] = model.Runner{ProtocolVersion: 2, ID: "runner-mixed", Name: "mixed", Capacity: 2, ActiveJobs: []string{"job-allowed", "job-denied"}}
+	s.runners["runner-cloneurl"] = model.Runner{ProtocolVersion: 2, ID: "runner-cloneurl", Name: "cloneurl", Capacity: 1, ActiveJobs: []string{"job-cloneurl"}}
+	s.runners["runner-denied"] = model.Runner{ProtocolVersion: 2, ID: "runner-denied", Name: "denied-only", Capacity: 1, ActiveJobs: []string{"job-denied"}}
 }
 
 // rauthzServer builds an in-memory server with the given store principals
@@ -120,8 +120,8 @@ func TestRepoAuthorizationExplicitDenyBeatsGlobalRead(t *testing.T) {
 	if !rauthzHas(ids, "run-allowed") || !rauthzHas(ids, "run-cloneurl") {
 		t.Fatalf("role fallback must still reach unmentioned repositories: %v", ids)
 	}
-	if w := c.do(http.MethodGet, "/api/v1/runs/run-denied", nil, nil); w.Code != http.StatusForbidden {
-		t.Fatalf("denied per-run read = %d, want 403", w.Code)
+	if w := c.do(http.MethodGet, "/api/v1/runs/run-denied", nil, nil); w.Code != http.StatusNotFound {
+		t.Fatalf("denied per-run read = %d, want masked 404", w.Code)
 	}
 	if w := c.do(http.MethodGet, "/api/v1/runs/run-allowed", nil, nil); w.Code != http.StatusOK {
 		t.Fatalf("role-fallback per-run read = %d, want 200", w.Code)
@@ -164,8 +164,8 @@ func TestRepoAuthorizationRepoOnlyReaderReachesCollections(t *testing.T) {
 	if w := c.do(http.MethodGet, "/api/v1/runs/run-allowed", nil, nil); w.Code != http.StatusOK {
 		t.Fatalf("granted per-run read = %d, want 200", w.Code)
 	}
-	if w := c.do(http.MethodGet, "/api/v1/runs/run-denied", nil, nil); w.Code != http.StatusForbidden {
-		t.Fatalf("foreign per-run read = %d, want 403", w.Code)
+	if w := c.do(http.MethodGet, "/api/v1/runs/run-denied", nil, nil); w.Code != http.StatusNotFound {
+		t.Fatalf("foreign per-run read = %d, want masked 404", w.Code)
 	}
 
 	serving, raw := rauthzServing(t, c)
@@ -212,8 +212,8 @@ func TestRepoAuthorizationCanonicalAliasesAgreeAcrossEndpoints(t *testing.T) {
 			if w := c.do(http.MethodGet, "/api/v1/runs/run-cloneurl", nil, nil); w.Code != http.StatusOK {
 				t.Fatalf("alias per-run read (clone-URL identity) = %d, want 200: %s", w.Code, w.Body.String())
 			}
-			if w := c.do(http.MethodGet, "/api/v1/runs/run-denied", nil, nil); w.Code != http.StatusForbidden {
-				t.Fatalf("alias per-run read of the denied repo = %d, want 403", w.Code)
+			if w := c.do(http.MethodGet, "/api/v1/runs/run-denied", nil, nil); w.Code != http.StatusNotFound {
+				t.Fatalf("alias per-run read of the denied repo = %d, want masked 404", w.Code)
 			}
 
 			ids := rauthzListRunIDs(t, c)
@@ -267,8 +267,8 @@ func TestRepoAuthorizationConflictingGrantsFailClosed(t *testing.T) {
 	})
 
 	conflict := newTestClient(t, s.Handler(), "conflict")
-	if w := conflict.do(http.MethodGet, "/api/v1/runs/run-allowed", nil, nil); w.Code != http.StatusForbidden {
-		t.Fatalf("conflicting grants per-run read = %d, want 403: %s", w.Code, w.Body.String())
+	if w := conflict.do(http.MethodGet, "/api/v1/runs/run-allowed", nil, nil); w.Code != http.StatusNotFound {
+		t.Fatalf("conflicting grants per-run read = %d, want masked 404: %s", w.Code, w.Body.String())
 	}
 	ids := rauthzListRunIDs(t, conflict)
 	for _, denied := range []string{"run-allowed", "run-cloneurl", "run-denied"} {

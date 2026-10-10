@@ -135,7 +135,7 @@ func TestControllerCapabilityEventScope(t *testing.T) {
 	}{
 		{"repo-scoped capability reads its run", "events-a", "/api/v1/events?run_id=" + runA.ID, http.StatusOK},
 		{"repo-scoped capability reads its repo", "events-a", "/api/v1/events?repo_id=github.com/acme/repo-a", http.StatusOK},
-		{"repo-scoped capability denied another repo", "events-a", "/api/v1/events?run_id=" + runB.ID, http.StatusForbidden},
+		{"repo-scoped capability masked on another repo", "events-a", "/api/v1/events?run_id=" + runB.ID, http.StatusNotFound},
 		{"repo-scoped capability denied another repo scope", "events-a", "/api/v1/events?repo_id=github.com/acme/repo-b", http.StatusForbidden},
 		{"repo-scoped capability denied unscoped", "events-a", "/api/v1/events", http.StatusForbidden},
 		{"global capability reads unscoped", "global-events", "/api/v1/events", http.StatusOK},
@@ -143,12 +143,12 @@ func TestControllerCapabilityEventScope(t *testing.T) {
 		{"global capability reads any repo scope", "global-events", "/api/v1/events?repo_id=github.com/acme/repo-b", http.StatusOK},
 		{"repo reader reads its own run history", "reader-a", "/api/v1/events?run_id=" + runA.ID, http.StatusOK},
 		{"repo reader reads its own repo scope", "reader-a", "/api/v1/events?repo_id=github.com/acme/repo-a", http.StatusOK},
-		{"repo reader denied another repo", "reader-a", "/api/v1/events?run_id=" + runB.ID, http.StatusForbidden},
+		{"repo reader masked on another repo", "reader-a", "/api/v1/events?run_id=" + runB.ID, http.StatusNotFound},
 		{"repo reader denied another repo scope", "reader-a", "/api/v1/events?repo_id=github.com/acme/repo-b", http.StatusForbidden},
 		{"repo reader denied unscoped", "reader-a", "/api/v1/events", http.StatusForbidden},
 		{"global read role denied unscoped without capability", "read-role", "/api/v1/events", http.StatusForbidden},
 		{"unrelated capability denied", "graph-only", "/api/v1/events", http.StatusForbidden},
-		{"unknown run denied without global capability", "events-a", "/api/v1/events?run_id=missing", http.StatusForbidden},
+		{"unknown run masked without global capability", "events-a", "/api/v1/events?run_id=missing", http.StatusNotFound},
 		{"unknown run allowed with global capability", "global-events", "/api/v1/events?run_id=missing", http.StatusOK},
 		{"admin token unchanged", "admin-tok", "/api/v1/events", http.StatusOK},
 		{"runner bearer refused", "runner-tok", "/api/v1/events", http.StatusUnauthorized},
@@ -211,13 +211,13 @@ func TestControllerCapabilitySnapshotAndPipelineScope(t *testing.T) {
 		want              int
 	}{
 		{"checkpoints reads its run listing", "checkpoints-a", "/api/v1/runs/" + runA.ID + "/snapshots", http.StatusOK},
-		{"checkpoints denied another run listing", "checkpoints-a", "/api/v1/runs/" + runB.ID + "/snapshots", http.StatusForbidden},
+		{"checkpoints masked on another run listing", "checkpoints-a", "/api/v1/runs/" + runB.ID + "/snapshots", http.StatusNotFound},
 		{"checkpoints downloads its run archive", "checkpoints-a", "/api/v1/runs/" + runA.ID + "/snapshots/" + sidA, http.StatusOK},
-		{"checkpoints downloads another run archive", "checkpoints-a", "/api/v1/runs/" + runB.ID + "/snapshots/" + sidB, http.StatusForbidden},
+		{"checkpoints masked on another run archive", "checkpoints-a", "/api/v1/runs/" + runB.ID + "/snapshots/" + sidB, http.StatusNotFound},
 		{"repo reader denied snapshots", "reader-a", "/api/v1/runs/" + runA.ID + "/snapshots", http.StatusForbidden},
 		{"evidence capability denied snapshots", "repo-evidence", "/api/v1/runs/" + runA.ID + "/snapshots", http.StatusForbidden},
 		{"repo-scoped evidence exports its run pipeline", "repo-evidence", "/api/v1/runs/" + runA.ID + "/jobs/" + jobA + "/pipeline", http.StatusOK},
-		{"repo-scoped evidence denied another run pipeline", "repo-evidence", "/api/v1/runs/" + runB.ID + "/jobs/" + jobB + "/pipeline", http.StatusForbidden},
+		{"repo-scoped evidence masked on another run pipeline", "repo-evidence", "/api/v1/runs/" + runB.ID + "/jobs/" + jobB + "/pipeline", http.StatusNotFound},
 		{"checkpoints capability denied pipeline export", "checkpoints-a", "/api/v1/runs/" + runA.ID + "/jobs/" + jobA + "/pipeline", http.StatusForbidden},
 		{"repo reader denied pipeline export", "reader-a", "/api/v1/runs/" + runA.ID + "/jobs/" + jobA + "/pipeline", http.StatusForbidden},
 		{"admin token unchanged list", "admin-tok", "/api/v1/runs/" + runA.ID + "/snapshots", http.StatusOK},
@@ -241,12 +241,12 @@ func TestControllerCapabilityCancelScope(t *testing.T) {
 		name, token, run string
 		want             int
 	}{
-		{"capability denied another repo's run", "canceller-a", runB.ID, http.StatusForbidden},
+		{"capability masked on another repo's run", "canceller-a", runB.ID, http.StatusNotFound},
 		{"capability cancels its own run", "canceller-a", runA.ID, http.StatusOK},
 		{"capability cancels its own run on the other repo", "canceller-b", runB.ID, http.StatusOK},
 		{"runner bearer refused", "runner-tok", runA.ID, http.StatusUnauthorized},
-		{"repo reader denied cancel", "reader-a", runB.ID, http.StatusForbidden},
-		{"events capability denied cancel", "events-a", runB.ID, http.StatusForbidden},
+		{"repo reader masked on another repo's run", "reader-a", runB.ID, http.StatusNotFound},
+		{"events capability masked on another repo's run", "events-a", runB.ID, http.StatusNotFound},
 	}
 	for _, tc := range cases {
 		if w := doJSON(t, s, http.MethodPost, "/api/v1/runs/"+tc.run+"/cancel", tc.token, ""); w.Code != tc.want {
@@ -274,9 +274,9 @@ func TestControllerCapabilityStreamScope(t *testing.T) {
 		name, token, path string
 		want              int
 	}{
-		{"scoped controller denied another repo stream", "events-a", "/api/v1/events/stream?run_id=" + runB.ID, http.StatusForbidden},
+		{"scoped controller masked on another repo stream", "events-a", "/api/v1/events/stream?run_id=" + runB.ID, http.StatusNotFound},
 		{"scoped controller denied unscoped stream", "events-a", "/api/v1/events/stream", http.StatusForbidden},
-		{"repo reader denied another repo stream", "reader-a", "/api/v1/events/stream?run_id=" + runB.ID, http.StatusForbidden},
+		{"repo reader masked on another repo stream", "reader-a", "/api/v1/events/stream?run_id=" + runB.ID, http.StatusNotFound},
 		{"runner bearer refused", "runner-tok", "/api/v1/events/stream", http.StatusUnauthorized},
 	} {
 		if w := doJSON(t, s, http.MethodGet, tc.path, tc.token, ""); w.Code != tc.want {

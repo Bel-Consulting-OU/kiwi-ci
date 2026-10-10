@@ -73,7 +73,7 @@ func TestCRLRevokedCertCannotReRegister(t *testing.T) {
 		h := s.Handler()
 		// Register, then disable (revokes the serial).
 		if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register",
-			map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "protocol_min": 3, "protocol_max": 3}, "runner-tok", certA); w.Code != http.StatusOK {
+			map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}, "runner-tok", certA); w.Code != http.StatusOK {
 			t.Fatalf("register: %d %s", w.Code, w.Body.String())
 		}
 		if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/runner-a/disable", "admin-tok", ""); w.Code != http.StatusOK {
@@ -84,7 +84,7 @@ func TestCRLRevokedCertCannotReRegister(t *testing.T) {
 		}
 		// Re-registration with the revoked certificate is refused.
 		if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register",
-			map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "protocol_min": 3, "protocol_max": 3}, "runner-tok", certA); w.Code != http.StatusUnauthorized && w.Code != http.StatusForbidden {
+			map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}, "runner-tok", certA); w.Code != http.StatusUnauthorized && w.Code != http.StatusForbidden {
 			t.Fatalf("revoked cert re-registered: %d %s", w.Code, w.Body.String())
 		}
 		// Every runner-tier route rejects it too.
@@ -120,7 +120,7 @@ func TestCRLRevokedCertCannotReRegister(t *testing.T) {
 		}
 		h := s.Handler()
 		if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register",
-			map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "protocol_min": 3, "protocol_max": 3}, "runner-tok", certA); w.Code != http.StatusOK {
+			map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}, "runner-tok", certA); w.Code != http.StatusOK {
 			t.Fatalf("register: %d %s", w.Code, w.Body.String())
 		}
 		if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/runner-a/disable", "admin-tok", ""); w.Code != http.StatusOK {
@@ -131,7 +131,7 @@ func TestCRLRevokedCertCannotReRegister(t *testing.T) {
 			t.Fatalf("durable revocation missing: %v %v", revoked, err)
 		}
 		if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register",
-			map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "protocol_min": 3, "protocol_max": 3}, "runner-tok", certA); w.Code != http.StatusUnauthorized && w.Code != http.StatusForbidden {
+			map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}, "runner-tok", certA); w.Code != http.StatusUnauthorized && w.Code != http.StatusForbidden {
 			t.Fatalf("revoked cert re-registered in DB mode: %d %s", w.Code, w.Body.String())
 		}
 		if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/runner-a/next", map[string]any{}, "runner-tok", certA); w.Code != http.StatusUnauthorized && w.Code != http.StatusForbidden {
@@ -324,7 +324,7 @@ func TestDisableRevocationWriteFailureFailsClosed(t *testing.T) {
 	}
 	h := s.Handler()
 	if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register",
-		map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "protocol_min": 3, "protocol_max": 3}, "runner-tok", certA); w.Code != http.StatusOK {
+		map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}, "runner-tok", certA); w.Code != http.StatusOK {
 		t.Fatalf("register: %d %s", w.Code, w.Body.String())
 	}
 	// A leased job makes the lease revocation observable.
@@ -379,7 +379,7 @@ func TestDisableRevocationWriteFailureFailsClosed(t *testing.T) {
 		t.Fatal("revoked certificate accepted after cache expiry")
 	}
 	if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register",
-		map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "protocol_min": 3, "protocol_max": 3}, "runner-tok", certA); w.Code != http.StatusUnauthorized && w.Code != http.StatusForbidden {
+		map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}, "runner-tok", certA); w.Code != http.StatusUnauthorized && w.Code != http.StatusForbidden {
 		t.Fatalf("revoked cert re-registered after cache expiry: %d", w.Code)
 	}
 }

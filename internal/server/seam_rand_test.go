@@ -182,7 +182,7 @@ func TestSeamRandHTTPHandlers(t *testing.T) {
 	if w := c.do(http.MethodPost, "/api/v1/runs", SubmitRun{RepoURL: "https://github.com/o/r.git", Ref: "main", Pipeline: testPipeline}, nil); w.Code != http.StatusAccepted {
 		t.Fatalf("seed submit = %d: %s", w.Code, w.Body.String())
 	}
-	w := c.do(http.MethodPost, "/api/v1/runners/register", map[string]any{"name": "r", "capacity": 1, "labels": []string{"container"}, "protocol_min": 3, "protocol_max": 3}, nil)
+	w := c.do(http.MethodPost, "/api/v1/runners/register", map[string]any{"name": "r", "capacity": 1, "labels": []string{"container"}, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("seed register = %d: %s", w.Code, w.Body.String())
 	}
@@ -198,7 +198,7 @@ func TestSeamRandHTTPHandlers(t *testing.T) {
 	if w := c.do(http.MethodPost, "/api/v1/runs", SubmitRun{RepoURL: "https://github.com/o/r.git", Ref: "main", Pipeline: testPipeline}, nil); w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "generate run id") {
 		t.Fatalf("submit with failing entropy = %d %s; want 400 generate run id", w.Code, w.Body.String())
 	}
-	if w := c.do(http.MethodPost, "/api/v1/runners/register", map[string]any{"name": "r2", "capacity": 1, "labels": []string{"container"}, "protocol_min": 3, "protocol_max": 3}, nil); w.Code != http.StatusInternalServerError {
+	if w := c.do(http.MethodPost, "/api/v1/runners/register", map[string]any{"name": "r2", "capacity": 1, "labels": []string{"container"}, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}, nil); w.Code != http.StatusInternalServerError {
 		t.Fatalf("register with failing entropy = %d; want 500", w.Code)
 	}
 	if w := c.do(http.MethodPost, "/api/v1/runners/"+reg.ID+"/next", map[string]any{}, nil); w.Code != http.StatusInternalServerError {

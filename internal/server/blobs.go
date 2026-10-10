@@ -933,6 +933,11 @@ func artifactProvenanceInput(j model.Job, run model.Run, rec model.ArtifactRecor
 		ArtifactPublishedAt: publishedAt,
 		RunnerIdentity:      runnerID,
 		ArtifactSize:        rec.Size,
+		// The signed statement binds the execution-engine semantics the
+		// producing attempt ran under, read from the durable stamped records
+		// (job, falling back to its run). Legacy records keep the empty
+		// string: it is never guessed.
+		ExecutionSemantics: jobExecutionSemantics(j, run),
 	}
 	if j.StartedAt != nil {
 		in.StartTime = j.StartedAt
@@ -1013,22 +1018,17 @@ func effectivePolicyDigest(p *model.CompiledJobPayload) string {
 
 func (s *Server) listArtifacts(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
+	// Existence masking first: a missing run and another repository's run are
+	// the same masked 404; a visible run then faces the artifact_read
+	// decision, so a reader without artifact_read keeps its 403.
+	run, ok := s.requireRunVisible(w, r, runID)
+	if !ok {
+		return
+	}
+	if !s.requireRunArtifactRead(w, r, run) {
+		return
+	}
 	if s.DB != nil {
-		// Unlike the upload path, this run load only scopes the read; it
-		// signs no provenance. It is already fail-closed: a missing record
-		// answers 404 and a store failure aborts before any authorization,
-		// so a zero-valued run can never widen the list.
-		run, err := s.DB.GetRun(r.Context(), runID)
-		if errors.Is(err, storage.ErrNotFound) {
-			http.NotFound(w, r)
-			return
-		} else if err != nil {
-			s.internalError(w, r, err, "")
-			return
-		}
-		if !s.requireRunArtifactRead(w, r, run) {
-			return
-		}
 		out, err := s.DB.ListArtifacts(r.Context(), runID)
 		if err != nil {
 			s.internalError(w, r, err, "")
@@ -1042,19 +1042,7 @@ func (s *Server) listArtifacts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	run, ok := s.runs[runID]
-	if ok {
-		s.mu.Unlock()
-		if !s.requireRunArtifactRead(w, r, run) {
-			return
-		}
-		s.mu.Lock()
-	}
 	defer s.mu.Unlock()
-	if !ok {
-		http.NotFound(w, r)
-		return
-	}
 	out := []model.ArtifactRecord{}
 	for _, a := range s.artifacts {
 		if a.RunID == runID {
@@ -1073,10 +1061,17 @@ func (s *Server) downloadArtifact(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	rec, err := s.artifactRecord(r.Context(), id)
 	if err != nil {
-		http.NotFound(w, r)
+		// A missing artifact and an artifact whose run is missing or not
+		// visible are the same masked 404: the artifact id is not an
+		// existence oracle for another repository's records.
+		s.writeMaskedRunNotFound(w)
 		return
 	}
-	if !s.requireArtifactRead(w, r, rec) {
+	run, ok := s.requireRunVisible(w, r, rec.RunID)
+	if !ok {
+		return
+	}
+	if !s.requireRunArtifactRead(w, r, run) {
 		return
 	}
 	f, err := s.openArtifact(r.Context(), rec)
@@ -1629,11 +1624,21 @@ func manifestDigestOf(b []byte) string {
 func (s *Server) downloadProvenance(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	a, err := s.artifactRecord(r.Context(), id)
-	if err != nil || a.ProvenanceSHA256 == "" {
-		http.NotFound(w, r)
+	if err != nil {
+		// Same masking rule as the artifact download: a missing record and
+		// another repository's record are byte-identical.
+		s.writeMaskedRunNotFound(w)
 		return
 	}
-	if !s.requireArtifactRead(w, r, a) {
+	run, ok := s.requireRunVisible(w, r, a.RunID)
+	if !ok {
+		return
+	}
+	if !s.requireRunArtifactRead(w, r, run) {
+		return
+	}
+	if a.ProvenanceSHA256 == "" {
+		http.NotFound(w, r)
 		return
 	}
 	rc, err := s.openSidecar(r.Context(), a.ProvenancePath, a.ProvenanceSHA256)

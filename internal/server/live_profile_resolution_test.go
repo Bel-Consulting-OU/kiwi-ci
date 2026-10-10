@@ -42,7 +42,7 @@ func TestMemoryLiveRunnerUsesRunnerIDBinding(t *testing.T) {
 	s := adminProfileServer(t)
 	createProfile(t, s, model.RunnerProfile{ID: "p", Labels: []string{"bound"}, Region: "east", Repositories: []string{"github.com/o/allowed"}, MaxCapacity: 2, CostPerHour: 3, PowerWatts: 40})
 	bindRunnerProfile(t, s, "p", "runner-a", "admin-tok")
-	snapshot := model.Runner{ID: "runner-a", Capacity: 9, Labels: []string{"snapshot"}, Region: "west", CostPerHour: 9}
+	snapshot := model.Runner{ProtocolVersion: 2, ID: "runner-a", Capacity: 9, Labels: []string{"snapshot"}, Region: "west", CostPerHour: 9}
 	seedLiveRunner(t, s, snapshot)
 
 	eff, linked := liveRunnerForTest(t, s, snapshot)
@@ -95,7 +95,7 @@ func TestMemoryLiveRunnerCertPrecedence(t *testing.T) {
 	createProfile(t, s, model.RunnerProfile{ID: "id-p", Labels: []string{"id"}, MaxCapacity: 5})
 	bindSerial(t, s, "cert-p", "serial-1")
 	bindRunnerProfile(t, s, "id-p", "runner-a", "admin-tok")
-	withSerial := model.Runner{ID: "runner-a", Capacity: 9, Labels: []string{"snapshot"}, CertSerial: "serial-1"}
+	withSerial := model.Runner{ProtocolVersion: 2, ID: "runner-a", Capacity: 9, Labels: []string{"snapshot"}, CertSerial: "serial-1"}
 	seedLiveRunner(t, s, withSerial)
 	eff, linked := liveRunnerForTest(t, s, withSerial)
 	if !linked || eff.Capacity != 3 || len(eff.Labels) != 1 || eff.Labels[0] != "cert" {
@@ -135,7 +135,7 @@ func TestMemoryQueueReasonUsesRunnerIDBinding(t *testing.T) {
 	s := adminProfileServer(t)
 	createProfile(t, s, model.RunnerProfile{ID: "p", Labels: []string{"bound"}, Capabilities: []string{"native"}, MaxCapacity: 1})
 	bindRunnerProfile(t, s, "p", "runner-a", "admin-tok")
-	ri := model.Runner{ID: "runner-a", Capacity: 1, Labels: []string{"snapshot"}, ReportedCapabilities: []string{"native"}}
+	ri := model.Runner{ProtocolVersion: 2, ID: "runner-a", Capacity: 1, Labels: []string{"snapshot"}, ReportedCapabilities: []string{"native"}}
 	seedLiveRunner(t, s, ri)
 	s.mu.Lock()
 	s.jobs["job-q"] = model.Job{ID: "job-q", RunID: "run-q", Key: "build", Status: model.StatusQueued, RequiredLabels: []string{"bound"}, RepoID: "github.com/o/r"}
@@ -170,11 +170,11 @@ func TestDBExplainUsesRunnerIDBinding(t *testing.T) {
 	f.mu.Lock()
 	f.profiles["p"] = model.RunnerProfile{ID: "p", Labels: []string{"bound"}, Capabilities: []string{"native"}, MaxCapacity: 1}
 	f.runnerProfiles["runner-a"] = "p"
-	f.runners["runner-a"] = model.Runner{ID: "runner-a", Name: "runner-a", Capacity: 1, Labels: []string{"snapshot"}, ReportedCapabilities: []string{"native"}}
+	f.runners["runner-a"] = model.Runner{ProtocolVersion: 2, ID: "runner-a", Name: "runner-a", Capacity: 1, Labels: []string{"snapshot"}, ReportedCapabilities: []string{"native"}}
 	f.jobs["job-q"] = model.Job{ID: "job-q", RunID: "run-q", Key: "build", Status: model.StatusQueued, RepoURL: "https://github.com/o/repo-a.git", RepoFullName: "o/repo-a", RequiredLabels: []string{"bound"}}
 	f.mu.Unlock()
 
-	ri := model.Runner{ID: "runner-a", Capacity: 1, Labels: []string{"snapshot"}}
+	ri := model.Runner{ProtocolVersion: 2, ID: "runner-a", Capacity: 1, Labels: []string{"snapshot"}}
 	got, err := f.GetRunner(ctx, "runner-a")
 	if err != nil {
 		t.Fatal(err)

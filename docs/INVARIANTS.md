@@ -163,6 +163,33 @@ when the request passed the authentication gate earlier.
 | Runner incarnation | Registration session must still be current for OIDC/secrets/artifact/snapshot/cache | `runnerIncarnationCurrent` / `requireCurrentRunnerIncarnation` — `internal/server/server.go:3856`, `:3905` | `TestCompletionRefusedForSupersededIncarnation`, `TestModernHeaderlessRefusedAfterSupersession`, `TestIntegrationRegisterRevokesPredecessorIncarnation` |
 | Leader-only mutations | Leadership epoch fence (`ErrStaleLeader`) on every leader-owned transaction | `beginFencedTx` (`internal/storage`) | `TestIntegrationLeaderFence...` (`internal/server/leader_fence_it_test.go`), scheduler epoch tests |
 
+**Rolling-upgrade protocol floor (I3 / rolling upgrade).** A runner whose
+negotiated WIRE-SEMANTIC protocol is below `model.JobRequiresProtocol` never
+receives a new lease: `/next` answers HTTP `409 RUNNER_PROTOCOL_UNSUPPORTED`
+before any claim or reservation mutation — enforced identically in the
+memory path (`(*Server).next`) and the DB path (`(*Server).nextDB`) through
+`writeRunnerProtocolUnsupported`/`effectiveRunnerProtocol` — while
+heartbeat, logs and completion for already-claimed work stay governed by the
+SAME generation-based commit fences in the matrix above. Registration
+refuses a runner below the configured floor
+(`server.min_runner_protocol`, default `model.RunnerProtocolVersion`) with
+`400` and stores nothing; the negotiated version is persisted additively on
+the runner payload (`model.Runner.ProtocolVersion`; absent = legacy v1), and
+every leased task advertises the required `protocol_version`. Regression
+tests: `TestNextRefusesLegacyRunnerButDrainsClaimedWork`,
+`TestRegisterRefusesLegacyProtocolByDefault`,
+`TestRegisterLegacyDuringUpgradeWindow`, `TestLeaseAdvertisesProtocolVersion`
+(`internal/server/runner_protocol_test.go`),
+`TestCheckServerProtocol`, `TestCheckTaskProtocol`,
+`TestRegisterRefusesIncompatibleServerResponse`,
+`TestNextRefusesTaskRequiringNewerProtocol`
+(`internal/runner/runner_protocol_test.go`),
+`TestMinRunnerProtocolDefault`, `TestMinRunnerProtocolValidation`,
+`TestMinRunnerProtocolTOMLRoundTrip` (`internal/config/runner_protocol_test.go`),
+`TestRunnerProtocolConstants`, `TestRunnerProtocolVersionAdditiveJSON`
+(`internal/model/runner_protocol_test.go`). Procedure:
+`docs/production-deployment.md#rolling-upgrades-and-the-runner-protocol-floor`.
+
 **Closure of GAP-1/GAP-2 (this change).**
 
 - **GAP-1 — closed. DB log append has a commit fence.**
@@ -298,17 +325,23 @@ only path that could turn a recorded `generate:` fragment into control-plane
 work — `executor.Options.GenerateUpload` — is deliberately never wired by
 replay; step-declared effects (deployment phases, secrets, OIDC) are refused
 unless `--allow-external-effects` is passed, and the residual undeclared-effect
-risk is always warned about.
+risk is always warned about. Exact replay also never silently reinterprets a
+record produced under a different execution-engine semantics: see
+"Reproducibility boundary" below.
 
 **Enforcement points.**
 - Replay never sets `GenerateUpload`; a replayed generator executes its step
   locally, reads the declared fragment for validation, and uploads nothing:
-  `internal/app/replay.go:425-435` (invariant comment at the execution site),
+  `internal/app/replay.go` (invariant comment at the execution site),
   executor read/upload split at `internal/executor/executor.go:1049-1091`
   (upload only when the hook is non-nil; the runner wires it at
   `internal/runner/runner.go:1655`).
 - Declared-effect gate: `replayDeclaredEffects` + `--allow-external-effects`:
   `internal/app/replay.go`.
+- Reproducibility boundary: `replayExecutionSemanticsCheck` refuses to
+  reinterpret a record stamped with a different non-empty execution semantics
+  (see "Reproducibility boundary" below); empty pre-stamp records warn and
+  proceed.
 - Control-plane access is read-only: the replay client issues only GETs
   (recorded pipeline, snapshot pages, snapshot archive).
 
@@ -320,11 +353,102 @@ risk is always warned about.
   call.
 - `TestReplayExactRefusesDeclaredExternalEffects`,
   `TestReplayExactAllowsDeclaredEffectsWithFlag`,
-  `TestReplayExactWarnsAboutUndeclaredEffects`
+  `TestReplayExactWarnsAboutUndeclaredEffects`,
+  `TestReplayExactExecutionSemanticsDecisionTable`
   (`internal/app/replay_exact_test.go`).
 - `TestReplayExactIgnoresLocalPipelineFile`,
   `TestReplayExactRefusesMismatchedPayload`
   (`internal/app/replay_exact_test.go`).
+
+**Status.** enforced+tested.
+
+---
+
+## Reproducibility boundary — execution semantics vs wire schema
+
+**Statement.** Every run and job Kiwi creates carries an explicit
+EXECUTION-ENGINE SEMANTIC version: `model.ExecutionSemanticsVersion`
+(`kiwi.execution.v2`). It is deliberately not the wire/serialization schema
+(`model.RunnerProtocolVersion` plus the per-record `schemaVersion` fields):
+two builds may exchange the same fields while INTERPRETING durable state or a
+compiled job differently. The stamp is durable state; it travels into the
+signed evidence (the execution attestation's canonical digest and the artifact
+provenance statement) and into workspace snapshot records, and exact replay
+refuses to reinterpret a record produced under a different non-empty version
+under the current engine.
+
+**Bump rule.** Any change to how the scheduler, the runner or the executor
+interprets durable state or compiled jobs — a changed MEANING of existing
+state, not a field addition the existing semantics safely ignore — MUST bump
+`model.ExecutionSemanticsVersion` and document the new semantics on the
+constant. Records persisted before stamping existed carry the empty string;
+exact replay assumes the current semantics for them and prints a warning.
+
+**Enforcement points.**
+- Constant and stamp fields: `model.ExecutionSemanticsVersion`,
+  `model.Run.ExecutionSemantics`, `model.Job.ExecutionSemantics` and
+  `model.SnapshotRecord.ExecutionSemantics` (`internal/model/model.go`).
+- Enqueue stamping: every ingress (submit, webhook, rerun, schedule,
+  downstream dispatch) funnels through `(*Server).enqueueID`
+  (`internal/server/server.go`), which stamps the run and copies the run's
+  value to every job; dynamically generated children inherit the parent run's
+  stamp (`processGeneratedFragment`, `internal/server/dynamic.go`). A rerun or
+  a downstream child is a NEW run and is stamped with the semantics in effect
+  when it is created.
+- Snapshot records: both upload paths stamp `j.ExecutionSemantics`
+  (`internal/server/snapshots.go`).
+- Evidence binding: `provenance.ExecutionAttestation.ExecutionSemantics` is
+  part of `ExecutionAttestationDigest` (attestation `schemaVersion` 3), and
+  `provenance.Statement.ExecutionSemantics` is set by `ArtifactStatement`
+  from `server.artifactProvenanceInput`; both are covered by the DSSE
+  signature. `kiwi verify` prints the verified value and enforces the
+  optional `--execution-semantics` constraint.
+- Exact replay decision table: `replayExecutionSemanticsCheck`
+  (`internal/app/replay.go`) — equal to the current version: proceed; EMPTY
+  (pre-stamp legacy record): warn that current semantics are assumed, then
+  proceed; any OTHER value: refuse naming the recorded and current versions,
+  unless the forensic `--allow-unknown-semantics` escape hatch is passed
+  (loud warning; `--debug-rerun` is exempt because it never claims to
+  reproduce the recorded execution).
+- Attempt identity: the replay export carries the job's stamp
+  (`runJobPipeline.ExecutionSemantics`, `exportRunJobPipeline`) and the
+  replay client reads it from the recorded data.
+
+**Related.** Exact replay (I5) and the constrained graph-mutation algebra
+([graph-mutations.md](graph-mutations.md)): a graph mutation may only ADD
+nodes to its run (`AddNode`/`AddDependency`/`ExpandFanout`), so it can never
+introduce a job stamped with semantics different from its run's.
+
+**Regression tests.**
+- `TestExecutionSemanticsConstants`, `TestExecutionSemanticsAdditiveJSON`
+  (`internal/model/runner_protocol_test.go`).
+- `TestEnqueueStampsExecutionSemanticsMemory`,
+  `TestEnqueueStampsExecutionSemanticsDBFake`,
+  `TestRerunStampsExecutionSemantics`,
+  `TestGeneratedFragmentInheritsExecutionSemantics`
+  (`internal/server/enqueue_test.go`, `internal/server/rerun_trusted_test.go`,
+  `internal/server/dynamic_receipt_test.go`).
+- `TestAttestationEffectBindsDurableEvidence`,
+  `TestArtifactUploadProvenanceCarriesFullIdentity`,
+  `TestSnapshotUploadStampsAttemptIdentityMemory`,
+  `TestSnapshotUploadStampsAttemptIdentityDB`,
+  `TestExportRunJobPipelineRequiresAdminMemory`,
+  `TestExportRunJobPipelineDB` (`internal/server/attestation_test.go`,
+  `internal/server/blobs_provenance_identity_test.go`,
+  `internal/server/replay_pipeline_test.go`).
+- `TestExecutionAttestationBindsExecutionSemantics`,
+  `TestArtifactStatementCarriesExecutionSemantics`,
+  `TestExtendedFieldsRoundTrip`, `TestExecutionAttestationConstraints`
+  (`internal/provenance/attestation_test.go`,
+  `internal/provenance/provenance_test.go`): the version is digest-bound and
+  tampering with it fails verification.
+- `TestReplayExactExecutionSemanticsDecisionTable`
+  (`internal/app/replay_exact_test.go`).
+- `TestVerifyFlagsPlumbedToVerifyWith`, `TestVerifyPrintsExecutionSemantics`
+  (`internal/app/verify_test.go`, `internal/app/verify_attestation_test.go`).
+- `TestPostgresIntegrationExecutionSemanticsRoundTrip`
+  (`internal/storage/postgres_roundtrip_it_test.go`): payload-additive in
+  PostgreSQL, legacy payloads read back empty.
 
 **Status.** enforced+tested.
 
@@ -339,6 +463,16 @@ the recorded receipt, a different fragment for the same slot is refused, and a
 child key that collides with an existing run job (run-scoped logical identity)
 is refused before any insert. Committed history is therefore stable under any
 late, duplicated, or racing graph mutation.
+
+**Constrained algebra.** The mutation surface is defined as a deliberately
+limited operation algebra — AddNode, AddConditionalNode, AddDependency,
+ExpandFanout, CancelPendingSubgraph, SealSubgraph — with explicit legality
+rules (queued-only insertion, no rewrite of a committed node's prerequisite
+set, fragment-confined edges, acyclic graphs, depth/count caps,
+slot-idempotent replay, run-scoped key uniqueness) and explicit non-goals
+(remove edge, replace node, arbitrary fan-outs, mutation of committed nodes).
+Each rule is mapped to enforcement and tests in
+[graph-mutations.md](graph-mutations.md).
 
 **Enforcement points.**
 - Mutation-slot winner: `(parent_job_id, mutation_slot)` unique index
@@ -360,6 +494,19 @@ late, duplicated, or racing graph mutation.
   `TestGeneratedFragmentStaleGenerationCannotReplay`,
   `TestRestoreGeneratedFragmentsSlotConflictKeepsNewest`
   (`internal/server/dynamic_receipt_test.go`).
+- Operation/legality algebra pinning (queue-only insertion, implicit parent
+  edge, fragment-confined dependencies, cycles, conditional children,
+  committed-node immutability, completion/cancel sealing):
+  `TestGraphMutationAddNodeQueuesChildWithParentEdge`,
+  `TestGraphMutationAddDependencyStaysInsideFragment`,
+  `TestGraphMutationFragmentJobNeedsFieldCannotSmuggleEdges`,
+  `TestGraphMutationRejectsCycle`,
+  `TestGraphMutationConditionalChild`,
+  `TestGraphMutationNeverMutatesCommittedNodes`,
+  `TestGraphMutationCompletedParentSealsGeneration`,
+  `TestGraphMutationCancelRunSealsPendingSubgraph`
+  (`internal/server/graph_mutation_algebra_test.go`; mapped in
+  [graph-mutations.md](graph-mutations.md)).
 - `TestGeneratedFragmentChildKeyCollidesWithExistingRunJob`,
   `TestGeneratedFragmentChildKeyCollidesAcrossFragments`,
   `TestGeneratedFragmentMatrixKeysStayDistinct`

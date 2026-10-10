@@ -233,6 +233,48 @@ func TestPostgresIntegrationJobsRoundTrip(t *testing.T) {
 	}
 }
 
+// TestPostgresIntegrationExecutionSemanticsRoundTrip proves the
+// reproducibility-boundary stamp is payload-additive in PostgreSQL: a run and
+// a job written with model.ExecutionSemanticsVersion read it back unchanged,
+// while a legacy record written without it reads back as the empty string
+// (no migration, no dedicated column).
+func TestPostgresIntegrationExecutionSemanticsRoundTrip(t *testing.T) {
+	st := pgITStore(t)
+	ctx := context.Background()
+	runID, jobID := pgITNewID(t), pgITNewID(t)
+
+	req := InsertCompiledRunRequest{
+		Run: model.Run{ID: runID, Repo: pgITRepo, RepoFullName: "kiwi-it/repo", RepoID: pgITRepoID, Status: model.StatusQueued, CreatedAt: time.Now().UTC(), ExecutionSemantics: model.ExecutionSemanticsVersion},
+		Jobs: map[string]model.Job{jobID: {
+			ID: jobID, RunID: runID, Key: "build-" + jobID, RepoURL: pgITRepo, RepoFullName: "kiwi-it/repo",
+			Status: model.StatusQueued, CreatedAt: time.Now().UTC(), ExecutionSemantics: model.ExecutionSemanticsVersion,
+		}},
+	}
+	if err := st.InsertCompiledRun(ctx, req); err != nil {
+		t.Fatalf("InsertCompiledRun: %v", err)
+	}
+	gotRun, err := st.GetRun(ctx, runID)
+	if err != nil || gotRun.ExecutionSemantics != model.ExecutionSemanticsVersion {
+		t.Fatalf("GetRun semantics = %q, %v; want %q", gotRun.ExecutionSemantics, err, model.ExecutionSemanticsVersion)
+	}
+	gotJob, err := st.GetJob(ctx, jobID)
+	if err != nil || gotJob.ExecutionSemantics != model.ExecutionSemanticsVersion {
+		t.Fatalf("GetJob semantics = %q, %v; want %q", gotJob.ExecutionSemantics, err, model.ExecutionSemanticsVersion)
+	}
+
+	// A legacy record (stamp absent) reads back empty, never guessed.
+	legacyRunID, legacyJobID := pgITNewID(t), pgITNewID(t)
+	pgITEnqueueOne(t, st, legacyRunID, legacyJobID, pgITRepo)
+	legacyRun, err := st.GetRun(ctx, legacyRunID)
+	if err != nil || legacyRun.ExecutionSemantics != "" {
+		t.Fatalf("legacy GetRun semantics = %q, %v; want empty", legacyRun.ExecutionSemantics, err)
+	}
+	legacyJob, err := st.GetJob(ctx, legacyJobID)
+	if err != nil || legacyJob.ExecutionSemantics != "" {
+		t.Fatalf("legacy GetJob semantics = %q, %v; want empty", legacyJob.ExecutionSemantics, err)
+	}
+}
+
 func TestPostgresIntegrationPlainLeaseRoundTrip(t *testing.T) {
 	st := pgITStore(t)
 	ctx := context.Background()

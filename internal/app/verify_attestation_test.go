@@ -32,6 +32,7 @@ func attestationVerifyFixture(t *testing.T) ([]byte, ed25519.PublicKey, string) 
 		Artifacts: []provenance.ExecutionAttestationArtifact{
 			{Name: "bin", SHA256: strings.Repeat("1", 64), Size: 3, ProvenanceSHA256: strings.Repeat("2", 64)},
 		},
+		ExecutionSemantics: model.ExecutionSemanticsVersion,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -90,13 +91,14 @@ func TestVerifyExecutionAttestationModes(t *testing.T) {
 	}
 
 	// Constraints: matching passes, each mismatch fails.
-	if err := VerifyArtifact(append(append([]string{}, base...), "--attempt", "job-1:3", "--capsule-digest", strings.Repeat("a", 64), "--execution-capsule-digest", strings.Repeat("b", 64))); err != nil {
+	if err := VerifyArtifact(append(append([]string{}, base...), "--attempt", "job-1:3", "--capsule-digest", strings.Repeat("a", 64), "--execution-capsule-digest", strings.Repeat("b", 64), "--execution-semantics", model.ExecutionSemanticsVersion)); err != nil {
 		t.Fatalf("matching constraints: %v", err)
 	}
 	for name, extra := range map[string][]string{
 		"attempt":                  {"--attempt", "job-1:4"},
 		"capsule-digest":           {"--capsule-digest", strings.Repeat("f", 64)},
 		"execution-capsule-digest": {"--execution-capsule-digest", strings.Repeat("f", 64)},
+		"execution-semantics":      {"--execution-semantics", "kiwi.execution.v-future"},
 	} {
 		if err := VerifyArtifact(append(append([]string{}, base...), extra...)); err == nil {
 			t.Fatalf("%s mismatch accepted", name)
@@ -202,5 +204,61 @@ func TestVerifyAttestationUsageErrors(t *testing.T) {
 	}
 	if err := VerifyArtifact([]string{"--attestation", "j", "--generation", "-1"}); err == nil {
 		t.Fatal("negative generation accepted")
+	}
+}
+
+// TestVerifyPrintsExecutionSemantics proves the verified execution-engine
+// semantic version is printed in attestation mode, and that a legacy record
+// (no stamp) prints an explicit "predates ... stamping" marker instead of a
+// blank field. --execution-semantics constrains the same value.
+func TestVerifyPrintsExecutionSemantics(t *testing.T) {
+	envBytes, _, keyPath := attestationVerifyFixture(t)
+	attPath := filepath.Join(t.TempDir(), "attestation.json")
+	if err := os.WriteFile(attPath, envBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() {
+		if err := VerifyArtifact([]string{"--trusted-key", keyPath, "--attestation-file", attPath, "--attempt", "job-1:3"}); err != nil {
+			t.Fatalf("verify: %v", err)
+		}
+	})
+	if !strings.Contains(out, "execution semantics: "+model.ExecutionSemanticsVersion) {
+		t.Fatalf("verified semantics not printed: %q", out)
+	}
+	if err := VerifyArtifact([]string{"--trusted-key", keyPath, "--attestation-file", attPath, "--execution-semantics", "kiwi.execution.v-future"}); err == nil || !strings.Contains(err.Error(), "execution semantics mismatch") {
+		t.Fatalf("execution-semantics constraint not enforced: %v", err)
+	}
+
+	// A legacy (unstamped) attestation prints the explicit marker.
+	start := time.Unix(1700000000, 0).UTC()
+	legacy, err := provenance.ExecutionAttestationStatement(provenance.ExecutionAttestationInput{RunID: "run-1", JobID: "job-1", Generation: 3, Status: "success", StartedAt: &start})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := provenance.Sign(legacy, "kid-att", priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, _ := x509.MarshalPKIXPublicKey(priv.Public())
+	legacyKey := filepath.Join(t.TempDir(), "legacy.pub")
+	if err := os.WriteFile(legacyKey, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	legacyBytes, _ := json.Marshal(env)
+	legacyPath := filepath.Join(t.TempDir(), "legacy.json")
+	if err := os.WriteFile(legacyPath, legacyBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out = captureStdout(t, func() {
+		if err := VerifyArtifact([]string{"--trusted-key", legacyKey, "--attestation-file", legacyPath, "--attempt", "job-1:3"}); err != nil {
+			t.Fatalf("legacy verify: %v", err)
+		}
+	})
+	if !strings.Contains(out, "predates execution-semantics stamping") {
+		t.Fatalf("legacy semantics marker not printed: %q", out)
 	}
 }

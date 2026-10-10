@@ -36,6 +36,64 @@ func (s Status) Terminal() bool {
 // RunnerProfile.JobCgroup and Runner.JobCgroup.
 const CapabilityJobCgroup = "job-cgroup"
 
+// RunnerProtocolVersion is the current WIRE-SEMANTIC protocol version of the
+// runner/control-plane protocol. It versions REQUIREMENTS, not fields: every
+// v2 participant must implement all of the following, so a v1 runner must
+// never be leased new work:
+//
+//   - lease-generation fencing on every runner-originated mutation: a
+//     completion, log append, artifact/cache/snapshot commit, secret
+//     issuance or OIDC issuance re-validates (holder, generation, token,
+//     expiry) against the locked durable row at COMMIT time, so a
+//     superseded generation can never mutate authoritative state;
+//   - typed/scoped event cursors: execution-event reads carry an explicit
+//     scope and a typed cursor, and a cursor below the retention watermark
+//     is refused (410 cursor_expired) instead of silently truncating;
+//   - execution attestation: completion carries the executor-observed
+//     runtime evidence (model.ObservedRuntime) bound to the attempt;
+//   - checkpoint phases: checkpoint publication carries its explicit phase;
+//   - artifact commit fencing: artifact publication is fenced by the live
+//     lease at commit time, not merely authenticated when the upload starts.
+//
+// Any new wire-semantic requirement MUST bump this constant. The server
+// refuses a registration below its configured minimum
+// (server.min_runner_protocol, default RunnerProtocolVersion; 400) and
+// refuses to lease to a registered runner whose negotiated version is below
+// JobRequiresProtocol (409 RUNNER_PROTOCOL_UNSUPPORTED). A legacy
+// registration that omits protocol_version is version 1.
+const RunnerProtocolVersion = 2
+
+// JobRequiresProtocol is the wire-semantic protocol version a leased task
+// requires: the semantics of this binary's /next response. It currently
+// equals RunnerProtocolVersion; a runner whose registration negotiated a
+// lower version is refused a lease (409 RUNNER_PROTOCOL_UNSUPPORTED) before
+// any claim or reservation mutation.
+const JobRequiresProtocol = RunnerProtocolVersion
+
+// ExecutionSemanticsVersion is the SEMANTIC compatibility version of the
+// execution engine: the version of the rules by which the scheduler, the
+// runner and the executor INTERPRET durable state and compiled jobs. It is
+// deliberately NOT the wire/serialization schema (that is
+// RunnerProtocolVersion plus the per-record schemaVersion fields): two builds
+// can speak the same wire while interpreting a lease, a cursor, a checkpoint
+// phase or a compiled job differently.
+//
+// v2 covers: lease-generation fencing, scoped event cursors, execution
+// attestation, checkpoint phases, artifact commit fencing and runner protocol
+// negotiation. Every run and job created by the server is stamped with the
+// value in effect at creation, and the stamp travels with the durable record,
+// the execution attestation and the artifact provenance.
+//
+// Bump rule: ANY change to how the scheduler, the runner or the executor
+// interprets durable state or compiled jobs — not a field addition that the
+// existing semantics safely ignore, but a changed MEANING of existing state —
+// MUST bump this constant. Exact replay reinterprets recorded history under
+// the CURRENT engine, so it refuses a record stamped with a different
+// non-empty value: a historical execution reproduced by a different
+// interpreter is not the same execution. A record persisted before stamping
+// (empty value) predates this boundary; replay proceeds with a warning.
+const ExecutionSemanticsVersion = "kiwi.execution.v2"
+
 type Run struct {
 	ID string `json:"id"`
 	// RepoID is the immutable canonical repository identity, derived ONCE at
@@ -88,6 +146,15 @@ type Run struct {
 	// the shared lease predicate denies them independently of repository ACLs
 	// (see Job.RepoIdentityQuarantined). Additive.
 	RepoIdentityQuarantined bool `json:"repo_identity_quarantined,omitempty"`
+	// ExecutionSemantics is the execution-engine semantic version (see
+	// ExecutionSemanticsVersion) in effect when this run was created. The
+	// server stamps it on every run it enqueues — every ingress (submit,
+	// webhook, rerun, schedule, downstream dispatch) enters through the same
+	// enqueue path — and every job of the run inherits the run's value.
+	// Additive: records persisted before the field existed carry the empty
+	// string and predate semantics stamping (exact replay warns and assumes
+	// current semantics for them).
+	ExecutionSemantics string `json:"execution_semantics,omitempty"`
 }
 
 // Job is the control-plane representation of one compiled job. It deliberately
@@ -302,6 +369,13 @@ type Job struct {
 	// attestation binds; additive and empty for records completed before the
 	// field existed.
 	AttemptRunnerID string `json:"attempt_runner_id,omitempty"`
+	// ExecutionSemantics is the execution-engine semantic version (see
+	// ExecutionSemanticsVersion) the job is interpreted under: copied from
+	// the owning run at creation. Dynamically generated children inherit the
+	// parent run's value, so one run's graph is never half-stamped. Additive:
+	// empty for records persisted before the field existed (see
+	// Run.ExecutionSemantics).
+	ExecutionSemantics string `json:"execution_semantics,omitempty"`
 }
 
 // ExecutionAttestationRecord is the durable index row of one signed final
@@ -407,6 +481,13 @@ type Runner struct {
 	Version     string `json:"version,omitempty"`
 	ProtocolMin int    `json:"protocol_min,omitempty"`
 	ProtocolMax int    `json:"protocol_max,omitempty"`
+	// ProtocolVersion is the WIRE-SEMANTIC protocol version negotiated at
+	// registration: the runner's declared value (RunnerProtocolVersion or
+	// below), or 1 when a legacy registration omitted protocol_version. A
+	// stored 0 is a row persisted before this field existed and is treated
+	// as legacy v1 by lease admission. Additive: no migration, the value
+	// rides the runner payload in every store.
+	ProtocolVersion int `json:"protocol_version,omitempty"`
 	// Capabilities is the EFFECTIVE runtime capability set the scheduler
 	// decides on. When CapabilitiesEnforced is true it is the hardware claim
 	// (ReportedCapabilities) intersected with the linked profile's ceiling;
@@ -820,4 +901,10 @@ type SnapshotRecord struct {
 	// Attempts is the job's attempt counter when the snapshot was uploaded.
 	// Additive; zero for legacy records.
 	Attempts int `json:"attempts,omitempty"`
+	// ExecutionSemantics is the execution-engine semantic version (see
+	// ExecutionSemanticsVersion) of the run the snapshot was captured for,
+	// stamped from the uploading job at commit, so a restored workspace
+	// declares which engine semantics produced it. Additive; empty for
+	// legacy records (exact replay warns and assumes current semantics).
+	ExecutionSemantics string `json:"execution_semantics,omitempty"`
 }

@@ -108,7 +108,7 @@ func pgITWaitForLogCursorLockWait(t *testing.T, st *PostgresStore) int {
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		var pid int
-		err := st.pool.QueryRow(ctx, `SELECT pid FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%log_cursors%' LIMIT 1`).Scan(&pid)
+		err := st.pool.QueryRow(ctx, `SELECT pid FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%log_cursors%' LIMIT 1`).Scan(&pid)
 		if err == nil && pid != 0 {
 			return pid
 		}

@@ -9,7 +9,7 @@ import (
 
 func TestRunnerAuth(t *testing.T) {
 	s := New("secret")
-	body := `{"name":"x","protocol_min":3,"protocol_max":3}`
+	body := `{"name":"x","protocol_version": 2, "protocol_min":3,"protocol_max":3}`
 	r := httptest.NewRequest(http.MethodPost, "/api/v1/runners/register", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	s.Handler().ServeHTTP(w, r)

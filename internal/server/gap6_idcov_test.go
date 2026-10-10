@@ -40,7 +40,7 @@ func TestIDCovGetRunAndLogsDBEdges(t *testing.T) {
 func TestIDCovServingBareAliasVisibility(t *testing.T) {
 	s := New("admin")
 	s.mu.Lock()
-	s.runners["r-serv"] = model.Runner{ID: "r-serv", Name: "rs", Capacity: 1, ActiveJobs: []string{"job-bare"}}
+	s.runners["r-serv"] = model.Runner{ProtocolVersion: 2, ID: "r-serv", Name: "rs", Capacity: 1, ActiveJobs: []string{"job-bare"}}
 	s.jobs["job-bare"] = model.Job{ID: "job-bare", RunID: "run-bare", Key: "build", Status: model.StatusRunning}
 	s.runs["run-bare"] = model.Run{ID: "run-bare", RepoID: "github.com/acme/service", RepoFullName: "acme/service-full", Status: model.StatusRunning}
 	s.mu.Unlock()
@@ -65,7 +65,7 @@ func TestIDCovRunnerDisableMemoryEdges(t *testing.T) {
 	idcovSeedMemoryJob(t, s, "job-other", "run-other", "r-other", "tok", nil)
 	idcovSeedMemoryJob(t, s, "job-mine", "run-mine", "r-mine", "tok", nil)
 	s.mu.Lock()
-	s.runners["r-mine"] = model.Runner{ID: "r-mine", Name: "rm", Capacity: 1, ActiveJobs: []string{"job-mine"}}
+	s.runners["r-mine"] = model.Runner{ProtocolVersion: 2, ID: "r-mine", Name: "rm", Capacity: 1, ActiveJobs: []string{"job-mine"}}
 	s.mu.Unlock()
 	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/r-mine/disable", "admin", ""); w.Code != http.StatusOK {
 		t.Fatalf("disable = %d: %s", w.Code, w.Body.String())

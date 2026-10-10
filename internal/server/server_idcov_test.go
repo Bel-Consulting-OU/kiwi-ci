@@ -132,7 +132,7 @@ func (f *idcovFaultStore) GetJob(ctx context.Context, id string) (model.Job, err
 
 func (f *idcovFaultStore) GetRunner(ctx context.Context, id string) (model.Runner, error) {
 	if f.getRunnerErr != nil {
-		return model.Runner{}, f.getRunnerErr
+		return model.Runner{ProtocolVersion: 2}, f.getRunnerErr
 	}
 	return f.dbFakeStore.GetRunner(ctx, id)
 }
@@ -296,7 +296,7 @@ func TestIDCovRunnerTierMTLSOnlyWithoutBearer(t *testing.T) {
 	s.RequireRunnerClientCerts = true
 	s.LoadRunnerTokens(map[string]string{"other": auth.TokenDigest("other-token")})
 	_, cert := pkiSignRunner(t, ca, "runner-mtls")
-	body := map[string]any{"name": "rm", "capacity": 1, "protocol_min": 3, "protocol_max": 3}
+	body := map[string]any{"name": "rm", "capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}
 	if w := pkiRequest(t, s.Handler(), http.MethodPost, "/api/v1/runners/register", body, "", cert); w.Code != http.StatusOK {
 		t.Fatalf("certificate-only register = %d: %s", w.Code, w.Body.String())
 	}
@@ -359,8 +359,8 @@ func TestIDCovGetLogsEndpoints(t *testing.T) {
 	restricted.runs["run-4"] = model.Run{ID: "run-4", RepoID: "github.com/kiwi/repo", Repo: "https://github.com/kiwi/repo.git", RepoFullName: "kiwi/repo", Status: model.StatusRunning}
 	restricted.mu.Unlock()
 	c := newTestClient(t, restricted.Handler(), "read-token")
-	if w := c.do(http.MethodGet, "/api/v1/runs/run-4/logs", nil, nil); w.Code != http.StatusForbidden {
-		t.Fatalf("scoped-out logs = %d, want 403", w.Code)
+	if w := c.do(http.MethodGet, "/api/v1/runs/run-4/logs", nil, nil); w.Code != http.StatusNotFound {
+		t.Fatalf("scoped-out logs = %d, want masked 404", w.Code)
 	}
 }
 
@@ -448,7 +448,7 @@ func TestIDCovNextUnregisteredAndCapacityClamp(t *testing.T) {
 	}
 	// Capacity 0 in dev mode is clamped to 1 so legacy runners keep working.
 	s.mu.Lock()
-	s.runners["r-zero"] = model.Runner{ID: "r-zero", Name: "rz", Capacity: 0}
+	s.runners["r-zero"] = model.Runner{ProtocolVersion: 2, ID: "r-zero", Name: "rz", Capacity: 0}
 	s.mu.Unlock()
 	idcovSeedQueuedJob(t, s, "job-clamp", "run-clamp", nil)
 	w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/r-zero/next", map[string]any{}, "secret", nil)
@@ -468,7 +468,7 @@ func TestIDCovNextUnregisteredAndCapacityClamp(t *testing.T) {
 func TestIDCovNextQueueDeadlineSkip(t *testing.T) {
 	s := New("secret")
 	s.mu.Lock()
-	s.runners["r-q"] = model.Runner{ID: "r-q", Name: "rq", Capacity: 1}
+	s.runners["r-q"] = model.Runner{ProtocolVersion: 2, ID: "r-q", Name: "rq", Capacity: 1}
 	s.mu.Unlock()
 	past := time.Now().UTC().Add(-time.Hour)
 	idcovSeedQueuedJob(t, s, "job-expired", "run-expired", func(j *model.Job) { j.QueueDeadline = &past })
@@ -493,7 +493,7 @@ func TestIDCovNextQuotaLimitsSkip(t *testing.T) {
 			s := New("secret")
 			s.QuotaLimits = tc.limit
 			s.mu.Lock()
-			s.runners["r-quota"] = model.Runner{ID: "r-quota", Name: "rquota", Capacity: 2}
+			s.runners["r-quota"] = model.Runner{ProtocolVersion: 2, ID: "r-quota", Name: "rquota", Capacity: 2}
 			s.mu.Unlock()
 			idcovSeedMemoryJob(t, s, "job-running", "run-quota", "other-runner", "tok", nil)
 			idcovSeedQueuedJob(t, s, "job-queued", "run-quota", nil)
@@ -509,7 +509,7 @@ func TestIDCovNextQuotaLimitsSkip(t *testing.T) {
 func TestIDCovNextPriorityOrder(t *testing.T) {
 	s := New("secret")
 	s.mu.Lock()
-	s.runners["r-pri"] = model.Runner{ID: "r-pri", Name: "rpri", Capacity: 1}
+	s.runners["r-pri"] = model.Runner{ProtocolVersion: 2, ID: "r-pri", Name: "rpri", Capacity: 1}
 	s.mu.Unlock()
 	idcovSeedQueuedJob(t, s, "job-low", "run-pri", func(j *model.Job) { j.Priority = 1 })
 	idcovSeedQueuedJob(t, s, "job-high", "run-pri", func(j *model.Job) { j.Priority = 5 })
@@ -732,7 +732,7 @@ func TestIDCovRunnerAdminDBBranches(t *testing.T) {
 	}
 	fault.getRunnerErr = nil
 	f.mu.Lock()
-	f.runners["r1"] = model.Runner{ID: "r1", Name: "r1", Capacity: 1}
+	f.runners["r1"] = model.Runner{ProtocolVersion: 2, ID: "r1", Name: "r1", Capacity: 1}
 	f.mu.Unlock()
 	// Upsert failures are 500.
 	fault.upsertRunErr = errors.New("runner write failed")
@@ -745,7 +745,7 @@ func TestIDCovRunnerAdminDBBranches(t *testing.T) {
 	fault.upsertRunErr = nil
 	// Success paths.
 	f.mu.Lock()
-	f.runners["r1"] = model.Runner{ID: "r1", Name: "r1", Capacity: 1}
+	f.runners["r1"] = model.Runner{ProtocolVersion: 2, ID: "r1", Name: "r1", Capacity: 1}
 	f.mu.Unlock()
 	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/r1/drain", "admin", ""); w.Code != http.StatusOK {
 		t.Fatalf("drain = %d: %s", w.Code, w.Body.String())
@@ -763,7 +763,7 @@ func TestIDCovRunnerDisableDBKillSwitch(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.mu.Lock()
-	f.runners["r1"] = model.Runner{ID: "r1", Name: "r1", Capacity: 1, CertSerial: "abc"}
+	f.runners["r1"] = model.Runner{ProtocolVersion: 2, ID: "r1", Name: "r1", Capacity: 1, CertSerial: "abc"}
 	f.jobs["job-k"] = model.Job{ID: "job-k", RunID: "run-k", Key: "build", Status: model.StatusRunning, LeaseRunnerID: "r1", LeaseGeneration: 1}
 	f.mu.Unlock()
 	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/r1/disable", "admin", ""); w.Code != http.StatusOK {
@@ -776,7 +776,7 @@ func TestIDCovRunnerDisableDBKillSwitch(t *testing.T) {
 func TestIDCovListServingRunnersBranches(t *testing.T) {
 	s := New("admin")
 	s.mu.Lock()
-	s.runners["r-serv"] = model.Runner{ID: "r-serv", Name: "rs", Capacity: 1, ActiveJobs: []string{"job-s1", "job-missing"}, LastSeen: time.Now().UTC()}
+	s.runners["r-serv"] = model.Runner{ProtocolVersion: 2, ID: "r-serv", Name: "rs", Capacity: 1, ActiveJobs: []string{"job-s1", "job-missing"}, LastSeen: time.Now().UTC()}
 	s.jobs["job-s1"] = model.Job{ID: "job-s1", RunID: "run-s1", Key: "build", Status: model.StatusRunning, RepoID: "github.com/kiwi/repo"}
 	s.runs["run-s1"] = model.Run{ID: "run-s1", RepoID: "github.com/kiwi/repo", RepoFullName: "kiwi/repo", Status: model.StatusRunning}
 	s.mu.Unlock()
@@ -797,7 +797,7 @@ func TestIDCovListServingRunnersBranches(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.mu.Lock()
-	f.runners["r-serv"] = model.Runner{ID: "r-serv", Name: "rs", Capacity: 1, ActiveJobs: []string{"job-s1"}}
+	f.runners["r-serv"] = model.Runner{ProtocolVersion: 2, ID: "r-serv", Name: "rs", Capacity: 1, ActiveJobs: []string{"job-s1"}}
 	f.jobs["job-s1"] = model.Job{ID: "job-s1", RunID: "run-s1", Key: "build", Status: model.StatusRunning, RepoID: "github.com/kiwi/repo"}
 	f.runs["run-s1"] = model.Run{ID: "run-s1", RepoID: "github.com/kiwi/repo", RepoFullName: "kiwi/repo", Status: model.StatusRunning}
 	f.mu.Unlock()

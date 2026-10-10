@@ -53,7 +53,7 @@ func runnerLeaseTableServer(t *testing.T) (*Server, http.Handler, Task, *x509.Ce
 	h := s.Handler()
 	_, certA := pkiSignRunner(t, ca, "runner-a")
 	_, certB := pkiSignRunner(t, ca, "runner-b")
-	reg := map[string]any{"id": "runner-a", "name": "ra", "capacity": 2, "protocol_min": 3, "protocol_max": 3, "labels": []string{"container"}}
+	reg := map[string]any{"id": "runner-a", "name": "ra", "capacity": 2, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3, "labels": []string{"container"}}
 	if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register", reg, "runner-tok", certA); w.Code != http.StatusOK {
 		t.Fatalf("register runner-a: %d %s", w.Code, w.Body.String())
 	}

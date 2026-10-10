@@ -57,6 +57,9 @@ func TestSnapshotUploadStampsAttemptIdentityMemory(t *testing.T) {
 	if rec.Attempts != 3 {
 		t.Fatalf("record attempts = %d, want 3", rec.Attempts)
 	}
+	if rec.ExecutionSemantics != model.ExecutionSemanticsVersion {
+		t.Fatalf("record execution semantics = %q, want %q", rec.ExecutionSemantics, model.ExecutionSemanticsVersion)
+	}
 	w := c.do(http.MethodGet, "/api/v1/runs/"+runID+"/snapshots", nil, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("list snapshots = %d: %s", w.Code, w.Body.String())
@@ -67,6 +70,9 @@ func TestSnapshotUploadStampsAttemptIdentityMemory(t *testing.T) {
 	}
 	if len(listed) != 1 || listed[0].LeaseGeneration != gen || listed[0].Attempts != 3 {
 		t.Fatalf("listed records = %+v", listed)
+	}
+	if listed[0].ExecutionSemantics != model.ExecutionSemanticsVersion {
+		t.Fatalf("listed execution semantics = %q, want %q", listed[0].ExecutionSemantics, model.ExecutionSemanticsVersion)
 	}
 }
 
@@ -94,12 +100,18 @@ func TestSnapshotUploadStampsAttemptIdentityDB(t *testing.T) {
 	if rec.LeaseGeneration != task.LeaseGeneration || rec.Attempts != 2 {
 		t.Fatalf("uploaded record = generation %d attempts %d, want %d/2", rec.LeaseGeneration, rec.Attempts, task.LeaseGeneration)
 	}
+	if rec.ExecutionSemantics != model.ExecutionSemanticsVersion {
+		t.Fatalf("uploaded record semantics = %q, want %q", rec.ExecutionSemantics, model.ExecutionSemanticsVersion)
+	}
 	stored, found, err := f.GetSnapshot(t.Context(), runID, rec.ID)
 	if err != nil || !found {
 		t.Fatalf("stored record = found %t err %v", found, err)
 	}
 	if stored.LeaseGeneration != task.LeaseGeneration || stored.Attempts != 2 {
 		t.Fatalf("stored record = generation %d attempts %d, want %d/2", stored.LeaseGeneration, stored.Attempts, task.LeaseGeneration)
+	}
+	if stored.ExecutionSemantics != model.ExecutionSemanticsVersion {
+		t.Fatalf("stored record semantics = %q, want %q", stored.ExecutionSemantics, model.ExecutionSemanticsVersion)
 	}
 }
 
@@ -123,6 +135,12 @@ func assertExportedPipeline(t *testing.T, w *httptest.ResponseRecorder, j model.
 	}
 	if got.LeaseGeneration != j.LeaseGeneration || got.Attempts != j.Attempts {
 		t.Fatalf("export attempt identity = gen %d attempts %d, want %d/%d", got.LeaseGeneration, got.Attempts, j.LeaseGeneration, j.Attempts)
+	}
+	// The reproducibility boundary must travel with the exported record:
+	// exact replay refuses to reinterpret a job stamped with different
+	// semantics, and every server-created job is stamped.
+	if got.ExecutionSemantics != j.ExecutionSemantics || got.ExecutionSemantics != model.ExecutionSemanticsVersion {
+		t.Fatalf("export execution semantics = %q, want the stamped %q (%q)", got.ExecutionSemantics, j.ExecutionSemantics, model.ExecutionSemanticsVersion)
 	}
 	// The persisted execution state the replay materializer consumes must be
 	// exported exactly; without it exact replay cannot derive the effective

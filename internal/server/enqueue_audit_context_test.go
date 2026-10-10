@@ -107,7 +107,7 @@ func TestAuditFirstCanceledRequestFailsMutationClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.runners["runner-1"] = model.Runner{ID: "runner-1", Name: "r1", Disabled: true, Draining: true}
+	s.runners["runner-1"] = model.Runner{ProtocolVersion: 2, ID: "runner-1", Name: "r1", Disabled: true, Draining: true}
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/runners/runner-1/enable", nil)
 	req.SetPathValue("id", "runner-1")

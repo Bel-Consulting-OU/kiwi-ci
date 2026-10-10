@@ -810,7 +810,7 @@ func TestDBAuditFailureBlocksAdminMutations(t *testing.T) {
 	f.mu.Lock()
 	f.jobs["job-wait"] = model.Job{ID: "job-wait", RunID: "run-1", Key: "deploy", Status: model.StatusWaitingApproval, ApprovalRequired: true, Environment: "prod"}
 	f.runs["run-1"] = model.Run{ID: "run-1", Status: model.StatusQueued, ConcurrencyGroup: "grp"}
-	f.runners["runner-1"] = model.Runner{ID: "runner-1", Name: "r1", Capacity: 1}
+	f.runners["runner-1"] = model.Runner{ProtocolVersion: 2, ID: "runner-1", Name: "r1", Capacity: 1}
 	f.auditErr = errors.New("audit down")
 	f.mu.Unlock()
 

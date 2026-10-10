@@ -468,10 +468,43 @@ type Runner struct {
 // authority signal — only the explicit flag marks a profile claim. A legacy
 // server without the flag leaves capEnforced false and every runtime
 // accepted.
+//
+// ProtocolVersion/MinRunnerProtocol are the wire-semantic negotiation
+// answer: the server's CURRENT protocol and the minimum it accepts
+// (model.RunnerProtocolVersion semantics). An old server omits both (0) and
+// imposes nothing; checkServerProtocol refuses to start against a server
+// that speaks or requires a newer protocol than this runner implements.
 type registerResponse struct {
 	model.Runner
 	Capabilities         []string `json:"capabilities"`
 	CapabilitiesEnforced bool     `json:"capabilities_enforced"`
+	MinRunnerProtocol    int      `json:"min_runner_protocol"`
+}
+
+// checkServerProtocol is the runner-side fail-closed compatibility rule: the
+// runner supports wire-semantic protocol versions up to its own
+// model.RunnerProtocolVersion. A server that REQUIRES a higher minimum, or
+// advertises a current protocol above it, cannot be served without silently
+// degraded semantics, so the runner refuses to start and names the upgrade.
+func checkServerProtocol(serverProtocol, minProtocol int) error {
+	if minProtocol > model.RunnerProtocolVersion {
+		return fmt.Errorf("server requires runner protocol >= %d but this runner implements %d; upgrade the runner", minProtocol, model.RunnerProtocolVersion)
+	}
+	if serverProtocol > model.RunnerProtocolVersion {
+		return fmt.Errorf("server speaks runner protocol %d but this runner implements %d; upgrade the runner", serverProtocol, model.RunnerProtocolVersion)
+	}
+	return nil
+}
+
+// checkTaskProtocol refuses a leased task whose required wire-semantic
+// protocol exceeds what this runner implements. Registration negotiation
+// should make this impossible; it fails closed anyway so a misbehaving or
+// older server can never downgrade this runner's semantics silently.
+func checkTaskProtocol(taskProtocol int) error {
+	if taskProtocol > model.RunnerProtocolVersion {
+		return fmt.Errorf("server leased a task requiring runner protocol %d but this runner implements %d; upgrade the runner", taskProtocol, model.RunnerProtocolVersion)
+	}
+	return nil
 }
 
 func (r *Runner) Run(ctx context.Context) error {
@@ -900,15 +933,19 @@ func (r *Runner) register(ctx context.Context) error {
 	labels = append(labels, discovered...)
 	in := model.Runner{
 		ID: r.ID, Name: r.Cfg.Name, Labels: unique(labels),
-		Metadata:     map[string]string{"go": runtime.Version()},
-		Capacity:     r.Cfg.Concurrency,
-		ProtocolMin:  runnerProtocol,
-		ProtocolMax:  runnerProtocol,
-		Version:      RunnerVersion,
-		Region:       os.Getenv(envRunnerRegion),
-		Capabilities: discovered,
-		CertSerial:   r.clientCertSerial(),
-		Draining:     r.Cfg.Drain,
+		Metadata:    map[string]string{"go": runtime.Version()},
+		Capacity:    r.Cfg.Concurrency,
+		ProtocolMin: runnerProtocol,
+		ProtocolMax: runnerProtocol,
+		// Wire-semantic protocol this runner implements: the server
+		// negotiates it (min with its own current version) and refuses the
+		// registration when it is below server.min_runner_protocol.
+		ProtocolVersion: model.RunnerProtocolVersion,
+		Version:         RunnerVersion,
+		Region:          os.Getenv(envRunnerRegion),
+		Capabilities:    discovered,
+		CertSerial:      r.clientCertSerial(),
+		Draining:        r.Cfg.Drain,
 	}
 	var out registerResponse
 	if err := r.post(ctx, "/api/v1/runners/register", in, &out); err != nil {
@@ -920,6 +957,12 @@ func (r *Runner) register(ctx context.Context) error {
 			// re-enrolls under the same identity.
 			return r.onDisabled(fmt.Errorf("%w (server: %v)", ErrRunnerDisabledOrRevoked, err))
 		}
+		return err
+	}
+	// Fail closed on protocol incompatibility BEFORE adopting the session:
+	// running with a server that requires or speaks newer semantics would
+	// silently degrade every mutation fence.
+	if err := checkServerProtocol(out.ProtocolVersion, out.MinRunnerProtocol); err != nil {
 		return err
 	}
 	r.ID = out.ID
@@ -1039,6 +1082,13 @@ func (r *Runner) next(ctx context.Context) (*server.Task, bool, error) {
 	}
 	var t server.Task
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxControlResponseBytes)).Decode(&t); err != nil {
+		return nil, false, err
+	}
+	// Fail closed on a task requiring newer semantics than this runner
+	// implements. Registration negotiation should make this unreachable;
+	// refusing here guarantees a rogue/older server can never hand this
+	// runner work it cannot execute under the required fences.
+	if err := checkTaskProtocol(t.ProtocolVersion); err != nil {
 		return nil, false, err
 	}
 	return &t, false, nil

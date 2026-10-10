@@ -20,7 +20,7 @@ func TestDrainBlocksLeasesAndReadiness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token", `{"name":"r1","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token", `{"name":"r1","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d", w.Code)
 	}
@@ -152,7 +152,7 @@ func TestDrainBlocksLeasesDBMode(t *testing.T) {
 	if err := s.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
-	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token", `{"name":"r1","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token", `{"name":"r1","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d", w.Code)
 	}

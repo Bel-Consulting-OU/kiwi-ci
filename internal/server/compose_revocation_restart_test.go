@@ -59,7 +59,7 @@ func composeProvisionRunnerBearer(s *Server, runnerID string) {
 func composeRegisterCert(t *testing.T, s *Server, runnerID, bearer string, cert *x509.Certificate) int {
 	t.Helper()
 	w := pkiRequest(t, s.Handler(), http.MethodPost, "/api/v1/runners/register",
-		map[string]any{"id": runnerID, "name": runnerID, "capacity": 1, "protocol_min": 3, "protocol_max": 3},
+		map[string]any{"id": runnerID, "name": runnerID, "capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3},
 		bearer, cert)
 	return w.Code
 }
@@ -189,7 +189,7 @@ func TestComposeUnacknowledgedRevocationNeverSurvivesFSRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.mu.Lock()
-	s.runners["runner-a"] = model.Runner{ID: "runner-a", Name: "ra", Capacity: 1, CertSerial: serial}
+	s.runners["runner-a"] = model.Runner{ProtocolVersion: 2, ID: "runner-a", Name: "ra", Capacity: 1, CertSerial: serial}
 	perr := s.persistCheckedErrLocked("test.seed")
 	s.mu.Unlock()
 	if perr != nil {

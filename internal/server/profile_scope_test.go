@@ -64,7 +64,7 @@ func TestProfileBindingFourCombinations(t *testing.T) {
 		createProfile(t, s, model.RunnerProfile{ID: "p", Labels: []string{"container"}, Capabilities: []string{"container"}, MaxCapacity: 2})
 		_, certA := pkiSignRunner(t, ca, "runner-a")
 		bindSerial(t, s, "p", certA.SerialNumber.Text(16))
-		ri := registerProfiled(t, s, map[string]any{"id": "runner-a", "name": "ra", "protocol_min": 3, "protocol_max": 3, "labels": []string{"spoofed"}, "cert_serial": "0deadbeef"}, certA)
+		ri := registerProfiled(t, s, map[string]any{"id": "runner-a", "name": "ra", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3, "labels": []string{"spoofed"}, "cert_serial": "0deadbeef"}, certA)
 		if len(ri.Labels) != 1 || ri.Labels[0] != "container" || ri.Capacity != 2 || ri.CertSerial != certA.SerialNumber.Text(16) {
 			t.Fatalf("mTLS profile binding wrong: %+v", ri)
 		}
@@ -73,7 +73,7 @@ func TestProfileBindingFourCombinations(t *testing.T) {
 		s := adminProfileServer(t)
 		s.RunnerCA = ca
 		_, certA := pkiSignRunner(t, ca, "runner-a")
-		ri := registerProfiled(t, s, map[string]any{"id": "runner-a", "name": "ra", "protocol_min": 3, "protocol_max": 3, "labels": []string{"self"}}, certA)
+		ri := registerProfiled(t, s, map[string]any{"id": "runner-a", "name": "ra", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3, "labels": []string{"self"}}, certA)
 		if len(ri.Labels) != 0 || ri.Capacity != 0 {
 			t.Fatalf("unprofiled mTLS runner must register empty: %+v", ri)
 		}
@@ -88,7 +88,7 @@ func TestProfileBindingFourCombinations(t *testing.T) {
 		bindSerial(t, s, "p", certB.SerialNumber.Text(16))
 		// Runner A presents B's serial in the payload: the peer cert
 		// serial must win, so no profile is applied.
-		ri := registerProfiled(t, s, map[string]any{"id": "runner-a", "name": "ra", "protocol_min": 3, "protocol_max": 3, "cert_serial": certB.SerialNumber.Text(16)}, certA)
+		ri := registerProfiled(t, s, map[string]any{"id": "runner-a", "name": "ra", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3, "cert_serial": certB.SerialNumber.Text(16)}, certA)
 		if len(ri.Labels) != 0 || ri.Capacity != 0 || ri.CertSerial != certA.SerialNumber.Text(16) {
 			t.Fatalf("payload serial overrode the peer certificate serial: %+v", ri)
 		}
@@ -97,14 +97,14 @@ func TestProfileBindingFourCombinations(t *testing.T) {
 		s := adminProfileServer(t)
 		createProfile(t, s, model.RunnerProfile{ID: "p", Labels: []string{"container"}, Capabilities: []string{"container"}, MaxCapacity: 2})
 		bindSerial(t, s, "p", "0abc")
-		ri := registerProfiled(t, s, map[string]any{"id": "runner-a", "name": "ra", "protocol_min": 3, "protocol_max": 3, "cert_serial": "0abc", "labels": []string{"spoofed"}}, nil)
+		ri := registerProfiled(t, s, map[string]any{"id": "runner-a", "name": "ra", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3, "cert_serial": "0abc", "labels": []string{"spoofed"}}, nil)
 		if len(ri.Labels) != 1 || ri.Labels[0] != "container" || ri.Capacity != 2 || ri.CertSerial != "0abc" {
 			t.Fatalf("bearer profile binding wrong: %+v", ri)
 		}
 	})
 	t.Run("bearer without profile", func(t *testing.T) {
 		s := adminProfileServer(t)
-		ri := registerProfiled(t, s, map[string]any{"id": "runner-a", "name": "ra", "protocol_min": 3, "protocol_max": 3, "cert_serial": "0nope", "labels": []string{"self"}}, nil)
+		ri := registerProfiled(t, s, map[string]any{"id": "runner-a", "name": "ra", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3, "cert_serial": "0nope", "labels": []string{"self"}}, nil)
 		// The serial is stored as the (currently unbound) profile key, but
 		// it grants nothing: no labels, no capacity, no rates.
 		if len(ri.Labels) != 0 || ri.Capacity != 0 || ri.CertSerial != "0nope" {
@@ -127,7 +127,7 @@ func TestProfileBindingFourCombinations(t *testing.T) {
 		for i, id := range []string{"runner-a", "runner-b"} {
 			token := []string{"token-a", "token-b"}[i]
 			w := pkiRequest(t, s.Handler(), http.MethodPost, "/api/v1/runners/register",
-				map[string]any{"id": id, "name": id, "protocol_min": 3, "protocol_max": 3, "cert_serial": "0owned"}, token, nil)
+				map[string]any{"id": id, "name": id, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3, "cert_serial": "0owned"}, token, nil)
 			if w.Code != http.StatusOK {
 				t.Fatalf("register %s: %d %s", id, w.Code, w.Body.String())
 			}
@@ -143,7 +143,7 @@ func TestProfileBindingFourCombinations(t *testing.T) {
 		// runner-b then resolves its own profile by runner ID.
 		bindRunnerProfile(t, s, "p", "runner-b", "admin-tok")
 		w := pkiRequest(t, s.Handler(), http.MethodPost, "/api/v1/runners/register",
-			map[string]any{"id": "runner-b", "name": "rb", "protocol_min": 3, "protocol_max": 3, "cert_serial": "0owned"}, "token-b", nil)
+			map[string]any{"id": "runner-b", "name": "rb", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3, "cert_serial": "0owned"}, "token-b", nil)
 		if w.Code != http.StatusOK {
 			t.Fatalf("runner-b register: %d %s", w.Code, w.Body.String())
 		}
@@ -167,7 +167,7 @@ func TestProfileEditShrinksLeaseAuthorizationMemory(t *testing.T) {
 		MaxCapacity: 3,
 	})
 	bindSerial(t, s, "p", "0live")
-	ri := registerProfiled(t, s, map[string]any{"id": "runner-live", "name": "rl", "protocol_min": 3, "protocol_max": 3, "cert_serial": "0live", "capabilities": []string{"native", "container"}}, nil)
+	ri := registerProfiled(t, s, map[string]any{"id": "runner-live", "name": "rl", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3, "cert_serial": "0live", "capabilities": []string{"native", "container"}}, nil)
 	if ri.Capacity != 3 {
 		t.Fatalf("registration capacity = %d", ri.Capacity)
 	}
@@ -228,7 +228,7 @@ func TestProfileEditShrinksLeaseAuthorizationDB(t *testing.T) {
 		MaxCapacity: 2,
 	})
 	bindSerial(t, s, "p", "0db")
-	registerProfiled(t, s, map[string]any{"id": "runner-db", "name": "rd", "protocol_min": 3, "protocol_max": 3, "cert_serial": "0db", "capabilities": []string{"container"}}, nil)
+	registerProfiled(t, s, map[string]any{"id": "runner-db", "name": "rd", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3, "cert_serial": "0db", "capabilities": []string{"container"}}, nil)
 
 	profileLabelJob(t, s, "https://github.com/o/db1.git", "container")
 	if w := pkiRequest(t, s.Handler(), http.MethodPost, "/api/v1/runners/runner-db/next", map[string]any{}, "runner-tok", nil); w.Code != http.StatusOK {
@@ -290,7 +290,7 @@ func TestBearerSerialNeverConsultedUnderStoreOutage(t *testing.T) {
 	s.DB = listErrStore{dbFakeStore: f}
 
 	w := pkiRequest(t, s.Handler(), http.MethodPost, "/api/v1/runners/register",
-		map[string]any{"id": "runner-a", "name": "ra", "protocol_min": 3, "protocol_max": 3, "cert_serial": "0owned2"}, "token-a", nil)
+		map[string]any{"id": "runner-a", "name": "ra", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3, "cert_serial": "0owned2"}, "token-a", nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register with runner-listing outage = %d %s", w.Code, w.Body.String())
 	}
@@ -307,7 +307,7 @@ func TestBearerSerialNeverConsultedUnderStoreOutage(t *testing.T) {
 		t.Fatal(err)
 	}
 	w = pkiRequest(t, s.Handler(), http.MethodPost, "/api/v1/runners/register",
-		map[string]any{"id": "runner-a", "name": "ra", "protocol_min": 3, "protocol_max": 3, "cert_serial": "0owned2"}, "token-a", nil)
+		map[string]any{"id": "runner-a", "name": "ra", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3, "cert_serial": "0owned2"}, "token-a", nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("bound register with runner-listing outage = %d %s", w.Code, w.Body.String())
 	}

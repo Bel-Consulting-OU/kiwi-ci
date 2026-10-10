@@ -331,13 +331,13 @@ func TestForkPRPolicyIdentityIsBaseCheckoutIsHead(t *testing.T) {
 	if w = doJSON(t, s, http.MethodGet, "/api/v1/runs/"+runID, "base-token", ""); w.Code != http.StatusOK {
 		t.Fatalf("base principal read = %d: %s", w.Code, w.Body.String())
 	}
-	if w = doJSON(t, s, http.MethodGet, "/api/v1/runs/"+runID, "head-token", ""); w.Code != http.StatusForbidden {
-		t.Fatalf("head principal read = %d, want 403: %s", w.Code, w.Body.String())
+	if w = doJSON(t, s, http.MethodGet, "/api/v1/runs/"+runID, "head-token", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("head principal read = %d, want masked 404: %s", w.Code, w.Body.String())
 	}
 
 	// The leased task delivers the CHECKOUT URL to the runner, never the
 	// policy identity. The runner registers with the server's admin bearer.
-	w = doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "runner-secret", `{"name":"fork-runner","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2}`)
+	w = doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "runner-secret", `{"name":"fork-runner","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register runner = %d: %s", w.Code, w.Body.String())
 	}

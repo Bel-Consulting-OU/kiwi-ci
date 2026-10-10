@@ -250,8 +250,9 @@ func TestCancelUsesPrincipalSubject(t *testing.T) {
 
 func TestCancelForbiddenWithoutCancelRole(t *testing.T) {
 	s := storeServer(t, "", map[string]auth.Principal{
-		"run-token": {Subject: "runner-bot", Roles: []auth.Role{auth.RoleRun}},
-		"ops-token": {Subject: "ops", Roles: []auth.Role{auth.RoleAdmin}},
+		"run-token":  {Subject: "runner-bot", Roles: []auth.Role{auth.RoleRun}},
+		"read-token": {Subject: "reader", Repositories: map[string]auth.RepositoryPermission{"github.com/kiwi/repo": {Read: true}}},
+		"ops-token":  {Subject: "ops", Roles: []auth.Role{auth.RoleAdmin}},
 	})
 	c := newTestClient(t, s.Handler(), "run-token")
 	w := c.do(http.MethodPost, "/api/v1/runs", SubmitRun{RepoURL: "https://github.com/kiwi/repo.git", Ref: "main", Pipeline: testPipeline}, nil)
@@ -263,8 +264,14 @@ func TestCancelForbiddenWithoutCancelRole(t *testing.T) {
 		t.Fatal(err)
 	}
 	w = c.do(http.MethodPost, "/api/v1/runs/"+run.ID+"/cancel", nil, nil)
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("cancel without role: want 403 got %d", w.Code)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("cancel without read access: want masked 404 got %d", w.Code)
+	}
+	// A principal that can READ the run but lacks the cancel action keeps the
+	// capability-style 403: visibility passed, the action was denied.
+	cReader := newTestClient(t, s.Handler(), "read-token")
+	if w := cReader.do(http.MethodPost, "/api/v1/runs/"+run.ID+"/cancel", nil, nil); w.Code != http.StatusForbidden {
+		t.Fatalf("cancel without cancel action: want 403 got %d", w.Code)
 	}
 	// An admin principal can still cancel.
 	c2 := newTestClient(t, s.Handler(), "ops-token")
@@ -276,8 +283,9 @@ func TestCancelForbiddenWithoutCancelRole(t *testing.T) {
 
 func TestRerunRequiresRerunRole(t *testing.T) {
 	s := storeServer(t, "", map[string]auth.Principal{
-		"run-token": {Subject: "runner-bot", Roles: []auth.Role{auth.RoleRun}},
-		"ops-token": {Subject: "ops", Roles: []auth.Role{auth.RoleAdmin}},
+		"run-token":  {Subject: "runner-bot", Roles: []auth.Role{auth.RoleRun}},
+		"read-token": {Subject: "reader", Repositories: map[string]auth.RepositoryPermission{"github.com/kiwi/repo": {Read: true}}},
+		"ops-token":  {Subject: "ops", Roles: []auth.Role{auth.RoleAdmin}},
 	})
 	c := newTestClient(t, s.Handler(), "run-token")
 	w := c.do(http.MethodPost, "/api/v1/runs", SubmitRun{RepoURL: "https://github.com/kiwi/repo.git", Ref: "main", Pipeline: testPipeline}, nil)
@@ -289,8 +297,14 @@ func TestRerunRequiresRerunRole(t *testing.T) {
 		t.Fatal(err)
 	}
 	w = c.do(http.MethodPost, "/api/v1/runs/"+run.ID+"/rerun", nil, nil)
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("rerun without role: want 403 got %d", w.Code)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("rerun without read access: want masked 404 got %d", w.Code)
+	}
+	// A principal that can READ the run but lacks the rerun action keeps the
+	// 403: visibility passed, the action was denied.
+	cReader := newTestClient(t, s.Handler(), "read-token")
+	if w := cReader.do(http.MethodPost, "/api/v1/runs/"+run.ID+"/rerun", nil, nil); w.Code != http.StatusForbidden {
+		t.Fatalf("rerun without rerun action: want 403 got %d", w.Code)
 	}
 	c2 := newTestClient(t, s.Handler(), "ops-token")
 	w = c2.do(http.MethodPost, "/api/v1/runs/"+run.ID+"/rerun", nil, nil)

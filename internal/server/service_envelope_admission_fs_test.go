@@ -180,7 +180,7 @@ func TestMemoryServiceEnvelopeReasonParityWithDBMode(t *testing.T) {
 	f.mu.Lock()
 	f.profiles["env-par-prof"] = model.RunnerProfile{ID: "env-par-prof", Capabilities: []string{"native"}, MaxCapacity: 8, MaxMemory: 8 << 30}
 	f.certProfiles["env-par-serial"] = "env-par-prof"
-	f.runners["env-par-runner"] = model.Runner{ID: "env-par-runner", Name: "env-par-runner", Capacity: 8, CertSerial: "env-par-serial", ReportedCapabilities: []string{"native"}}
+	f.runners["env-par-runner"] = model.Runner{ProtocolVersion: 2, ID: "env-par-runner", Name: "env-par-runner", Capacity: 8, CertSerial: "env-par-serial", ReportedCapabilities: []string{"native"}}
 	f.runs["env-par-run"] = model.Run{ID: "env-par-run", Status: model.StatusQueued}
 	f.jobs["env-par-wait"] = model.Job{ID: "env-par-wait", RunID: "env-par-run", Key: "wait", Status: model.StatusQueued,
 		MemoryRequest: 5 << 30, ServiceEnvelopeRequest: model.ResourceCapacity{Memory: 2 << 30}, CreatedAt: time.Now().UTC()}
@@ -311,7 +311,7 @@ func nativeServiceEnvelopeServer(t *testing.T) (*Server, string) {
 	})
 	bindSerial(t, s, "native-env-prof", serial)
 	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "runner-tok",
-		`{"name":"native-env-runner","cert_serial":"`+serial+`","capabilities":["native","container"],"protocol_min":3,"protocol_max":3}`)
+		`{"name":"native-env-runner","cert_serial":"`+serial+`","capabilities":["native","container"],"protocol_version": 2, "protocol_min":3,"protocol_max":3}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d %s", w.Code, w.Body.String())
 	}

@@ -318,7 +318,7 @@ func TestIntegrationRunnerTokenSharedRejectedWithProvisionedCredentials(t *testi
 		t.Fatalf("provision per-runner token: %v", err)
 	}
 	s.runnerTokensDBAt = time.Time{}
-	register := `{"name":"r1","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`
+	register := `{"name":"r1","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`
 
 	if w := pgITDo(t, s, http.MethodPost, "/api/v1/runners/register", "token", register, nil); w.Code != http.StatusUnauthorized {
 		t.Fatalf("shared token with per-runner credentials = %d %s, want 401", w.Code, w.Body.String())

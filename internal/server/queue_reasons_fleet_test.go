@@ -44,8 +44,8 @@ func TestQueueReasonFleetGlobalJobFitsAnotherRunner(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.mu.Lock()
-	f.runners["fleet-a"] = model.Runner{ID: "fleet-a", Name: "a", Labels: []string{"container"}, Capacity: 1}
-	f.runners["fleet-b"] = model.Runner{ID: "fleet-b", Name: "b", Labels: []string{"gpu", "container"}, Capacity: 1}
+	f.runners["fleet-a"] = model.Runner{ProtocolVersion: 2, ID: "fleet-a", Name: "a", Labels: []string{"container"}, Capacity: 1}
+	f.runners["fleet-b"] = model.Runner{ProtocolVersion: 2, ID: "fleet-b", Name: "b", Labels: []string{"gpu", "container"}, Capacity: 1}
 	f.runs["fleet-run"] = model.Run{ID: "fleet-run", Status: model.StatusQueued}
 	// A stale, runner-local diagnostic is already persisted (the job payload
 	// is where the store keeps it; queue_reason mirrors the same value): the
@@ -78,8 +78,8 @@ func TestQueueReasonFleetGlobalCapacityIsRunnerCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.mu.Lock()
-	f.runners["fleet-a"] = model.Runner{ID: "fleet-a", Name: "a", Labels: []string{"container"}, Capacity: 1, ActiveJobs: []string{"busy-a"}}
-	f.runners["fleet-b"] = model.Runner{ID: "fleet-b", Name: "b", Labels: []string{"container"}, Capacity: 1, ActiveJobs: []string{"busy-b"}}
+	f.runners["fleet-a"] = model.Runner{ProtocolVersion: 2, ID: "fleet-a", Name: "a", Labels: []string{"container"}, Capacity: 1, ActiveJobs: []string{"busy-a"}}
+	f.runners["fleet-b"] = model.Runner{ProtocolVersion: 2, ID: "fleet-b", Name: "b", Labels: []string{"container"}, Capacity: 1, ActiveJobs: []string{"busy-b"}}
 	f.runs["fleet-run"] = model.Run{ID: "fleet-run", Status: model.StatusQueued}
 	f.jobs["fleet-wait"] = model.Job{ID: "fleet-wait", RunID: "fleet-run", Key: "wait", Status: model.StatusQueued, CreatedAt: time.Now().UTC()}
 	f.mu.Unlock()
@@ -104,7 +104,7 @@ func TestQueueReasonFleetGlobalGenuinelyIncompatible(t *testing.T) {
 	f.mu.Lock()
 	f.profiles["cap-prof"] = model.RunnerProfile{ID: "cap-prof", MaxCapacity: 2, MaxMemory: 4 << 30}
 	f.certProfiles["cap-serial"] = "cap-prof"
-	f.runners["cap-runner"] = model.Runner{ID: "cap-runner", Name: "cap", Labels: []string{"container"}, Capacity: 2, CertSerial: "cap-serial"}
+	f.runners["cap-runner"] = model.Runner{ProtocolVersion: 2, ID: "cap-runner", Name: "cap", Labels: []string{"container"}, Capacity: 2, CertSerial: "cap-serial"}
 	f.runs["cap-run"] = model.Run{ID: "cap-run", Status: model.StatusQueued}
 	f.jobs["cap-label"] = model.Job{ID: "cap-label", RunID: "cap-run", Key: "label", Status: model.StatusQueued, RequiredLabels: []string{"fpga"}, CreatedAt: time.Now().UTC()}
 	f.jobs["cap-over"] = model.Job{ID: "cap-over", RunID: "cap-run", Key: "over", Status: model.StatusQueued, MemoryRequest: 8 << 30, CreatedAt: time.Now().UTC().Add(time.Second)}
@@ -133,7 +133,7 @@ func TestQueueReasonFleetListingFailureKeepsOnlyJobScopedReasons(t *testing.T) {
 		t.Fatal(err)
 	}
 	inner.mu.Lock()
-	inner.runners["solo"] = model.Runner{ID: "solo", Name: "solo", Labels: []string{"container"}, Capacity: 1}
+	inner.runners["solo"] = model.Runner{ProtocolVersion: 2, ID: "solo", Name: "solo", Labels: []string{"container"}, Capacity: 1}
 	inner.runs["solo-run"] = model.Run{ID: "solo-run", Status: model.StatusQueued}
 	inner.jobs["solo-dep"] = model.Job{ID: "solo-dep", RunID: "solo-run", Key: "dep", Status: model.StatusQueued, Needs: []string{"missing"}, CreatedAt: time.Now().UTC()}
 	// A previously persisted fleet-level diagnostic must survive the
@@ -165,7 +165,7 @@ func TestQueueReasonFleetListingFailureKeepsOnlyJobScopedReasons(t *testing.T) {
 func TestMemoryQueueReasonIsFleetGlobal(t *testing.T) {
 	s := New("token")
 	regA := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
-		`{"name":"fleet-a","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
+		`{"name":"fleet-a","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
 	if regA.Code != http.StatusOK {
 		t.Fatalf("register a: %d %s", regA.Code, regA.Body.String())
 	}
@@ -174,7 +174,7 @@ func TestMemoryQueueReasonIsFleetGlobal(t *testing.T) {
 		t.Fatal(err)
 	}
 	regB := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
-		`{"name":"fleet-b","protocol_min":3,"protocol_max":3,"labels":["gpu","container"],"capacity":1}`)
+		`{"name":"fleet-b","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["gpu","container"],"capacity":1}`)
 	if regB.Code != http.StatusOK {
 		t.Fatalf("register b: %d %s", regB.Code, regB.Body.String())
 	}
@@ -224,7 +224,7 @@ jobs:
 func TestMemoryQueueReasonGenuinelyIncompatible(t *testing.T) {
 	s := New("token")
 	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
-		`{"name":"fleet-a","protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
+		`{"name":"fleet-a","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d %s", w.Code, w.Body.String())
 	}
@@ -267,7 +267,7 @@ jobs:
 func TestMemoryQueueReasonTableIsFleetGlobal(t *testing.T) {
 	s := New("shared-dev-tok")
 	now := time.Now().UTC()
-	runner := model.Runner{ID: "runner-1", Labels: []string{"linux"}, Region: "eu", Capacity: 4}
+	runner := model.Runner{ProtocolVersion: 2, ID: "runner-1", Labels: []string{"linux"}, Region: "eu", Capacity: 4}
 
 	// A stale annotation on a job that is now leasable must be cleared.
 	jobs := map[string]model.Job{
@@ -319,8 +319,8 @@ func TestMemoryQueueReasonRequiresOneRunnerWithAllLabels(t *testing.T) {
 		"both":   {ID: "both", RunID: "run-1", Status: model.StatusQueued, RequiredLabels: []string{"linux", "gpu"}, CreatedAt: now},
 		"subset": {ID: "subset", RunID: "run-1", Status: model.StatusQueued, RequiredLabels: []string{"linux"}, CreatedAt: now},
 	}
-	linuxOnly := model.Runner{ID: "linux-only", Labels: []string{"linux"}, Capacity: 1}
-	gpuOnly := model.Runner{ID: "gpu-only", Labels: []string{"gpu"}, Capacity: 1}
+	linuxOnly := model.Runner{ProtocolVersion: 2, ID: "linux-only", Labels: []string{"linux"}, Capacity: 1}
+	gpuOnly := model.Runner{ProtocolVersion: 2, ID: "gpu-only", Labels: []string{"gpu"}, Capacity: 1}
 	s.runners = map[string]model.Runner{linuxOnly.ID: linuxOnly, gpuOnly.ID: gpuOnly}
 
 	s.mu.Lock()
@@ -378,7 +378,7 @@ func TestQueueReasonFleetGlobalResourceCapacity(t *testing.T) {
 		prof := "prof-" + id
 		f.profiles[prof] = model.RunnerProfile{ID: prof, Capabilities: []string{"native"}, MaxCapacity: 8, MaxMemory: 8 << 30}
 		f.certProfiles["serial-"+id] = prof
-		f.runners[id] = model.Runner{ID: id, Name: id, Capacity: 8, CertSerial: "serial-" + id, ReportedCapabilities: []string{"native"}}
+		f.runners[id] = model.Runner{ProtocolVersion: 2, ID: id, Name: id, Capacity: 8, CertSerial: "serial-" + id, ReportedCapabilities: []string{"native"}}
 	}
 	f.runs["res-run"] = model.Run{ID: "res-run", Status: model.StatusQueued}
 	f.jobs["res-wait"] = model.Job{ID: "res-wait", RunID: "res-run", Key: "wait", Status: model.StatusQueued, MemoryRequest: 5 << 30, CreatedAt: time.Now().UTC()}

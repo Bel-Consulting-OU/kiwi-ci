@@ -86,6 +86,17 @@ type Task struct {
 	LeaseToken      string    `json:"lease_token"`
 	LeaseGeneration int64     `json:"lease_generation"`
 	LeaseExpiresAt  time.Time `json:"lease_expires_at"`
+	// ProtocolVersion is the WIRE-SEMANTIC protocol version this task
+	// requires (model.JobRequiresProtocol): the semantics a runner must
+	// implement to execute it (lease-generation fencing on every
+	// runner-originated mutation, typed/scoped event cursors, execution
+	// attestation, checkpoint phases, artifact commit fencing). A runner
+	// whose registration negotiated a lower version is never handed this
+	// task — /next refuses with 409 RUNNER_PROTOCOL_UNSUPPORTED before any
+	// claim or reservation mutation — and the runner itself refuses a task
+	// whose protocol_version exceeds what it implements. Additive: an older
+	// server omits the field (0), which every runner treats as compatible.
+	ProtocolVersion int `json:"protocol_version,omitempty"`
 	// JobCgroup advertises that the leased runner's effective profile can
 	// establish a job-scoped parent cgroup (model.CapabilityJobCgroup). The
 	// scheduler reserved only the job's own request for this lease; the
@@ -106,12 +117,17 @@ type RunnerInfo struct {
 	LastSeen time.Time `json:"last_seen"`
 	Busy     bool      `json:"busy"`
 
-	Region      string  `json:"region,omitempty"`
-	Capacity    int     `json:"capacity,omitempty"`
-	ProtocolMin int     `json:"protocol_min,omitempty"`
-	ProtocolMax int     `json:"protocol_max,omitempty"`
-	CostPerHour float64 `json:"cost_per_hour,omitempty"`
-	PowerWatts  float64 `json:"power_watts,omitempty"`
+	Region      string `json:"region,omitempty"`
+	Capacity    int    `json:"capacity,omitempty"`
+	ProtocolMin int    `json:"protocol_min,omitempty"`
+	ProtocolMax int    `json:"protocol_max,omitempty"`
+	// ProtocolVersion is the runner's declared wire-semantic protocol
+	// version (model.RunnerProtocolVersion for current binaries; absent or
+	// 0 means a legacy v1 runner). The handler negotiates it against
+	// server.min_runner_protocol before a record is stored.
+	ProtocolVersion int     `json:"protocol_version,omitempty"`
+	CostPerHour     float64 `json:"cost_per_hour,omitempty"`
+	PowerWatts      float64 `json:"power_watts,omitempty"`
 }
 
 type Heartbeat struct {

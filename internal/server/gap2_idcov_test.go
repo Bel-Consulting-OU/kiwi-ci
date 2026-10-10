@@ -562,8 +562,8 @@ func TestIDCovGetRunAndListJobsDBBranches(t *testing.T) {
 	f.mu.Lock()
 	f.runs["r1"] = model.Run{ID: "r1", RepoID: "github.com/kiwi/repo", RepoFullName: "kiwi/repo", Status: model.StatusRunning}
 	f.mu.Unlock()
-	// A repo-only read principal restricted to another repository is refused
-	// on both endpoints.
+	// A repo-only read principal restricted to another repository is masked
+	// on both endpoints (the run's existence is not disclosed).
 	scoped := storeServer(t, "", map[string]auth.Principal{
 		"read-token": {Subject: "reader", Repositories: map[string]auth.RepositoryPermission{"github.com/other/repo": {Read: true}}},
 	})
@@ -571,11 +571,11 @@ func TestIDCovGetRunAndListJobsDBBranches(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := newTestClient(t, scoped.Handler(), "read-token")
-	if w := c.do(http.MethodGet, "/api/v1/runs/r1", nil, nil); w.Code != http.StatusForbidden {
-		t.Fatalf("scoped-out getRun = %d, want 403", w.Code)
+	if w := c.do(http.MethodGet, "/api/v1/runs/r1", nil, nil); w.Code != http.StatusNotFound {
+		t.Fatalf("scoped-out getRun = %d, want masked 404", w.Code)
 	}
-	if w := c.do(http.MethodGet, "/api/v1/runs/r1/jobs", nil, nil); w.Code != http.StatusForbidden {
-		t.Fatalf("scoped-out listJobs = %d, want 403", w.Code)
+	if w := c.do(http.MethodGet, "/api/v1/runs/r1/jobs", nil, nil); w.Code != http.StatusNotFound {
+		t.Fatalf("scoped-out listJobs = %d, want masked 404", w.Code)
 	}
 }
 
@@ -626,7 +626,7 @@ func TestIDCovRegisterIdentityAndPreservation(t *testing.T) {
 	// Bearer-derived ID and defaulted name (memory mode).
 	s := New("shared")
 	s.LoadRunnerTokens(map[string]string{"runner-bearer": auth.TokenDigest("tok-b")})
-	body := map[string]any{"capacity": 1, "protocol_min": 3, "protocol_max": 3}
+	body := map[string]any{"capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}
 	w := pkiRequest(t, s.Handler(), http.MethodPost, "/api/v1/runners/register", body, "tok-b", nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("bearer register = %d: %s", w.Code, w.Body.String())
@@ -669,7 +669,7 @@ func TestIDCovRegisterDBBranches(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := s.Handler()
-	body := `{"id":"db-r1","name":"r1","capacity":1,"protocol_min":3,"protocol_max":3}`
+	body := `{"id":"db-r1","name":"r1","capacity":1,"protocol_version": 2, "protocol_min":3,"protocol_max":3}`
 	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "admin", body); w.Code != http.StatusOK {
 		t.Fatalf("db register = %d: %s", w.Code, w.Body.String())
 	}
@@ -713,7 +713,7 @@ func TestIDCovRegisterDBBranches(t *testing.T) {
 	if err := s2.SwitchToDB(faultProfile); err != nil {
 		t.Fatal(err)
 	}
-	profBody := `{"id":"db-r2","name":"r2","capacity":1,"protocol_min":3,"protocol_max":3,"cert_serial":"ser-1"}`
+	profBody := `{"id":"db-r2","name":"r2","capacity":1,"protocol_version": 2, "protocol_min":3,"protocol_max":3,"cert_serial":"ser-1"}`
 	if w := doJSON(t, s2, http.MethodPost, "/api/v1/runners/register", "admin", profBody); w.Code != http.StatusOK {
 		t.Fatalf("register with failing profile lookup = %d: %s", w.Code, w.Body.String())
 	}
@@ -749,7 +749,7 @@ func TestIDCovRunnerAdminForbiddenAndMemory(t *testing.T) {
 	// a serial.
 	idcovSeedMemoryJob(t, s, "job-kill", "run-kill", "r-kill", "tok", nil)
 	s.mu.Lock()
-	s.runners["r-kill"] = model.Runner{ID: "r-kill", Name: "rk", Capacity: 1, ActiveJobs: []string{"job-kill"}}
+	s.runners["r-kill"] = model.Runner{ProtocolVersion: 2, ID: "r-kill", Name: "rk", Capacity: 1, ActiveJobs: []string{"job-kill"}}
 	s.mu.Unlock()
 	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/r-kill/disable", "admin", ""); w.Code != http.StatusOK {
 		t.Fatalf("memory disable = %d: %s", w.Code, w.Body.String())
@@ -781,7 +781,7 @@ func TestIDCovRunnerDisableDBErrors(t *testing.T) {
 	}
 	fault.getRunnerErr = nil
 	f.mu.Lock()
-	f.runners["r1"] = model.Runner{ID: "r1", Name: "r1", Capacity: 1, CertSerial: "serial-r1"}
+	f.runners["r1"] = model.Runner{ProtocolVersion: 2, ID: "r1", Name: "r1", Capacity: 1, CertSerial: "serial-r1"}
 	f.mu.Unlock()
 	// ADAPTATION (S6-B): the handler no longer composes UpsertRunner +
 	// RevokeRunnerLeases + best-effort RevokeCert; the whole disable is the
@@ -821,7 +821,7 @@ func TestIDCovRunnerDisableDBErrors(t *testing.T) {
 func TestIDCovServingRunnersAliasAndMissingRun(t *testing.T) {
 	s := New("admin")
 	s.mu.Lock()
-	s.runners["r-serv"] = model.Runner{ID: "r-serv", Name: "rs", Capacity: 1, ActiveJobs: []string{"job-missing-run", "job-alias"}}
+	s.runners["r-serv"] = model.Runner{ProtocolVersion: 2, ID: "r-serv", Name: "rs", Capacity: 1, ActiveJobs: []string{"job-missing-run", "job-alias"}}
 	s.jobs["job-missing-run"] = model.Job{ID: "job-missing-run", RunID: "run-gone", Key: "build", Status: model.StatusRunning}
 	s.jobs["job-alias"] = model.Job{ID: "job-alias", RunID: "run-alias", Key: "build", Status: model.StatusRunning}
 	s.runs["run-alias"] = model.Run{ID: "run-alias", RepoID: "github.com/acme/service", RepoFullName: "acme/service", Status: model.StatusRunning}

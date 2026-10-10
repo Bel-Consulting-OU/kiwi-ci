@@ -39,7 +39,7 @@ func TestMemoryReservationLedgerConcurrentTransitions(t *testing.T) {
 	now := time.Now().UTC()
 	runnerIDs := []string{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01"}
 	for _, id := range runnerIDs {
-		s.runners[id] = model.Runner{ID: id, Name: id, Labels: []string{"container"}, Capacity: 8, ResourceCapacity: model.ResourceCapacity{CPU: 8, Memory: 16 << 30}}
+		s.runners[id] = model.Runner{ProtocolVersion: 2, ID: id, Name: id, Labels: []string{"container"}, Capacity: 8, ResourceCapacity: model.ResourceCapacity{CPU: 8, Memory: 16 << 30}}
 	}
 	const jobs = 60
 	runIDs := make([]string, 0, jobs)

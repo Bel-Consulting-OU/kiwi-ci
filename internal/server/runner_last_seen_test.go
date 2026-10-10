@@ -21,10 +21,10 @@ func TestRegistrationTouchesRunnerLastSeenNarrowly(t *testing.T) {
 	}
 	ctx := context.Background()
 	f.mu.Lock()
-	f.runners["r-touch"] = model.Runner{ID: "r-touch", Name: "old", Capacity: 2, LastSeen: time.Now().UTC().Add(-2 * time.Hour)}
+	f.runners["r-touch"] = model.Runner{ProtocolVersion: 2, ID: "r-touch", Name: "old", Capacity: 2, LastSeen: time.Now().UTC().Add(-2 * time.Hour)}
 	f.mu.Unlock()
 
-	stale := model.Runner{ID: "r-touch", Name: "new", Capacity: 2, LastSeen: time.Now().UTC().Add(-time.Hour)}
+	stale := model.Runner{ProtocolVersion: 2, ID: "r-touch", Name: "new", Capacity: 2, LastSeen: time.Now().UTC().Add(-time.Hour)}
 	if err := s.writeRunnerProfileDB(ctx, stale, model.Runner{ID: "r-touch"}, true); err != nil {
 		t.Fatalf("registration write: %v", err)
 	}

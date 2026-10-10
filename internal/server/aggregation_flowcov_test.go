@@ -139,7 +139,7 @@ func TestFlowAggregationRecoverLeases(t *testing.T) {
 	s2.runs["run-1"] = model.Run{ID: "run-1", Status: model.StatusRunning}
 	s2.jobs["lost"] = model.Job{ID: "lost", RunID: "run-1", Key: "build", Status: model.StatusRunning,
 		LeaseRunnerID: "r1", LeaseExpiresAt: &past, Attempts: 5, MaxInfraRetries: 1}
-	s2.runners["r1"] = model.Runner{ID: "r1", Capacity: 2, ActiveJobs: []string{"lost", "next"}, CurrentJob: "lost"}
+	s2.runners["r1"] = model.Runner{ProtocolVersion: 2, ID: "r1", Capacity: 2, ActiveJobs: []string{"lost", "next"}, CurrentJob: "lost"}
 	s2.mu.Unlock()
 	s2.mu.Lock()
 	s2.recoverLeasesLocked(now, false)

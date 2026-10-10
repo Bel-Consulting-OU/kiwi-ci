@@ -202,11 +202,11 @@ func TestFlowStreamLogsErrorBranches(t *testing.T) {
 	if w := doJSON(t, sdb, http.MethodGet, "/api/v1/runs/run-c/logs/stream", "admin-tok", ""); w.Code != http.StatusInternalServerError {
 		t.Fatalf("run read failure stream = %d, want 500", w.Code)
 	}
-	// Scoped denial: 403.
+	// Scoped denial: masked 404 (existence preservation).
 	sdb2, _, _, _ := cacheFixture(t)
 	fcScopedLogServer(t, sdb2)
-	if w := doJSON(t, sdb2, http.MethodGet, "/api/v1/runs/run-c/logs/stream", "outsider", ""); w.Code != http.StatusForbidden {
-		t.Fatalf("scoped stream = %d, want 403", w.Code)
+	if w := doJSON(t, sdb2, http.MethodGet, "/api/v1/runs/run-c/logs/stream", "outsider", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("scoped stream = %d, want masked 404", w.Code)
 	}
 }
 

@@ -5437,7 +5437,16 @@ func (m *memStore) recomputeDependentsLocked(cancelled map[string]bool, now time
 	if len(cancelled) == 0 {
 		return
 	}
-	for id, j := range m.jobs {
+	// Deterministic order, matching the SQL store's ORDER BY job_id: this
+	// pass MUTATES statuses that later iterations read, so map order would
+	// make dev-mode dependents blocked/queued nondeterministically.
+	ids := make([]string, 0, len(m.jobs))
+	for id := range m.jobs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		j := m.jobs[id]
 		if j.Status != model.StatusQueued && j.Status != model.StatusWaitingApproval {
 			continue
 		}

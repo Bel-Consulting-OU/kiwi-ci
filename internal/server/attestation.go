@@ -208,6 +208,11 @@ func attestationInput(ev attestationEvidence, generation int64) provenance.Execu
 		RunnerIdentity:         j.AttemptRunnerID,
 		ObservedRuntime:        j.ObservedRuntime,
 		CompletionResultDigest: ev.completionResultDigest,
+		// The signed evidence binds WHICH execution-engine semantics the
+		// attempt ran under, read from the durable stamped records (the job,
+		// falling back to its run). Legacy records carry the empty string,
+		// which the statement preserves verbatim: it is never guessed.
+		ExecutionSemantics: jobExecutionSemantics(j, ev.run),
 	}
 	if p := j.CompiledJobPayload; p != nil {
 		if d, err := provenance.CapsuleDigest(p); err == nil {
@@ -490,15 +495,23 @@ func (s *Server) jobForAttestation(ctx context.Context, id string) (model.Job, e
 func (s *Server) getJobAttestation(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	j, err := s.jobForAttestation(r.Context(), id)
-	if errors.Is(err, storage.ErrNotFound) {
-		http.NotFound(w, r)
-		return
-	}
 	if err != nil {
-		s.internalError(w, r, err, "")
+		if errors.Is(err, storage.ErrNotFound) {
+			// Same masked 404 as an invisible job's run: the job id is not an
+			// existence oracle for another repository.
+			s.writeMaskedRunNotFound(w)
+		} else {
+			s.internalError(w, r, err, "")
+		}
 		return
 	}
-	if !s.requireRunCapability(w, r, auth.CapEvidenceRead, j.RunID) {
+	// Visibility of the job's run precedes the evidence:read decision, so an
+	// invisible run and a missing job are indistinguishable.
+	run, ok := s.requireRunVisible(w, r, j.RunID)
+	if !ok {
+		return
+	}
+	if !s.requireRunCapability(w, r, auth.CapEvidenceRead, run.ID) {
 		return
 	}
 	generation := j.LeaseGeneration

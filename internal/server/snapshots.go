@@ -377,6 +377,9 @@ func (s *Server) uploadSnapshot(w http.ResponseWriter, r *http.Request) {
 		Phase:           phase,
 		LeaseGeneration: gen,
 		Attempts:        j.Attempts,
+		// The checkpoint records which engine semantics produced the
+		// workspace state, so a restore can refuse to reinterpret it.
+		ExecutionSemantics: j.ExecutionSemantics,
 	}
 	for _, e := range m.Entries {
 		rec.Entries = append(rec.Entries, model.SnapshotEntry{Path: e.Path, Mode: e.Mode, Size: e.Size, SHA256: e.SHA256})
@@ -647,6 +650,9 @@ func (s *Server) uploadSnapshotDB(w http.ResponseWriter, r *http.Request, j mode
 		Phase:           phase,
 		LeaseGeneration: gen,
 		Attempts:        j.Attempts,
+		// The checkpoint records which engine semantics produced the
+		// workspace state, so a restore can refuse to reinterpret it.
+		ExecutionSemantics: j.ExecutionSemantics,
 	}
 	for _, e := range m.Entries {
 		rec.Entries = append(rec.Entries, model.SnapshotEntry{Path: e.Path, Mode: e.Mode, Size: e.Size, SHA256: e.SHA256})
@@ -766,18 +772,19 @@ func (s *Server) listSnapshots(w http.ResponseWriter, r *http.Request) {
 	}
 	limit := storage.NormalizeSnapshotPageLimit(snapshotsPageLimitParam(r))
 	var page storage.SnapshotPage
+	// Existence masking precedes the capability decision on both store modes:
+	// a missing run and another repository's run are the same masked 404; a
+	// visible run (read access) then faces requireRunCapability, so a reader
+	// without checkpoints:read keeps its existing 403.
 	if s.DB != nil {
-		run, err := s.DB.GetRun(r.Context(), runID)
-		if errors.Is(err, storage.ErrNotFound) {
-			http.NotFound(w, r)
-			return
-		} else if err != nil {
-			s.internalError(w, r, err, "")
+		run, ok := s.requireRunVisible(w, r, runID)
+		if !ok {
 			return
 		}
 		if !s.requireRunCapability(w, r, auth.CapCheckpointsRead, run.ID) {
 			return
 		}
+		var err error
 		page, err = listSnapshotsPageFromStore(r.Context(), s.DB, runID, cursor, limit)
 		if err != nil {
 			s.internalError(w, r, err, "")
@@ -786,21 +793,17 @@ func (s *Server) listSnapshots(w http.ResponseWriter, r *http.Request) {
 	} else {
 		// Memory mode: resolve the run and copy only its records under the
 		// lock, then page, redact and serialize outside it.
-		snapshotListMemoryLock()
-		s.mu.Lock()
-		run, ok := s.runs[runID]
-		var recs []model.SnapshotRecord
-		if ok {
-			recs = s.snapshotRecordsForRunLocked(runID)
-		}
-		s.mu.Unlock()
+		run, ok := s.requireRunVisible(w, r, runID)
 		if !ok {
-			http.NotFound(w, r)
 			return
 		}
 		if !s.requireRunCapability(w, r, auth.CapCheckpointsRead, run.ID) {
 			return
 		}
+		snapshotListMemoryLock()
+		s.mu.Lock()
+		recs := s.snapshotRecordsForRunLocked(runID)
+		s.mu.Unlock()
 		page = storage.PageSnapshots(recs, runID, cursor.createdAt, cursor.id, limit)
 	}
 	out := make([]model.SnapshotRecord, 0, len(page.Snapshots))
@@ -930,16 +933,17 @@ func (s *Server) downloadSnapshot(w http.ResponseWriter, r *http.Request) {
 	rec, ok := s.snapshots[sid]
 	s.mu.Unlock()
 	if !ok {
-		http.NotFound(w, r)
+		// The snapshot id is not an existence oracle either: a missing record
+		// and a record in an invisible run are byte-identical.
+		s.writeMaskedRunNotFound(w)
 		return
 	}
 	if rec.RunID != r.PathValue("id") {
-		http.NotFound(w, r)
+		s.writeMaskedRunNotFound(w)
 		return
 	}
-	run, err := s.runForAuth(r.Context(), rec.RunID)
-	if err != nil {
-		http.NotFound(w, r)
+	run, ok := s.requireRunVisible(w, r, rec.RunID)
+	if !ok {
 		return
 	}
 	if !s.requireRunCapability(w, r, auth.CapCheckpointsRead, run.ID) {
@@ -974,13 +978,11 @@ func (s *Server) downloadSnapshotDB(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	runID := r.PathValue("id")
 	sid := r.PathValue("sid")
-	run, err := s.DB.GetRun(ctx, runID)
-	if errors.Is(err, storage.ErrNotFound) {
-		http.NotFound(w, r)
-		return
-	}
-	if err != nil {
-		s.internalError(w, r, err, "")
+	// Existence masking first: a missing run and another repository's run are
+	// the same masked 404; the capability decision then runs on the visible
+	// run (a read principal without checkpoints:read keeps its 403).
+	run, ok := s.requireRunVisible(w, r, runID)
+	if !ok {
 		return
 	}
 	if !s.requireRunCapability(w, r, auth.CapCheckpointsRead, run.ID) {
@@ -1072,6 +1074,11 @@ type runJobPipeline struct {
 	// and the service envelope) so replay derives the same effective
 	// execution the distributed runner executed under.
 	PersistedJob exportedPersistedJob `json:"persisted_job"`
+	// ExecutionSemantics is the execution-engine semantic version (see
+	// model.ExecutionSemanticsVersion) stamped on the job at enqueue, so
+	// exact replay can refuse to reinterpret the record under different
+	// semantics. Empty on records that predate stamping.
+	ExecutionSemantics string `json:"execution_semantics,omitempty"`
 }
 
 // exportedPersistedJob is the exact-replay subset of model.Job the shared
@@ -1153,13 +1160,10 @@ func (s *Server) jobInRun(ctx context.Context, runID, ref string) (model.Job, bo
 // recompiles or invents a record.
 func (s *Server) exportRunJobPipeline(w http.ResponseWriter, r *http.Request) {
 	runID := r.PathValue("id")
-	run, err := s.runForAuth(r.Context(), runID)
-	if errors.Is(err, storage.ErrNotFound) {
-		http.NotFound(w, r)
-		return
-	}
-	if err != nil {
-		s.internalError(w, r, err, "")
+	// Existence masking first: the replay-material export must not tell a
+	// principal that another repository's run exists.
+	run, ok := s.requireRunVisible(w, r, runID)
+	if !ok {
 		return
 	}
 	if !s.requireRunCapability(w, r, auth.CapEvidenceRead, run.ID) {
@@ -1184,7 +1188,19 @@ func (s *Server) exportRunJobPipeline(w http.ResponseWriter, r *http.Request) {
 		Pipeline:           j.Pipeline,
 		CompiledJobPayload: j.CompiledJobPayload,
 		PersistedJob:       persistedJobForExport(j),
+		ExecutionSemantics: jobExecutionSemantics(j, run),
 	})
+}
+
+// jobExecutionSemantics resolves the stamped execution semantics of a job,
+// falling back to the owning run's value for a job record persisted without
+// its own copy. It returns the empty string for records that predate
+// semantics stamping; callers decide how to treat that legacy case.
+func jobExecutionSemantics(j model.Job, run model.Run) string {
+	if j.ExecutionSemantics != "" {
+		return j.ExecutionSemantics
+	}
+	return run.ExecutionSemantics
 }
 
 // fileSHA256 hashes a staged file so the digest fence can be taken before

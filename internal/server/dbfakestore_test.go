@@ -1451,7 +1451,7 @@ func (f *dbFakeStore) GetRunner(ctx context.Context, id string) (model.Runner, e
 	defer f.mu.Unlock()
 	r, ok := f.runners[id]
 	if !ok {
-		return model.Runner{}, storage.ErrNotFound
+		return model.Runner{ProtocolVersion: 2}, storage.ErrNotFound
 	}
 	return r, nil
 }

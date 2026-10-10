@@ -61,6 +61,7 @@ func extendedStatement() Statement {
 		EndTime:                &end,
 		ArtifactSize:           999,
 		ArtifactPublishedAt:    &published,
+		ExecutionSemantics:     "kiwi.execution.v2",
 	}
 }
 
@@ -79,6 +80,7 @@ func TestExtendedFieldsRoundTrip(t *testing.T) {
 		TrustedKey: pub,
 		Repository: "example/repo", Commit: "abc123", Ref: "main", Job: "build",
 		Builder: "https://kiwi-ci.dev/runner/runner-7", Issuer: "https://issuer.example",
+		ExecutionSemantics: "kiwi.execution.v2",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -103,6 +105,9 @@ func TestExtendedFieldsRoundTrip(t *testing.T) {
 	}
 	if got.AttemptID != st.AttemptID || got.CapsuleDigest != st.CapsuleDigest {
 		t.Fatalf("attempt/capsule identity lost: %+v", got)
+	}
+	if got.ExecutionSemantics != st.ExecutionSemantics {
+		t.Fatalf("execution semantics lost: %q != %q", got.ExecutionSemantics, st.ExecutionSemantics)
 	}
 	if got.ArtifactPublishedAt == nil || !got.ArtifactPublishedAt.Equal(*st.ArtifactPublishedAt) {
 		t.Fatalf("artifactPublishedAt lost: %+v", got.ArtifactPublishedAt)
@@ -146,6 +151,28 @@ func TestArtifactStatementBuilderOverride(t *testing.T) {
 	def := ArtifactStatement(ArtifactInput{Name: "app", SHA256: strings.Repeat("c", 64), Runner: "runner-7"})
 	if got := def.Predicate.RunDetails.Builder.ID; got != "https://kiwi-ci.dev/runner/runner-7" {
 		t.Fatalf("default predicate builder = %q", got)
+	}
+}
+
+// TestArtifactStatementCarriesExecutionSemantics proves the artifact
+// provenance statement binds the execution-engine semantic version when the
+// caller supplies one, and omits the field entirely for records that predate
+// stamping (an empty value is never guessed).
+func TestArtifactStatementCarriesExecutionSemantics(t *testing.T) {
+	st := ArtifactStatement(ArtifactInput{Name: "app", SHA256: strings.Repeat("c", 64), ExecutionSemantics: "kiwi.execution.v2"})
+	if st.ExecutionSemantics != "kiwi.execution.v2" {
+		t.Fatalf("artifact statement semantics = %q, want the input value", st.ExecutionSemantics)
+	}
+	legacy := ArtifactStatement(ArtifactInput{Name: "app", SHA256: strings.Repeat("c", 64)})
+	if legacy.ExecutionSemantics != "" {
+		t.Fatalf("unstamped artifact statement semantics = %q, want empty", legacy.ExecutionSemantics)
+	}
+	raw, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "executionSemantics") {
+		t.Fatalf("unstamped artifact statement leaked the field: %s", raw)
 	}
 }
 
