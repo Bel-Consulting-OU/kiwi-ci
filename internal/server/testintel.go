@@ -195,8 +195,27 @@ func (s *Server) uploadTestReport(w http.ResponseWriter, r *http.Request) {
 	// or is refused as a conflict). The digest conflict is detected by
 	// comparing the client-authored report content, because there is no
 	// delivery table to hold the digest.
+	//
+	// The persistence is additionally COMMIT-TIME LEASE-FENCED: s.mu is this
+	// store's transaction, so the live-lease predicate is re-evaluated under
+	// it immediately before the report and its history fold are written. A
+	// lease superseded, revoked or expired between the request gate and this
+	// point persists NOTHING and answers the standard 409 — including a
+	// replay of an already-persisted delivery, mirroring the DB fence's
+	// predicate-before-replay precedence.
 	rep.ID = testintel.DeliveryReportID(delivery.JobID, delivery.LeaseGeneration, delivery.DeliveryID)
 	s.mu.Lock()
+	cur, ok := s.jobs[j.ID]
+	if !ok {
+		s.mu.Unlock()
+		http.NotFound(w, r)
+		return
+	}
+	if !s.validActiveLease(cur, in.RunnerID, in.LeaseToken, in.LeaseGeneration, s.leaseNow()) {
+		s.mu.Unlock()
+		s.writeLeaseAuthError(w, r, errStaleLease)
+		return
+	}
 	if existing, ok := s.reports[rep.ID]; ok {
 		s.mu.Unlock()
 		if sameTestReportContent(existing, rep) {

@@ -36,10 +36,12 @@ const (
 	capabilityScopeGlobal capabilityScope = iota
 	// capabilityScopeRun: the route addresses one run; the handler resolves
 	// the run's canonical repository identity (repoIDForRun) and authorizes
-	// the capability there. Every scoped capability route today addresses a
-	// run (or accepts an optional run_id), so there is no separate
-	// repo-addressed scope constant until one is needed.
+	// the capability there.
 	capabilityScopeRun
+	// capabilityScopeRepo: the route addresses a repository directly (the
+	// repo_id query parameter, or a run window resolved to one repository);
+	// the handler authorizes the capability against that repository.
+	capabilityScopeRepo
 )
 
 // capabilityRoute is one entry of the capability route table: the
@@ -74,13 +76,17 @@ var capabilityRoutes = []capabilityRoute{
 	// The canonical execution event stream: admin gates were too broad for
 	// external controllers consuming execution history. A run_id-scoped read
 	// is covered by the capability for that run's repository or by read
-	// access to it; the unscoped cursor read requires a GLOBAL capability.
+	// access to it; a repo_id-scoped read by the capability for the addressed
+	// repository or read access to it; the unscoped cursor read requires a
+	// GLOBAL capability.
 	{method: http.MethodGet, pattern: "/api/v1/events", capability: auth.CapExecutionEventsRead, scope: capabilityScopeRun, readFallback: true},
 	{method: http.MethodGet, pattern: "/api/v1/events/stream", capability: auth.CapExecutionEventsRead, scope: capabilityScopeRun, readFallback: true},
-	// The atomic bootstrap snapshot addresses no run: the cursor and the
-	// state summary span every repository, so only a GLOBAL
+	// The atomic bootstrap snapshot mirrors the event stream's visibility: a
+	// repo_id-scoped request is authorized exactly like a repo-scoped event
+	// read (capability for the repository or read access to it); the
+	// unscoped form spans every repository, so only a GLOBAL
 	// execution.events:read (or admin) may read it.
-	{method: http.MethodGet, pattern: "/api/v1/execution-snapshot", capability: auth.CapExecutionEventsRead, scope: capabilityScopeGlobal},
+	{method: http.MethodGet, pattern: "/api/v1/execution-snapshot", capability: auth.CapExecutionEventsRead, scope: capabilityScopeRepo, readFallback: true},
 	// The audit trail is repository-less: evidence:read must be global.
 	{method: http.MethodGet, pattern: "/api/v1/audit", capability: auth.CapEvidenceRead, scope: capabilityScopeGlobal},
 	// Workspace snapshot listing and archive download: the record carries the
@@ -361,48 +367,6 @@ func (s *Server) requireGlobalCapability(w http.ResponseWriter, r *http.Request,
 		return true
 	}
 	if auth.AuthorizeCapability(p, capability, "") {
-		return true
-	}
-	http.Error(w, "forbidden", http.StatusForbidden)
-	return false
-}
-
-// requireExecutionEventsRead enforces GET /api/v1/events and
-// /api/v1/events/stream:
-//
-//   - without run_id the read spans every repository, so only a GLOBAL
-//     execution.events:read capability (or admin) is accepted;
-//   - with run_id the run's canonical repository identity is resolved and
-//     the request is accepted with the capability scoped to that repository
-//     OR with plain READ access to it (a repository reader may consume the
-//     run's own execution history — the same material its read routes
-//     expose — without the controller capability);
-//   - a run_id that cannot be resolved (unknown run, store error) fails
-//     closed: only a global capability (or admin) covers a scope that cannot
-//     be established.
-func (s *Server) requireExecutionEventsRead(w http.ResponseWriter, r *http.Request) bool {
-	p, ok := auth.PrincipalFrom(r)
-	if !ok {
-		return true
-	}
-	runID := strings.TrimSpace(r.URL.Query().Get("run_id"))
-	if runID == "" {
-		if auth.AuthorizeCapability(p, auth.CapExecutionEventsRead, "") {
-			return true
-		}
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return false
-	}
-	run, err := s.runForAuth(r.Context(), runID)
-	if err != nil {
-		if auth.AuthorizeCapability(p, auth.CapExecutionEventsRead, "") {
-			return true
-		}
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return false
-	}
-	repo := repoIDForRun(run)
-	if auth.AuthorizeCapability(p, auth.CapExecutionEventsRead, repo) || auth.CanReadRepo(p, repo) {
 		return true
 	}
 	http.Error(w, "forbidden", http.StatusForbidden)

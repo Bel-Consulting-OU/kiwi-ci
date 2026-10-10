@@ -36,11 +36,15 @@ func TestMemStoreApproveJob(t *testing.T) {
 	if err != nil || got.Status != model.StatusQueued || got.ApprovedBy != "alice" || got.WaitingSince != nil {
 		t.Fatalf("approve = %+v, %v; want queued by alice", got, err)
 	}
-	// Approving an already-approved queued job records the actor without
-	// changing the status.
+	// Re-approving an already-approved job is an idempotent replay: the first
+	// approver is preserved, the status does not move, and no second
+	// approval.granted event is appended (docs/INVARIANTS.md I8).
 	again, err := m.ApproveJob(ctx, "waiting", "bob")
-	if err != nil || again.Status != model.StatusQueued || again.ApprovedBy != "bob" {
-		t.Fatalf("re-approve = %+v, %v", again, err)
+	if err != nil || again.Status != model.StatusQueued || again.ApprovedBy != "alice" {
+		t.Fatalf("re-approve = %+v, %v; want the first approver alice preserved", again, err)
+	}
+	if n := m.approvalGrantedEventsLocked(); n != 1 {
+		t.Fatalf("approval.granted events = %d, want exactly 1", n)
 	}
 }
 

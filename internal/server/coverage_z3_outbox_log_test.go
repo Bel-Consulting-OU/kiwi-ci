@@ -55,10 +55,13 @@ func TestLogBatchValidationBranches(t *testing.T) {
 	}
 }
 
-// TestLogBatchPerLineFallbackAppends covers a DB store without the batch
-// extension: the batch is appended line by line through the base append
-// contract and answered 204 exactly once the lines are durable.
-func TestLogBatchPerLineFallbackAppends(t *testing.T) {
+// TestLogBatchPerLineFallbackRefused covers a DB store that exposes neither
+// the batch extension nor the transactional single-line capability: the
+// request fails closed with 503 and persists nothing. There is no unfenced
+// per-line fallback any more (see logDBWrite): a store without
+// storage.LeaseLogStore cannot commit log lines under a lease predicate, so
+// accepting them would reopen the stale-lease append.
+func TestLogBatchPerLineFallbackRefused(t *testing.T) {
 	s, f, _, hdrs := cacheFixture(t)
 	s.DB = fcPlainStore{f}
 	body := logBatchBody(t, "runner-a", "cache-lease-token", 5, "fallback-batch", []map[string]string{
@@ -66,15 +69,15 @@ func TestLogBatchPerLineFallbackAppends(t *testing.T) {
 		{"step": "run", "line": "two", "job_key": "build"},
 	})
 	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/job-a/log/batch", "runner-tok", body, hdrs)
-	if w.Code != http.StatusNoContent {
-		t.Fatalf("per-line fallback batch = %d, want 204: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("capability-less batch = %d, want 503: %s", w.Code, w.Body.String())
 	}
 	logs, err := f.ReadLogs(context.Background(), "run-c", 0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(logs) != 2 {
-		t.Fatalf("appended log lines = %d, want 2", len(logs))
+	if len(logs) != 0 {
+		t.Fatalf("capability-less batch persisted %d log lines", len(logs))
 	}
 }
 

@@ -293,22 +293,33 @@ var _ = storage.ErrNotFound
 func TestDBFakeLogBatchConflictMatchesDurableStores(t *testing.T) {
 	ctx := context.Background()
 	f := newDBFakeStore()
-	r := storage.LogBatchReceipt{JobID: "j1", Generation: 1, BatchID: "b1"}
-	entries := []model.LogEntry{{RunID: "r1", JobID: "j1", JobKey: "build", Step: "run", Line: "one", CreatedAt: time.Now().UTC()}}
-	inserted, err := f.AppendLogBatch(ctx, entries, r)
+	// A live lease is now part of the commit predicate for every log batch:
+	// seed a running job under the same runner/generation the batches present.
+	const (
+		runID    = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		jobID    = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		runnerID = "cccccccccccccccccccccccccccccccc"
+	)
+	exp := time.Now().UTC().Add(time.Hour)
+	f.mu.Lock()
+	f.jobs[jobID] = model.Job{ID: jobID, RunID: runID, Key: "build", Status: model.StatusRunning, LeaseRunnerID: runnerID, LeaseGeneration: 1, LeaseExpiresAt: &exp}
+	f.mu.Unlock()
+	r := storage.LogBatchReceipt{JobID: jobID, Generation: 1, BatchID: "b1"}
+	entries := []model.LogEntry{{RunID: runID, JobID: jobID, JobKey: "build", Step: "run", Line: "one", CreatedAt: time.Now().UTC()}}
+	inserted, err := f.AppendLogBatch(ctx, runnerID, entries, r)
 	if err != nil || !inserted {
 		t.Fatalf("first batch = inserted %v err %v, want true/nil", inserted, err)
 	}
 	// An identical ordered payload with fresh per-delivery metadata (Seq,
 	// CreatedAt) is the idempotent duplicate, not a conflict.
-	replay := []model.LogEntry{{RunID: "r1", JobID: "j1", JobKey: "build", Step: "run", Line: "one", CreatedAt: time.Now().UTC(), Seq: 99}}
-	if inserted, err = f.AppendLogBatch(ctx, replay, r); err != nil || inserted {
+	replay := []model.LogEntry{{RunID: runID, JobID: jobID, JobKey: "build", Step: "run", Line: "one", CreatedAt: time.Now().UTC(), Seq: 99}}
+	if inserted, err = f.AppendLogBatch(ctx, runnerID, replay, r); err != nil || inserted {
 		t.Fatalf("identical replay = inserted %v err %v, want false/nil", inserted, err)
 	}
 	// A reused identity with different lines is the same conflict the
 	// durable stores report.
-	conflict := []model.LogEntry{{RunID: "r1", JobID: "j1", JobKey: "build", Step: "run", Line: "changed"}}
-	if _, err = f.AppendLogBatch(ctx, conflict, r); !errors.Is(err, storage.ErrLogBatchConflict) {
+	conflict := []model.LogEntry{{RunID: runID, JobID: jobID, JobKey: "build", Step: "run", Line: "changed"}}
+	if _, err = f.AppendLogBatch(ctx, runnerID, conflict, r); !errors.Is(err, storage.ErrLogBatchConflict) {
 		t.Fatalf("conflicting batch = %v, want storage.ErrLogBatchConflict", err)
 	}
 	f.mu.Lock()

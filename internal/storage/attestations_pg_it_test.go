@@ -163,12 +163,19 @@ func TestPostgresIntegrationLogEntryLeaseGeneration(t *testing.T) {
 	}
 
 	batchRun := pgITNewID(t)
-	batch := []model.LogEntry{
-		{RunID: batchRun, Line: "batch-1", LeaseGeneration: 5, CreatedAt: time.Now().UTC()},
-		{RunID: batchRun, Line: "batch-2", LeaseGeneration: 5, CreatedAt: time.Now().UTC()},
+	batchJob := pgITNewID(t)
+	batchRunner := pgITNewID(t)
+	pgITEnqueueOne(t, st, batchRun, batchJob, pgITRepo)
+	pgITSeedRunner(t, st, batchRunner, 1, 0, 0)
+	if _, err := st.AcquireLeaseAtomic(ctx, LeaseClaim{JobID: batchJob, RunnerID: batchRunner, Generation: 5, ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+		t.Fatalf("lease batch job: %v", err)
 	}
-	ident := LogBatchIdentity{JobID: pgITNewID(t), Generation: 5, BatchID: "b-" + batchRun}
-	if ok, err := st.AppendLogBatch(ctx, batch, ident); err != nil || !ok {
+	batch := []model.LogEntry{
+		{RunID: batchRun, JobID: batchJob, JobKey: "build-" + batchJob, Line: "batch-1", LeaseGeneration: 5, CreatedAt: time.Now().UTC()},
+		{RunID: batchRun, JobID: batchJob, JobKey: "build-" + batchJob, Line: "batch-2", LeaseGeneration: 5, CreatedAt: time.Now().UTC()},
+	}
+	ident := LogBatchIdentity{JobID: batchJob, Generation: 5, BatchID: "b-" + batchRun}
+	if ok, err := st.AppendLogBatch(ctx, batchRunner, batch, ident); err != nil || !ok {
 		t.Fatalf("append batch = %v/%v", ok, err)
 	}
 	entries, err = st.ReadLogs(ctx, batchRun, -1, 100)

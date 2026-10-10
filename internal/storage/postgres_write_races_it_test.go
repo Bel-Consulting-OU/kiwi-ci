@@ -234,7 +234,8 @@ func TestIntegrationPostgresApproveJobDoesNotClobberLeaseRegression(t *testing.T
 		t.Fatalf("claim after approval: %v", err)
 	}
 	// A stale duplicate approval (the server's Get-then-UpdateJob shape) must
-	// not reset the lease: it only (re)records the approver.
+	// not reset the lease; it is an idempotent replay that keeps the FIRST
+	// approver (docs/INVARIANTS.md I8).
 	dup, err := st.ApproveJob(ctx, jobID, "bob")
 	if err != nil {
 		t.Fatalf("duplicate approval: %v", err)
@@ -242,8 +243,8 @@ func TestIntegrationPostgresApproveJobDoesNotClobberLeaseRegression(t *testing.T
 	if dup.Status != model.StatusRunning || dup.LeaseRunnerID != runnerID || dup.LeaseGeneration != 1 {
 		t.Fatalf("duplicate approval clobbered the lease: %+v", dup)
 	}
-	if dup.ApprovedBy != "bob" {
-		t.Fatalf("duplicate approval did not record the approver: %+v", dup)
+	if dup.ApprovedBy != "alice" {
+		t.Fatalf("duplicate approval rewrote the approver: %+v", dup)
 	}
 	assertApprovalStateConsistent(t, st, runnerID, jobID)
 
@@ -318,8 +319,8 @@ func TestMemStoreApproveJobDoesNotClobberLease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("duplicate approval: %v", err)
 	}
-	if dup.Status != model.StatusRunning || dup.LeaseRunnerID != runnerID || dup.LeaseGeneration != 1 || dup.ApprovedBy != "bob" {
-		t.Fatalf("duplicate approval clobbered the lease: %+v", dup)
+	if dup.Status != model.StatusRunning || dup.LeaseRunnerID != runnerID || dup.LeaseGeneration != 1 || dup.ApprovedBy != "alice" {
+		t.Fatalf("duplicate approval clobbered the lease or the first approver: %+v", dup)
 	}
 	if _, err := m.ApproveJob(ctx, "ffffffffffffffffffffffffffffffff", "x"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("approve missing = %v, want ErrNotFound", err)

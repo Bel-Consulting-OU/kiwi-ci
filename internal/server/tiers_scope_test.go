@@ -523,7 +523,7 @@ func TestCapabilityRouteTableExactInventory(t *testing.T) {
 	}{
 		{"/api/v1/events", auth.CapExecutionEventsRead, capabilityScopeRun, true},
 		{"/api/v1/events/stream", auth.CapExecutionEventsRead, capabilityScopeRun, true},
-		{"/api/v1/execution-snapshot", auth.CapExecutionEventsRead, capabilityScopeGlobal, false},
+		{"/api/v1/execution-snapshot", auth.CapExecutionEventsRead, capabilityScopeRepo, true},
 		{"/api/v1/audit", auth.CapEvidenceRead, capabilityScopeGlobal, false},
 		{"/api/v1/runs/{id}/snapshots", auth.CapCheckpointsRead, capabilityScopeRun, false},
 		{"/api/v1/runs/{id}/snapshots/{sid}", auth.CapCheckpointsRead, capabilityScopeRun, false},

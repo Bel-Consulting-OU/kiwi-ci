@@ -140,6 +140,16 @@ func (s *Server) generateJobs(w http.ResponseWriter, r *http.Request) {
 			s.serverError(w, r, http.StatusServiceUnavailable, nd, "state not durable")
 			return
 		}
+		// A commit-time lease refusal that is not one of the typed slot
+		// conflicts above (the parent lease was superseded, revoked or
+		// expired between the request gate and the insertion transaction;
+		// storage.ValidateGeneratedParentLease wraps ErrLeaseLost) is a
+		// stale-lease 409, never a 400 validation error. The transaction
+		// committed nothing.
+		if leaseCommitRefused(aerr) {
+			s.writeLeaseAuthError(w, r, errStaleLease)
+			return
+		}
 		http.Error(w, aerr.Error(), http.StatusBadRequest)
 		return
 	}

@@ -998,22 +998,29 @@ type GeneratedFragmentRequest struct {
 // is made in the same clock domain that persists the expiry — never by the
 // request handler's clock, which a skewed replica could use to launder an
 // expired lease.
+//
+// Every refusal wraps ErrLeaseLost: the predicate found that the parent is
+// no longer running under the presented (runner, generation, token) with a
+// live lease, which is exactly the commit-time lease-loss condition. The
+// server therefore maps a raced generation change (the request passed the
+// gate, the lease was superseded before the insertion transaction) to the
+// standard 409 instead of a generic 400 validation error.
 func ValidateGeneratedParentLease(parent model.Job, req GeneratedFragmentRequest, commitNow time.Time) error {
 	if parent.Status != model.StatusRunning {
-		return fmt.Errorf("storage: parent job is not running")
+		return fmt.Errorf("%w: parent job is not running", ErrLeaseLost)
 	}
 	if parent.LeaseRunnerID != req.RunnerID {
-		return fmt.Errorf("storage: parent lease runner changed")
+		return fmt.Errorf("%w: parent lease runner changed", ErrLeaseLost)
 	}
 	if parent.LeaseGeneration != req.LeaseGeneration {
-		return fmt.Errorf("storage: parent lease generation changed")
+		return fmt.Errorf("%w: parent lease generation changed", ErrLeaseLost)
 	}
 	if len(parent.LeaseTokenHash) == 0 || len(req.LeaseTokenHash) == 0 ||
 		subtle.ConstantTimeCompare(parent.LeaseTokenHash, req.LeaseTokenHash) != 1 {
-		return fmt.Errorf("storage: parent lease token changed")
+		return fmt.Errorf("%w: parent lease token changed", ErrLeaseLost)
 	}
 	if parent.LeaseExpiresAt == nil || !parent.LeaseExpiresAt.After(commitNow) {
-		return fmt.Errorf("storage: parent lease expired")
+		return fmt.Errorf("%w: parent lease expired", ErrLeaseLost)
 	}
 	return nil
 }

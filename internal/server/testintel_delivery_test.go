@@ -210,6 +210,51 @@ func TestTestReportDeliveryDigestAndIDValidation(t *testing.T) {
 	}
 }
 
+// TestTestReportMemoryCommitFenceRejectsExpiredAtCommit proves the GAP-2
+// closure: the memory/fs branch re-validates the live lease under s.mu
+// immediately before persisting. The lease clock passes the request gate and
+// then expires before the commit re-check, so the report and its history
+// fold must persist NOTHING (neither in memory nor in the durable state file)
+// and answer the standard 409.
+func TestTestReportMemoryCommitFenceRejectsExpiredAtCommit(t *testing.T) {
+	s, hdrs := fcMemoryBlobServer(t)
+	calls := 0
+	s.leaseClock = func() time.Time {
+		calls++
+		if calls == 1 {
+			return time.Now().UTC()
+		}
+		return time.Now().UTC().Add(2 * time.Hour)
+	}
+	body := deliveryReportBody("job-a", "runner-a", "cache-lease-token", 5, "delivery-commit-fence",
+		model.TestResult{Name: "m", Passed: true})
+	w := doJSONHeaders(t, s, http.MethodPost, "/api/v1/jobs/job-a/tests", "runner-tok", body, hdrs)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expired-at-commit report = %d, want 409: %s", w.Code, w.Body.String())
+	}
+	if calls < 2 {
+		t.Fatalf("lease clock sampled %d times, want the request gate and the commit re-check", calls)
+	}
+	s.mu.Lock()
+	n := len(s.reports)
+	s.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("commit-fenced report persisted in memory: %d", n)
+	}
+	// The persist path never ran: a restarted server over the same data dir
+	// sees no report and no history fold.
+	s2, err := NewPersistent("runner-tok", "admin-tok", s.dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2.mu.Lock()
+	n2 := len(s2.reports)
+	s2.mu.Unlock()
+	if n2 != 0 {
+		t.Fatalf("commit-fenced report persisted durably: %d", n2)
+	}
+}
+
 // TestTestReportDeliveryMemoryReplay proves the memory/fs fallback: there is
 // no delivery table, so the delivery ID maps deterministically to the report
 // ID and a replay is idempotent, while a reused ID with different content is

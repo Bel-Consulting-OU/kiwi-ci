@@ -182,7 +182,7 @@ func TestRepositoryExecutionEventsRetentionAtomicRead(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	page, cursor, retained, latest, err := repo.ReadExecutionEventsRetention(ctx, 0, 100, "")
+	page, cursor, retained, latest, err := repo.ReadExecutionEventsRetention(ctx, 0, 100, ExecutionEventScope{Kind: ExecutionEventScopeGlobal})
 	if err != nil || len(page) != 4 || cursor != 4 || retained != 0 || latest != 4 {
 		t.Fatalf("initial atomic read = %d cursor %d retained %d latest %d err %v", len(page), cursor, retained, latest, err)
 	}
@@ -192,7 +192,7 @@ func TestRepositoryExecutionEventsRetentionAtomicRead(t *testing.T) {
 	}
 	// after == retainedFrom stays valid; the page is empty and latest does
 	// not regress.
-	page, cursor, retained, latest, err = repo.ReadExecutionEventsRetention(ctx, 4, 100, "")
+	page, cursor, retained, latest, err = repo.ReadExecutionEventsRetention(ctx, 4, 100, ExecutionEventScope{Kind: ExecutionEventScopeGlobal})
 	if err != nil || len(page) != 0 || cursor != 4 || retained != 4 || latest != 4 {
 		t.Fatalf("all-pruned atomic read = %d cursor %d retained %d latest %d err %v", len(page), cursor, retained, latest, err)
 	}
@@ -211,7 +211,7 @@ func TestRepositoryExecutionEventsRetentionAtomicRead(t *testing.T) {
 	if err := repo2.AppendExecutionEvent(ctx, model.ExecutionEvent{RunID: "run-a", Type: "run.succeeded"}); err != nil {
 		t.Fatal(err)
 	}
-	page, _, _, latest, err = repo2.ReadExecutionEventsRetention(ctx, 4, 100, "")
+	page, _, _, latest, err = repo2.ReadExecutionEventsRetention(ctx, 4, 100, ExecutionEventScope{Kind: ExecutionEventScopeGlobal})
 	if err != nil || len(page) != 1 || page[0].Seq != 5 || latest != 5 {
 		t.Fatalf("post-restart page = %+v latest %d err %v, want seq 5", page, latest, err)
 	}

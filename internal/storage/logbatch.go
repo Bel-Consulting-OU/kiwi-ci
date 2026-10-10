@@ -85,28 +85,90 @@ func LogBatchPayloadDigest(identity LogBatchIdentity, entries []model.LogEntry) 
 // delivery that must answer 204 without duplicating lines). A reused
 // identity with a DIFFERENT payload returns ErrLogBatchConflict and inserts
 // nothing.
+//
+// runnerID is the claimed lease holder of r.JobID/r.Generation and takes
+// part in the commit-time lease predicate (see AppendLogBatch); a store
+// whose lease is no longer held under that runner and generation reports
+// ErrLeaseLost and inserts nothing.
 type LogBatchStore interface {
-	AppendLogBatch(ctx context.Context, entries []model.LogEntry, r LogBatchIdentity) (bool, error)
+	AppendLogBatch(ctx context.Context, runnerID string, entries []model.LogEntry, r LogBatchIdentity) (bool, error)
 }
 
-var _ LogBatchStore = (*PostgresStore)(nil)
+// LeaseLogStore is the single-line sibling of the commit-time lease
+// predicate: AppendLogForLease appends one runner log line only while the
+// named job is still running under (runnerID, generation) with an unexpired
+// lease, in the SAME transaction as the commit-ordered seq allocation and
+// the insert. A lost lease returns ErrLeaseLost and commits nothing, so a
+// request that passed the request-start gate and then lost its lease cannot
+// append lines attributed to the stale generation. The presented token is
+// NOT re-verified here: token possession is checked at request start (see
+// LeaseCommitStore for the shared contract).
+type LeaseLogStore interface {
+	AppendLogForLease(ctx context.Context, jobID, runnerID string, generation int64, e model.LogEntry) error
+}
 
-// AppendLogBatch inserts the receipt and all lines atomically. The receipt
-// row is the idempotency key: an existing (job, generation, batch_id) with
-// the same payload_sha256 is a retry of an already-persisted batch; a
-// different digest is a conflicting reuse of the identity and fails closed
-// with ErrLogBatchConflict (the whole transaction rolls back).
+var (
+	_ LogBatchStore = (*PostgresStore)(nil)
+	_ LeaseLogStore = (*PostgresStore)(nil)
+	_ LeaseLogStore = (*memStore)(nil)
+	_ LeaseLogStore = (*FaultyStore)(nil)
+)
+
+// bindLogLeaseIdentity validates one log line against the locked job's
+// coordinates and stamps the authoritative job identity. The run is
+// REQUIRED to match the locked job's run (a line cross-bound to another run
+// is refused); a non-empty job id, job key or lease generation must agree
+// with the locked job (an empty value is stamped from the predicate, so a
+// caller that omits them can never manufacture another identity). The
+// generation on the persisted line is always the predicate generation.
+func bindLogLeaseIdentity(coords leaseJobCoords, jobID string, generation int64, e *model.LogEntry) error {
+	if e.RunID != coords.RunID {
+		return leaseIdentityErrorf("log line run id %q does not match leased job run %s", e.RunID, coords.RunID)
+	}
+	if e.JobID != "" && e.JobID != jobID {
+		return leaseIdentityErrorf("log line job id %q does not match leased job %s", e.JobID, jobID)
+	}
+	if e.JobKey != "" && e.JobKey != coords.JobKey {
+		return leaseIdentityErrorf("log line job key %q does not match leased job key %q", e.JobKey, coords.JobKey)
+	}
+	if e.LeaseGeneration != 0 && e.LeaseGeneration != generation {
+		return leaseIdentityErrorf("log line lease generation %d does not match leased generation %d", e.LeaseGeneration, generation)
+	}
+	e.JobID = jobID
+	e.JobKey = coords.JobKey
+	e.LeaseGeneration = generation
+	return nil
+}
+
+// AppendLogBatch inserts the receipt and all lines atomically, AFTER a
+// commit-time lease re-assertion: the job row is locked and the live-lease
+// predicate (status running, holder = runnerID, generation, unexpired lease
+// at the post-lock database clock) is evaluated in the SAME transaction
+// that writes the receipt and the lines. A lease that was superseded,
+// revoked or expired before this transaction commits reports ErrLeaseLost
+// and inserts nothing — even when the same (job, generation, batch_id) was
+// already receipted, so a stale generation can never be answered with the
+// idempotent 204 of a still-live retry.
+//
+// The receipt row is the idempotency key for retries of a LIVE generation:
+// an existing (job, generation, batch_id) with the same payload_sha256 is a
+// retry of an already-persisted batch; a different digest is a conflicting
+// reuse of the identity and fails closed with ErrLogBatchConflict (the
+// whole transaction rolls back).
 //
 // The lines must belong to ONE run. They get ONE contiguous seq range
 // allocated from that run's commit-ordered log cursor (migration 0052),
 // whose row lock is held to commit; caller-supplied Seq values are ignored
 // and a rollback frees the whole range.
-func (s *PostgresStore) AppendLogBatch(ctx context.Context, entries []model.LogEntry, r LogBatchIdentity) (bool, error) {
+func (s *PostgresStore) AppendLogBatch(ctx context.Context, runnerID string, entries []model.LogEntry, r LogBatchIdentity) (bool, error) {
 	if r.JobID == "" || r.BatchID == "" {
 		return false, fmt.Errorf("storage: log batch requires job id and batch id")
 	}
 	if len(entries) == 0 {
 		return false, fmt.Errorf("storage: empty log batch")
+	}
+	if err := validateLeaseCommitKey(r.JobID, runnerID, r.Generation); err != nil {
+		return false, err
 	}
 	digest := LogBatchPayloadDigest(r, entries)
 	tx, err := s.beginSchemaCompatibleTx(ctx)
@@ -114,13 +176,32 @@ func (s *PostgresStore) AppendLogBatch(ctx context.Context, entries []model.LogE
 		return false, err
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
+	coords, held, err := s.lockedLeaseJobTx(ctx, tx, r.JobID, runnerID, r.Generation)
+	if err != nil {
+		return false, err
+	}
+	if !held {
+		return false, fmt.Errorf("%w: log batch %s for job %s", ErrLeaseLost, r.BatchID, r.JobID)
+	}
+	runID := entries[0].RunID
+	for i := range entries {
+		if entries[i].RunID != runID {
+			return false, fmt.Errorf("storage: log batch entries must share one run")
+		}
+	}
+	for i := range entries {
+		if err := bindLogLeaseIdentity(coords, r.JobID, r.Generation, &entries[i]); err != nil {
+			return false, err
+		}
+	}
 	tag, err := tx.Exec(ctx, `INSERT INTO log_batches (job_id, generation, batch_id, payload_sha256, created_at) VALUES ($1, $2, $3, $4, now()) ON CONFLICT (job_id, generation, batch_id) DO NOTHING`,
 		r.JobID, r.Generation, r.BatchID, digest)
 	if err != nil {
 		return false, err
 	}
 	if tag.RowsAffected() == 0 {
-		// Duplicate delivery: only the SAME payload is an idempotent success.
+		// Duplicate delivery of a LIVE generation: only the SAME payload is
+		// an idempotent success.
 		var stored string
 		if err := tx.QueryRow(ctx, `SELECT payload_sha256 FROM log_batches WHERE job_id=$1 AND generation=$2 AND batch_id=$3`,
 			r.JobID, r.Generation, r.BatchID).Scan(&stored); err != nil {
@@ -136,12 +217,6 @@ func (s *PostgresStore) AppendLogBatch(ctx context.Context, entries []model.LogE
 	// to commit, so a concurrent append to the same run blocks until this
 	// transaction commits or rolls back and the range can never interleave
 	// with another batch's. The caller-supplied Seq values are ignored.
-	runID := entries[0].RunID
-	for _, e := range entries {
-		if e.RunID != runID {
-			return false, fmt.Errorf("storage: log batch entries must share one run")
-		}
-	}
 	n := int64(len(entries))
 	var end int64
 	if err := tx.QueryRow(ctx, `

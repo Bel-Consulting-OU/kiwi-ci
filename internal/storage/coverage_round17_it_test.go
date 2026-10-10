@@ -395,25 +395,26 @@ func TestPostgresIntegrationLogBatchArms(t *testing.T) {
 
 	t.Run("validation", func(t *testing.T) {
 		// The guards run before any pool access, so a zero store is enough.
-		if _, err := (&PostgresStore{}).AppendLogBatch(ctx, nil, LogBatchIdentity{}); err == nil {
+		if _, err := (&PostgresStore{}).AppendLogBatch(ctx, pgITNewID(t), nil, LogBatchIdentity{}); err == nil {
 			t.Fatal("empty log batch identity was accepted")
 		}
-		if _, err := (&PostgresStore{}).AppendLogBatch(ctx, nil, LogBatchIdentity{JobID: pgITNewID(t), BatchID: "b"}); err == nil {
+		if _, err := (&PostgresStore{}).AppendLogBatch(ctx, pgITNewID(t), nil, LogBatchIdentity{JobID: pgITNewID(t), BatchID: "b"}); err == nil {
 			t.Fatal("empty log batch was accepted")
 		}
 	})
 
-	entries := func(runID string) []model.LogEntry {
-		return []model.LogEntry{{RunID: runID, JobID: pgITNewID(t), Line: "hello", CreatedAt: time.Now().UTC()}}
+	entries := func(runID, jobID string) []model.LogEntry {
+		return []model.LogEntry{{RunID: runID, JobID: jobID, Line: "hello", CreatedAt: time.Now().UTC()}}
 	}
 
 	t.Run("entries span two runs", func(t *testing.T) {
 		st := pgITStore(t)
+		_, jobID, runnerID := pgITLeasedLogJob(t, st)
 		multi := []model.LogEntry{
-			{RunID: pgITNewID(t), JobID: pgITNewID(t), Line: "a", CreatedAt: time.Now().UTC()},
-			{RunID: pgITNewID(t), JobID: pgITNewID(t), Line: "b", CreatedAt: time.Now().UTC()},
+			{RunID: pgITNewID(t), JobID: jobID, Line: "a", CreatedAt: time.Now().UTC()},
+			{RunID: pgITNewID(t), JobID: jobID, Line: "b", CreatedAt: time.Now().UTC()},
 		}
-		_, err := st.AppendLogBatch(ctx, multi, LogBatchIdentity{JobID: pgITNewID(t), Generation: 1, BatchID: "b1"})
+		_, err := st.AppendLogBatch(ctx, runnerID, multi, LogBatchIdentity{JobID: jobID, Generation: 1, BatchID: "b1"})
 		if err == nil || !strings.Contains(err.Error(), "share one run") {
 			t.Fatalf("cross-run batch = %v, want the shared-run refusal", err)
 		}
@@ -421,47 +422,50 @@ func TestPostgresIntegrationLogBatchArms(t *testing.T) {
 
 	t.Run("begin tx error", func(t *testing.T) {
 		st := pgITStore(t)
+		_, jobID, runnerID := pgITLeasedLogJob(t, st)
 		st.Close()
-		if _, err := st.AppendLogBatch(ctx, entries(pgITNewID(t)), LogBatchIdentity{JobID: pgITNewID(t), Generation: 1, BatchID: "b1"}); err == nil {
+		if _, err := st.AppendLogBatch(ctx, runnerID, entries(pgITNewID(t), jobID), LogBatchIdentity{JobID: jobID, Generation: 1, BatchID: "b1"}); err == nil {
 			t.Fatal("log batch over a closed pool succeeded")
 		}
 	})
 
 	t.Run("receipt insert error", func(t *testing.T) {
 		st := pgITStore(t)
+		runID, jobID, runnerID := pgITLeasedLogJob(t, st)
 		pgITBoomOp(t, st, "log_batches", "INSERT")
-		if _, err := st.AppendLogBatch(ctx, entries(pgITNewID(t)), LogBatchIdentity{JobID: pgITNewID(t), Generation: 1, BatchID: "b1"}); err == nil {
+		if _, err := st.AppendLogBatch(ctx, runnerID, entries(runID, jobID), LogBatchIdentity{JobID: jobID, Generation: 1, BatchID: "b1"}); err == nil {
 			t.Fatal("log batch with a failing receipt insert succeeded")
 		}
 	})
 
 	t.Run("duplicate receipt with a NULL digest", func(t *testing.T) {
 		st := pgITStore(t)
-		jobID := pgITNewID(t)
+		_, jobID, runnerID := pgITLeasedLogJob(t, st)
 		if _, err := st.pool.Exec(ctx, `ALTER TABLE log_batches ALTER COLUMN payload_sha256 DROP NOT NULL`); err != nil {
 			t.Fatalf("drop not null: %v", err)
 		}
 		if _, err := st.pool.Exec(ctx, `INSERT INTO log_batches (job_id, generation, batch_id, created_at, payload_sha256) VALUES ($1, 1, 'dup', now(), NULL)`, jobID); err != nil {
 			t.Fatalf("seed NULL digest: %v", err)
 		}
-		if _, err := st.AppendLogBatch(ctx, entries(pgITNewID(t)), LogBatchIdentity{JobID: jobID, Generation: 1, BatchID: "dup"}); err == nil {
+		if _, err := st.AppendLogBatch(ctx, runnerID, entries(pgITNewID(t), jobID), LogBatchIdentity{JobID: jobID, Generation: 1, BatchID: "dup"}); err == nil {
 			t.Fatal("duplicate receipt with a NULL digest was accepted")
 		}
 	})
 
 	t.Run("cursor error", func(t *testing.T) {
 		st := pgITStore(t)
+		runID, jobID, runnerID := pgITLeasedLogJob(t, st)
 		pgITBoomOp(t, st, "log_cursors", "INSERT")
-		if _, err := st.AppendLogBatch(ctx, entries(pgITNewID(t)), LogBatchIdentity{JobID: pgITNewID(t), Generation: 1, BatchID: "b1"}); err == nil {
+		if _, err := st.AppendLogBatch(ctx, runnerID, entries(runID, jobID), LogBatchIdentity{JobID: jobID, Generation: 1, BatchID: "b1"}); err == nil {
 			t.Fatal("log batch with a failing cursor allocation succeeded")
 		}
 	})
 
 	t.Run("line insert error rolls back the receipt", func(t *testing.T) {
 		st := pgITStore(t)
-		jobID := pgITNewID(t)
+		runID, jobID, runnerID := pgITLeasedLogJob(t, st)
 		pgITBoomOp(t, st, "log_entries", "INSERT")
-		if _, err := st.AppendLogBatch(ctx, entries(pgITNewID(t)), LogBatchIdentity{JobID: jobID, Generation: 1, BatchID: "b1"}); err == nil {
+		if _, err := st.AppendLogBatch(ctx, runnerID, entries(runID, jobID), LogBatchIdentity{JobID: jobID, Generation: 1, BatchID: "b1"}); err == nil {
 			t.Fatal("log batch with a failing line insert succeeded")
 		}
 		var n int
@@ -475,8 +479,9 @@ func TestPostgresIntegrationLogBatchArms(t *testing.T) {
 
 	t.Run("commit error", func(t *testing.T) {
 		st := pgITStore(t)
+		runID, jobID, runnerID := pgITLeasedLogJob(t, st)
 		itDeferBoom(t, st, "log_batches")
-		if _, err := st.AppendLogBatch(ctx, entries(pgITNewID(t)), LogBatchIdentity{JobID: pgITNewID(t), Generation: 1, BatchID: "b1"}); err == nil || !strings.Contains(err.Error(), "deferred failure") {
+		if _, err := st.AppendLogBatch(ctx, runnerID, entries(runID, jobID), LogBatchIdentity{JobID: jobID, Generation: 1, BatchID: "b1"}); err == nil || !strings.Contains(err.Error(), "deferred failure") {
 			t.Fatalf("commit failure = %v, want the deferred error", err)
 		}
 	})

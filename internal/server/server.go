@@ -4552,16 +4552,18 @@ func (s *Server) heartbeatDB(w http.ResponseWriter, r *http.Request, jobID strin
 // and the spool then overflows. Validation mirrors the single-line handler
 // per line; the whole request fails closed on the first invalid line.
 //
-// Lease posture (deliberate LATE-LOG GRACE): the request is authorized by the
-// shared DB-clock lease gate, but the append is NOT transactionally
-// lease-fenced like the artifact/cache/snapshot metadata commits. A batch
-// that raced the gate can therefore land just after the lease expired. That
-// is accepted by design: log lines carry no lifecycle, authority or
-// accounting meaning, the batch receipt is generation-scoped (a late batch
-// can never collide with a new generation's batch identity), and refusing a
-// build's final log flush at the lease boundary would lose data the job
-// already produced. Every behavior-affecting runner mutation remains
-// commit-time fenced.
+// Lease posture (NO LATE-LOG GRACE): the request is authorized by the
+// shared DB-clock lease gate, and the append is COMMIT-TIME FENCED like the
+// artifact/cache/snapshot metadata commits. In DB mode the store locks the
+// job row and re-asserts the live lease inside the same transaction as the
+// receipt and the lines; in memory/fs mode the in-memory lease is
+// re-validated under s.mu immediately before the append. A batch retried
+// while its lease is still live is an idempotent success (204) — the batch
+// receipt is generation-scoped, so a retry can never collide with a new
+// generation's identity — while any request carrying a superseded
+// generation, a revoked holder or an expired lease is unconditionally
+// rejected with 409 and persists nothing, even when the batch identity was
+// already receipted.
 func (s *Server) logBatch(w http.ResponseWriter, r *http.Request) {
 	const maxLogBatchLines = 2000
 	jobID := r.PathValue("id")
@@ -4615,14 +4617,22 @@ func (s *Server) logBatch(w http.ResponseWriter, r *http.Request) {
 			for _, l := range in.Lines {
 				entries = append(entries, model.LogEntry{RunID: j.RunID, JobID: j.ID, JobKey: j.Key, Step: l.Step, Line: l.Line, CreatedAt: now, LeaseGeneration: in.LeaseGeneration})
 			}
-			inserted, err := lbs.AppendLogBatch(r.Context(), entries, storage.LogBatchReceipt{JobID: j.ID, Generation: in.LeaseGeneration, BatchID: in.BatchID})
+			inserted, err := lbs.AppendLogBatch(r.Context(), in.RunnerID, entries, storage.LogBatchReceipt{JobID: j.ID, Generation: in.LeaseGeneration, BatchID: in.BatchID})
 			if err != nil {
+				if leaseCommitRefused(err) {
+					// The commit-time lease predicate lost (superseded,
+					// revoked or expired after the request gate): the same
+					// 409 shape as a stale lease at request start, and
+					// nothing was persisted.
+					s.writeLeaseAuthError(w, r, errStaleLease)
+					return
+				}
 				http.Error(w, "log batch append failed", 500)
 				return
 			}
 			if !inserted {
-				// Duplicate delivery of an already-persisted batch: answer
-				// 204 without re-inserting.
+				// Duplicate delivery of an already-persisted batch under a
+				// still-live lease: answer 204 without re-inserting.
 				w.WriteHeader(http.StatusNoContent)
 				return
 			}
@@ -4630,7 +4640,15 @@ func (s *Server) logBatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for _, l := range in.Lines {
-			if !s.logDBWrite(r.Context(), j, l, now) {
+			if err := s.logDBWrite(r.Context(), j, in.RunnerID, l, now); err != nil {
+				if leaseCommitRefused(err) {
+					s.writeLeaseAuthError(w, r, errStaleLease)
+					return
+				}
+				if errors.Is(err, errLeaseCommitUnsupported) {
+					http.Error(w, "store does not support transactional lease commits", http.StatusServiceUnavailable)
+					return
+				}
 				http.Error(w, "log append failed", 500)
 				return
 			}
@@ -4657,32 +4675,41 @@ func (s *Server) logBatch(w http.ResponseWriter, r *http.Request) {
 	// (job, generation, batch_id) identity as an idempotent duplicate (204)
 	// instead of a payload conflict. No first-delivery state has to be
 	// remembered for that, so the retry also works across a restart.
+	//
+	// The fs append runs UNDER s.mu, in the SAME critical section as the
+	// lease re-check: a revocation (cancel, recovery, re-registration) also
+	// takes s.mu, so it can never interleave between the check and the write.
 	entries := make([]model.LogEntry, 0, len(in.Lines))
 	for _, l := range in.Lines {
 		s.logSeq++
 		entries = append(entries, model.LogEntry{Seq: s.logSeq, RunID: cur.RunID, JobID: cur.ID, JobKey: cur.Key, Step: l.Step, Line: l.Line, CreatedAt: now, LeaseGeneration: in.LeaseGeneration})
 	}
-	s.mu.Unlock()
+	var appendErr error
 	if s.store != nil {
-		err := s.store.AppendLogBatch(storage.LogBatchIdentity{JobID: cur.ID, Generation: in.LeaseGeneration, BatchID: in.BatchID}, entries)
-		if err != nil {
-			// Every append failure answers exactly like the DB-mode batch
-			// path: a fixed 500 body, including storage.ErrLogBatchConflict
-			// (a reused identity with different lines). Nothing partial is
-			// exposed: the fs store publishes the batch atomically, so the
-			// retry of a failed write starts from the same clean state.
-			http.Error(w, "log batch append failed", 500)
-			return
-		}
+		appendErr = s.store.AppendLogBatch(storage.LogBatchIdentity{JobID: cur.ID, Generation: in.LeaseGeneration, BatchID: in.BatchID}, entries)
+	}
+	s.mu.Unlock()
+	if appendErr != nil {
+		// Every append failure answers exactly like the DB-mode batch
+		// path: a fixed 500 body, including storage.ErrLogBatchConflict
+		// (a reused identity with different lines). Nothing partial is
+		// exposed: the fs store publishes the batch atomically, so the
+		// retry of a failed write starts from the same clean state.
+		http.Error(w, "log batch append failed", 500)
+		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
 // log is POST /api/v1/jobs/{id}/log: single-line delivery under the shared
-// DB-clock lease gate. It carries the same deliberate LATE-LOG GRACE posture
-// as logBatch (see above): the append is not transactionally lease-fenced,
-// and only the memory/fs branch below (single-process, no shared DB clock)
-// re-checks the in-memory lease under s.mu.
+// DB-clock lease gate. It carries the same NO-LATE-LOG-GRACE posture as
+// logBatch (see above): the append is commit-time lease-fenced in DB mode
+// (storage.LeaseLogStore.AppendLogForLease re-asserts the live lease in the
+// same transaction as the seq allocation and the insert), and the memory/fs
+// branch re-checks the in-memory lease and appends under the SAME s.mu
+// critical section (single-process, no shared DB clock). A superseded
+// generation or expired/revoked lease is rejected with 409 and persists
+// nothing.
 func (s *Server) log(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("id")
 	var in LogLine
@@ -4718,14 +4745,19 @@ func (s *Server) log(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "stale or invalid lease", http.StatusConflict)
 		return
 	}
+	// The fs append runs UNDER s.mu, in the SAME critical section as the
+	// lease re-check: a revocation (cancel, recovery, re-registration) also
+	// takes s.mu, so it can never interleave between the check and the write.
 	s.logSeq++
 	e := model.LogEntry{Seq: s.logSeq, RunID: cur.RunID, JobID: cur.ID, JobKey: cur.Key, Step: in.Step, Line: in.Line, CreatedAt: time.Now().UTC(), LeaseGeneration: in.LeaseGeneration}
-	s.mu.Unlock()
+	var appendErr error
 	if s.store != nil {
-		if err := s.store.AppendLog(e); err != nil {
-			s.internalError(w, r, err, "")
-			return
-		}
+		appendErr = s.store.AppendLog(e)
+	}
+	s.mu.Unlock()
+	if appendErr != nil {
+		s.internalError(w, r, appendErr, "")
+		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -4735,20 +4767,39 @@ func (s *Server) log(w http.ResponseWriter, r *http.Request) {
 // log_cursors row inside the append transaction (UPDATE ... RETURNING), with
 // the cursor row lock held to commit, so allocation order equals visible
 // order across replicas and a rollback frees its range instead of leaving a
-// hole.
+// hole. The same transaction re-asserts the live lease (LeaseLogStore), so a
+// lease lost after the request gate maps to the standard 409 and appends
+// nothing.
 func (s *Server) logDB(w http.ResponseWriter, r *http.Request, jobID string, in LogLine, j model.Job, now time.Time) {
-	if !s.logDBWrite(r.Context(), j, in, now) {
+	if err := s.logDBWrite(r.Context(), j, in.RunnerID, in, now); err != nil {
+		if leaseCommitRefused(err) {
+			s.writeLeaseAuthError(w, r, errStaleLease)
+			return
+		}
+		if errors.Is(err, errLeaseCommitUnsupported) {
+			http.Error(w, "store does not support transactional lease commits", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, "log append failed", 500)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// logDBWrite appends one line through the commit-ordered DB path. The job row
-// is authoritative for run/job coordinates.
-func (s *Server) logDBWrite(ctx context.Context, j model.Job, in LogLine, now time.Time) bool {
+// logDBWrite appends one line through the commit-ordered DB path via the
+// transactional lease predicate. The job row is authoritative for
+// run/job coordinates; the store validates the line's identity against the
+// LOCKED row, so a stale j passed in by a racing handler can never smuggle
+// another job's identity past the predicate. A DB store without
+// storage.LeaseLogStore fails closed (errLeaseCommitUnsupported): there is
+// no unfenced fallback.
+func (s *Server) logDBWrite(ctx context.Context, j model.Job, runnerID string, in LogLine, now time.Time) error {
+	ls, ok := s.DB.(storage.LeaseLogStore)
+	if !ok {
+		return errLeaseCommitUnsupported
+	}
 	e := model.LogEntry{RunID: j.RunID, JobID: j.ID, JobKey: j.Key, Step: in.Step, Line: in.Line, CreatedAt: now, LeaseGeneration: in.LeaseGeneration}
-	return s.DB.AppendLog(ctx, e) == nil
+	return ls.AppendLogForLease(ctx, j.ID, runnerID, in.LeaseGeneration, e)
 }
 
 func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
@@ -5706,6 +5757,17 @@ func (s *Server) approveJob(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "job is already terminal", http.StatusConflict)
 		return
 	}
+	// Idempotent replay (docs/INVARIANTS.md I8): the approval is already
+	// granted on a non-terminal job. Return the CURRENT job and change
+	// nothing: the first approver and wait accounting stay authoritative,
+	// and no second audit row or approval.granted event is emitted. A
+	// waiting_approval job can never carry ApprovedBy (the scheduler sets
+	// the wait state only while it is empty), so the status guard keeps the
+	// genuine waiting -> queued transition on the normal path.
+	if j.ApprovedBy != "" && j.Status != model.StatusWaitingApproval {
+		writeJSON(w, http.StatusOK, redactJob(j))
+		return
+	}
 	// Audit-first: an unwritable audit row blocks the approval with 503
 	// before any state changes, so a durable approval can never lack its
 	// evidence.
@@ -5784,6 +5846,15 @@ func (s *Server) approveJobDB(w http.ResponseWriter, r *http.Request, jobID, act
 	}
 	if j.Status.Terminal() {
 		http.Error(w, "job is already terminal", http.StatusConflict)
+		return
+	}
+	// Idempotent replay (docs/INVARIANTS.md I8), mirroring the memory path:
+	// an already-granted approval on a non-terminal job returns the stored
+	// job untouched. The optimistic read avoids a second audit row and a
+	// second transition attempt; ApproveJob re-checks under the row lock
+	// (and commits no second approval.granted event) for a racing repeat.
+	if j.ApprovedBy != "" && j.Status != model.StatusWaitingApproval {
+		writeJSON(w, http.StatusOK, redactJob(j))
 		return
 	}
 	waitSeconds, waited := approvalWaitSeconds(&j)
@@ -6028,9 +6099,23 @@ func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	if _, ok := s.runs[id]; !ok {
+	run, ok = s.runs[id]
+	if !ok {
 		s.mu.Unlock()
 		http.NotFound(w, r)
+		return
+	}
+	// Idempotent replay (docs/INVARIANTS.md I8): the run already reached a
+	// terminal state (a completed run, or the cancelled outcome the first
+	// cancel recorded). Repeating the request is the SAME logical
+	// transition: return the current run with 200 and change nothing — no
+	// second audit row, no second state persist, no forge status
+	// republish. The check runs under s.mu, the same critical section that
+	// applies and persists the cancellation, so it also covers a repeat
+	// that raced the first request.
+	if run.Status.Terminal() {
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, run)
 		return
 	}
 	// Audit-first: the cancellation's evidence is written before the state
@@ -6086,6 +6171,19 @@ func (s *Server) cancelRunDB(w http.ResponseWriter, r *http.Request, id, actor s
 		return
 	}
 	if !s.requireRunActionOrCapability(w, r, auth.ActionCancel, auth.CapRunsCancel, run) {
+		return
+	}
+	// Idempotent replay (docs/INVARIANTS.md I8): the run already reached a
+	// terminal state (a completed run, or the cancelled outcome the first
+	// cancel recorded durably). Repeating the request is the SAME logical
+	// transition: return the stored current run with 200 and change nothing
+	// — no second audit row and no forge status republish. The store's
+	// CancelRunJobs is itself effect-idempotent, so a repeat that races
+	// this read still commits exactly one job/run transition (that
+	// winner's request owns the audit row); this read removes the
+	// duplicate audit/forge effects for every subsequent request.
+	if run.Status.Terminal() {
+		writeJSON(w, http.StatusOK, run)
 		return
 	}
 	reason := "cancelled by " + actor

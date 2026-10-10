@@ -134,12 +134,17 @@ func TestControllerCapabilityEventScope(t *testing.T) {
 		want              int
 	}{
 		{"repo-scoped capability reads its run", "events-a", "/api/v1/events?run_id=" + runA.ID, http.StatusOK},
+		{"repo-scoped capability reads its repo", "events-a", "/api/v1/events?repo_id=github.com/acme/repo-a", http.StatusOK},
 		{"repo-scoped capability denied another repo", "events-a", "/api/v1/events?run_id=" + runB.ID, http.StatusForbidden},
+		{"repo-scoped capability denied another repo scope", "events-a", "/api/v1/events?repo_id=github.com/acme/repo-b", http.StatusForbidden},
 		{"repo-scoped capability denied unscoped", "events-a", "/api/v1/events", http.StatusForbidden},
 		{"global capability reads unscoped", "global-events", "/api/v1/events", http.StatusOK},
 		{"global capability reads any run", "global-events", "/api/v1/events?run_id=" + runB.ID, http.StatusOK},
+		{"global capability reads any repo scope", "global-events", "/api/v1/events?repo_id=github.com/acme/repo-b", http.StatusOK},
 		{"repo reader reads its own run history", "reader-a", "/api/v1/events?run_id=" + runA.ID, http.StatusOK},
+		{"repo reader reads its own repo scope", "reader-a", "/api/v1/events?repo_id=github.com/acme/repo-a", http.StatusOK},
 		{"repo reader denied another repo", "reader-a", "/api/v1/events?run_id=" + runB.ID, http.StatusForbidden},
+		{"repo reader denied another repo scope", "reader-a", "/api/v1/events?repo_id=github.com/acme/repo-b", http.StatusForbidden},
 		{"repo reader denied unscoped", "reader-a", "/api/v1/events", http.StatusForbidden},
 		{"global read role denied unscoped without capability", "read-role", "/api/v1/events", http.StatusForbidden},
 		{"unrelated capability denied", "graph-only", "/api/v1/events", http.StatusForbidden},

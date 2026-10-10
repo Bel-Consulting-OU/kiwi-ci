@@ -19,7 +19,7 @@ func TestPostgresIntegrationExecutionSnapshotArms(t *testing.T) {
 
 	t.Run("default run limit", func(t *testing.T) {
 		st := pgITStore(t)
-		snap, err := st.ExecutionSnapshot(ctx, 0)
+		snap, err := st.ExecutionSnapshot(ctx, 0, "")
 		if err != nil {
 			t.Fatalf("snapshot: %v", err)
 		}
@@ -31,7 +31,7 @@ func TestPostgresIntegrationExecutionSnapshotArms(t *testing.T) {
 	t.Run("begin error", func(t *testing.T) {
 		st := pgITStore(t)
 		st.Close()
-		if _, err := st.ExecutionSnapshot(ctx, 0); err == nil {
+		if _, err := st.ExecutionSnapshot(ctx, 0, ""); err == nil {
 			t.Fatal("snapshot over a closed pool succeeded")
 		}
 	})
@@ -39,7 +39,7 @@ func TestPostgresIntegrationExecutionSnapshotArms(t *testing.T) {
 	t.Run("cursor read error", func(t *testing.T) {
 		st := pgITStore(t)
 		pgITDropColumn(t, st, "execution_event_cursor", "value")
-		if _, err := st.ExecutionSnapshot(ctx, 0); err == nil {
+		if _, err := st.ExecutionSnapshot(ctx, 0, ""); err == nil {
 			t.Fatal("snapshot without the cursor column succeeded")
 		}
 	})
@@ -49,7 +49,7 @@ func TestPostgresIntegrationExecutionSnapshotArms(t *testing.T) {
 		if _, err := st.pool.Exec(ctx, `ALTER TABLE runs RENAME TO runs_r17`); err != nil {
 			t.Fatalf("rename runs: %v", err)
 		}
-		if _, err := st.ExecutionSnapshot(ctx, 0); err == nil {
+		if _, err := st.ExecutionSnapshot(ctx, 0, ""); err == nil {
 			t.Fatal("snapshot without the runs table succeeded")
 		}
 	})
@@ -58,7 +58,7 @@ func TestPostgresIntegrationExecutionSnapshotArms(t *testing.T) {
 		st := pgITStore(t)
 		pgITInsertRunIdentity(t, st, pgITNewID(t), "group/sub/project", "group/sub/project", "", "")
 		pgITBreakColumnToArray(t, st, "runs", "status")
-		if _, err := st.ExecutionSnapshot(ctx, 0); err == nil {
+		if _, err := st.ExecutionSnapshot(ctx, 0, ""); err == nil {
 			t.Fatal("snapshot over an undecodable status succeeded")
 		}
 	})
@@ -108,7 +108,7 @@ func TestPostgresIntegrationExecutionRetentionArms(t *testing.T) {
 	t.Run("cursor scan error", func(t *testing.T) {
 		st := pgITStore(t)
 		pgITBreakColumnToArray(t, st, "execution_event_cursor", "retained_from")
-		if _, _, _, _, err := st.ReadExecutionEventsRetention(ctx, 0, 10, ""); err == nil {
+		if _, _, _, _, err := st.ReadExecutionEventsRetention(ctx, 0, 10, ExecutionEventScope{Kind: ExecutionEventScopeGlobal}); err == nil {
 			t.Fatal("retention read over an undecodable watermark succeeded")
 		}
 	})
@@ -119,7 +119,7 @@ func TestPostgresIntegrationExecutionRetentionArms(t *testing.T) {
 			t.Fatalf("append: %v", err)
 		}
 		pgITBreakColumnToArray(t, st, "execution_events", "attempt")
-		if _, _, _, _, err := st.ReadExecutionEventsRetention(ctx, 0, 10, ""); err == nil {
+		if _, _, _, _, err := st.ReadExecutionEventsRetention(ctx, 0, 10, ExecutionEventScope{Kind: ExecutionEventScopeGlobal}); err == nil {
 			t.Fatal("retention read over an undecodable attempt succeeded")
 		}
 	})

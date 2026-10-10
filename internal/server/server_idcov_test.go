@@ -114,6 +114,15 @@ func (f *idcovFaultStore) AppendLog(ctx context.Context, e model.LogEntry) error
 	return f.dbFakeStore.AppendLog(ctx, e)
 }
 
+// AppendLogForLease carries the injected append failure into the transactional
+// single-line runner path: the handler no longer calls the unfenced AppendLog.
+func (f *idcovFaultStore) AppendLogForLease(ctx context.Context, jobID, runnerID string, generation int64, e model.LogEntry) error {
+	if f.appendLogErr != nil {
+		return f.appendLogErr
+	}
+	return f.dbFakeStore.AppendLogForLease(ctx, jobID, runnerID, generation, e)
+}
+
 func (f *idcovFaultStore) GetJob(ctx context.Context, id string) (model.Job, error) {
 	if f.getJobErr != nil {
 		return model.Job{}, f.getJobErr
@@ -869,6 +878,16 @@ func TestIDCovApproveJobBranches(t *testing.T) {
 	}
 	fault.getJobErr = nil
 	fault.updateJobErr = errors.New("write down")
+	// Reset the approved job to waiting_approval so the transactional
+	// write-failure arm is reachable: repeated approval of an already
+	// approved non-terminal job is now an idempotent 200 replay answered
+	// before the store write (docs/INVARIANTS.md I8).
+	f.mu.Lock()
+	reset := f.jobs["job-wait"]
+	reset.Status = model.StatusWaitingApproval
+	reset.ApprovedBy = ""
+	f.jobs["job-wait"] = reset
+	f.mu.Unlock()
 	if w := doJSON(t, sd, http.MethodPost, "/api/v1/jobs/job-wait/approve", "admin", ""); w.Code != http.StatusInternalServerError {
 		t.Fatalf("db approve write failure = %d, want 500", w.Code)
 	}

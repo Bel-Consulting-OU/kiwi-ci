@@ -189,9 +189,13 @@ type Repository struct {
 	// whether it was initialized from the file yet; the append path
 	// initializes it lazily and Load() initializes it at startup, so a
 	// restarted process can never reuse a seq already present on disk.
-	// Guarded by mu.
-	executionEventSeq       int64
-	executionEventSeqLoaded bool
+	// executionEventPruned is the durable per-run deletion frontier
+	// (execution-events.pruned.json), loaded by the same one-time init and
+	// updated by PruneExecutionEvents. Guarded by mu.
+	executionEventSeq          int64
+	executionEventSeqLoaded    bool
+	executionEventPruned       map[string]executionEventPrunedRecord
+	executionEventPrunedLoaded bool
 }
 
 func New(root string) *Repository { return &Repository{Root: root} }
@@ -801,13 +805,32 @@ const executionEventsFile = "execution-events.jsonl"
 // it names is still readable.
 const executionEventsRetainedFile = "execution-events.retained"
 
+// executionEventsPrunedFile is the fs-mode per-run deletion frontier: the
+// durable equivalent of PostgreSQL's execution_event_pruned table, a JSON
+// object keyed by run id with the run's repository and the highest seq
+// removed for it. The file is written BEFORE the journal compaction (the
+// frontier may claim more than the journal reflects after a crash, never
+// less), so a scoped consumer can be told its cursor expired while the
+// events are still readable — conservative — but can never silently skip a
+// deleted event.
+const executionEventsPrunedFile = "execution-events.pruned.json"
+
+// executionEventPrunedRecord is one run's durable deletion frontier in the
+// fs journal (the execution_event_pruned row equivalent).
+type executionEventPrunedRecord struct {
+	RepoID string `json:"repo_id"`
+	MaxSeq int64  `json:"max_seq"`
+}
+
 // AppendExecutionEvent appends one event to the durable journal with the
 // next monotonically increasing seq, returning after the record is fsynced
 // (the same durability the audit append provides). The seq is allocated
 // under the repository lock from the journal's own watermark, so a restart
 // continues the stream instead of reusing cursors. A failed append still
 // CONSUMES its seq: the cursor may skip a value, but it can never regress or
-// duplicate one.
+// duplicate one. The repository dimension is persisted exactly as the
+// caller supplied it (the server resolves it from its run/job state before
+// appending).
 func (r *Repository) AppendExecutionEvent(ctx context.Context, e model.ExecutionEvent) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -861,13 +884,15 @@ func (r *Repository) LatestExecutionEventSeq(ctx context.Context) (int64, error)
 }
 
 // ReadExecutionEventsRetention implements ExecutionEventRetentionReadStore
-// for the filesystem journal: the watermark (execution-events.retained), the
-// page and the monotonic latest watermark are read under ONE repository-lock
-// critical section, so a concurrent PruneExecutionEvents cannot interleave
-// between the checks. latestCursor is the monotonic seq watermark, never the
-// highest surviving row, so compaction of the whole journal cannot regress
-// it. A corrupt/unreadable journal or watermark fails closed.
-func (r *Repository) ReadExecutionEventsRetention(ctx context.Context, afterSeq int64, limit int, runID string) ([]model.ExecutionEvent, int64, int64, int64, error) {
+// for the filesystem journal: the SCOPED frontier (the global
+// execution-events.retained watermark, or the per-run execution-events.pruned
+// map), the page and the monotonic latest watermark are read under ONE
+// repository-lock critical section, so a concurrent PruneExecutionEvents
+// cannot interleave between the checks. latestCursor is the monotonic seq
+// watermark, never the highest surviving row, so compaction of the whole
+// journal cannot regress it. A corrupt/unreadable journal or frontier fails
+// closed.
+func (r *Repository) ReadExecutionEventsRetention(ctx context.Context, afterSeq int64, limit int, scope ExecutionEventScope) ([]model.ExecutionEvent, int64, int64, int64, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, afterSeq, 0, 0, err
 	}
@@ -876,11 +901,11 @@ func (r *Repository) ReadExecutionEventsRetention(ctx context.Context, afterSeq 
 	if err := r.initExecutionEventSeqLocked(); err != nil {
 		return nil, afterSeq, 0, 0, err
 	}
-	retainedFrom, err := readExecutionEventRetainedFrom(r.Root)
+	retainedFrom, err := r.scopedRetainedLocked(scope)
 	if err != nil {
 		return nil, afterSeq, 0, 0, err
 	}
-	page, cursor, err := r.readExecutionEventsLocked(afterSeq, limit, runID)
+	page, cursor, err := r.readExecutionEventsScopeLocked(afterSeq, limit, scope)
 	if err != nil {
 		return nil, afterSeq, 0, 0, err
 	}
@@ -895,13 +920,19 @@ func (r *Repository) ReadExecutionEventsRetention(ctx context.Context, afterSeq 
 func (r *Repository) ReadExecutionEvents(afterSeq int64, limit int, runID string) ([]model.ExecutionEvent, int64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.readExecutionEventsLocked(afterSeq, limit, runID)
+	scope := ExecutionEventScope{Kind: ExecutionEventScopeGlobal}
+	if runID != "" {
+		scope = ExecutionEventScope{Kind: ExecutionEventScopeRun, RunID: runID}
+	}
+	return r.readExecutionEventsScopeLocked(afterSeq, limit, scope)
 }
 
-// readExecutionEventsLocked is ReadExecutionEvents for callers already
-// holding r.mu (the atomic retention read shares one critical section for
-// the watermark and the page).
-func (r *Repository) readExecutionEventsLocked(afterSeq int64, limit int, runID string) ([]model.ExecutionEvent, int64, error) {
+// readExecutionEventsScopeLocked is the scope-filtered page read for callers
+// already holding r.mu (the atomic retention read shares one critical
+// section for the frontier and the page). A repository scope matches the
+// event's persisted RepoID exactly; a run scope matches RunID; an event with
+// an unknown repository belongs to no repository scope.
+func (r *Repository) readExecutionEventsScopeLocked(afterSeq int64, limit int, scope ExecutionEventScope) ([]model.ExecutionEvent, int64, error) {
 	limit = ClampExecutionEventLimit(limit)
 	f, err := os.Open(filepath.Join(r.Root, executionEventsFile))
 	if errors.Is(err, os.ErrNotExist) {
@@ -925,7 +956,7 @@ func (r *Repository) readExecutionEventsLocked(afterSeq int64, limit int, runID 
 		if e.Seq <= afterSeq {
 			continue
 		}
-		if runID != "" && e.RunID != runID {
+		if !executionEventMatchesScope(e, scope) {
 			continue
 		}
 		out = append(out, e)
@@ -936,12 +967,28 @@ func (r *Repository) readExecutionEventsLocked(afterSeq int64, limit int, runID 
 	}
 }
 
+// executionEventMatchesScope is the ONE scope predicate shared by the fs and
+// memory reads and the server's defensive frame filter: global matches
+// everything, repo requires the persisted repository id (an event with none
+// is not visible to any repository), run requires the run id.
+func executionEventMatchesScope(e model.ExecutionEvent, scope ExecutionEventScope) bool {
+	switch scope.Kind {
+	case ExecutionEventScopeRepo:
+		return e.RepoID == scope.RepoID
+	case ExecutionEventScopeRun:
+		return e.RunID == scope.RunID
+	default:
+		return true
+	}
+}
+
 // initExecutionEventSeqLocked initializes the in-memory seq watermark from
 // the durable journal AND the durable retention watermark, whichever is
-// higher, once. Compaction removes rows but never rewinds the cursor, and a
-// prune of the WHOLE journal leaves max seq < retainedFrom; taking the max
-// with retainedFrom means a restart can never reuse a pruned seq. A corrupt
-// record fails closed (the store cannot prove which seq values are already
+// higher, once, and loads the durable per-run deletion frontier. Compaction
+// removes rows but never rewinds the cursor, and a prune of the WHOLE
+// journal leaves max seq < retainedFrom; taking the max with retainedFrom
+// means a restart can never reuse a pruned seq. A corrupt record or frontier
+// fails closed (the store cannot prove which seq values are already
 // published, so continuing could reuse a cursor); a missing journal simply
 // starts at zero.
 func (r *Repository) initExecutionEventSeqLocked() error {
@@ -959,9 +1006,74 @@ func (r *Repository) initExecutionEventSeqLocked() error {
 	if retainedFrom > maxSeq {
 		maxSeq = retainedFrom
 	}
+	pruned, err := readExecutionEventPruned(r.Root)
+	if err != nil {
+		return err
+	}
 	r.executionEventSeq = maxSeq
 	r.executionEventSeqLoaded = true
+	r.executionEventPruned = pruned
+	r.executionEventPrunedLoaded = true
 	return nil
+}
+
+// scopedRetainedLocked is the per-scope frontier for callers holding r.mu
+// and having initialized the pruned map: the global watermark file for a
+// global scope, MAX(pruned max seq) over the repository for a repository
+// scope, the run's own row for a run scope (0 when none).
+func (r *Repository) scopedRetainedLocked(scope ExecutionEventScope) (int64, error) {
+	switch scope.Kind {
+	case ExecutionEventScopeRepo:
+		var maxSeq int64
+		for _, rec := range r.executionEventPruned {
+			if rec.RepoID == scope.RepoID && rec.MaxSeq > maxSeq {
+				maxSeq = rec.MaxSeq
+			}
+		}
+		return maxSeq, nil
+	case ExecutionEventScopeRun:
+		return r.executionEventPruned[scope.RunID].MaxSeq, nil
+	default:
+		return readExecutionEventRetainedFrom(r.Root)
+	}
+}
+
+// ScopedRetainedFrom implements ExecutionEventScopedRetentionStore for the
+// filesystem journal: the durable frontier of the requested scope, read
+// under the repository lock (the pruned map is loaded once at init and
+// advanced by every prune). Fail closed on an unreadable frontier.
+func (r *Repository) ScopedRetainedFrom(ctx context.Context, scope ExecutionEventScope) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.initExecutionEventSeqLocked(); err != nil {
+		return 0, err
+	}
+	return r.scopedRetainedLocked(scope)
+}
+
+// readExecutionEventPruned reads the per-run deletion frontier file. A
+// missing file means nothing has been pruned for any scope; a corrupt file
+// fails closed (a consumer must never be told a cursor is valid when events
+// of its scope may already be gone).
+func readExecutionEventPruned(root string) (map[string]executionEventPrunedRecord, error) {
+	b, err := os.ReadFile(filepath.Join(root, executionEventsPrunedFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return map[string]executionEventPrunedRecord{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]executionEventPrunedRecord{}
+	if len(bytes.TrimSpace(b)) == 0 {
+		return out, nil
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, fmt.Errorf("storage: corrupt execution event pruned frontier: %w", err)
+	}
+	return out, nil
 }
 
 // ExecutionEventRetainedFrom implements RetentionExecutionEventStore for the
@@ -1001,10 +1113,12 @@ func readExecutionEventRetainedFrom(root string) (int64, error) {
 // older than olderThan: the journal is decoded in order, the first limit
 // events below both the cutoff and the first event at or after it are
 // dropped, and the survivors are atomically rewritten (the fs analog of the
-// secret-receipt journal compaction). The watermark file is advanced AFTER
-// the journal rewrite, so a crash can only make retention look smaller than
-// it is. Pruned events are gone from ListExecutionEvents; the surviving seq
-// values are unchanged, so cursor paging over the compacted journal is still
+// secret-receipt journal compaction). The per-run deletion frontier is
+// persisted BEFORE the journal rewrite and the global watermark file AFTER
+// it, so a crash can only make retention look LARGER (scoped) or smaller
+// (global) than it is, never hide a deleted event while reporting resume_ok.
+// Pruned events are gone from ListExecutionEvents; the surviving seq values
+// are unchanged, so cursor paging over the compacted journal is still
 // gap-free.
 func (r *Repository) PruneExecutionEvents(ctx context.Context, olderThan time.Time, limit int) (int64, int64, error) {
 	if err := ctx.Err(); err != nil {
@@ -1055,12 +1169,12 @@ func (r *Repository) PruneExecutionEvents(ctx context.Context, olderThan time.Ti
 	}
 	var (
 		kept    = make([]model.ExecutionEvent, 0, len(events))
-		victims int64
+		victims []model.ExecutionEvent
 		highest = retainedFrom
 	)
 	for _, e := range events {
-		if victims < int64(limit) && e.Seq > retainedFrom && (!hasKeep || e.Seq < keepFrom) {
-			victims++
+		if int64(len(victims)) < int64(limit) && e.Seq > retainedFrom && (!hasKeep || e.Seq < keepFrom) {
+			victims = append(victims, e)
 			if e.Seq > highest {
 				highest = e.Seq
 			}
@@ -1068,8 +1182,14 @@ func (r *Repository) PruneExecutionEvents(ctx context.Context, olderThan time.Ti
 		}
 		kept = append(kept, e)
 	}
-	if victims == 0 {
+	if len(victims) == 0 {
 		return 0, retainedFrom, nil
+	}
+	// Per-run frontier FIRST (conservative on a crash between the two
+	// writes): a scoped consumer may be expired while its events are still
+	// readable, never told resume_ok after they were deleted.
+	if err := r.recordExecutionEventPrunedLocked(victims); err != nil {
+		return 0, 0, err
 	}
 	var b bytes.Buffer
 	enc := json.NewEncoder(&b)
@@ -1087,7 +1207,49 @@ func (r *Repository) PruneExecutionEvents(ctx context.Context, olderThan time.Ti
 		}
 		retainedFrom = highest
 	}
-	return victims, retainedFrom, nil
+	return int64(len(victims)), retainedFrom, nil
+}
+
+// recordExecutionEventPrunedLocked merges the pruned victims into the
+// durable per-run deletion frontier and writes it atomically. The caller
+// holds r.mu. Events with no run attribution are skipped: they belong to no
+// run or repository scope (the global watermark still covers them). The
+// in-memory map is advanced only after the durable write succeeded.
+func (r *Repository) recordExecutionEventPrunedLocked(victims []model.ExecutionEvent) error {
+	merged := make(map[string]executionEventPrunedRecord, len(r.executionEventPruned))
+	for k, v := range r.executionEventPruned {
+		merged[k] = v
+	}
+	changed := false
+	for _, e := range victims {
+		if e.RunID == "" {
+			continue
+		}
+		rec := merged[e.RunID]
+		if e.Seq > rec.MaxSeq {
+			rec.MaxSeq = e.Seq
+		}
+		if e.RepoID != "" {
+			rec.RepoID = e.RepoID
+		}
+		if rec != merged[e.RunID] {
+			merged[e.RunID] = rec
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	b, err := json.MarshalIndent(merged, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := AtomicWriteFile(filepath.Join(r.Root, executionEventsPrunedFile), append(b, '\n'), 0o600); err != nil {
+		return err
+	}
+	r.executionEventPruned = merged
+	r.executionEventPrunedLoaded = true
+	return nil
 }
 
 // maxExecutionEventSeqLocked scans the journal for its highest seq.

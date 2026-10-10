@@ -690,7 +690,10 @@ const (
 // job.running, job.succeeded, job.failed, job.cancelled, job.requeued,
 // run.running, run.succeeded, ...) or the semantic Event* vocabularies
 // above; FromStatus and ToStatus carry the transition so consumers never
-// diff mutable resources to infer what happened. Attempt is the lease
+// diff mutable resources to infer what happened. RepoID is the repository
+// dimension the event belongs to (the owning run's immutable RepoID,
+// propagated at append time; empty when the owning run is unknown), so the
+// stream can be scoped and authorized per repository. Attempt is the lease
 // generation of the attempt the event belongs to (0 when none). Actor is
 // the runner name or principal that drove the event when known. Payload is
 // small and non-secret by contract. Additive and self-describing: unknown
@@ -700,6 +703,7 @@ type ExecutionEvent struct {
 	SchemaVersion int               `json:"schema_version"`
 	RunID         string            `json:"run_id,omitempty"`
 	JobID         string            `json:"job_id,omitempty"`
+	RepoID        string            `json:"repo_id,omitempty"`
 	Attempt       int64             `json:"attempt,omitempty"`
 	Type          string            `json:"type"`
 	FromStatus    string            `json:"from_status,omitempty"`

@@ -725,12 +725,21 @@ func (f *FaultyStore) ListExecutionEvents(ctx context.Context, afterSeq int64, l
 
 // ReadExecutionEventsRetention forwards the atomic retention read untouched:
 // it is a read, so a fault-injecting outer store still answers it.
-func (f *FaultyStore) ReadExecutionEventsRetention(ctx context.Context, afterSeq int64, limit int, runID string) ([]model.ExecutionEvent, int64, int64, int64, error) {
+func (f *FaultyStore) ReadExecutionEventsRetention(ctx context.Context, afterSeq int64, limit int, scope ExecutionEventScope) ([]model.ExecutionEvent, int64, int64, int64, error) {
 	inner, ok := f.Inner.(ExecutionEventRetentionReadStore)
 	if !ok {
 		return nil, afterSeq, 0, 0, errMissingInnerInterface("ExecutionEventRetentionReadStore")
 	}
-	return inner.ReadExecutionEventsRetention(ctx, afterSeq, limit, runID)
+	return inner.ReadExecutionEventsRetention(ctx, afterSeq, limit, scope)
+}
+
+// ScopedRetainedFrom forwards the scope-aware frontier read untouched.
+func (f *FaultyStore) ScopedRetainedFrom(ctx context.Context, scope ExecutionEventScope) (int64, error) {
+	inner, ok := f.Inner.(ExecutionEventScopedRetentionStore)
+	if !ok {
+		return 0, errMissingInnerInterface("ExecutionEventScopedRetentionStore")
+	}
+	return inner.ScopedRetainedFrom(ctx, scope)
 }
 
 // LatestExecutionEventSeq forwards the monotonic cursor read untouched.
@@ -761,12 +770,12 @@ func (f *FaultyStore) RunKeyIndexPresent(ctx context.Context) (bool, error) {
 }
 
 // ExecutionSnapshot forwards the atomic bootstrap read untouched.
-func (f *FaultyStore) ExecutionSnapshot(ctx context.Context, runLimit int) (ExecutionSnapshot, error) {
+func (f *FaultyStore) ExecutionSnapshot(ctx context.Context, runLimit int, repoID string) (ExecutionSnapshot, error) {
 	inner, ok := f.Inner.(ExecutionSnapshotStore)
 	if !ok {
 		return ExecutionSnapshot{}, errMissingInnerInterface("ExecutionSnapshotStore")
 	}
-	return inner.ExecutionSnapshot(ctx, runLimit)
+	return inner.ExecutionSnapshot(ctx, runLimit, repoID)
 }
 
 func (f *FaultyStore) InsertCompletionReceipt(ctx context.Context, r model.CompletionReceipt) error {
@@ -2158,9 +2167,13 @@ type memStore struct {
 	// exactly like the SQL and fs stores. eventRetainedFrom is the retention
 	// watermark: the highest seq removed by a prefix prune (0 = nothing
 	// pruned), mirroring execution_event_cursor.retained_from.
+	// eventPruned is the per-run deletion frontier, mirroring the
+	// execution_event_pruned table: highest pruned seq (and repository) per
+	// run, so repository- and run-scoped resume decisions can be served.
 	events            []model.ExecutionEvent
 	eventSeq          int64
 	eventRetainedFrom int64
+	eventPruned       map[string]executionEventPrunedRecord
 }
 
 // quotaCounts is the in-memory reserved counter pair for one quota key.
@@ -2563,6 +2576,13 @@ func (m *memStore) ApproveJob(ctx context.Context, jobID, actor string) (model.J
 	}
 	if j.Status.Terminal() {
 		return model.Job{}, ErrJobTerminal
+	}
+	// Idempotent replay (docs/INVARIANTS.md I8), mirroring the SQL store: an
+	// already-granted approval on a non-terminal job returns the stored job
+	// unchanged and appends NO second approval.granted event; the first
+	// approver is preserved.
+	if j.ApprovedBy != "" && j.Status != model.StatusWaitingApproval {
+		return j, nil
 	}
 	j.ApprovedBy = actor
 	if j.Status == model.StatusWaitingApproval {
@@ -3571,6 +3591,8 @@ func (m *memStore) AppendExecutionEvent(_ context.Context, e model.ExecutionEven
 // CreatedAt is stamped here; memory mode cannot fail the append, so a
 // semantic event never fails a mutation (the DB mode's fail-closed contract
 // is exercised by PostgreSQL, where the append is a real transaction step).
+// An event without a repository dimension is resolved from the owning run
+// (directly or through the job), mirroring the PostgreSQL triggers.
 func (m *memStore) appendExecutionEventLocked(e model.ExecutionEvent) {
 	if e.SchemaVersion <= 0 {
 		e.SchemaVersion = 1
@@ -3578,16 +3600,44 @@ func (m *memStore) appendExecutionEventLocked(e model.ExecutionEvent) {
 	if e.CreatedAt.IsZero() {
 		e.CreatedAt = time.Now().UTC()
 	}
+	if e.RepoID == "" {
+		e.RepoID = m.executionEventRepoIDLocked(e)
+	}
 	m.eventSeq++
 	e.Seq = m.eventSeq
 	m.events = append(m.events, e)
 }
 
+// executionEventRepoIDLocked resolves the repository dimension of an event
+// from the in-memory run/job state, exactly like the PostgreSQL trigger
+// (the run's immutable RepoID). An unknown owner yields an empty repository
+// rather than a guessed one.
+func (m *memStore) executionEventRepoIDLocked(e model.ExecutionEvent) string {
+	if e.RunID != "" {
+		if run, ok := m.runs[e.RunID]; ok {
+			return run.RepoID
+		}
+	}
+	if e.JobID != "" {
+		if j, ok := m.jobs[e.JobID]; ok {
+			if j.RepoID != "" {
+				return j.RepoID
+			}
+			if run, ok := m.runs[j.RunID]; ok {
+				return run.RepoID
+			}
+		}
+	}
+	return ""
+}
+
 // PruneExecutionEvents mirrors the SQL prefix prune: it removes the oldest
 // contiguous run of events older than olderThan (bounded by limit), never
-// crossing the first event at or after the cutoff, and advances the
-// retainedFrom watermark to the highest removed seq. The surviving slice
-// keeps its original seq values, so "seq > after" addressing is unchanged.
+// crossing the first event at or after the cutoff, advances the
+// retainedFrom watermark to the highest removed seq and records the
+// per-run deletion frontier (the execution_event_pruned rows). The
+// surviving slice keeps its original seq values, so "seq > after"
+// addressing is unchanged.
 func (m *memStore) PruneExecutionEvents(_ context.Context, olderThan time.Time, limit int) (int64, int64, error) {
 	if limit <= 0 {
 		limit = DefaultExecutionEventPruneLimit
@@ -3603,26 +3653,42 @@ func (m *memStore) PruneExecutionEvents(_ context.Context, olderThan time.Time, 
 			break
 		}
 	}
-	victims := 0
+	var victims []model.ExecutionEvent
 	highest := m.eventRetainedFrom
-	for victims < len(m.events) && victims < limit {
-		e := m.events[victims]
+	for len(victims) < len(m.events) && len(victims) < limit {
+		e := m.events[len(victims)]
 		if (hasKeep && e.Seq >= keepFrom) || e.Seq <= m.eventRetainedFrom {
 			break
 		}
-		victims++
+		victims = append(victims, e)
 		if e.Seq > highest {
 			highest = e.Seq
 		}
 	}
-	if victims == 0 {
+	if len(victims) == 0 {
 		return 0, m.eventRetainedFrom, nil
 	}
-	m.events = append([]model.ExecutionEvent(nil), m.events[victims:]...)
+	if m.eventPruned == nil {
+		m.eventPruned = map[string]executionEventPrunedRecord{}
+	}
+	for _, e := range victims {
+		if e.RunID == "" {
+			continue
+		}
+		rec := m.eventPruned[e.RunID]
+		if e.Seq > rec.MaxSeq {
+			rec.MaxSeq = e.Seq
+		}
+		if e.RepoID != "" {
+			rec.RepoID = e.RepoID
+		}
+		m.eventPruned[e.RunID] = rec
+	}
+	m.events = append([]model.ExecutionEvent(nil), m.events[len(victims):]...)
 	if highest > m.eventRetainedFrom {
 		m.eventRetainedFrom = highest
 	}
-	return int64(victims), m.eventRetainedFrom, nil
+	return int64(len(victims)), m.eventRetainedFrom, nil
 }
 
 // ExecutionEventRetainedFrom mirrors the SQL watermark read.
@@ -3682,18 +3748,64 @@ func (m *memStore) listExecutionEventsLocked(afterSeq int64, limit int, runID st
 }
 
 // ReadExecutionEventsRetention mirrors the atomic retention read of the SQL
-// and fs stores: the page, the retained_from watermark and the monotonic
+// and fs stores: the page, the SCOPED retained frontier and the monotonic
 // event watermark are read under one m.mu critical section, so the memStore
 // prune cannot interleave. latestCursor is the monotonic allocated watermark
-// (eventSeq), never the highest surviving row.
-func (m *memStore) ReadExecutionEventsRetention(_ context.Context, afterSeq int64, limit int, runID string) ([]model.ExecutionEvent, int64, int64, int64, error) {
+// (eventSeq), never the highest surviving row. The frontier is the global
+// eventRetainedFrom for a global read, MAX over the repository's pruned rows
+// for a repository read and the run's own row for a run read.
+func (m *memStore) ReadExecutionEventsRetention(_ context.Context, afterSeq int64, limit int, scope ExecutionEventScope) ([]model.ExecutionEvent, int64, int64, int64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	page, cursor, err := m.listExecutionEventsLocked(afterSeq, limit, runID)
+	page, cursor, err := m.listExecutionEventsScopeLocked(afterSeq, limit, scope)
 	if err != nil {
 		return nil, afterSeq, 0, 0, err
 	}
-	return page, cursor, m.eventRetainedFrom, m.eventSeq, nil
+	return page, cursor, m.scopedRetainedLocked(scope), m.eventSeq, nil
+}
+
+// listExecutionEventsScopeLocked is the scope-filtered page read for callers
+// holding m.mu.
+func (m *memStore) listExecutionEventsScopeLocked(afterSeq int64, limit int, scope ExecutionEventScope) ([]model.ExecutionEvent, int64, error) {
+	limit = ClampExecutionEventLimit(limit)
+	out := []model.ExecutionEvent{}
+	cursor := afterSeq
+	for _, e := range m.events {
+		if e.Seq <= afterSeq || !executionEventMatchesScope(e, scope) {
+			continue
+		}
+		out = append(out, e)
+		cursor = e.Seq
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, cursor, nil
+}
+
+// ScopedRetainedFrom mirrors the SQL scoped frontier read.
+func (m *memStore) ScopedRetainedFrom(_ context.Context, scope ExecutionEventScope) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.scopedRetainedLocked(scope), nil
+}
+
+// scopedRetainedLocked is the per-scope frontier for callers holding m.mu.
+func (m *memStore) scopedRetainedLocked(scope ExecutionEventScope) int64 {
+	switch scope.Kind {
+	case ExecutionEventScopeRepo:
+		var maxSeq int64
+		for _, rec := range m.eventPruned {
+			if rec.RepoID == scope.RepoID && rec.MaxSeq > maxSeq {
+				maxSeq = rec.MaxSeq
+			}
+		}
+		return maxSeq
+	case ExecutionEventScopeRun:
+		return m.eventPruned[scope.RunID].MaxSeq
+	default:
+		return m.eventRetainedFrom
+	}
 }
 
 // LatestExecutionEventSeq mirrors the monotonic event watermark.
@@ -4339,12 +4451,38 @@ func (f *FaultyStore) GetSchedule(ctx context.Context, id string) (Schedule, boo
 	return inner.GetSchedule(ctx, id)
 }
 
-func (m *memStore) AppendLogBatch(ctx context.Context, entries []model.LogEntry, r LogBatchIdentity) (bool, error) {
+func (m *memStore) AppendLogBatch(ctx context.Context, runnerID string, entries []model.LogEntry, r LogBatchIdentity) (bool, error) {
 	if r.JobID == "" || r.BatchID == "" {
 		return false, fmt.Errorf("storage: log batch requires job id and batch id")
 	}
 	if len(entries) == 0 {
 		return false, fmt.Errorf("storage: empty log batch")
+	}
+	if err := validateLeaseCommitKey(r.JobID, runnerID, r.Generation); err != nil {
+		return false, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// The commit-time lease predicate is evaluated in the same critical
+	// section as the receipt claim and the append: this store's mutex is its
+	// transaction, so a revocation cannot interleave between the check and
+	// the write. It runs BEFORE the receipt lookup: a stale generation is
+	// refused with ErrLeaseLost even when the identical payload was already
+	// receipted (there is no post-expiry idempotent ack).
+	coords, held := m.leaseJobCoordsLocked(r.JobID, runnerID, r.Generation, time.Now().UTC())
+	if !held {
+		return false, fmt.Errorf("%w: log batch %s for job %s", ErrLeaseLost, r.BatchID, r.JobID)
+	}
+	runID := entries[0].RunID
+	for i := range entries {
+		if entries[i].RunID != runID {
+			return false, fmt.Errorf("storage: log batch entries must share one run")
+		}
+	}
+	for i := range entries {
+		if err := bindLogLeaseIdentity(coords, r.JobID, r.Generation, &entries[i]); err != nil {
+			return false, err
+		}
 	}
 	key := r.JobID + "\x00" + strconv.FormatInt(r.Generation, 10) + "\x00" + r.BatchID
 	claimed, conflict := m.logBatches.claim(key, LogBatchPayloadDigest(r, entries))
@@ -4354,15 +4492,47 @@ func (m *memStore) AppendLogBatch(ctx context.Context, entries []model.LogEntry,
 	if !claimed {
 		return false, nil
 	}
-	m.mu.Lock()
 	m.logs = append(m.logs, entries...)
-	m.mu.Unlock()
 	return true, nil
 }
 
+// AppendLogForLease is the in-memory mirror of the PostgreSQL transactional
+// single-line runner commit: the live-lease predicate and the append happen
+// under one critical section (this store's transaction), and a line whose
+// identity disagrees with the locked in-memory job is refused. The seq is
+// allocated as one past the run's current high-water, mirroring the
+// commit-ordered cursor of the durable stores.
+func (m *memStore) AppendLogForLease(ctx context.Context, jobID, runnerID string, generation int64, e model.LogEntry) error {
+	if err := validateLeaseCommitKey(jobID, runnerID, generation); err != nil {
+		return err
+	}
+	if err := ValidateRunID(e.RunID); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	coords, held := m.leaseJobCoordsLocked(jobID, runnerID, generation, time.Now().UTC())
+	if !held {
+		return fmt.Errorf("%w: log line for job %s", ErrLeaseLost, jobID)
+	}
+	if err := bindLogLeaseIdentity(coords, jobID, generation, &e); err != nil {
+		return err
+	}
+	var seq int64
+	for _, existing := range m.logs {
+		if existing.RunID == e.RunID && existing.Seq > seq {
+			seq = existing.Seq
+		}
+	}
+	e.Seq = seq + 1
+	m.logs = append(m.logs, e)
+	return nil
+}
+
 // AppendLogBatch passes the inner store's result (including
-// ErrLogBatchConflict) through untouched; only injected faults replace it.
-func (f *FaultyStore) AppendLogBatch(ctx context.Context, entries []model.LogEntry, r LogBatchIdentity) (bool, error) {
+// ErrLeaseLost/ErrLogBatchConflict) through untouched; only injected faults
+// replace it.
+func (f *FaultyStore) AppendLogBatch(ctx context.Context, runnerID string, entries []model.LogEntry, r LogBatchIdentity) (bool, error) {
 	op := f.fail()
 	if op != nil {
 		return false, op
@@ -4371,7 +4541,21 @@ func (f *FaultyStore) AppendLogBatch(ctx context.Context, entries []model.LogEnt
 	if !ok {
 		return false, errMissingInnerInterface("LogBatchStore")
 	}
-	return inner.AppendLogBatch(ctx, entries, r)
+	return inner.AppendLogBatch(ctx, runnerID, entries, r)
+}
+
+// AppendLogForLease injects the configured mutation fault, then forwards to
+// the inner store's LeaseLogStore implementation.
+func (f *FaultyStore) AppendLogForLease(ctx context.Context, jobID, runnerID string, generation int64, e model.LogEntry) error {
+	op := f.fail()
+	if op != nil {
+		return op
+	}
+	inner, ok := f.Inner.(LeaseLogStore)
+	if !ok {
+		return errMissingInnerInterface("LeaseLogStore")
+	}
+	return inner.AppendLogForLease(ctx, jobID, runnerID, generation, e)
 }
 
 func (m *memStore) PutCheckRun(ctx context.Context, key, checkRunID string) error {

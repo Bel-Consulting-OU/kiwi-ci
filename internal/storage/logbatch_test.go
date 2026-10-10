@@ -85,40 +85,119 @@ func TestLogBatchPayloadDigestCanonical(t *testing.T) {
 
 func TestMemAppendLogBatchIdempotentAndConflict(t *testing.T) {
 	m := newMemStore()
+	seedRunningJob(m)
 	ctx := context.Background()
-	id := LogBatchIdentity{JobID: "job-1", Generation: 1, BatchID: "batch-1"}
-	entries := wave1BatchEntries("run-1", "job-1")
+	id := LogBatchIdentity{JobID: testJob.ID, Generation: 1, BatchID: "batch-1"}
+	entries := wave1BatchEntries(testRun.ID, testJob.ID)
 
-	inserted, err := m.AppendLogBatch(ctx, entries, id)
+	inserted, err := m.AppendLogBatch(ctx, testRunner.ID, entries, id)
 	if err != nil || !inserted {
 		t.Fatalf("first append = inserted=%v err=%v, want true, nil", inserted, err)
 	}
 	// The replay carries a fresh CreatedAt and re-allocated Seq values: it
 	// must still be recognized as a duplicate of the same logical batch.
-	inserted, err = m.AppendLogBatch(ctx, redeliverBatchEntries(entries, 500, time.Minute), id)
+	inserted, err = m.AppendLogBatch(ctx, testRunner.ID, redeliverBatchEntries(entries, 500, time.Minute), id)
 	if err != nil || inserted {
 		t.Fatalf("identical replay = inserted=%v err=%v, want false, nil", inserted, err)
 	}
-	got, err := m.ReadLogs(ctx, "run-1", 0, 100)
+	got, err := m.ReadLogs(ctx, testRun.ID, 0, 100)
 	if err != nil || len(got) != 3 {
 		t.Fatalf("logs after replay = %d, %v; want 3 (no duplicates)", len(got), err)
 	}
 
-	conflict := wave1BatchEntries("run-1", "job-1")
+	conflict := wave1BatchEntries(testRun.ID, testJob.ID)
 	conflict[0].Line = "changed"
-	if _, err := m.AppendLogBatch(ctx, conflict, id); !errors.Is(err, ErrLogBatchConflict) {
+	if _, err := m.AppendLogBatch(ctx, testRunner.ID, conflict, id); !errors.Is(err, ErrLogBatchConflict) {
 		t.Fatalf("conflicting payload = %v, want ErrLogBatchConflict", err)
 	}
-	got, _ = m.ReadLogs(ctx, "run-1", 0, 100)
+	got, _ = m.ReadLogs(ctx, testRun.ID, 0, 100)
 	if len(got) != 3 || got[0].Line != "one" {
 		t.Fatalf("conflict mutated the stored batch: %+v", got)
 	}
 
-	if _, err := m.AppendLogBatch(ctx, entries, LogBatchIdentity{}); err == nil {
+	if _, err := m.AppendLogBatch(ctx, testRunner.ID, entries, LogBatchIdentity{}); err == nil {
 		t.Fatal("empty batch identity must fail")
 	}
-	if _, err := m.AppendLogBatch(ctx, nil, id); err == nil {
+	if _, err := m.AppendLogBatch(ctx, testRunner.ID, nil, id); err == nil {
 		t.Fatal("empty batch payload must fail")
+	}
+}
+
+// TestMemAppendLogBatchLeaseFence proves the in-memory batch commit is fenced
+// by the live lease: a generation that is no longer held (revoked holder or
+// superseded generation) is refused with ErrLeaseLost for BOTH a fresh batch
+// and a replay of an already-receipted one, so there is no post-expiry
+// idempotent ack. The predicate is evaluated before the receipt and inserts
+// nothing.
+func TestMemAppendLogBatchLeaseFence(t *testing.T) {
+	m := newMemStore()
+	seedRunningJob(m)
+	ctx := context.Background()
+	id := LogBatchIdentity{JobID: testJob.ID, Generation: 1, BatchID: "batch-fence"}
+	entries := wave1BatchEntries(testRun.ID, testJob.ID)
+	if inserted, err := m.AppendLogBatch(ctx, testRunner.ID, entries, id); err != nil || !inserted {
+		t.Fatalf("live append = inserted=%v err=%v", inserted, err)
+	}
+	// Revoke the lease out from under the batch: the same identity and the
+	// identical payload must now be refused, not acked.
+	m.mu.Lock()
+	j := m.jobs[testJob.ID]
+	j.LeaseTokenHash = nil
+	j.LeaseExpiresAt = nil
+	m.jobs[testJob.ID] = j
+	m.mu.Unlock()
+	if _, err := m.AppendLogBatch(ctx, testRunner.ID, entries, id); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("stale replay = %v, want ErrLeaseLost", err)
+	}
+	fresh := LogBatchIdentity{JobID: testJob.ID, Generation: 1, BatchID: "batch-fence-fresh"}
+	if _, err := m.AppendLogBatch(ctx, testRunner.ID, freshEntries(entries), fresh); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("stale fresh batch = %v, want ErrLeaseLost", err)
+	}
+	got, _ := m.ReadLogs(ctx, testRun.ID, 0, 100)
+	if len(got) != 3 {
+		t.Fatalf("stale batch persisted lines: %d", len(got))
+	}
+}
+
+// freshEntries clones a batch payload with different line text so a refused
+// append cannot be mistaken for a dedupe of the earlier payload.
+func freshEntries(entries []model.LogEntry) []model.LogEntry {
+	out := append([]model.LogEntry(nil), entries...)
+	for i := range out {
+		out[i].Line += "!"
+	}
+	return out
+}
+
+// TestMemAppendLogForLeaseFenceAndIdentity proves the in-memory single-line
+// commit applies the same predicate and identity binding as PostgreSQL:
+// a live lease appends an allocated seq, a revoked lease is ErrLeaseLost,
+// and a run/job identity that disagrees with the locked job is refused
+// without persisting.
+func TestMemAppendLogForLeaseFenceAndIdentity(t *testing.T) {
+	m := newMemStore()
+	seedRunningJob(m)
+	ctx := context.Background()
+	e := model.LogEntry{RunID: testRun.ID, JobID: testJob.ID, JobKey: testJob.Key, Step: "run", Line: "one", CreatedAt: time.Now().UTC()}
+	if err := m.AppendLogForLease(ctx, testJob.ID, testRunner.ID, 1, e); err != nil {
+		t.Fatalf("live append: %v", err)
+	}
+	got, _ := m.ReadLogs(ctx, testRun.ID, 0, 10)
+	if len(got) != 1 || got[0].Seq != 1 || got[0].LeaseGeneration != 1 {
+		t.Fatalf("stored line = %+v", got)
+	}
+	// Identity disagreements are refused and persist nothing.
+	if err := m.AppendLogForLease(ctx, testJob.ID, testRunner.ID, 1, model.LogEntry{RunID: "dddddddddddddddddddddddddddddddd", Line: "x"}); !errors.Is(err, ErrLeaseIdentityMismatch) {
+		t.Fatalf("foreign run = %v, want ErrLeaseIdentityMismatch", err)
+	}
+	if err := m.AppendLogForLease(ctx, testJob.ID, testRunner.ID, 1, model.LogEntry{RunID: testRun.ID, JobKey: "other", Line: "x"}); !errors.Is(err, ErrLeaseIdentityMismatch) {
+		t.Fatalf("foreign key = %v, want ErrLeaseIdentityMismatch", err)
+	}
+	if err := m.AppendLogForLease(ctx, testJob.ID, testRunner.ID, 2, model.LogEntry{RunID: testRun.ID, Line: "x"}); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("stale generation = %v, want ErrLeaseLost", err)
+	}
+	if got, _ := m.ReadLogs(ctx, testRun.ID, 0, 10); len(got) != 1 {
+		t.Fatalf("refused lines persisted: %d", len(got))
 	}
 }
 
@@ -126,22 +205,23 @@ func TestMemAppendLogBatchIdempotentAndConflict(t *testing.T) {
 // or rewrites the inner store's conflict sentinel.
 func TestFaultyStoreLogBatchConflictPassThrough(t *testing.T) {
 	f := &FaultyStore{Inner: newMemStore()}
+	seedRunningJob(f.Inner.(*memStore))
 	ctx := context.Background()
-	id := LogBatchIdentity{JobID: "job-1", Generation: 1, BatchID: "batch-1"}
-	entries := wave1BatchEntries("run-1", "job-1")
-	if _, err := f.AppendLogBatch(ctx, entries, id); err != nil {
+	id := LogBatchIdentity{JobID: testJob.ID, Generation: 1, BatchID: "batch-1"}
+	entries := wave1BatchEntries(testRun.ID, testJob.ID)
+	if _, err := f.AppendLogBatch(ctx, testRunner.ID, entries, id); err != nil {
 		t.Fatalf("first append: %v", err)
 	}
-	conflict := wave1BatchEntries("run-1", "job-1")
+	conflict := wave1BatchEntries(testRun.ID, testJob.ID)
 	conflict[2].Line = "other"
-	if _, err := f.AppendLogBatch(ctx, conflict, id); !errors.Is(err, ErrLogBatchConflict) {
+	if _, err := f.AppendLogBatch(ctx, testRunner.ID, conflict, id); !errors.Is(err, ErrLogBatchConflict) {
 		t.Fatalf("wrapper conflict = %v, want ErrLogBatchConflict", err)
 	}
 	// An injected fault still wins over the pass-through.
 	injected := errors.New("injected append failure")
 	f.FailAfter = 1
 	f.Err = injected
-	if _, err := f.AppendLogBatch(ctx, entries, id); !errors.Is(err, injected) {
+	if _, err := f.AppendLogBatch(ctx, testRunner.ID, entries, id); !errors.Is(err, injected) {
 		t.Fatalf("injected fault = %v, want %v", err, injected)
 	}
 }

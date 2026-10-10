@@ -250,14 +250,14 @@ func TestMemStoreAtomicRetentionReadLatestMonotonic(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	page, cursor, retained, latest, err := m.ReadExecutionEventsRetention(ctx, 0, 100, "run-a")
+	page, cursor, retained, latest, err := m.ReadExecutionEventsRetention(ctx, 0, 100, ExecutionEventScope{Kind: ExecutionEventScopeRun, RunID: "run-a"})
 	if err != nil || len(page) != 3 || cursor != 3 || retained != 0 || latest != 3 {
 		t.Fatalf("initial atomic read = %d cursor %d retained %d latest %d err %v", len(page), cursor, retained, latest, err)
 	}
 	if _, _, err := m.PruneExecutionEvents(ctx, now.Add(time.Hour), 100); err != nil {
 		t.Fatal(err)
 	}
-	page, cursor, retained, latest, err = m.ReadExecutionEventsRetention(ctx, 3, 100, "")
+	page, cursor, retained, latest, err = m.ReadExecutionEventsRetention(ctx, 3, 100, ExecutionEventScope{Kind: ExecutionEventScopeGlobal})
 	if err != nil || len(page) != 0 || cursor != 3 || retained != 3 || latest != 3 {
 		t.Fatalf("all-pruned atomic read = %d cursor %d retained %d latest %d err %v", len(page), cursor, retained, latest, err)
 	}

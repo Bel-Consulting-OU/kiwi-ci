@@ -422,6 +422,16 @@ func Replay(ctx context.Context, args []string) error {
 	if replayOptionsSeam != nil {
 		replayOptionsSeam(opts)
 	}
+	// Invariant I5 (docs/INVARIANTS.md): exact replay cannot add external
+	// effects or work unless authorized. executor.Options.GenerateUpload —
+	// the ONLY path that can turn a recorded `generate:` fragment into child
+	// jobs on the control plane — is deliberately NEVER wired here (the
+	// distributed runner wires it in runner.go). A replayed generator
+	// therefore executes its step locally and reads the declared fragment
+	// file for validation, but never uploads it: replay schedules no
+	// children, submits no runs and enqueues no outbox work. Step-declared
+	// external effects (deployments, secrets, OIDC) are the separately gated
+	// surface handled by replayDeclaredEffects above.
 	e := &executor.Executor{Opt: opts, Masker: masker}
 	result := e.RunCompiledJob(ctx, spec, matchJob)
 	fmt.Printf("replayed %-36s %-10s %s\n", matchJob.ID, result.Status, result.Duration.Round(1e6))

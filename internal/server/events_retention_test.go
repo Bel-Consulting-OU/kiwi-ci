@@ -24,11 +24,19 @@ import (
 
 // eventsRetentionFakeStore adds the RetentionExecutionEventStore contract to
 // eventsFakeStore: a monotonic cursor watermark (a prefix prune must never
-// let a later append reuse a seq) plus the prefix-delete rule.
+// let a later append reuse a seq) plus the prefix-delete rule and the
+// per-run deletion frontier (the execution_event_pruned equivalent).
 type eventsRetentionFakeStore struct {
 	*eventsFakeStore
 	seq          int64
 	retainedFrom int64
+	pruned       map[string]eventsPrunedRecord
+}
+
+// eventsPrunedRecord is one run's pruned frontier in the fake.
+type eventsPrunedRecord struct {
+	repo string
+	max  int64
 }
 
 func (f *eventsRetentionFakeStore) AppendExecutionEvent(_ context.Context, e model.ExecutionEvent) error {
@@ -50,16 +58,16 @@ func (f *eventsRetentionFakeStore) LatestExecutionEventSeq(_ context.Context) (i
 }
 
 // ReadExecutionEventsRetention mirrors the atomic retention read of the real
-// stores: the page, the watermark and the monotonic watermark share one fake
-// lock critical section.
-func (f *eventsRetentionFakeStore) ReadExecutionEventsRetention(_ context.Context, afterSeq int64, limit int, runID string) ([]model.ExecutionEvent, int64, int64, int64, error) {
+// stores: the scope-filtered page, the scoped frontier and the monotonic
+// watermark share one fake lock critical section.
+func (f *eventsRetentionFakeStore) ReadExecutionEventsRetention(_ context.Context, afterSeq int64, limit int, scope storage.ExecutionEventScope) ([]model.ExecutionEvent, int64, int64, int64, error) {
 	f.eventsMu.Lock()
 	defer f.eventsMu.Unlock()
 	limit = storage.ClampExecutionEventLimit(limit)
 	out := []model.ExecutionEvent{}
 	cursor := afterSeq
 	for _, e := range f.events {
-		if e.Seq <= afterSeq || (runID != "" && e.RunID != runID) {
+		if e.Seq <= afterSeq || !f.eventInScopeLocked(e, scope) {
 			continue
 		}
 		out = append(out, e)
@@ -68,7 +76,47 @@ func (f *eventsRetentionFakeStore) ReadExecutionEventsRetention(_ context.Contex
 			break
 		}
 	}
-	return out, cursor, f.retainedFrom, f.seq, nil
+	return out, cursor, f.scopedRetainedLocked(scope), f.seq, nil
+}
+
+// ScopedRetainedFrom mirrors the scoped frontier read of the real stores.
+func (f *eventsRetentionFakeStore) ScopedRetainedFrom(_ context.Context, scope storage.ExecutionEventScope) (int64, error) {
+	f.eventsMu.Lock()
+	defer f.eventsMu.Unlock()
+	return f.scopedRetainedLocked(scope), nil
+}
+
+// eventInScopeLocked is the fake's scope predicate: global sees everything,
+// repo matches the event's persisted RepoID, run matches RunID.
+func (f *eventsRetentionFakeStore) eventInScopeLocked(e model.ExecutionEvent, scope storage.ExecutionEventScope) bool {
+	switch scope.Kind {
+	case storage.ExecutionEventScopeRepo:
+		return e.RepoID == scope.RepoID
+	case storage.ExecutionEventScopeRun:
+		return e.RunID == scope.RunID
+	default:
+		return true
+	}
+}
+
+// scopedRetainedLocked is the fake's per-scope frontier: the global watermark
+// for a global read, MAX over the repository's pruned runs for a repository
+// read and the run's own row for a run read.
+func (f *eventsRetentionFakeStore) scopedRetainedLocked(scope storage.ExecutionEventScope) int64 {
+	switch scope.Kind {
+	case storage.ExecutionEventScopeRepo:
+		var maxSeq int64
+		for _, rec := range f.pruned {
+			if rec.repo == scope.RepoID && rec.max > maxSeq {
+				maxSeq = rec.max
+			}
+		}
+		return maxSeq
+	case storage.ExecutionEventScopeRun:
+		return f.pruned[scope.RunID].max
+	default:
+		return f.retainedFrom
+	}
 }
 
 func (f *eventsRetentionFakeStore) PruneExecutionEvents(_ context.Context, olderThan time.Time, limit int) (int64, int64, error) {
@@ -98,6 +146,22 @@ func (f *eventsRetentionFakeStore) PruneExecutionEvents(_ context.Context, older
 	}
 	if victims == 0 {
 		return 0, f.retainedFrom, nil
+	}
+	if f.pruned == nil {
+		f.pruned = map[string]eventsPrunedRecord{}
+	}
+	for _, e := range f.events[:victims] {
+		if e.RunID == "" {
+			continue
+		}
+		rec := f.pruned[e.RunID]
+		if e.Seq > rec.max {
+			rec.max = e.Seq
+		}
+		if e.RepoID != "" {
+			rec.repo = e.RepoID
+		}
+		f.pruned[e.RunID] = rec
 	}
 	f.events = append([]model.ExecutionEvent(nil), f.events[victims:]...)
 	f.retainedFrom = highest
@@ -154,7 +218,7 @@ func TestEventsCursorExpiredList(t *testing.T) {
 		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
 			t.Fatalf("decode 410 body: %v: %s", err, w.Body.String())
 		}
-		if body.Error != "cursor_expired" || body.RetainedFrom != "3" || body.LatestCursor != "5" {
+		if body.Error != "cursor_expired" || body.Reason != "cursor_expired_snapshot_required" || body.RetainedFrom != "3" || eventCursorSeq(t, body.LatestCursor) != 5 {
 			t.Fatalf("after=%s 410 = %+v, want cursor_expired/3/5", after, body)
 		}
 	}
@@ -166,21 +230,21 @@ func TestEventsCursorExpiredList(t *testing.T) {
 		t.Fatalf("after=3 = %d, want 200: %s", w.Code, w.Body.String())
 	}
 	resp := decodeEventsResponse(t, w.Body.Bytes())
-	if len(resp.Events) != 2 || resp.Events[0].Seq != 4 || resp.RetainedFrom != "3" {
+	if len(resp.Events) != 2 || resp.Events[0].Seq != 4 || resp.RetainedFrom != "3" || resp.ResumeStatus != "resume_ok" {
 		t.Fatalf("after=3 page = %+v, want seqs 4,5 retained_from 3", resp)
 	}
 
 	// Bootstrap: after=latest_cursor returns nothing until a new event, then
 	// exactly the new event.
 	w = doJSON(t, s, http.MethodGet, "/api/v1/events?after=5", "admin-tok", "")
-	if resp := decodeEventsResponse(t, w.Body.Bytes()); len(resp.Events) != 0 || resp.LatestCursor != "5" {
+	if resp := decodeEventsResponse(t, w.Body.Bytes()); len(resp.Events) != 0 || eventCursorSeq(t, resp.LatestCursor) != 5 {
 		t.Fatalf("bootstrap empty page = %+v", resp)
 	}
 	if err := f.AppendExecutionEvent(context.Background(), model.ExecutionEvent{RunID: "r1", Type: "run.succeeded", ToStatus: "success", CreatedAt: now.Add(time.Minute)}); err != nil {
 		t.Fatal(err)
 	}
 	w = doJSON(t, s, http.MethodGet, "/api/v1/events?after=5", "admin-tok", "")
-	if resp := decodeEventsResponse(t, w.Body.Bytes()); len(resp.Events) != 1 || resp.Events[0].Seq != 6 || resp.LatestCursor != "6" {
+	if resp := decodeEventsResponse(t, w.Body.Bytes()); len(resp.Events) != 1 || resp.Events[0].Seq != 6 || eventCursorSeq(t, resp.LatestCursor) != 6 {
 		t.Fatalf("bootstrap page = %+v, want seq 6", resp)
 	}
 }
@@ -241,7 +305,7 @@ func TestEventsCursorExpiredStream(t *testing.T) {
 		t.Fatalf("decode 410 stream body: %v", err)
 	}
 	resp.Body.Close()
-	if body.Error != "cursor_expired" || body.RetainedFrom != "2" || body.LatestCursor != "4" {
+	if body.Error != "cursor_expired" || body.Reason != "cursor_expired_snapshot_required" || body.RetainedFrom != "2" || eventCursorSeq(t, body.LatestCursor) != 4 {
 		t.Fatalf("expired stream 410 = %+v, want cursor_expired/2/4", body)
 	}
 

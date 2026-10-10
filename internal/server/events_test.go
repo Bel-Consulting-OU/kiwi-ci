@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -60,6 +62,21 @@ func (f *eventsFakeStore) LatestExecutionEventSeq(_ context.Context) (int64, err
 	return int64(len(f.events)), nil
 }
 
+// eventCursorSeq extracts the numeric sequence from a typed execution event
+// cursor (xe1:<seq>:<fingerprint>), asserting the wire form.
+func eventCursorSeq(t *testing.T, cursor string) int64 {
+	t.Helper()
+	parts := strings.Split(cursor, ":")
+	if len(parts) != 3 || parts[0] != "xe1" {
+		t.Fatalf("cursor %q is not a typed execution event cursor", cursor)
+	}
+	seq, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		t.Fatalf("cursor %q has no numeric sequence: %v", cursor, err)
+	}
+	return seq
+}
+
 func decodeEventsResponse(t *testing.T, body []byte) executionEventsResponse {
 	t.Helper()
 	var resp executionEventsResponse
@@ -103,15 +120,18 @@ func TestEventsEndpointAdminOnlyAndPagination(t *testing.T) {
 		t.Fatalf("list events = %d: %s", w.Code, w.Body.String())
 	}
 	resp := decodeEventsResponse(t, w.Body.Bytes())
-	if len(resp.Events) != 3 || resp.NextCursor != "3" {
+	if len(resp.Events) != 3 || eventCursorSeq(t, resp.NextCursor) != 3 {
 		t.Fatalf("events = %d next_cursor %q, want 3/3", len(resp.Events), resp.NextCursor)
+	}
+	if resp.ResumeStatus != "resume_ok" || resp.ScopeFingerprint == "" {
+		t.Fatalf("fresh global page resume/scope = %q/%q", resp.ResumeStatus, resp.ScopeFingerprint)
 	}
 	// fs mode is explicitly non-canonical, and latest_cursor is the journal
 	// watermark (the bootstrap reference).
 	if resp.Canonical {
 		t.Fatalf("fs events response claims canonical: %s", w.Body.String())
 	}
-	if resp.LatestCursor != "3" {
+	if eventCursorSeq(t, resp.LatestCursor) != 3 {
 		t.Fatalf("fs latest_cursor = %q, want 3", resp.LatestCursor)
 	}
 	for i, e := range resp.Events {
@@ -123,12 +143,12 @@ func TestEventsEndpointAdminOnlyAndPagination(t *testing.T) {
 	// Page 1 ends at the cursor; page 2 resumes with no gap.
 	w = doJSON(t, s, http.MethodGet, "/api/v1/events?limit=2", "admin-tok", "")
 	resp = decodeEventsResponse(t, w.Body.Bytes())
-	if len(resp.Events) != 2 || resp.NextCursor != "2" {
+	if len(resp.Events) != 2 || eventCursorSeq(t, resp.NextCursor) != 2 {
 		t.Fatalf("page 1 = %d next %q", len(resp.Events), resp.NextCursor)
 	}
 	w = doJSON(t, s, http.MethodGet, "/api/v1/events?after=2&limit=2", "admin-tok", "")
 	resp = decodeEventsResponse(t, w.Body.Bytes())
-	if len(resp.Events) != 1 || resp.Events[0].Seq != 3 || resp.NextCursor != "3" {
+	if len(resp.Events) != 1 || resp.Events[0].Seq != 3 || eventCursorSeq(t, resp.NextCursor) != 3 {
 		t.Fatalf("page 2 = %+v next %q", resp.Events, resp.NextCursor)
 	}
 
@@ -172,7 +192,7 @@ func TestEventsEndpointDBMode(t *testing.T) {
 		t.Fatalf("db events = %d: %s", w.Code, w.Body.String())
 	}
 	resp := decodeEventsResponse(t, w.Body.Bytes())
-	if len(resp.Events) != 1 || resp.Events[0].Type != "run.running" || resp.NextCursor != "1" {
+	if len(resp.Events) != 1 || resp.Events[0].Type != "run.running" || eventCursorSeq(t, resp.NextCursor) != 1 {
 		t.Fatalf("db events = %+v next %q", resp.Events, resp.NextCursor)
 	}
 	// DB mode is canonical, and latest_cursor comes from the store's
@@ -180,7 +200,7 @@ func TestEventsEndpointDBMode(t *testing.T) {
 	if !resp.Canonical {
 		t.Fatalf("db events response not canonical: %s", w.Body.String())
 	}
-	if resp.LatestCursor != "1" {
+	if eventCursorSeq(t, resp.LatestCursor) != 1 {
 		t.Fatalf("db latest_cursor = %q, want 1", resp.LatestCursor)
 	}
 	// Bootstrap contract: after=latest_cursor returns nothing until a new
@@ -195,7 +215,7 @@ func TestEventsEndpointDBMode(t *testing.T) {
 	}
 	w = doJSON(t, s2, http.MethodGet, "/api/v1/events?after="+resp.LatestCursor, "admin-tok", "")
 	page := decodeEventsResponse(t, w.Body.Bytes())
-	if len(page.Events) != 1 || page.Events[0].Type != "run.succeeded" || page.LatestCursor != "2" {
+	if len(page.Events) != 1 || page.Events[0].Type != "run.succeeded" || eventCursorSeq(t, page.LatestCursor) != 2 {
 		t.Fatalf("after=latest bootstrap = %+v latest %q", page.Events, page.LatestCursor)
 	}
 }
@@ -412,7 +432,7 @@ func expectEventFrame(t *testing.T, frames <-chan sseFrame, seq int64) {
 		if !ok {
 			t.Fatalf("stream closed before event %d", seq)
 		}
-		if f.event != "execution" || f.id != fmt.Sprint(seq) {
+		if f.event != "execution" || eventCursorSeq(t, f.id) != seq {
 			t.Fatalf("frame = %+v, want execution id %d", f, seq)
 		}
 		var e model.ExecutionEvent

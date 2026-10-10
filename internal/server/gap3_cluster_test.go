@@ -206,7 +206,7 @@ func TestGapExecutionEventRetentionFallbackArms(t *testing.T) {
 	t.Run("noEventContract", func(t *testing.T) {
 		s := New("tok")
 		s.DB = &gapNoEventStore{Store: newDBFakeStore()}
-		if _, _, _, _, err := s.readExecutionEventsRetention(ctx, 0, 10, ""); !errors.Is(err, errUnsupportedExecutionEvents) {
+		if _, _, _, _, err := s.readExecutionEventsRetention(ctx, 0, 10, storage.ExecutionEventScope{Kind: storage.ExecutionEventScopeGlobal}); !errors.Is(err, errUnsupportedExecutionEvents) {
 			t.Fatalf("missing event contract = %v, want errUnsupportedExecutionEvents", err)
 		}
 	})
@@ -214,7 +214,7 @@ func TestGapExecutionEventRetentionFallbackArms(t *testing.T) {
 	t.Run("listError", func(t *testing.T) {
 		s := New("tok")
 		s.DB = &gapLegacyEventStore{eventsFakeStore: &eventsFakeStore{dbFakeStore: newDBFakeStore()}, listErr: errors.New("page down")}
-		if _, _, _, _, err := s.readExecutionEventsRetention(ctx, 0, 10, ""); err == nil {
+		if _, _, _, _, err := s.readExecutionEventsRetention(ctx, 0, 10, storage.ExecutionEventScope{Kind: storage.ExecutionEventScopeGlobal}); err == nil {
 			t.Fatal("list failure was swallowed")
 		}
 	})
@@ -222,7 +222,7 @@ func TestGapExecutionEventRetentionFallbackArms(t *testing.T) {
 	t.Run("latestError", func(t *testing.T) {
 		s := New("tok")
 		s.DB = &gapLegacyEventStore{eventsFakeStore: &eventsFakeStore{dbFakeStore: newDBFakeStore()}, latestErr: errors.New("cursor down")}
-		if _, _, _, _, err := s.readExecutionEventsRetention(ctx, 0, 10, ""); err == nil {
+		if _, _, _, _, err := s.readExecutionEventsRetention(ctx, 0, 10, storage.ExecutionEventScope{Kind: storage.ExecutionEventScopeGlobal}); err == nil {
 			t.Fatal("latest cursor failure was swallowed")
 		}
 	})
@@ -234,7 +234,7 @@ func TestGapExecutionEventRetentionFallbackArms(t *testing.T) {
 		}
 		s := New("tok")
 		s.DB = &gapLegacyEventStore{eventsFakeStore: f, retained: 1}
-		events, cursor, retained, latest, err := s.readExecutionEventsRetention(ctx, 0, 10, "")
+		events, cursor, retained, latest, err := s.readExecutionEventsRetention(ctx, 0, 10, storage.ExecutionEventScope{Kind: storage.ExecutionEventScopeGlobal})
 		if err != nil || len(events) != 1 || cursor != 1 || retained != 0 || latest != 7 {
 			t.Fatalf("split-contract retention read = %d events cursor=%d retained=%d latest=%d err=%v", len(events), cursor, retained, latest, err)
 		}

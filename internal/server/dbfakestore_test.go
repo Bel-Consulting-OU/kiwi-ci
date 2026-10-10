@@ -1430,12 +1430,19 @@ func (f *dbFakeStore) ApproveJob(ctx context.Context, jobID, actor string) (mode
 	if j.Status.Terminal() {
 		return model.Job{}, storage.ErrJobTerminal
 	}
+	// Idempotent replay, mirroring the SQL ApproveJob contract: an
+	// already-granted approval on a non-terminal job returns the stored job
+	// unchanged and commits NO second approval.granted event.
+	if j.ApprovedBy != "" && j.Status != model.StatusWaitingApproval {
+		return j, nil
+	}
 	j.ApprovedBy = actor
 	if j.Status == model.StatusWaitingApproval {
 		j.Status = model.StatusQueued
 		j.WaitingSince = nil
 	}
 	f.jobs[jobID] = j
+	f.executionEvents = append(f.executionEvents, storage.ExecutionEventApprovalGranted(j, actor))
 	return j, nil
 }
 
@@ -1604,6 +1611,37 @@ func (f *dbFakeStore) AppendLog(ctx context.Context, e model.LogEntry) error {
 	defer f.mu.Unlock()
 	// Identity-sequence semantics: the store assigns the next sequence in
 	// the append, ignoring any caller-supplied (wall-clock) value.
+	f.logSeq++
+	e.Seq = f.logSeq
+	f.logs = append(f.logs, e)
+	return nil
+}
+
+// AppendLogForLease mirrors the PostgreSQL transactional single-line commit:
+// the live-lease predicate and the append happen in the same critical section
+// (f.mu), and a line whose identity disagrees with the locked job is refused
+// with ErrLeaseIdentityMismatch. The predicate runs BEFORE any write, so a
+// lost lease commits nothing.
+func (f *dbFakeStore) AppendLogForLease(ctx context.Context, jobID, runnerID string, generation int64, e model.LogEntry) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	j, held := f.leaseHeldLocked(jobID, runnerID, generation)
+	if !held {
+		return fmt.Errorf("%w: log line for job %s", storage.ErrLeaseLost, jobID)
+	}
+	if e.RunID != j.RunID {
+		return fmt.Errorf("%w: log line run id %q does not match leased job run %s", storage.ErrLeaseIdentityMismatch, e.RunID, j.RunID)
+	}
+	if e.JobID != "" && e.JobID != jobID {
+		return fmt.Errorf("%w: log line job id %q does not match leased job %s", storage.ErrLeaseIdentityMismatch, e.JobID, jobID)
+	}
+	if e.JobKey != "" && e.JobKey != j.Key {
+		return fmt.Errorf("%w: log line job key %q does not match leased job key %q", storage.ErrLeaseIdentityMismatch, e.JobKey, j.Key)
+	}
+	if e.LeaseGeneration != 0 && e.LeaseGeneration != generation {
+		return fmt.Errorf("%w: log line lease generation %d does not match leased generation %d", storage.ErrLeaseIdentityMismatch, e.LeaseGeneration, generation)
+	}
+	e.JobID, e.JobKey, e.LeaseGeneration = jobID, j.Key, generation
 	f.logSeq++
 	e.Seq = f.logSeq
 	f.logs = append(f.logs, e)
@@ -1983,9 +2021,32 @@ func (f *dbFakeStore) OutboxVersionGuard(ctx context.Context, id, logicalKey str
 	return alive && f.forgeState[logicalKey] < version && !newerPending, nil
 }
 
-func (f *dbFakeStore) AppendLogBatch(ctx context.Context, entries []model.LogEntry, r storage.LogBatchReceipt) (bool, error) {
+func (f *dbFakeStore) AppendLogBatch(ctx context.Context, runnerID string, entries []model.LogEntry, r storage.LogBatchReceipt) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Commit-time lease predicate first: a stale generation is refused with
+	// ErrLeaseLost even when the identical payload was already receipted
+	// (there is no post-expiry idempotent ack).
+	j, held := f.leaseHeldLocked(r.JobID, runnerID, r.Generation)
+	if !held {
+		return false, fmt.Errorf("%w: log batch %s for job %s", storage.ErrLeaseLost, r.BatchID, r.JobID)
+	}
+	for i := range entries {
+		e := &entries[i]
+		if e.RunID != j.RunID {
+			return false, fmt.Errorf("%w: log line run id %q does not match leased job run %s", storage.ErrLeaseIdentityMismatch, e.RunID, j.RunID)
+		}
+		if e.JobID != "" && e.JobID != r.JobID {
+			return false, fmt.Errorf("%w: log line job id %q does not match leased job %s", storage.ErrLeaseIdentityMismatch, e.JobID, r.JobID)
+		}
+		if e.JobKey != "" && e.JobKey != j.Key {
+			return false, fmt.Errorf("%w: log line job key %q does not match leased job key %q", storage.ErrLeaseIdentityMismatch, e.JobKey, j.Key)
+		}
+		if e.LeaseGeneration != 0 && e.LeaseGeneration != r.Generation {
+			return false, fmt.Errorf("%w: log line lease generation %d does not match leased generation %d", storage.ErrLeaseIdentityMismatch, e.LeaseGeneration, r.Generation)
+		}
+		e.JobID, e.JobKey, e.LeaseGeneration = r.JobID, j.Key, r.Generation
+	}
 	if f.logBatches == nil {
 		f.logBatches = map[string]string{}
 	}

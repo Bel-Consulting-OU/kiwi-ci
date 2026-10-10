@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -10,12 +12,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 // executionEventsResponse is the GET /api/v1/events body: the ascending page
-// plus the cursor a follow-up call must send as ?after.
+// plus the scope-bound typed cursors a follow-up call must send as ?after.
 //
 // Canonical is true only in DB mode, where the stream is the authoritative
 // commit-ordered PostgreSQL feed. fs/memory mode reports false: its journal
@@ -24,60 +27,120 @@ import (
 // change wins over the stream, and consumers must treat fs events as a
 // non-canonical mirror that may lag or omit events.
 //
-// LatestCursor is the latest committed cursor: the monotonic commit-ordered
-// cursor value in DB mode, the durable journal watermark in fs mode. A
-// consumer can snapshot state, read latest_cursor, then poll
-// after=latest_cursor and miss no event in between; it never regresses when
-// retention removes rows.
+// NextCursor is the typed cursor (xe1:<seq>:<scope fingerprint>) of the last
+// returned event; LatestCursor is the latest committed cursor in the SAME
+// typed form: the monotonic commit-ordered cursor value in DB mode, the
+// durable journal watermark in fs mode. A consumer can snapshot state, read
+// latest_cursor, then poll after=latest_cursor and miss no event in between;
+// it never regresses when retention removes rows. Both cursors are bound to
+// the request's scope: presenting one under a different scope (repo, run or
+// global) is refused with 409 cursor_scope_mismatch, while the timestamp of
+// the principal's credentials plays no role.
 //
-// RetainedFrom is the retention watermark: the HIGHEST seq already pruned
-// from the stream (0 when nothing was pruned). A cursor strictly BELOW
-// retained_from has lost events; the endpoint answers 410 cursor_expired
-// with the watermark and latest_cursor so the consumer re-bootstraps.
-// after == retained_from stays valid (the consumer consumed the removed
-// prefix's last seq).
+// RetainedFrom is the SCOPED retention frontier: the highest seq pruned for
+// this scope (0 when nothing was pruned). A cursor strictly BELOW the
+// frontier has lost events; the endpoint answers 410 cursor_expired with
+// reason cursor_expired_snapshot_required, the scoped frontier and
+// latest_cursor so the consumer re-bootstraps via the (scope-matched)
+// execution snapshot. after >= the scoped frontier always reports
+// resume_status resume_ok, even when the GLOBAL watermark passed it: the
+// consumer lost nothing visible of its own scope.
 //
-// Both values come from the store's ATOMIC retention read (watermark + page
-// + latest from one consistency point), so a prune cannot interleave between
-// the watermark check and the page read.
+// The page, the scoped frontier and latest_cursor come from the store's
+// ATOMIC retention read (page + frontier + latest from one consistency
+// point), so a prune cannot interleave between the frontier check and the
+// page read.
 type executionEventsResponse struct {
-	Events       []model.ExecutionEvent `json:"events"`
-	NextCursor   string                 `json:"next_cursor"`
-	Canonical    bool                   `json:"canonical"`
-	LatestCursor string                 `json:"latest_cursor"`
-	RetainedFrom string                 `json:"retained_from,omitempty"`
+	Events           []model.ExecutionEvent `json:"events"`
+	NextCursor       string                 `json:"next_cursor"`
+	Canonical        bool                   `json:"canonical"`
+	LatestCursor     string                 `json:"latest_cursor"`
+	RetainedFrom     string                 `json:"retained_from,omitempty"`
+	ScopeFingerprint string                 `json:"scope_fingerprint"`
+	ResumeStatus     string                 `json:"resume_status,omitempty"`
 }
 
 // executionSnapshotResponse is the GET /api/v1/execution-snapshot body: the
 // atomic bootstrap point of the execution event stream.
 //
-// Contract: Cursor and the state summary (Runs, Counts) are read from ONE
-// consistency point, with the cursor read FIRST. A transition committed
-// between the two reads is therefore included in the state summary AND has
-// an event seq strictly greater than Cursor, so starting from this snapshot
-// and polling GET /api/v1/events?after=Cursor can never miss it. Runs carries
-// at most the bounded active-run list (newest first); Counts covers every
-// job in the store regardless of that bound.
+// Contract: ThroughSequence (also rendered as the typed Cursor/ResumeCursor
+// pair) and the state summary (Runs, Counts) are read from ONE consistency
+// point, with the cursor read FIRST. A transition committed between the two
+// reads is therefore included in the state summary AND has an event seq
+// strictly greater than ThroughSequence, so starting from this snapshot and
+// polling GET /api/v1/events?after=resume_cursor can never miss it. Runs
+// carries at most the bounded active-run list (newest first); Counts covers
+// every job in the snapshot's scope regardless of that bound.
+//
+// Scope: without repo_id the snapshot spans every repository and requires a
+// GLOBAL execution.events:read (or admin); with repo_id it exposes only that
+// repository's runs and jobs and is authorized exactly like a
+// repository-scoped event read (capability for the repository or plain read
+// access to it). ResumeCursor is typed for the request's scope, so a
+// repo-scoped consumer can only resume the matching repo-scoped stream.
 type executionSnapshotResponse struct {
-	Cursor      string                         `json:"cursor"`
-	GeneratedAt time.Time                      `json:"generated_at"`
-	Runs        []storage.ExecutionSnapshotRun `json:"runs"`
-	Counts      executionSnapshotCounts        `json:"counts"`
+	Cursor           string                         `json:"cursor"`
+	ResumeCursor     string                         `json:"resume_cursor"`
+	ThroughSequence  int64                          `json:"through_sequence"`
+	ScopeFingerprint string                         `json:"scope_fingerprint"`
+	GeneratedAt      time.Time                      `json:"generated_at"`
+	Runs             []storage.ExecutionSnapshotRun `json:"runs"`
+	Counts           executionSnapshotCounts        `json:"counts"`
 }
 
-// executionSnapshotCounts is the queued/running JOB count across every run.
+// executionSnapshotCounts is the queued/running JOB count in the snapshot's
+// scope (every run for the global form, the addressed repository's runs for
+// the repo_id form).
 type executionSnapshotCounts struct {
 	Queued  int `json:"queued"`
 	Running int `json:"running"`
 }
 
-// cursorExpiredResponse is the 410 body for a cursor below the retention
-// watermark (list and stream alike): the fixed reason plus the watermark and
-// the latest committed cursor the consumer must re-bootstrap from.
+// cursorExpiredResponse is the 410 body for a cursor below the SCOPED
+// retention frontier (list and stream alike): the fixed wire error kept for
+// compatibility, the machine-readable reason telling the consumer to
+// re-bootstrap through the execution snapshot, the scoped frontier and the
+// typed latest committed cursor of the request's scope.
 type cursorExpiredResponse struct {
-	Error        string `json:"error"`
-	RetainedFrom string `json:"retained_from"`
-	LatestCursor string `json:"latest_cursor"`
+	Error            string `json:"error"`
+	Reason           string `json:"reason"`
+	RetainedFrom     string `json:"retained_from"`
+	LatestCursor     string `json:"latest_cursor"`
+	ScopeFingerprint string `json:"scope_fingerprint"`
+}
+
+// cursorScopeMismatchResponse is the 409 body for a cursor presented under a
+// different scope than the one it was issued for (including a legacy bare
+// integer under a repository or run scope): the consumer must re-bootstrap
+// for the requested scope instead of silently paging the wrong stream.
+type cursorScopeMismatchResponse struct {
+	Error            string `json:"error"`
+	ScopeFingerprint string `json:"scope_fingerprint"`
+}
+
+// Typed execution event cursors: the wire form is xe1:<seq>:<fingerprint>,
+// where the fingerprint is the first 16 hex characters of
+// sha256("kiwi-events-cursor-v1\x00" + scope key) and the scope key is
+// "global", "repo:<repoID>" or "run:<repoID>/<runID>". The fingerprint
+// binds a cursor to the SCOPE, never to the principal: token rotation on the
+// same scope keeps every cursor valid, and presenting a cursor across scopes
+// is refused.
+const (
+	executionEventCursorPrefix = "xe1:"
+	executionEventCursorDomain = "kiwi-events-cursor-v1"
+)
+
+// executionEventScopeFingerprint renders the scope's typed-cursor
+// fingerprint (16 hex characters).
+func executionEventScopeFingerprint(scope storage.ExecutionEventScope) string {
+	sum := sha256.Sum256([]byte(executionEventCursorDomain + "\x00" + scope.ScopeKey()))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+// buildExecutionEventCursor renders the typed cursor for one sequence in one
+// scope.
+func buildExecutionEventCursor(seq int64, scope storage.ExecutionEventScope) string {
+	return executionEventCursorPrefix + strconv.FormatInt(seq, 10) + ":" + executionEventScopeFingerprint(scope)
 }
 
 // Execution event stream tuning, mirroring logs_stream.go.
@@ -94,6 +157,9 @@ const (
 // s.mu, which serializes the fs sequence allocation with the state mutation
 // it describes. ctx is the caller's request/detach context: a canceled request
 // fails the append before the journal is touched, matching auditFirstLocked.
+// The repository dimension is resolved here from the server's run/job state
+// when the caller left it empty, so the fs journal carries the same repo
+// dimension the PostgreSQL triggers write.
 func (s *Server) appendExecutionEventErrLocked(ctx context.Context, e model.ExecutionEvent) error {
 	if s.store == nil || s.DB != nil {
 		return nil
@@ -107,7 +173,34 @@ func (s *Server) appendExecutionEventErrLocked(ctx context.Context, e model.Exec
 	if e.CreatedAt.IsZero() {
 		e.CreatedAt = time.Now().UTC()
 	}
+	if e.RepoID == "" {
+		e.RepoID = s.executionEventRepoIDLocked(e)
+	}
 	return s.store.AppendExecutionEvent(ctx, e)
+}
+
+// executionEventRepoIDLocked resolves an event's repository dimension from
+// the in-memory run/job maps (fs/memory mode), mirroring the PostgreSQL
+// trigger: the owning run's immutable RepoID, resolved directly or through
+// the job. An unknown owner stays empty and is therefore invisible to every
+// repository scope.
+func (s *Server) executionEventRepoIDLocked(e model.ExecutionEvent) string {
+	if e.RunID != "" {
+		if run, ok := s.runs[e.RunID]; ok {
+			return run.RepoID
+		}
+	}
+	if e.JobID != "" {
+		if j, ok := s.jobs[e.JobID]; ok {
+			if j.RepoID != "" {
+				return j.RepoID
+			}
+			if run, ok := s.runs[j.RunID]; ok {
+				return run.RepoID
+			}
+		}
+	}
+	return ""
 }
 
 // appendExecutionEventLocked is the best-effort sibling used next to
@@ -142,6 +235,7 @@ func jobExecutionEvent(j model.Job, from, to model.Status, actor string, payload
 	return model.ExecutionEvent{
 		RunID:      j.RunID,
 		JobID:      j.ID,
+		RepoID:     j.RepoID,
 		Attempt:    j.LeaseGeneration,
 		Type:       storage.ExecutionEventType("job", from, to),
 		FromStatus: string(from),
@@ -170,46 +264,49 @@ func (s *Server) appendJobEventLocked(j model.Job, from, to model.Status, actor 
 	s.appendExecutionEventLocked(jobExecutionEvent(j, from, to, actor, payload))
 }
 
-// listEvents serves GET /api/v1/events: the canonical ascending event page
-// plus its next cursor, the store's latest committed cursor (bootstrap
-// reference) and the canonical flag (true only in DB mode). The route is
+// listEvents serves GET /api/v1/events: the scope-filtered ascending event
+// page plus its typed next cursor, the store's latest committed cursor
+// (bootstrap reference, typed in the same scope), the scoped retention
+// frontier and the canonical flag (true only in DB mode). The route is
 // capability tier: admin keeps its existing access, and a controller
-// principal needs execution.events:read — GLOBALLY for the unscoped cursor
-// read, or scoped to the run's repository (or plain read access to that
-// repository) when run_id is supplied. Enforcement runs before any store
-// read.
+// principal needs execution.events:read — GLOBALLY for the unscoped read,
+// for the addressed repository when repo_id is supplied, or scoped to the
+// run's repository (or plain read access to it) when run_id is supplied.
+// Enforcement runs before any store read.
 func (s *Server) listEvents(w http.ResponseWriter, r *http.Request) {
-	if !s.requireExecutionEventsRead(w, r) {
+	scope, ok := s.requireExecutionEventsRead(w, r)
+	if !ok {
 		return
 	}
 	if !s.executionEventsSupported(w) {
 		return
 	}
-	after, ok := parseEventCursor(w, r)
+	after, ok := parseEventCursor(w, r, scope)
 	if !ok {
 		return
 	}
 	limit := storage.ClampExecutionEventLimit(queryInt(r, "limit"))
-	runID := strings.TrimSpace(r.URL.Query().Get("run_id"))
-	// ONE atomic read: page + retained_from + latest cursor share one
-	// consistency point, so a prune cannot interleave between the watermark
+	// ONE atomic read: page + scoped frontier + latest cursor share one
+	// consistency point, so a prune cannot interleave between the frontier
 	// check and the page read. Any store error fails closed (500): an
-	// unproven watermark or cursor must never be treated as 0.
-	events, cursor, retained, latest, err := s.readExecutionEventsRetention(r.Context(), after, limit, runID)
+	// unproven frontier or cursor must never be treated as 0.
+	events, cursor, retained, latest, err := s.readExecutionEventsRetention(r.Context(), after, limit, scope)
 	if err != nil {
 		s.internalError(w, r, err, "")
 		return
 	}
 	if storage.ExecutionEventCursorExpired(after, retained) {
-		s.writeCursorExpired(w, retained, latest)
+		s.writeCursorExpired(w, retained, latest, scope)
 		return
 	}
 	writeJSON(w, http.StatusOK, executionEventsResponse{
-		Events:       events,
-		NextCursor:   strconv.FormatInt(cursor, 10),
-		Canonical:    s.DB != nil,
-		LatestCursor: strconv.FormatInt(latest, 10),
-		RetainedFrom: strconv.FormatInt(retained, 10),
+		Events:           filterExecutionEventsInScope(events, scope),
+		NextCursor:       buildExecutionEventCursor(cursor, scope),
+		Canonical:        s.DB != nil,
+		LatestCursor:     buildExecutionEventCursor(latest, scope),
+		RetainedFrom:     strconv.FormatInt(retained, 10),
+		ScopeFingerprint: executionEventScopeFingerprint(scope),
+		ResumeStatus:     "resume_ok",
 	})
 }
 
@@ -232,16 +329,34 @@ func (s *Server) executionEventRetentionStore() (storage.RetentionExecutionEvent
 // readExecutionEventsRetention is the ONE list/stream read. It prefers the
 // store's atomic ExecutionEventRetentionReadStore (PostgreSQL single-snapshot
 // CTE; fs one repository-lock read); a store that only implements the legacy
-// split contracts (test fakes) falls back to watermark + page + latest reads
-// that still fail closed on ANY error, never defaulting to 0. A store that
-// lacks the execution event contract fails closed.
-func (s *Server) readExecutionEventsRetention(ctx context.Context, after int64, limit int, runID string) ([]model.ExecutionEvent, int64, int64, int64, error) {
+// split contracts (test fakes) falls back to frontier + page + latest reads
+// that still fail closed on ANY error, never defaulting to 0. Because the
+// legacy split contracts cannot filter by repository or prove a repository
+// frontier, a repository scope WITHOUT the atomic contract fails closed
+// (503) instead of leaking another repository's events or mis-expiring a
+// cursor; a run scope needs the scoped frontier contract (ScopedRetainedFrom)
+// and a global scope keeps the legacy ExecutionEventRetainedFrom fallback. A
+// store that lacks the execution event contract fails closed.
+func (s *Server) readExecutionEventsRetention(ctx context.Context, after int64, limit int, scope storage.ExecutionEventScope) ([]model.ExecutionEvent, int64, int64, int64, error) {
 	if s.DB != nil {
 		if rs, ok := s.DB.(storage.ExecutionEventRetentionReadStore); ok {
-			return rs.ReadExecutionEventsRetention(ctx, after, limit, runID)
+			return rs.ReadExecutionEventsRetention(ctx, after, limit, scope)
+		}
+		if scope.Kind == storage.ExecutionEventScopeRepo {
+			return nil, after, 0, 0, errUnsupportedExecutionEvents
 		}
 		var retained int64
-		if rs, ok := s.DB.(storage.RetentionExecutionEventStore); ok {
+		if scope.Kind == storage.ExecutionEventScopeRun {
+			rs, ok := s.DB.(storage.ExecutionEventScopedRetentionStore)
+			if !ok {
+				return nil, after, 0, 0, errUnsupportedExecutionEvents
+			}
+			r, err := rs.ScopedRetainedFrom(ctx, scope)
+			if err != nil {
+				return nil, after, 0, 0, err
+			}
+			retained = r
+		} else if rs, ok := s.DB.(storage.RetentionExecutionEventStore); ok {
 			r, err := rs.ExecutionEventRetainedFrom(ctx)
 			if err != nil {
 				return nil, after, 0, 0, err
@@ -252,7 +367,11 @@ func (s *Server) readExecutionEventsRetention(ctx context.Context, after int64, 
 		if !ok {
 			return nil, after, 0, 0, errUnsupportedExecutionEvents
 		}
-		events, cursor, err := es.ListExecutionEvents(ctx, after, limit, runID)
+		runFilter := ""
+		if scope.Kind == storage.ExecutionEventScopeRun {
+			runFilter = scope.RunID
+		}
+		events, cursor, err := es.ListExecutionEvents(ctx, after, limit, runFilter)
 		if err != nil {
 			return nil, after, 0, 0, err
 		}
@@ -264,26 +383,72 @@ func (s *Server) readExecutionEventsRetention(ctx context.Context, after int64, 
 			}
 			latest = l
 		}
-		return events, cursor, retained, latest, nil
+		return filterExecutionEventsInScope(events, scope), cursor, retained, latest, nil
 	}
 	if s.store == nil {
 		// Memory-only server: the event stream is unsupported (empty), and
 		// the cursor is the caller's position.
 		return []model.ExecutionEvent{}, after, 0, after, nil
 	}
-	return s.store.ReadExecutionEventsRetention(ctx, after, limit, runID)
+	return s.store.ReadExecutionEventsRetention(ctx, after, limit, scope)
+}
+
+// filterExecutionEventsInScope is the server-side defense-in-depth filter:
+// the store already scopes its page, and scoping again here guarantees a
+// repository- or run-scoped response can never contain another scope's event
+// even through a buggy or legacy store implementation.
+func filterExecutionEventsInScope(events []model.ExecutionEvent, scope storage.ExecutionEventScope) []model.ExecutionEvent {
+	if scope.Kind == storage.ExecutionEventScopeGlobal || len(events) == 0 {
+		return events
+	}
+	out := make([]model.ExecutionEvent, 0, len(events))
+	for _, e := range events {
+		if executionEventInScope(e, scope) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// executionEventInScope reports whether one execution event is visible in
+// the request's scope: global sees everything, a repository scope requires
+// the persisted repository id (an event with none belongs to no repository),
+// a run scope requires the run id.
+func executionEventInScope(e model.ExecutionEvent, scope storage.ExecutionEventScope) bool {
+	switch scope.Kind {
+	case storage.ExecutionEventScopeRepo:
+		return e.RepoID == scope.RepoID
+	case storage.ExecutionEventScopeRun:
+		return e.RunID == scope.RunID
+	default:
+		return true
+	}
 }
 
 // writeCursorExpired answers the retention refusal for list and stream
-// consumers: HTTP 410 with the fixed cursor_expired reason and the watermark
-// plus latest_cursor the consumer must re-bootstrap from. Both values come
-// from the atomic read that proved the expiry, so they cannot disagree with
-// the page the consumer would have read.
-func (s *Server) writeCursorExpired(w http.ResponseWriter, retainedFrom, latest int64) {
+// consumers: HTTP 410 with the fixed cursor_expired wire error, the
+// snapshot-required reason, the SCOPED frontier and the typed latest_cursor
+// of the request's scope. All values come from the atomic read that proved
+// the expiry, so they cannot disagree with the page the consumer would have
+// read.
+func (s *Server) writeCursorExpired(w http.ResponseWriter, retainedFrom, latest int64, scope storage.ExecutionEventScope) {
 	writeJSON(w, http.StatusGone, cursorExpiredResponse{
-		Error:        "cursor_expired",
-		RetainedFrom: strconv.FormatInt(retainedFrom, 10),
-		LatestCursor: strconv.FormatInt(latest, 10),
+		Error:            "cursor_expired",
+		Reason:           "cursor_expired_snapshot_required",
+		RetainedFrom:     strconv.FormatInt(retainedFrom, 10),
+		LatestCursor:     buildExecutionEventCursor(latest, scope),
+		ScopeFingerprint: executionEventScopeFingerprint(scope),
+	})
+}
+
+// writeCursorScopeMismatch answers a cursor bound to a different scope (or a
+// legacy bare integer under a non-global scope): HTTP 409, so the consumer
+// re-bootstraps for the requested scope instead of silently paging another
+// scope's stream.
+func writeCursorScopeMismatch(w http.ResponseWriter, scope storage.ExecutionEventScope) {
+	writeJSON(w, http.StatusConflict, cursorScopeMismatchResponse{
+		Error:            "cursor_scope_mismatch",
+		ScopeFingerprint: executionEventScopeFingerprint(scope),
 	})
 }
 
@@ -309,14 +474,17 @@ var errUnsupportedExecutionSnapshot = errors.New("server: store lacks the execut
 // bootstrap endpoint a controller starts from. It returns the event cursor
 // and the active-run/state summary from ONE consistency point (cursor read
 // FIRST; see ExecutionSnapshotStore) so a consumer that then pages
-// GET /api/v1/events?after=cursor cannot miss a transition committed between
-// the two reads. The route is capability tier: no repository is addressed,
-// so execution.events:read must be held GLOBALLY (or admin).
+// GET /api/v1/events?after=resume_cursor cannot miss a transition committed
+// between the two reads. The route is capability tier: without repo_id no
+// repository is addressed, so execution.events:read must be held GLOBALLY
+// (or admin); with repo_id the request is authorized exactly like a
+// repository-scoped event read.
 func (s *Server) executionSnapshot(w http.ResponseWriter, r *http.Request) {
-	if !s.requireExecutionEventsRead(w, r) {
+	repoID, ok := s.requireExecutionSnapshotRead(w, r)
+	if !ok {
 		return
 	}
-	snap, err := s.buildExecutionSnapshot(r.Context(), storage.DefaultExecutionSnapshotRuns)
+	snap, err := s.buildExecutionSnapshot(r.Context(), storage.DefaultExecutionSnapshotRuns, repoID)
 	if err != nil {
 		if errors.Is(err, errUnsupportedExecutionSnapshot) {
 			http.Error(w, "store does not support the execution snapshot", http.StatusServiceUnavailable)
@@ -328,10 +496,18 @@ func (s *Server) executionSnapshot(w http.ResponseWriter, r *http.Request) {
 	if snap.Runs == nil {
 		snap.Runs = []storage.ExecutionSnapshotRun{}
 	}
+	scope := storage.ExecutionEventScope{Kind: storage.ExecutionEventScopeGlobal}
+	if repoID != "" {
+		scope = storage.ExecutionEventScope{Kind: storage.ExecutionEventScopeRepo, RepoID: repoID}
+	}
+	resume := buildExecutionEventCursor(snap.Cursor, scope)
 	writeJSON(w, http.StatusOK, executionSnapshotResponse{
-		Cursor:      strconv.FormatInt(snap.Cursor, 10),
-		GeneratedAt: snap.GeneratedAt,
-		Runs:        snap.Runs,
+		Cursor:           resume,
+		ResumeCursor:     resume,
+		ThroughSequence:  snap.Cursor,
+		ScopeFingerprint: executionEventScopeFingerprint(scope),
+		GeneratedAt:      snap.GeneratedAt,
+		Runs:             snap.Runs,
 		Counts: executionSnapshotCounts{
 			Queued:  snap.Queued,
 			Running: snap.Running,
@@ -344,14 +520,16 @@ func (s *Server) executionSnapshot(w http.ResponseWriter, r *http.Request) {
 // DB store without the contract fails closed (503) rather than serving a
 // non-atomic summary. fs/memory mode builds it under s.mu (the same lock
 // every transition and fs event append takes), reading the cursor FIRST from
-// the repository's monotonic watermark.
-func (s *Server) buildExecutionSnapshot(ctx context.Context, runLimit int) (storage.ExecutionSnapshot, error) {
+// the repository's monotonic watermark. repoID empty keeps the global
+// summary; otherwise only runs (and jobs of runs) with that repository
+// identity are included.
+func (s *Server) buildExecutionSnapshot(ctx context.Context, runLimit int, repoID string) (storage.ExecutionSnapshot, error) {
 	if s.DB != nil {
 		ss, ok := s.DB.(storage.ExecutionSnapshotStore)
 		if !ok {
 			return storage.ExecutionSnapshot{}, errUnsupportedExecutionSnapshot
 		}
-		return ss.ExecutionSnapshot(ctx, runLimit)
+		return ss.ExecutionSnapshot(ctx, runLimit, repoID)
 	}
 	if runLimit <= 0 || runLimit > storage.MaxExecutionSnapshotRuns {
 		runLimit = storage.DefaultExecutionSnapshotRuns
@@ -371,7 +549,12 @@ func (s *Server) buildExecutionSnapshot(ctx context.Context, runLimit int) (stor
 	}
 	snap := storage.ExecutionSnapshot{Cursor: cursor, GeneratedAt: time.Now().UTC(), Runs: []storage.ExecutionSnapshotRun{}}
 	runs := make([]storage.ExecutionSnapshotRun, 0, len(s.runs))
+	matching := make(map[string]bool, len(s.runs))
 	for _, run := range s.runs {
+		if repoID != "" && executionSnapshotRunRepoID(run) != repoID {
+			continue
+		}
+		matching[run.ID] = true
 		if run.Status.Terminal() {
 			continue
 		}
@@ -389,6 +572,9 @@ func (s *Server) buildExecutionSnapshot(ctx context.Context, runLimit int) (stor
 		runs = runs[:runLimit]
 	}
 	for _, j := range s.jobs {
+		if repoID != "" && !matching[j.RunID] {
+			continue
+		}
 		switch j.Status {
 		case model.StatusQueued:
 			snap.Queued++
@@ -400,17 +586,55 @@ func (s *Server) buildExecutionSnapshot(ctx context.Context, runLimit int) (stor
 	return snap, nil
 }
 
-// parseEventCursor parses the optional ?after cursor: empty or "0" starts
-// from the oldest retained event, a negative or non-numeric value is a 400
-// (a cursor typo must never silently restart the stream).
-func parseEventCursor(w http.ResponseWriter, r *http.Request) (int64, bool) {
+// executionSnapshotRunRepoID is the repository dimension of one fs/memory
+// run for the snapshot filter, matching the stored payload repo_id the SQL
+// form filters on: the immutable RepoID when present, otherwise the derived
+// canonical identity.
+func executionSnapshotRunRepoID(run model.Run) string {
+	return repoIDFor(run.RepoID, run.Repo, run.RepoFullName)
+}
+
+// parseEventCursor parses the optional ?after cursor for the request's
+// scope:
+//
+//   - empty starts fresh (0);
+//   - a typed xe1:<seq>:<fingerprint> cursor must match the request scope's
+//     fingerprint, otherwise 409 cursor_scope_mismatch (a cursor must never
+//     be replayed against a different visibility scope);
+//   - a legacy bare integer is accepted ONLY for the global scope and is
+//     treated as unbound, so consumers that never left the global stream
+//     keep working;
+//   - anything else is a 400 (a cursor typo must never silently restart the
+//     stream).
+func parseEventCursor(w http.ResponseWriter, r *http.Request, scope storage.ExecutionEventScope) (int64, bool) {
 	raw := strings.TrimSpace(r.URL.Query().Get("after"))
 	if raw == "" {
 		return 0, true
 	}
+	if strings.HasPrefix(raw, executionEventCursorPrefix) {
+		seqPart, fingerprint, ok := strings.Cut(strings.TrimPrefix(raw, executionEventCursorPrefix), ":")
+		if !ok || seqPart == "" || fingerprint == "" {
+			http.Error(w, "invalid after cursor", http.StatusBadRequest)
+			return 0, false
+		}
+		seq, err := strconv.ParseInt(seqPart, 10, 64)
+		if err != nil || seq < 0 {
+			http.Error(w, "invalid after cursor", http.StatusBadRequest)
+			return 0, false
+		}
+		if fingerprint != executionEventScopeFingerprint(scope) {
+			writeCursorScopeMismatch(w, scope)
+			return 0, false
+		}
+		return seq, true
+	}
 	after, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || after < 0 {
 		http.Error(w, "invalid after cursor", http.StatusBadRequest)
+		return 0, false
+	}
+	if scope.Kind != storage.ExecutionEventScopeGlobal {
+		writeCursorScopeMismatch(w, scope)
 		return 0, false
 	}
 	return after, true
@@ -423,20 +647,26 @@ func queryInt(r *http.Request, key string) int {
 
 // streamExecutionEvents serves GET /api/v1/events/stream as Server-Sent
 // Events, reusing the logs stream pattern: one `event: execution` frame per
-// event carrying the ExecutionEvent JSON, `id: <seq>` so a reconnect can
-// resume with ?after=<last-id> without gaps or duplicates, a 250ms poll, and
-// a 30s idle timeout. The route is capability tier with the same run_id scope
-// as the cursor-pull list endpoint; authorization runs before any streaming
-// begins (before the 200 is committed).
+// event carrying the ExecutionEvent JSON, `id: <typed cursor>` (the SAME
+// xe1:<seq>:<fingerprint> form the list endpoint issues, so a reconnect with
+// ?after=<last id> is valid for the stream's scope) and a 250ms poll, and a
+// 30s idle timeout. The route is capability tier with the same
+// run_id/repo_id scope as the cursor-pull list endpoint; authorization runs
+// before any streaming begins (before the 200 is committed), and the store
+// read is scope-filtered (plus a defensive server-side scope predicate), so
+// a repository-scoped stream can never emit another repository's events.
 //
-// Retention is checked ATOMICALLY both at establishment (before the 200, so
-// an expired reconnect observes HTTP 410 cursor_expired with the watermark
-// and latest cursor) and on every poll: a live tail whose cursor falls below
-// a newly advanced watermark receives a terminal `event: cursor_expired`
-// frame instead of silently skipping the pruned prefix. A non-expired cursor
-// keeps streaming normally.
+// Retention is checked ATOMICALLY against the SCOPED frontier both at
+// establishment (before the 200, so an expired reconnect observes HTTP 410
+// cursor_expired with the scoped frontier and latest cursor) and on every
+// poll: a live tail whose cursor falls below a newly advanced SCOPE frontier
+// receives a terminal `event: cursor_expired` frame instead of silently
+// skipping the pruned prefix. A global prune that removed only other scopes'
+// events leaves the scoped frontier unchanged, so the tail keeps
+// streaming.
 func (s *Server) streamExecutionEvents(w http.ResponseWriter, r *http.Request) {
-	if !s.requireExecutionEventsRead(w, r) {
+	scope, ok := s.requireExecutionEventsRead(w, r)
+	if !ok {
 		return
 	}
 	if s.DB == nil && s.store == nil {
@@ -446,25 +676,25 @@ func (s *Server) streamExecutionEvents(w http.ResponseWriter, r *http.Request) {
 	if !s.executionEventsSupported(w) {
 		return
 	}
-	after, ok := parseEventCursor(w, r)
+	after, ok := parseEventCursor(w, r, scope)
 	if !ok {
 		return
 	}
 	// Retention refusal BEFORE the 200 is committed, through the atomic read:
 	// an SSE reconnect with an expired cursor must observe HTTP 410
-	// cursor_expired (with the watermark and the latest cursor from the same
-	// consistency point), never a stream that silently resumes past the lost
-	// prefix. The page read is discarded; the loop re-reads from `after`.
-	_, _, retained, latest, err := s.readExecutionEventsRetention(r.Context(), after, 1, "")
+	// cursor_expired (with the scoped frontier and the latest cursor from the
+	// same consistency point), never a stream that silently resumes past the
+	// lost prefix. The page read is discarded; the loop re-reads from
+	// `after`.
+	_, _, retained, latest, err := s.readExecutionEventsRetention(r.Context(), after, 1, scope)
 	if err != nil {
 		s.internalError(w, r, err, "")
 		return
 	}
 	if storage.ExecutionEventCursorExpired(after, retained) {
-		s.writeCursorExpired(w, retained, latest)
+		s.writeCursorExpired(w, retained, latest, scope)
 		return
 	}
-	runID := strings.TrimSpace(r.URL.Query().Get("run_id"))
 	fl, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -478,7 +708,7 @@ func (s *Server) streamExecutionEvents(w http.ResponseWriter, r *http.Request) {
 
 	last := time.Now()
 	for {
-		events, cursor, retained, latest, err := s.readExecutionEventsRetention(r.Context(), after, executionEventStreamMaxChunk, runID)
+		events, cursor, retained, latest, err := s.readExecutionEventsRetention(r.Context(), after, executionEventStreamMaxChunk, scope)
 		if err != nil {
 			if r.Context().Err() != nil {
 				return
@@ -488,13 +718,15 @@ func (s *Server) streamExecutionEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if storage.ExecutionEventCursorExpired(after, retained) {
-			// A prune advanced the watermark past this live tail's cursor:
-			// terminate with the same cursor_expired contract the HTTP entry
-			// uses (the status cannot change after the 200).
+			// A prune advanced the SCOPED frontier past this live tail's
+			// cursor: terminate with the same cursor_expired contract the
+			// HTTP entry uses (the status cannot change after the 200).
 			body, _ := jsonMarshal(cursorExpiredResponse{
-				Error:        "cursor_expired",
-				RetainedFrom: strconv.FormatInt(retained, 10),
-				LatestCursor: strconv.FormatInt(latest, 10),
+				Error:            "cursor_expired",
+				Reason:           "cursor_expired_snapshot_required",
+				RetainedFrom:     strconv.FormatInt(retained, 10),
+				LatestCursor:     buildExecutionEventCursor(latest, scope),
+				ScopeFingerprint: executionEventScopeFingerprint(scope),
 			})
 			fmt.Fprintf(w, "event: cursor_expired\ndata: %s\n\n", body)
 			fl.Flush()
@@ -502,11 +734,18 @@ func (s *Server) streamExecutionEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(events) > 0 {
 			for _, e := range events {
+				if !executionEventInScope(e, scope) {
+					continue
+				}
 				b, merr := jsonMarshal(e)
 				if merr != nil {
 					continue
 				}
-				fmt.Fprintf(w, "id: %d\nevent: execution\ndata: %s\n\n", e.Seq, b)
+				// The SSE id is the SAME typed cursor the list endpoint
+				// issues, so a reconnect with ?after=<last id> is valid for
+				// the stream's scope (a numeric id could not be replayed
+				// under a repository or run scope).
+				fmt.Fprintf(w, "id: %s\nevent: execution\ndata: %s\n\n", buildExecutionEventCursor(e.Seq, scope), b)
 			}
 			after = cursor
 			fl.Flush()
@@ -523,4 +762,102 @@ func (s *Server) streamExecutionEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+// requireExecutionEventsRead enforces GET /api/v1/events and
+// /api/v1/events/stream and returns the resolved storage scope the read (and
+// every cursor it issues or accepts) is bound to:
+//
+//   - run_id resolves a run scope: the run's canonical repository identity is
+//     used for the authorization decision, which is accepted with the
+//     capability scoped to that repository OR plain READ access to it; a
+//     run_id that cannot be resolved (unknown run, store error) fails closed
+//     — only a global capability (or admin) covers a scope that cannot be
+//     established;
+//   - without run_id, a repo_id query parameter resolves a repository scope
+//     with the same decision (capability for that repository or read access
+//     to it);
+//   - with neither, the read spans every repository and only a GLOBAL
+//     execution.events:read capability (or admin) is accepted.
+func (s *Server) requireExecutionEventsRead(w http.ResponseWriter, r *http.Request) (storage.ExecutionEventScope, bool) {
+	runID := strings.TrimSpace(r.URL.Query().Get("run_id"))
+	repoID := strings.TrimSpace(r.URL.Query().Get("repo_id"))
+	p, ok := auth.PrincipalFrom(r)
+	if !ok {
+		// Legacy/admin/web-session access: the tier gate already decided.
+		// The scope is still resolved so typed cursors bind consistently.
+		return s.executionRequestScope(r, runID, repoID), true
+	}
+	if runID != "" {
+		run, err := s.runForAuth(r.Context(), runID)
+		if err != nil {
+			if auth.AuthorizeCapability(p, auth.CapExecutionEventsRead, "") {
+				return storage.ExecutionEventScope{Kind: storage.ExecutionEventScopeRun, RunID: runID}, true
+			}
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return storage.ExecutionEventScope{}, false
+		}
+		repo := repoIDForRun(run)
+		if auth.AuthorizeCapability(p, auth.CapExecutionEventsRead, repo) || auth.CanReadRepo(p, repo) {
+			return storage.ExecutionEventScope{Kind: storage.ExecutionEventScopeRun, RepoID: repo, RunID: runID}, true
+		}
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return storage.ExecutionEventScope{}, false
+	}
+	if repoID != "" {
+		if auth.AuthorizeCapability(p, auth.CapExecutionEventsRead, repoID) || auth.CanReadRepo(p, repoID) {
+			return storage.ExecutionEventScope{Kind: storage.ExecutionEventScopeRepo, RepoID: repoID}, true
+		}
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return storage.ExecutionEventScope{}, false
+	}
+	if auth.AuthorizeCapability(p, auth.CapExecutionEventsRead, "") {
+		return storage.ExecutionEventScope{Kind: storage.ExecutionEventScopeGlobal}, true
+	}
+	http.Error(w, "forbidden", http.StatusForbidden)
+	return storage.ExecutionEventScope{}, false
+}
+
+// executionRequestScope resolves the request's storage scope without an
+// authorization decision (the no-principal path): run_id wins, then repo_id,
+// then global. The run's repository is resolved best-effort for cursor
+// binding; an unknown run yields an empty repository in the run scope.
+func (s *Server) executionRequestScope(r *http.Request, runID, repoID string) storage.ExecutionEventScope {
+	if runID != "" {
+		scope := storage.ExecutionEventScope{Kind: storage.ExecutionEventScopeRun, RunID: runID}
+		if run, err := s.runForAuth(r.Context(), runID); err == nil {
+			scope.RepoID = repoIDForRun(run)
+		}
+		return scope
+	}
+	if repoID != "" {
+		return storage.ExecutionEventScope{Kind: storage.ExecutionEventScopeRepo, RepoID: repoID}
+	}
+	return storage.ExecutionEventScope{Kind: storage.ExecutionEventScopeGlobal}
+}
+
+// requireExecutionSnapshotRead enforces GET /api/v1/execution-snapshot and
+// returns the repository scope ("" = global). A repo_id parameter is
+// authorized exactly like a repository-scoped event read (capability for
+// that repository OR plain read access to it), so the snapshot can never
+// expose more than the event stream of the same repository; the unscoped
+// form spans every repository and requires a GLOBAL capability (or admin).
+func (s *Server) requireExecutionSnapshotRead(w http.ResponseWriter, r *http.Request) (string, bool) {
+	repoID := strings.TrimSpace(r.URL.Query().Get("repo_id"))
+	p, ok := auth.PrincipalFrom(r)
+	if !ok {
+		return repoID, true
+	}
+	if repoID == "" {
+		if auth.AuthorizeCapability(p, auth.CapExecutionEventsRead, "") {
+			return "", true
+		}
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return "", false
+	}
+	if auth.AuthorizeCapability(p, auth.CapExecutionEventsRead, repoID) || auth.CanReadRepo(p, repoID) {
+		return repoID, true
+	}
+	http.Error(w, "forbidden", http.StatusForbidden)
+	return "", false
 }

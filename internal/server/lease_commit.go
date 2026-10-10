@@ -72,3 +72,13 @@ func (s *Server) leaseActiveAtCommit(ctx context.Context, jobID, runnerID, token
 func leaseLostAtCommit(err error) bool {
 	return errors.Is(err, storage.ErrLeaseLost)
 }
+
+// leaseCommitRefused reports whether a store error is a commit-time
+// lease-fence refusal that must answer the standard stale-lease 409: the
+// predicate found no live lease for the addressed (runner, generation)
+// (ErrLeaseLost), or the fenced write carried identity fields that disagree
+// with the LOCKED job whose lease was proven
+// (ErrLeaseIdentityMismatch). Both commit nothing.
+func leaseCommitRefused(err error) bool {
+	return errors.Is(err, storage.ErrLeaseLost) || errors.Is(err, storage.ErrLeaseIdentityMismatch)
+}

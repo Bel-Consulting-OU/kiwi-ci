@@ -234,7 +234,7 @@ type gapStreamReadStore struct {
 	retained int64
 }
 
-func (g *gapStreamReadStore) ReadExecutionEventsRetention(ctx context.Context, afterSeq int64, limit int, runID string) ([]model.ExecutionEvent, int64, int64, int64, error) {
+func (g *gapStreamReadStore) ReadExecutionEventsRetention(ctx context.Context, afterSeq int64, limit int, scope storage.ExecutionEventScope) ([]model.ExecutionEvent, int64, int64, int64, error) {
 	g.calls++
 	if g.calls >= 2 {
 		if g.readErr != nil {
@@ -242,7 +242,7 @@ func (g *gapStreamReadStore) ReadExecutionEventsRetention(ctx context.Context, a
 		}
 		return []model.ExecutionEvent{}, afterSeq, g.retained, g.retained, nil
 	}
-	return g.eventsRetentionFakeStore.ReadExecutionEventsRetention(ctx, afterSeq, limit, runID)
+	return g.eventsRetentionFakeStore.ReadExecutionEventsRetention(ctx, afterSeq, limit, scope)
 }
 
 func TestGapStreamExecutionEventsLiveReadError(t *testing.T) {

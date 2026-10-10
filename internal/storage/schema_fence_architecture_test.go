@@ -107,6 +107,7 @@ var rawReadAllowlist = map[string]bool{
 	"GetGeneratedFragment":         true,
 	"LatestExecutionEventSeq":      true, // SELECT cursor.value read only
 	"ExecutionEventRetainedFrom":   true, // SELECT retained_from read only
+	"ScopedRetainedFrom":           true, // SELECT-only scoped frontier read
 	"ReadExecutionEventsRetention": true, // single-snapshot SELECT-only CTE
 	"LatestLogSeq":                 true, // SELECT log_cursors.value read only
 	"RunKeyIndexPresent":           true, // SELECT to_regclass read only

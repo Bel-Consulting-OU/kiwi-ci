@@ -27,6 +27,12 @@ untrusted code.
   untrusted floor, mTLS runner enrollment, HMAC-only lease tokens,
   sealed secret delivery, OIDC token issuance, and hardened archive
   extraction. See [docs/security-model.md](docs/security-model.md).
+- **Invariants**: the core correctness invariants (terminal outcomes, atomic
+  ledgers, lease fencing, scoped event recovery, replay safety, graph-history
+  stability, cancellation monotonicity, credential scoping, cache namespaces)
+  are mapped to their enforcing code and regression tests in
+  [docs/INVARIANTS.md](docs/INVARIANTS.md). A core change that does not update
+  that mapping is treated as a broken invariant.
 - **Forge integrations**: GitHub (App auth, Checks API), GitLab, and
   Forgejo webhooks with verified signatures, trigger matching, and
   deduplicated deliveries.

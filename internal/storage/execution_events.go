@@ -58,23 +58,78 @@ type ExecutionEventStore interface {
 	AppendExecutionEvent(ctx context.Context, e model.ExecutionEvent) error
 }
 
+// ExecutionEventScopeKind names the visibility scope of an execution event
+// read: the whole stream, one repository or one run.
+type ExecutionEventScopeKind int
+
+const (
+	// ExecutionEventScopeGlobal: every repository (the unscoped stream).
+	ExecutionEventScopeGlobal ExecutionEventScopeKind = iota
+	// ExecutionEventScopeRepo: events whose owning run belongs to RepoID.
+	ExecutionEventScopeRepo
+	// ExecutionEventScopeRun: events of the single run RunID (RepoID carries
+	// the run's repository identity for authorization and cursor binding,
+	// but the storage filter is the run id alone).
+	ExecutionEventScopeRun
+)
+
+// ExecutionEventScope is the request's visibility scope for an execution
+// event read. It is the storage counterpart of the HTTP scope: a global
+// read needs no identifiers, a repository read needs RepoID, a run read
+// needs RunID (and the run's canonical repository in RepoID for the typed
+// cursor binding).
+type ExecutionEventScope struct {
+	Kind   ExecutionEventScopeKind
+	RepoID string
+	RunID  string
+}
+
+// ScopeKey renders the canonical, deterministic key a typed cursor is bound
+// to: "global", "repo:<repoID>" or "run:<repoID>/<runID>". The key is
+// deliberately NOT token-bound, so a principal's credentials can rotate
+// without invalidating cursors issued to the same scope.
+func (s ExecutionEventScope) ScopeKey() string {
+	switch s.Kind {
+	case ExecutionEventScopeRepo:
+		return "repo:" + s.RepoID
+	case ExecutionEventScopeRun:
+		return "run:" + s.RepoID + "/" + s.RunID
+	default:
+		return "global"
+	}
+}
+
 // ExecutionEventRetentionReadStore is the ATOMIC retention read contract: it
-// returns the page, the retention watermark and the latest monotonic cursor
-// from ONE consistency point, so a concurrent prune can never produce a
-// silently truncated page (rows missing while the watermark still reads old)
-// or a regressed latest cursor.
+// returns the page, the SCOPED retention frontier and the latest monotonic
+// cursor from ONE consistency point, so a concurrent prune can never produce
+// a silently truncated page (rows missing while the frontier still reads
+// old) or a regressed latest cursor. The returned retainedFrom is the
+// frontier of the requested scope: the global retained_from watermark for a
+// global read, MAX(pruned max_seq) over the repository's runs for a
+// repository read, and the run's own pruned row for a run read (0 when
+// nothing of that scope was pruned).
 //
 // Readers MUST treat any error as unreadable state (fail closed, never
-// default a watermark or cursor to 0): an unproven watermark could hide lost
+// default a frontier or cursor to 0): an unproven frontier could hide lost
 // events. Expiry is decided by the caller from the returned retainedFrom
-// with ExecutionEventCursorExpired; because the page and the watermark share
+// with ExecutionEventCursorExpired; because the page and the frontier share
 // one snapshot, a returned non-expired cursor guarantees every event above
 // it that existed at the snapshot is returned or is beyond the page bound.
 //
 // The PostgreSQL implementation is one CTE statement (one snapshot);
 // the filesystem implementation is one repository-lock read.
 type ExecutionEventRetentionReadStore interface {
-	ReadExecutionEventsRetention(ctx context.Context, afterSeq int64, limit int, runID string) (events []model.ExecutionEvent, nextCursor int64, retainedFrom int64, latestCursor int64, err error)
+	ReadExecutionEventsRetention(ctx context.Context, afterSeq int64, limit int, scope ExecutionEventScope) (events []model.ExecutionEvent, nextCursor int64, retainedFrom int64, latestCursor int64, err error)
+}
+
+// ExecutionEventScopedRetentionStore is the optional frontier-only contract
+// for a scope-aware resume decision without a page read (kept separate from
+// RetentionExecutionEventStore so a legacy store that only knows the global
+// watermark still satisfies that interface). Global reads may fall back to
+// ExecutionEventRetainedFrom; repository and run reads that cannot prove
+// their frontier MUST fail closed instead of defaulting to 0.
+type ExecutionEventScopedRetentionStore interface {
+	ScopedRetainedFrom(ctx context.Context, scope ExecutionEventScope) (int64, error)
 }
 
 // ExecutionEventCursorStore is the optional companion contract for reading
@@ -132,9 +187,13 @@ const (
 
 // ExecutionSnapshotStore is the atomic bootstrap contract implemented by
 // PostgreSQL (one transaction, cursor first). The server builds the same
-// snapshot under its state lock for fs/memory mode.
+// snapshot under its state lock for fs/memory mode. An empty repoID keeps
+// the global behavior (every run, every job counted); a non-empty repoID
+// restricts the active-run list AND both job counts to that repository, so
+// the snapshot exposes exactly the visibility of a repository-scoped event
+// read.
 type ExecutionSnapshotStore interface {
-	ExecutionSnapshot(ctx context.Context, runLimit int) (ExecutionSnapshot, error)
+	ExecutionSnapshot(ctx context.Context, runLimit int, repoID string) (ExecutionSnapshot, error)
 }
 
 // RetentionExecutionEventStore is the optional windowed-retention contract.
@@ -253,16 +312,19 @@ func ExecutionEventTimingPayload(startedAt, finishedAt *time.Time) map[string]st
 }
 
 var (
-	_ ExecutionEventStore              = (*PostgresStore)(nil)
-	_ ExecutionEventStore              = (*Repository)(nil)
-	_ ExecutionEventRetentionReadStore = (*PostgresStore)(nil)
-	_ ExecutionEventRetentionReadStore = (*Repository)(nil)
-	_ RetentionExecutionEventStore     = (*PostgresStore)(nil)
-	_ RetentionExecutionEventStore     = (*Repository)(nil)
-	_ RetentionExecutionEventStore     = (*memStore)(nil)
-	_ ExecutionSnapshotStore           = (*PostgresStore)(nil)
-	_ ExecutionEventCursorStore        = (*PostgresStore)(nil)
-	_ ExecutionEventCursorStore        = (*Repository)(nil)
+	_ ExecutionEventStore                = (*PostgresStore)(nil)
+	_ ExecutionEventStore                = (*Repository)(nil)
+	_ ExecutionEventRetentionReadStore   = (*PostgresStore)(nil)
+	_ ExecutionEventRetentionReadStore   = (*Repository)(nil)
+	_ ExecutionEventScopedRetentionStore = (*PostgresStore)(nil)
+	_ ExecutionEventScopedRetentionStore = (*Repository)(nil)
+	_ ExecutionEventScopedRetentionStore = (*memStore)(nil)
+	_ RetentionExecutionEventStore       = (*PostgresStore)(nil)
+	_ RetentionExecutionEventStore       = (*Repository)(nil)
+	_ RetentionExecutionEventStore       = (*memStore)(nil)
+	_ ExecutionSnapshotStore             = (*PostgresStore)(nil)
+	_ ExecutionEventCursorStore          = (*PostgresStore)(nil)
+	_ ExecutionEventCursorStore          = (*Repository)(nil)
 )
 
 // ListExecutionEvents implements ExecutionEventStore for PostgreSQL with a
@@ -272,7 +334,7 @@ var (
 func (s *PostgresStore) ListExecutionEvents(ctx context.Context, afterSeq int64, limit int, runID string) ([]model.ExecutionEvent, int64, error) {
 	limit = ClampExecutionEventLimit(limit)
 	rows, err := s.pool.Query(ctx, `
-		SELECT seq, schema_version, COALESCE(run_id, ''), COALESCE(job_id, ''), attempt, event_type,
+		SELECT seq, schema_version, COALESCE(run_id, ''), COALESCE(job_id, ''), COALESCE(repo_id, ''), attempt, event_type,
 		       COALESCE(from_status, ''), COALESCE(to_status, ''), COALESCE(actor, ''),
 		       COALESCE(payload, '{}'::jsonb), created_at
 		FROM execution_events
@@ -290,7 +352,7 @@ func (s *PostgresStore) ListExecutionEvents(ctx context.Context, afterSeq int64,
 			e       model.ExecutionEvent
 			payload []byte
 		)
-		if err := rows.Scan(&e.Seq, &e.SchemaVersion, &e.RunID, &e.JobID, &e.Attempt, &e.Type,
+		if err := rows.Scan(&e.Seq, &e.SchemaVersion, &e.RunID, &e.JobID, &e.RepoID, &e.Attempt, &e.Type,
 			&e.FromStatus, &e.ToStatus, &e.Actor, &payload, &e.CreatedAt); err != nil {
 			return nil, afterSeq, err
 		}
@@ -310,39 +372,52 @@ func (s *PostgresStore) ListExecutionEvents(ctx context.Context, afterSeq int64,
 
 // ReadExecutionEventsRetention implements ExecutionEventRetentionReadStore
 // for PostgreSQL as ONE CTE statement: the cursor row (value, retained_from),
-// the bounded page and the run filter are read from a single snapshot, so a
-// concurrent prune transaction either commits entirely before the snapshot
-// (page lacks the removed rows AND retained_from is already advanced: the
-// caller sees a truthful expired cursor) or entirely after it (page still
-// contains the rows AND the watermark is still old). The interleaving that
-// produced the P1 (watermark read, then prune commits, then page read) is
-// impossible.
+// the SCOPED frontier, the bounded page and the scope filter are read from a
+// single snapshot, so a concurrent prune transaction either commits entirely
+// before the snapshot (page lacks the removed rows AND the frontier is
+// already advanced: the caller sees a truthful expired cursor) or entirely
+// after it (page still contains the rows AND the frontier is still old). The
+// interleaving that produced the P1 (watermark read, then prune commits,
+// then page read) is impossible.
 //
 // latestCursor comes from execution_event_cursor.value — the monotonic
 // commit-ordered high-water written by every event transaction — never from
 // MAX(seq) over retained rows, so pruning every row cannot make it regress.
 // Any read/scan error is returned (fail closed): the caller must never
-// treat an unreadable watermark as 0.
-func (s *PostgresStore) ReadExecutionEventsRetention(ctx context.Context, afterSeq int64, limit int, runID string) ([]model.ExecutionEvent, int64, int64, int64, error) {
+// treat an unreadable frontier as 0.
+func (s *PostgresStore) ReadExecutionEventsRetention(ctx context.Context, afterSeq int64, limit int, scope ExecutionEventScope) ([]model.ExecutionEvent, int64, int64, int64, error) {
 	limit = ClampExecutionEventLimit(limit)
+	kind, repo, runID := scopeColumns(scope)
 	row := s.pool.QueryRow(ctx, `
 		WITH cursor_state AS (
 			SELECT COALESCE((SELECT value FROM execution_event_cursor WHERE id = TRUE), 0) AS value,
 			       COALESCE((SELECT retained_from FROM execution_event_cursor WHERE id = TRUE), 0) AS retained_from
+		), scoped_state AS (
+			SELECT c.value, c.retained_from,
+			       CASE $3::int
+			           WHEN 0 THEN c.retained_from
+			           WHEN 1 THEN COALESCE((SELECT MAX(max_seq) FROM execution_event_pruned WHERE repo_id = $4), 0)
+			           ELSE COALESCE((SELECT max_seq FROM execution_event_pruned WHERE run_id = $5), 0)
+			       END AS scoped_retained
+			FROM cursor_state c
 		), page AS (
 			SELECT seq, schema_version, COALESCE(run_id, '') AS run_id, COALESCE(job_id, '') AS job_id,
-			       attempt, event_type AS type, COALESCE(from_status, '') AS from_status, COALESCE(to_status, '') AS to_status,
+			       COALESCE(repo_id, '') AS repo_id, attempt, event_type AS type,
+			       COALESCE(from_status, '') AS from_status, COALESCE(to_status, '') AS to_status,
 			       COALESCE(actor, '') AS actor, COALESCE(payload, '{}'::jsonb) AS payload, created_at
 			FROM execution_events
-			WHERE seq > $1 AND ($2 = '' OR run_id = $2)
+			WHERE seq > $1
+			  AND ($3::int = 0
+			       OR ($3::int = 1 AND COALESCE(repo_id, '') = $4)
+			       OR ($3::int = 2 AND run_id = $5))
 			ORDER BY seq ASC
-			LIMIT $3
+			LIMIT $2
 		)
-		SELECT c.value, c.retained_from,
+		SELECT s.value, s.scoped_retained,
 		       COALESCE(jsonb_agg(to_jsonb(p) ORDER BY p.seq) FILTER (WHERE p.seq IS NOT NULL), '[]'::jsonb)
-		FROM cursor_state c
+		FROM scoped_state s
 		LEFT JOIN page p ON TRUE
-		GROUP BY c.value, c.retained_from`, afterSeq, runID, limit)
+		GROUP BY s.value, s.scoped_retained`, afterSeq, limit, kind, repo, runID)
 	var (
 		latest, retained int64
 		raw              []byte
@@ -361,6 +436,19 @@ func (s *PostgresStore) ReadExecutionEventsRetention(ctx context.Context, afterS
 		cursor = out[len(out)-1].Seq
 	}
 	return out, cursor, retained, latest, nil
+}
+
+// scopeColumns renders a scope as the (kind, repo, run) parameter triple the
+// scope-aware SQL reads bind.
+func scopeColumns(scope ExecutionEventScope) (int, string, string) {
+	switch scope.Kind {
+	case ExecutionEventScopeRepo:
+		return int(ExecutionEventScopeRepo), scope.RepoID, ""
+	case ExecutionEventScopeRun:
+		return int(ExecutionEventScopeRun), scope.RepoID, scope.RunID
+	default:
+		return int(ExecutionEventScopeGlobal), "", ""
+	}
 }
 
 // AppendExecutionEvent implements ExecutionEventStore for PostgreSQL. It is
@@ -393,8 +481,11 @@ func (s *PostgresStore) AppendExecutionEvent(ctx context.Context, e model.Execut
 // commit, so a semantic event emitted next to the mutation it describes is
 // ordered with (and rolls back with) that mutation. It is the shared writer
 // for every DB-mode semantic append, so the payload/seq rules cannot drift
-// between call sites. A zero CreatedAt is stamped with the database clock
-// (clock_timestamp()), never the application clock.
+// between call sites. When the caller left RepoID empty it is resolved from
+// the owning run (by run id, or by the job's run), so semantic events carry
+// the same repository dimension the triggers write. A zero CreatedAt is
+// stamped with the database clock (clock_timestamp()), never the
+// application clock.
 func appendExecutionEventTx(ctx context.Context, tx pgx.Tx, e model.ExecutionEvent) error {
 	if e.Type == "" {
 		return errors.New("storage: execution event type is required")
@@ -402,6 +493,13 @@ func appendExecutionEventTx(ctx context.Context, tx pgx.Tx, e model.ExecutionEve
 	schemaVersion := e.SchemaVersion
 	if schemaVersion <= 0 {
 		schemaVersion = 1
+	}
+	if e.RepoID == "" {
+		repo, err := executionEventRepoIDTx(ctx, tx, e.RunID, e.JobID)
+		if err != nil {
+			return err
+		}
+		e.RepoID = repo
 	}
 	var payload []byte
 	if len(e.Payload) > 0 {
@@ -421,11 +519,35 @@ func appendExecutionEventTx(ctx context.Context, tx pgx.Tx, e model.ExecutionEve
 		return err
 	}
 	_, err := tx.Exec(ctx, `
-		INSERT INTO execution_events (seq, schema_version, run_id, job_id, attempt, event_type, from_status, to_status, actor, payload, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11, clock_timestamp()))`,
-		seq, schemaVersion, nullText(e.RunID), nullText(e.JobID), e.Attempt, e.Type,
+		INSERT INTO execution_events (seq, schema_version, run_id, job_id, repo_id, attempt, event_type, from_status, to_status, actor, payload, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, COALESCE($12, clock_timestamp()))`,
+		seq, schemaVersion, nullText(e.RunID), nullText(e.JobID), e.RepoID, e.Attempt, e.Type,
 		nullText(e.FromStatus), nullText(e.ToStatus), nullText(e.Actor), payload, createdAt)
 	return err
+}
+
+// executionEventRepoIDTx resolves the repository dimension of an event from
+// the owning run: directly by run id, or through the job's run when only a
+// job id is known. An unresolved owner yields an empty repository (never a
+// guessed one), which repository-scoped reads exclude.
+func executionEventRepoIDTx(ctx context.Context, tx pgx.Tx, runID, jobID string) (string, error) {
+	var repo string
+	var err error
+	switch {
+	case runID != "":
+		err = tx.QueryRow(ctx, `SELECT COALESCE(payload->>'repo_id', '') FROM runs WHERE id = $1`, runID).Scan(&repo)
+	case jobID != "":
+		err = tx.QueryRow(ctx, `
+			SELECT COALESCE(r.payload->>'repo_id', '')
+			FROM jobs j JOIN runs r ON r.id = j.run_id
+			WHERE j.id = $1`, jobID).Scan(&repo)
+	default:
+		return "", nil
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	return repo, err
 }
 
 // PruneExecutionEvents deletes a bounded, contiguous prefix of events older
@@ -464,6 +586,17 @@ func (s *PostgresStore) PruneExecutionEvents(ctx context.Context, olderThan time
 			WHERE e.seq < keep.keep_from AND e.seq > $3
 			ORDER BY e.seq ASC
 			LIMIT $2
+		), recorded AS (
+			INSERT INTO execution_event_pruned (run_id, repo_id, max_seq)
+			SELECT COALESCE(e.run_id, ''), COALESCE(e.repo_id, ''), MAX(e.seq)
+			FROM execution_events e
+			JOIN victims v ON v.seq = e.seq
+			WHERE COALESCE(e.run_id, '') <> ''
+			GROUP BY 1, 2
+			ON CONFLICT (run_id) DO UPDATE
+				SET max_seq = GREATEST(execution_event_pruned.max_seq, EXCLUDED.max_seq),
+				    repo_id = EXCLUDED.repo_id
+			RETURNING run_id
 		)
 		DELETE FROM execution_events WHERE seq IN (SELECT seq FROM victims)
 		RETURNING seq`, olderThan, limit, retainedFrom)
@@ -500,12 +633,30 @@ func (s *PostgresStore) PruneExecutionEvents(ctx context.Context, olderThan time
 }
 
 // ExecutionEventRetainedFrom returns the durable retained_from watermark
-// (0 when nothing has been pruned): the highest seq removed by retention.
-// It is a read-only raw SELECT and carries no schema fence.
+// (0 when nothing has been pruned): the highest seq removed by retention
+// from the GLOBAL stream. It is a read-only raw SELECT and carries no schema
+// fence.
 func (s *PostgresStore) ExecutionEventRetainedFrom(ctx context.Context) (int64, error) {
 	var retainedFrom int64
 	err := s.pool.QueryRow(ctx, `SELECT COALESCE((SELECT retained_from FROM execution_event_cursor WHERE id = TRUE), 0)`).Scan(&retainedFrom)
 	return retainedFrom, err
+}
+
+// ScopedRetainedFrom implements ExecutionEventScopedRetentionStore for
+// PostgreSQL: the durable deletion frontier of the requested scope. Global
+// reads the cursor watermark, repository reads MAX(max_seq) over the
+// repository's per-run pruned rows, run reads its own row (0 when none). A
+// read-only raw SELECT with no schema fence.
+func (s *PostgresStore) ScopedRetainedFrom(ctx context.Context, scope ExecutionEventScope) (int64, error) {
+	kind, repo, runID := scopeColumns(scope)
+	var retained int64
+	err := s.pool.QueryRow(ctx, `
+		SELECT CASE $1::int
+		    WHEN 0 THEN COALESCE((SELECT retained_from FROM execution_event_cursor WHERE id = TRUE), 0)
+		    WHEN 1 THEN COALESCE((SELECT MAX(max_seq) FROM execution_event_pruned WHERE repo_id = $2), 0)
+		    ELSE COALESCE((SELECT max_seq FROM execution_event_pruned WHERE run_id = $3), 0)
+		END`, kind, repo, runID).Scan(&retained)
+	return retained, err
 }
 
 // LatestExecutionEventSeq returns the monotonic commit-ordered cursor value
@@ -696,7 +847,10 @@ func deploymentExecutionEvent(typ string, d model.Deployment) model.ExecutionEve
 // summary SECOND (see the ExecutionSnapshot ordering contract). The
 // transaction holds the shared schema lock, so a migration cannot commit
 // between the reads and change the shape of the state being summarized.
-func (s *PostgresStore) ExecutionSnapshot(ctx context.Context, runLimit int) (ExecutionSnapshot, error) {
+// repoID empty keeps the global summary; a non-empty repoID restricts the
+// active-run list AND the queued/running job counts to runs whose stored
+// repository is that id.
+func (s *PostgresStore) ExecutionSnapshot(ctx context.Context, runLimit int, repoID string) (ExecutionSnapshot, error) {
 	if runLimit <= 0 || runLimit > MaxExecutionSnapshotRuns {
 		runLimit = DefaultExecutionSnapshotRuns
 	}
@@ -715,8 +869,9 @@ func (s *PostgresStore) ExecutionSnapshot(ctx context.Context, runLimit int) (Ex
 			SELECT id, COALESCE(payload->>'repo_id', ''), COALESCE(payload->>'ref', ''), status, created_at
 			FROM runs
 			WHERE status NOT IN ('success', 'failure', 'cancelled', 'skipped', 'blocked')
+			  AND ($2 = '' OR COALESCE(payload->>'repo_id', '') = $2)
 			ORDER BY created_at DESC, id ASC
-			LIMIT $1`, runLimit)
+			LIMIT $1`, runLimit, repoID)
 		if err != nil {
 			return err
 		}
@@ -731,7 +886,13 @@ func (s *PostgresStore) ExecutionSnapshot(ctx context.Context, runLimit int) (Ex
 		if err := rows.Err(); err != nil {
 			return err
 		}
-		return tx.QueryRow(ctx, `SELECT count(*) FILTER (WHERE status = 'queued'), count(*) FILTER (WHERE status = 'running') FROM jobs`).Scan(&snap.Queued, &snap.Running)
+		if repoID == "" {
+			return tx.QueryRow(ctx, `SELECT count(*) FILTER (WHERE status = 'queued'), count(*) FILTER (WHERE status = 'running') FROM jobs`).Scan(&snap.Queued, &snap.Running)
+		}
+		return tx.QueryRow(ctx, `
+			SELECT count(*) FILTER (WHERE j.status = 'queued'), count(*) FILTER (WHERE j.status = 'running')
+			FROM jobs j JOIN runs r ON r.id = j.run_id
+			WHERE COALESCE(r.payload->>'repo_id', '') = $1`, repoID).Scan(&snap.Queued, &snap.Running)
 	})
 	if err != nil {
 		return ExecutionSnapshot{}, err

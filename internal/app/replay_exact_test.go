@@ -90,6 +90,10 @@ type exactReplayEnv struct {
 	archives     map[string][]byte
 	downloads    []string
 	cursors      []string
+	// requests records "METHOD /path" for every request the CLI issues, so a
+	// test can prove replay never calls a mutating endpoint (e.g. the
+	// generated-fragment upload or a submit route).
+	requests []string
 }
 
 func newExactReplayEnv(t *testing.T, export string, pages [][]model.SnapshotRecord, next []string, archives map[string][]byte) *exactReplayEnv {
@@ -103,6 +107,7 @@ func newExactReplayEnv(t *testing.T, export string, pages [][]model.SnapshotReco
 		}
 	}
 	env.srv = scriptedServer(t, func(w http.ResponseWriter, r *http.Request) {
+		env.requests = append(env.requests, r.Method+" "+r.URL.Path)
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/pipeline"):
 			_, _ = w.Write([]byte(env.export))

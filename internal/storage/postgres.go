@@ -1709,6 +1709,18 @@ func (s *PostgresStore) ApproveJob(ctx context.Context, jobID, actor string) (mo
 	if j.Status.Terminal() {
 		return model.Job{}, ErrJobTerminal
 	}
+	// Idempotent replay (docs/INVARIANTS.md I8): the approval is already
+	// granted on a non-terminal job. Return the stored job unchanged and
+	// commit nothing: no second approval.granted event is appended, and the
+	// FIRST approver (ApprovedBy, and ApprovedAt when it is set) is
+	// preserved. A waiting_approval row can never carry ApprovedBy (the
+	// scheduler enters that state only while it is empty), so the status
+	// guard keeps the genuine waiting -> queued transition below on the
+	// normal path. The check runs under the job row lock, so a racing
+	// repeat commits the transition and the event exactly once.
+	if j.ApprovedBy != "" && j.Status != model.StatusWaitingApproval {
+		return j, nil
+	}
 	j.ApprovedBy = actor
 	if j.Status == model.StatusWaitingApproval {
 		j.Status = model.StatusQueued
@@ -3812,6 +3824,12 @@ func (s *PostgresStore) listTestReports(ctx context.Context, query string, args 
 // of leaving a hole. e.LeaseGeneration is the attempt identity the lease
 // delivered the line under and is persisted with it (migration 0051), so DB
 // reads can attribute a line to an attempt exactly like the fs/memory paths.
+//
+// This is the UNFENCED system append: it is NOT a runner endpoint path and
+// performs NO lease predicate. Runner log delivery MUST go through
+// AppendLogForLease (LeaseLogStore), which commits the live-lease predicate
+// and the insert in one transaction; using this method for a runner request
+// would let a stale generation append after its lease ended.
 func (s *PostgresStore) AppendLog(ctx context.Context, e model.LogEntry) error {
 	if err := ValidateRunID(e.RunID); err != nil {
 		return err
@@ -3821,6 +3839,56 @@ func (s *PostgresStore) AppendLog(ctx context.Context, e model.LogEntry) error {
 		return err
 	}
 	defer tx.Rollback(ctx)
+	var seq int64
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO log_cursors (run_id, value) VALUES ($1, 1)
+		ON CONFLICT (run_id) DO UPDATE SET value = log_cursors.value + 1
+		RETURNING value`, e.RunID).Scan(&seq); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO log_entries (seq, run_id, job_id, job_key, step, line, lease_generation, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		seq, e.RunID, nullText(e.JobID), nullText(e.JobKey), nullText(e.Step), e.Line, e.LeaseGeneration, e.CreatedAt); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	e.Seq = seq
+	return nil
+}
+
+// AppendLogForLease is the transactional single-line runner commit: it locks
+// the job row, re-evaluates the live-lease predicate against the post-lock
+// database clock, validates the line's identity against the locked job and
+// only then allocates the run's next commit-ordered seq and inserts the
+// line, all in one transaction. A lease no longer held by (runnerID,
+// generation) returns ErrLeaseLost and commits nothing; a line whose run,
+// job, job key or lease generation disagrees with the locked job is refused
+// with ErrLeaseIdentityMismatch and commits nothing. This mirrors
+// AppendLogBatch for the single-line transport and is the only runner-path
+// append in DB mode.
+func (s *PostgresStore) AppendLogForLease(ctx context.Context, jobID, runnerID string, generation int64, e model.LogEntry) error {
+	if err := validateLeaseCommitKey(jobID, runnerID, generation); err != nil {
+		return err
+	}
+	if err := ValidateRunID(e.RunID); err != nil {
+		return err
+	}
+	tx, err := s.beginSchemaCompatibleTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	coords, held, err := s.lockedLeaseJobTx(ctx, tx, jobID, runnerID, generation)
+	if err != nil {
+		return err
+	}
+	if !held {
+		return fmt.Errorf("%w: log line for job %s", ErrLeaseLost, jobID)
+	}
+	if err := bindLogLeaseIdentity(coords, jobID, generation, &e); err != nil {
+		return err
+	}
 	var seq int64
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO log_cursors (run_id, value) VALUES ($1, 1)

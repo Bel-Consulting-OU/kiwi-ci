@@ -62,7 +62,7 @@ func TestPostgresIntegrationExecutionEventsAtomicRetentionRead(t *testing.T) {
 	// all five rows and retained_from 0 (a page missing rows 1-2 while the
 	// watermark still reads 0 is exactly the silent truncation this read
 	// exists to prevent).
-	page, cursor, retained, latest, err := st.ReadExecutionEventsRetention(ctx, 0, 100, "")
+	page, cursor, retained, latest, err := st.ReadExecutionEventsRetention(ctx, 0, 100, ExecutionEventScope{Kind: ExecutionEventScopeGlobal})
 	if err != nil || len(page) != 5 || cursor != seqs[4] || retained != 0 || latest != highWater {
 		t.Fatalf("pre-prune atomic read = %d cursor %d retained %d latest %d err %v, want 5/%d/0/%d", len(page), cursor, retained, latest, err, seqs[4], highWater)
 	}
@@ -70,7 +70,7 @@ func TestPostgresIntegrationExecutionEventsAtomicRetentionRead(t *testing.T) {
 	if err := tx1.Commit(ctx); err != nil {
 		t.Fatalf("commit T1: %v", err)
 	}
-	page, cursor, retained, latest, err = st.ReadExecutionEventsRetention(ctx, 0, 100, "")
+	page, cursor, retained, latest, err = st.ReadExecutionEventsRetention(ctx, 0, 100, ExecutionEventScope{Kind: ExecutionEventScopeGlobal})
 	if err != nil || len(page) != 3 || page[0].Seq != seqs[2] || cursor != seqs[4] || retained != seqs[1] || latest != highWater {
 		t.Fatalf("post-prune atomic read = %d cursor %d retained %d latest %d err %v, want 3/%d/%d/%d", len(page), cursor, retained, latest, err, seqs[4], seqs[1], highWater)
 	}
@@ -79,7 +79,7 @@ func TestPostgresIntegrationExecutionEventsAtomicRetentionRead(t *testing.T) {
 		t.Fatalf("expiry boundary at retained %d disagrees", retained)
 	}
 	// The valid boundary cursor returns the survivors.
-	page, _, _, _, err = st.ReadExecutionEventsRetention(ctx, retained, 100, runID)
+	page, _, _, _, err = st.ReadExecutionEventsRetention(ctx, retained, 100, ExecutionEventScope{Kind: ExecutionEventScopeRun, RunID: runID})
 	if err != nil || len(page) != 3 || page[0].Seq != seqs[2] {
 		t.Fatalf("after=retainedFrom page = %+v err %v, want survivors from %d", page, err, seqs[2])
 	}
@@ -89,7 +89,7 @@ func TestPostgresIntegrationExecutionEventsAtomicRetentionRead(t *testing.T) {
 	if err != nil || pruned != 3 || retained != seqs[4] {
 		t.Fatalf("prune all = %d/%d err %v, want 3/%d", pruned, retained, err, seqs[4])
 	}
-	page, cursor, retained, latest, err = st.ReadExecutionEventsRetention(ctx, seqs[4], 100, "")
+	page, cursor, retained, latest, err = st.ReadExecutionEventsRetention(ctx, seqs[4], 100, ExecutionEventScope{Kind: ExecutionEventScopeGlobal})
 	if err != nil || len(page) != 0 || cursor != seqs[4] || retained != seqs[4] || latest != highWater {
 		t.Fatalf("all-pruned atomic read = %d cursor %d retained %d latest %d err %v, want empty/%d/%d/%d", len(page), cursor, retained, latest, err, seqs[4], seqs[4], highWater)
 	}
@@ -204,16 +204,15 @@ func TestPostgresIntegrationLogCursorCommitOrdered(t *testing.T) {
 func TestPostgresIntegrationLogBatchContiguousAndRollbackFreesRange(t *testing.T) {
 	st := pgITStore(t)
 	ctx := context.Background()
-	runID := pgITNewID(t)
-	jobID := pgITNewID(t)
+	runID, jobID, runnerID := pgITLeasedLogJob(t, st)
 	identity := LogBatchIdentity{JobID: jobID, Generation: 1, BatchID: "batch-" + pgITRandomHex(t, 8)}
 	now := time.Now().UTC()
 	entries := []model.LogEntry{
-		{RunID: runID, JobID: jobID, JobKey: "build", Step: "run", Line: "one", CreatedAt: now},
-		{RunID: runID, JobID: jobID, JobKey: "build", Step: "run", Line: "two", CreatedAt: now},
-		{RunID: runID, JobID: jobID, JobKey: "build", Step: "run", Line: "three", CreatedAt: now},
+		{RunID: runID, JobID: jobID, JobKey: "build-" + jobID, Step: "run", Line: "one", CreatedAt: now, LeaseGeneration: 1},
+		{RunID: runID, JobID: jobID, JobKey: "build-" + jobID, Step: "run", Line: "two", CreatedAt: now, LeaseGeneration: 1},
+		{RunID: runID, JobID: jobID, JobKey: "build-" + jobID, Step: "run", Line: "three", CreatedAt: now, LeaseGeneration: 1},
 	}
-	inserted, err := st.AppendLogBatch(ctx, entries, identity)
+	inserted, err := st.AppendLogBatch(ctx, runnerID, entries, identity)
 	if err != nil || !inserted {
 		t.Fatalf("batch append = %v err %v", inserted, err)
 	}
@@ -244,7 +243,7 @@ func TestPostgresIntegrationLogBatchContiguousAndRollbackFreesRange(t *testing.T
 	if err := tx.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.AppendLog(ctx, model.LogEntry{RunID: runID, JobID: jobID, JobKey: "build", Step: "run", Line: "four", CreatedAt: now}); err != nil {
+	if err := st.AppendLogForLease(ctx, jobID, runnerID, 1, model.LogEntry{RunID: runID, JobID: jobID, JobKey: "build-" + jobID, Step: "run", Line: "four", CreatedAt: now, LeaseGeneration: 1}); err != nil {
 		t.Fatalf("append after rollback: %v", err)
 	}
 	got, err = st.ReadLogs(ctx, runID, 0, 100)
@@ -280,7 +279,7 @@ func TestPostgresIntegrationExecutionSnapshotAtomic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	snap, err := st.ExecutionSnapshot(ctx, DefaultExecutionSnapshotRuns)
+	snap, err := st.ExecutionSnapshot(ctx, DefaultExecutionSnapshotRuns, "")
 	if err != nil || snap.Cursor == 0 || snap.GeneratedAt.IsZero() {
 		t.Fatalf("snapshot = %+v err %v", snap, err)
 	}
@@ -309,7 +308,7 @@ func TestPostgresIntegrationExecutionSnapshotAtomic(t *testing.T) {
 	if err != nil || latest <= snap.Cursor {
 		t.Fatalf("latest after post-snapshot transition = %d err %v, want > snapshot cursor %d", latest, err, snap.Cursor)
 	}
-	page, _, _, _, err := st.ReadExecutionEventsRetention(ctx, snap.Cursor, MaxExecutionEventLimit, runID)
+	page, _, _, _, err := st.ReadExecutionEventsRetention(ctx, snap.Cursor, MaxExecutionEventLimit, ExecutionEventScope{Kind: ExecutionEventScopeRun, RunID: runID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,7 +370,7 @@ func TestPostgresIntegrationDeploymentEventAttempt(t *testing.T) {
 	if _, created, err := st.StartDeployment(ctx, d, model.AuditEvent{ID: pgITNewID(t), Action: "deployment.started"}); err != nil || !created {
 		t.Fatalf("start = created %v err %v", created, err)
 	}
-	page, _, _, _, err := st.ReadExecutionEventsRetention(ctx, 0, MaxExecutionEventLimit, runID)
+	page, _, _, _, err := st.ReadExecutionEventsRetention(ctx, 0, MaxExecutionEventLimit, ExecutionEventScope{Kind: ExecutionEventScopeRun, RunID: runID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,19 +395,19 @@ func TestFaultyStoreNewForwards(t *testing.T) {
 		t.Fatal(err)
 	}
 	fault := &FaultyStore{Inner: inner}
-	if page, _, _, latest, err := fault.ReadExecutionEventsRetention(ctx, 0, 10, ""); err != nil || len(page) != 1 || latest != 1 {
+	if page, _, _, latest, err := fault.ReadExecutionEventsRetention(ctx, 0, 10, ExecutionEventScope{Kind: ExecutionEventScopeGlobal}); err != nil || len(page) != 1 || latest != 1 {
 		t.Fatalf("forwarded retention read = %d latest %d err %v", len(page), latest, err)
 	}
 	if latest, err := fault.LatestExecutionEventSeq(ctx); err != nil || latest != 1 {
 		t.Fatalf("forwarded latest = %d err %v", latest, err)
 	}
-	if _, _, _, _, err := (&FaultyStore{Inner: storeOnlyInner{}}).ReadExecutionEventsRetention(ctx, 0, 10, ""); err == nil {
+	if _, _, _, _, err := (&FaultyStore{Inner: storeOnlyInner{}}).ReadExecutionEventsRetention(ctx, 0, 10, ExecutionEventScope{Kind: ExecutionEventScopeGlobal}); err == nil {
 		t.Fatal("missing inner read contract must fail closed")
 	}
 	if _, err := (&FaultyStore{Inner: storeOnlyInner{}}).LatestExecutionEventSeq(ctx); err == nil {
 		t.Fatal("missing inner cursor contract must fail closed")
 	}
-	if _, err := (&FaultyStore{Inner: storeOnlyInner{}}).ExecutionSnapshot(ctx, 0); err == nil {
+	if _, err := (&FaultyStore{Inner: storeOnlyInner{}}).ExecutionSnapshot(ctx, 0, ""); err == nil {
 		t.Fatal("missing inner snapshot contract must fail closed")
 	}
 }

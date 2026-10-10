@@ -43,7 +43,7 @@ func TestFSCorruptExecutionEventJournalFailsClosed(t *testing.T) {
 	if _, _, err := repo.ListExecutionEvents(ctx, 0, 10, ""); err == nil {
 		t.Fatal("list over a corrupt journal succeeded")
 	}
-	if _, _, _, _, err := repo.ReadExecutionEventsRetention(ctx, 0, 10, ""); err == nil {
+	if _, _, _, _, err := repo.ReadExecutionEventsRetention(ctx, 0, 10, ExecutionEventScope{Kind: ExecutionEventScopeGlobal}); err == nil {
 		t.Fatal("retention read over a corrupt journal succeeded")
 	}
 }
