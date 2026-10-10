@@ -331,6 +331,18 @@ func TestArtifactUploadProvenanceCarriesExecutionCapsuleDigest(t *testing.T) {
 	if eff.DeclaredDiskBytes != 2<<30 || eff.WorkspaceMaxBytes != 2<<30 {
 		t.Fatalf("materialized disk = %d/%d, want the persisted 2Gi", eff.DeclaredDiskBytes, eff.WorkspaceMaxBytes)
 	}
+	// The signed statement carries the execution-assurance classification
+	// derived from the same records: a trusted container with the unrestricted
+	// trusted default secret policy is filesystem-isolated and opaque.
+	if st.ExecutionAssurance == nil || st.ExecutionAssurance.Level != int(model.AssuranceIsolatedFilesystem) || st.ExecutionAssurance.Name != "isolated_filesystem" {
+		t.Fatalf("executionAssurance = %+v, want level 1 isolated_filesystem", st.ExecutionAssurance)
+	}
+	if st.ExternalEffects != model.EffectsOpaqueExternal {
+		t.Fatalf("externalEffects = %q, want opaque_external", st.ExternalEffects)
+	}
+	if !strings.Contains(string(payloadBytes), "executionAssurance") || !strings.Contains(string(payloadBytes), "externalEffects") {
+		t.Fatalf("signed payload omits the assurance classification: %s", payloadBytes)
+	}
 }
 
 // TestArtifactProvenanceWithoutCapsulePayloadStillUploads proves the explicit

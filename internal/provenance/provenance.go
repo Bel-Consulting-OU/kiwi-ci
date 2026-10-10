@@ -76,15 +76,26 @@ type Statement struct {
 	// is part of the signed statement, so evidence can be refused when it
 	// was produced by a different engine semantics. Omitted for records that
 	// predate semantics stamping.
-	ExecutionSemantics    string          `json:"executionSemantics,omitempty"`
-	Runtime               string          `json:"runtime,omitempty"`
-	ImageDigest           string          `json:"imageDigest,omitempty"`
-	Issuer                string          `json:"issuer,omitempty"`
-	Materials             []MaterialEntry `json:"materials,omitempty"`
-	EffectivePolicyDigest string          `json:"effectivePolicyDigest,omitempty"`
-	StartTime             *time.Time      `json:"startTime,omitempty"`
-	EndTime               *time.Time      `json:"endTime,omitempty"`
-	ArtifactSize          int64           `json:"artifactSize,omitempty"`
+	ExecutionSemantics string `json:"executionSemantics,omitempty"`
+	// ExecutionAssurance is the execution-assurance classification of the
+	// producing attempt (level + stable name). It is omitted only for
+	// statements signed by callers that are not a Kiwi execution (release
+	// tooling): an executed attempt always carries it.
+	ExecutionAssurance *ExecutionAssuranceEvidence `json:"executionAssurance,omitempty"`
+	// ExternalEffects is the external-effects class
+	// (model.ExternalEffectsClass) of the producing attempt, signed under the
+	// same derivation as the execution attestation. Empty when the statement
+	// was not produced by a Kiwi execution or the classification could not be
+	// derived (never fabricated).
+	ExternalEffects       model.ExternalEffectsClass `json:"externalEffects,omitempty"`
+	Runtime               string                     `json:"runtime,omitempty"`
+	ImageDigest           string                     `json:"imageDigest,omitempty"`
+	Issuer                string                     `json:"issuer,omitempty"`
+	Materials             []MaterialEntry            `json:"materials,omitempty"`
+	EffectivePolicyDigest string                     `json:"effectivePolicyDigest,omitempty"`
+	StartTime             *time.Time                 `json:"startTime,omitempty"`
+	EndTime               *time.Time                 `json:"endTime,omitempty"`
+	ArtifactSize          int64                      `json:"artifactSize,omitempty"`
 	// ArtifactPublishedAt records when the artifact bytes were published. It
 	// is explicitly NOT the build completion time: FinishedOn is only set
 	// from a real terminal job timestamp.
@@ -204,6 +215,13 @@ type ArtifactInput struct {
 	// artifact. It is copied into the signed statement; empty for records
 	// that predate semantics stamping.
 	ExecutionSemantics string
+	// ExecutionAssurance and ExternalEffects are the derived
+	// execution-assurance classification of the producing attempt, from the
+	// same pure derivation the execution attestation uses. The server
+	// populates both; nil/empty omits the fields for statements not produced
+	// by a Kiwi execution (release tooling).
+	ExecutionAssurance *ExecutionAssuranceEvidence
+	ExternalEffects    model.ExternalEffectsClass
 }
 
 // InvocationID shapes the SLSA RunDetails.Metadata.InvocationID from the run
@@ -229,6 +247,8 @@ func ArtifactStatement(in ArtifactInput) Statement {
 		CapsuleDigest:          in.CapsuleDigest,
 		ExecutionCapsuleDigest: in.ExecutionCapsuleDigest,
 		ExecutionSemantics:     in.ExecutionSemantics,
+		ExecutionAssurance:     in.ExecutionAssurance,
+		ExternalEffects:        in.ExternalEffects,
 		PipelineDigest:         in.PipelineDigest,
 		CompilerVersion:        in.CompilerVersion,
 		RunnerIdentity:         in.RunnerIdentity,

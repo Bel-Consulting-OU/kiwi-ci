@@ -947,6 +947,16 @@ func artifactProvenanceInput(j model.Job, run model.Run, rec model.ArtifactRecor
 	if j.FinishedAt != nil {
 		in.Finished = *j.FinishedAt
 	}
+	// The execution-assurance classification of the producing attempt is
+	// derived from the same persisted job + payload + policy records the
+	// attestation path uses. When the execution cannot be re-verified the
+	// fields are omitted (never fabricated); an executed Kiwi upload always
+	// carries them.
+	if eff, ok := execution.MaterializeFromJob(j); ok {
+		level := eff.Assurance()
+		in.ExecutionAssurance = &provenance.ExecutionAssuranceEvidence{Level: int(level), Name: level.Name()}
+		in.ExternalEffects = eff.EffectsClass()
+	}
 	if p := j.CompiledJobPayload; p != nil {
 		in.PipelineDigest = p.PipelineDigest
 		in.CompilerVersion = p.CompilerVersion

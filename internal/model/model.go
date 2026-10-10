@@ -376,6 +376,22 @@ type Job struct {
 	// empty for records persisted before the field existed (see
 	// Run.ExecutionSemantics).
 	ExecutionSemantics string `json:"execution_semantics,omitempty"`
+	// CreatedByNode, CreatedByMutation and ExternalContext record the graph
+	// causality of a dynamically generated job. CreatedByNode is the
+	// generating parent job ID; CreatedByMutation is the canonical
+	// generation-free mutation receipt identity ("<parentID>:<mutationSlot>",
+	// see storage.GeneratedFragmentReceipt); ExternalContext is the bounded
+	// opaque correlation context the generating fragment request attached
+	// (api/v1.GeneratedFragment.ExternalContext), echoed verbatim and never
+	// interpreted by Kiwi. All three are empty for jobs enqueued through
+	// ordinary admission: generated children are stamped by the fragment
+	// admission path only. ExternalContext is caller-supplied correlation
+	// data, never secrets; it is bounded (<= 256 printable bytes) at
+	// admission. Additive: records persisted before the fields existed carry
+	// the empty string.
+	CreatedByNode     string `json:"created_by_node,omitempty"`
+	CreatedByMutation string `json:"created_by_mutation,omitempty"`
+	ExternalContext   string `json:"external_context,omitempty"`
 }
 
 // ExecutionAttestationRecord is the durable index row of one signed final

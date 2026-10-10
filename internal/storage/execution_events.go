@@ -702,10 +702,34 @@ func ExecutionEventAttemptCreated(j model.Job, runnerID string) model.ExecutionE
 // false) or graph.mutation_replayed (replayed true) event for a dynamic
 // fragment mutation keyed by (parent job, mutation slot). The fragment id is
 // the digest that won the slot; children is the committed child count.
-func ExecutionEventGraphMutation(replayed bool, parent model.Job, mutationSlot, fragmentID string, children int) model.ExecutionEvent {
+//
+// The payload carries the canonical mutation id (parent job id + ":" +
+// slot, the generation-free identity of the mutation receipt), whether an
+// external context was attached, and — when attached — the bounded opaque
+// external context string itself (at most
+// api/v1.MaxExternalContextBytes printable bytes). The context is
+// caller-supplied correlation data attached to the mutation request; it is
+// deliberately NOT part of the fragment digest and is never interpreted by
+// Kiwi. It must never carry secrets: the value is echoed verbatim into the
+// event stream. On a replay the payload carries the re-submitted request's
+// context; the created children keep the context stamped at the original
+// admission.
+func ExecutionEventGraphMutation(replayed bool, parent model.Job, mutationSlot, fragmentID string, children int, externalContext string) model.ExecutionEvent {
 	typ := model.EventGraphMutationCommitted
 	if replayed {
 		typ = model.EventGraphMutationReplayed
+	}
+	payload := map[string]string{
+		"slot":     mutationSlot,
+		"fragment": fragmentID,
+		"children": strconv.Itoa(children),
+		"mutation": parent.ID + ":" + mutationSlot,
+	}
+	if externalContext != "" {
+		payload["external_context_attached"] = "true"
+		payload["external_context"] = externalContext
+	} else {
+		payload["external_context_attached"] = "false"
 	}
 	return model.ExecutionEvent{
 		RunID:   parent.RunID,
@@ -713,11 +737,7 @@ func ExecutionEventGraphMutation(replayed bool, parent model.Job, mutationSlot, 
 		Attempt: parent.LeaseGeneration,
 		Type:    typ,
 		Actor:   parent.LeaseRunnerID,
-		Payload: map[string]string{
-			"slot":     mutationSlot,
-			"fragment": fragmentID,
-			"children": strconv.Itoa(children),
-		},
+		Payload: payload,
 	}
 }
 

@@ -987,6 +987,12 @@ type GeneratedFragmentRequest struct {
 	Deps            map[string][]string
 	Contracts       map[string]map[string]ArtifactContract
 	Children        []GeneratedFragmentChild
+	// ExternalContext is the bounded opaque correlation context the fragment
+	// request carried (api/v1.GeneratedFragment.ExternalContext). It is
+	// echoed into the graph.mutation_* event payload; the created children
+	// already carry their stamped copies. It never defines the mutation and
+	// is not part of the idempotency identity.
+	ExternalContext string
 }
 
 // ValidateGeneratedParentLease is the complete storage-side lease predicate

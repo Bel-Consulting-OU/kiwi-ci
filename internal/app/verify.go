@@ -151,7 +151,28 @@ func VerifyArtifact(args []string) error {
 		signer = env.Signatures[0].KeyID
 	}
 	fmt.Printf("verified artifact %s\n  sha256: %s\n  execution semantics: %s\n  signer: %s\n", id, artifactSHA, displayExecutionSemantics(st.ExecutionSemantics), signer)
+	printExecutionAssurance(st)
 	return nil
+}
+
+// printExecutionAssurance prints the signed execution-assurance classification
+// when the statement carries one. Execution attestations carry it in the
+// attestation block; artifact statements carry the mirrored top-level fields.
+// Artifact statements signed by callers that are not a Kiwi execution
+// (release tooling) omit the fields, in which case nothing is printed.
+func printExecutionAssurance(st provenance.Statement) {
+	evidence := st.ExecutionAssurance
+	class := st.ExternalEffects
+	if st.Attestation != nil {
+		evidence = &st.Attestation.ExecutionAssurance
+		class = st.Attestation.ExternalEffects
+	}
+	if evidence != nil {
+		fmt.Printf("  execution assurance: level %d (%s)\n", evidence.Level, evidence.Name)
+	}
+	if class != "" {
+		fmt.Printf("  external effects: %s\n", class)
+	}
 }
 
 // verifyKeyResolver builds the DSSE verification key resolution for one verify
@@ -239,6 +260,7 @@ func verifyExecutionAttestation(serverURL, token, jobID, file string, generation
 	}
 	fmt.Printf("verified execution attestation %s\n  status: %s\n  attempt: %s\n  capsule digest: %s\n  execution capsule digest: %s\n  execution semantics: %s\n  artifacts: %d\n  signer: %s\n",
 		display, st.Attestation.Status, st.AttemptID, st.CapsuleDigest, st.ExecutionCapsuleDigest, displayExecutionSemantics(st.ExecutionSemantics), artifacts, signer)
+	printExecutionAssurance(st)
 	return nil
 }
 

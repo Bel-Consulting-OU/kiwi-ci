@@ -5186,7 +5186,7 @@ func (s *PostgresStore) InsertGeneratedFragmentTx(ctx context.Context, req Gener
 		// The replay act is journaled in the same transaction that proved it
 		// (the tx mutated nothing, so committing is exactly the no-op the
 		// rollback would have been, plus the durable semantic event).
-		if err := appendExecutionEventTx(ctx, tx, ExecutionEventGraphMutation(true, parent, slot, rec.FragmentID, len(rec.Children))); err != nil {
+		if err := appendExecutionEventTx(ctx, tx, ExecutionEventGraphMutation(true, parent, slot, rec.FragmentID, len(rec.Children), req.ExternalContext)); err != nil {
 			return GeneratedFragmentReceipt{}, false, err
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -5297,7 +5297,7 @@ func (s *PostgresStore) InsertGeneratedFragmentTx(ctx context.Context, req Gener
 		if err := tx.Rollback(ctx); err != nil {
 			return GeneratedFragmentReceipt{}, false, err
 		}
-		if err := s.AppendExecutionEvent(ctx, ExecutionEventGraphMutation(true, parent, slot, winner.FragmentID, len(winner.Children))); err != nil {
+		if err := s.AppendExecutionEvent(ctx, ExecutionEventGraphMutation(true, parent, slot, winner.FragmentID, len(winner.Children), req.ExternalContext)); err != nil {
 			return GeneratedFragmentReceipt{}, false, err
 		}
 		return winner, true, nil
@@ -5305,7 +5305,7 @@ func (s *PostgresStore) InsertGeneratedFragmentTx(ctx context.Context, req Gener
 	// The committed mutation and its semantic event are ONE transaction: a
 	// failed append rolls the fragment (and its children) back, so a
 	// committed fragment can never be missing from the stream.
-	if err := appendExecutionEventTx(ctx, tx, ExecutionEventGraphMutation(false, parent, slot, req.FragmentID, len(children))); err != nil {
+	if err := appendExecutionEventTx(ctx, tx, ExecutionEventGraphMutation(false, parent, slot, req.FragmentID, len(children), req.ExternalContext)); err != nil {
 		return GeneratedFragmentReceipt{}, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {

@@ -28,9 +28,13 @@ const ExecutionAttestationPredicateType = "kiwi-ci/execution-attestation/v1"
 // change must bump it. Version 2 added completionResultDigest (the durable v2
 // completion identity) and evidenceRootSha256 (the full artifact-side
 // evidence graph root); version 3 added executionSemantics (the engine
-// semantics the attempt ran under). An envelope signed under an earlier
-// schema predates later fields and no longer verifies under this digest.
-const executionAttestationSchemaVersion = 3
+// semantics the attempt ran under); version 4 added the execution-assurance
+// classification (executionAssurance level+name and externalEffects), the
+// canonical effective-policy digest (policyDigest), the event-ledger frontier
+// (eventFrontier) and the run graph fingerprint (graphFingerprint). An
+// envelope signed under an earlier schema predates later fields and no longer
+// verifies under this digest.
+const executionAttestationSchemaVersion = 4
 
 // executionAttestationDigestVersion tags the canonical hashing encoding.
 const executionAttestationDigestVersion = "kiwi-ci/execution-attestation-digest/v1"
@@ -117,6 +121,31 @@ type ExecutionAttestation struct {
 	// canonical digest, so a verifier detects any tampering with it. Empty
 	// for attempts that predate semantics stamping.
 	ExecutionSemantics string `json:"executionSemantics,omitempty"`
+	// ExecutionAssurance is the execution-assurance level and its stable name
+	// (see model.ExecutionAssurance) derived purely from the persisted job,
+	// its compiled payload and the trust/policy records. It states what the
+	// execution ENFORCES; a verifier rejects a name that disagrees with the
+	// level. A record whose execution cannot be re-materialized is classified
+	// conservatively as uncontrolled/opaque_external, never upgraded.
+	ExecutionAssurance ExecutionAssuranceEvidence `json:"executionAssurance"`
+	// ExternalEffects is the external-effects class (model.ExternalEffectsClass)
+	// derived with the same pure derivation: pure, kiwi_mediated or
+	// opaque_external. It is part of the canonical digest.
+	ExternalEffects model.ExternalEffectsClass `json:"externalEffects"`
+	// PolicyDigest is the canonical digest of the payload's effective policy
+	// (provenance.EffectivePolicyDigest), or empty when the job carries no
+	// payload/policy. It binds WHICH admitted policy ceiling the assurance
+	// classification was derived against.
+	PolicyDigest string `json:"policyDigest,omitempty"`
+	// EventFrontier is the execution-event ledger's latest commit-ordered seq
+	// at attestation emission time (LatestExecutionEventSeq), or 0/omitted
+	// when the store does not expose the cursor contract or the read failed.
+	// It anchors the attestation against the ledger timeline.
+	EventFrontier int64 `json:"eventFrontier,omitempty"`
+	// GraphFingerprint is the canonical digest of the run's job graph
+	// (provenance.GraphFingerprint over the durable jobs' sorted keys and
+	// needs) at emission time. It is part of the canonical digest.
+	GraphFingerprint string `json:"graphFingerprint,omitempty"`
 }
 
 // ExecutionAttestationInput assembles the attestation statement's evidence.
@@ -156,6 +185,23 @@ type ExecutionAttestationInput struct {
 	// canonical digest, so a consumer detects any tampering with it. Empty
 	// for attempts that predate semantics stamping; it is never guessed.
 	ExecutionSemantics string
+	// ExecutionAssurance and ExternalEffects are the derived
+	// execution-assurance level and external-effects class of the attempt
+	// (see model.ExecutionAssurance / model.ExternalEffectsClass). They are
+	// required: the statement builder refuses an undefined level or class
+	// rather than signing an unclassifiable claim.
+	ExecutionAssurance model.ExecutionAssurance
+	ExternalEffects    model.ExternalEffectsClass
+	// PolicyDigest is the canonical digest of the payload's effective policy
+	// (provenance.EffectivePolicyDigest); empty when there is no policy to
+	// bind.
+	PolicyDigest string
+	// EventFrontier is the execution-event ledger's latest seq at emission
+	// time; 0 omits the field.
+	EventFrontier int64
+	// GraphFingerprint is the canonical run graph fingerprint at emission
+	// time (provenance.GraphFingerprint); empty omits the field.
+	GraphFingerprint string
 }
 
 // ExecutionAttestationStatement builds the signed statement of a final
@@ -167,6 +213,12 @@ type ExecutionAttestationInput struct {
 // existing provenance constraints (attempt/capsule digests) verify an
 // attestation envelope unchanged.
 func ExecutionAttestationStatement(in ExecutionAttestationInput) (Statement, error) {
+	if !in.ExecutionAssurance.Valid() {
+		return Statement{}, fmt.Errorf("provenance: undefined execution assurance level %d", int(in.ExecutionAssurance))
+	}
+	if !in.ExternalEffects.Valid() {
+		return Statement{}, fmt.Errorf("provenance: undefined external effects class %q", string(in.ExternalEffects))
+	}
 	att := ExecutionAttestation{
 		SchemaVersion:          executionAttestationSchemaVersion,
 		AttemptID:              model.AttemptID(in.JobID, in.Generation),
@@ -188,6 +240,11 @@ func ExecutionAttestationStatement(in ExecutionAttestationInput) (Statement, err
 		CompletionResultDigest: in.CompletionResultDigest,
 		EvidenceRootSHA256:     in.EvidenceRootSHA256,
 		ExecutionSemantics:     in.ExecutionSemantics,
+		ExecutionAssurance:     NewExecutionAssuranceEvidence(in.ExecutionAssurance),
+		ExternalEffects:        in.ExternalEffects,
+		PolicyDigest:           in.PolicyDigest,
+		EventFrontier:          in.EventFrontier,
+		GraphFingerprint:       in.GraphFingerprint,
 	}
 	SortAttestationEvidence(&att)
 	digest, err := ExecutionAttestationDigest(att)
@@ -432,6 +489,13 @@ func ExecutionAttestationDigest(att ExecutionAttestation) (string, error) {
 	field("completionResultDigest", att.CompletionResultDigest)
 	field("evidenceRootSha256", att.EvidenceRootSHA256)
 	field("executionSemantics", att.ExecutionSemantics)
+	if err := putJSON("executionAssurance", att.ExecutionAssurance); err != nil {
+		return "", err
+	}
+	field("externalEffects", string(att.ExternalEffects))
+	field("policyDigest", att.PolicyDigest)
+	field("eventFrontier", strconv.FormatInt(att.EventFrontier, 10))
+	field("graphFingerprint", att.GraphFingerprint)
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
@@ -481,6 +545,20 @@ func VerifyExecutionAttestation(st Statement) error {
 	}
 	if st.Attestation.ExecutionSemantics != st.ExecutionSemantics {
 		return fmt.Errorf("provenance: execution attestation execution semantics disagree with the statement")
+	}
+	// The assurance claim is a closed classification: an out-of-range level, a
+	// name that disagrees with its level, or an unknown effects class is
+	// refused so a validly signed but self-contradictory block can never be
+	// accepted.
+	level := model.ExecutionAssurance(st.Attestation.ExecutionAssurance.Level)
+	if !level.Valid() {
+		return fmt.Errorf("provenance: execution attestation has undefined execution assurance level %d", st.Attestation.ExecutionAssurance.Level)
+	}
+	if st.Attestation.ExecutionAssurance.Name != level.Name() {
+		return fmt.Errorf("provenance: execution attestation assurance name %q does not match level %d (%s)", st.Attestation.ExecutionAssurance.Name, level, level.Name())
+	}
+	if !st.Attestation.ExternalEffects.Valid() {
+		return fmt.Errorf("provenance: execution attestation has undefined external effects class %q", string(st.Attestation.ExternalEffects))
 	}
 	return nil
 }

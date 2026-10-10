@@ -5975,7 +5975,7 @@ func (m *memStore) InsertGeneratedFragmentTx(ctx context.Context, req GeneratedF
 				SubmittedFragmentID: req.FragmentID,
 			}
 		}
-		m.appendExecutionEventLocked(ExecutionEventGraphMutation(true, parent, slot, rec.FragmentID, len(rec.Children)))
+		m.appendExecutionEventLocked(ExecutionEventGraphMutation(true, parent, slot, rec.FragmentID, len(rec.Children), req.ExternalContext))
 		return rec, true, nil
 	}
 	// Run-scoped logical identity admission, mirrored from the SQL
@@ -6038,7 +6038,7 @@ func (m *memStore) InsertGeneratedFragmentTx(ctx context.Context, req GeneratedF
 		CreatedAt:       commitNow,
 	}
 	m.fragments[fragmentKey(req.ParentJobID, slot)] = rec
-	m.appendExecutionEventLocked(ExecutionEventGraphMutation(false, parent, slot, rec.FragmentID, len(rec.Children)))
+	m.appendExecutionEventLocked(ExecutionEventGraphMutation(false, parent, slot, rec.FragmentID, len(rec.Children), req.ExternalContext))
 	return rec, false, nil
 }
 

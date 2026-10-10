@@ -13,6 +13,12 @@ describe the tree as it is, never aspirations; a gap is listed explicitly and
 may only be marked closed once the enforcing code and its regression test both
 exist.
 
+**Evidence rule.** Any NEW invariant must land with at least one randomized or
+fault-injected test (a randomized/property lane, a chaos/fault-injection test,
+or a fuzz target), or it is assumed unenforced and must not be marked
+enforced+tested. The per-invariant evidence map below is the audit's record of
+which class of evidence backs every status.
+
 Line numbers are a convenience for the tree at the time of writing and drift
 quickly; the named symbol is the stable reference. PostgreSQL is the canonical
 store (the only one with transactional ledgers); filesystem/memory stores mirror
@@ -35,12 +41,53 @@ its behavior but are explicitly non-canonical unless stated otherwise.
 | I2 | State transition + ledger emission atomically | enforced+tested (canonical PG); fs best-effort by design |
 | I3 | Stale lease never mutates authoritative state | enforced+tested |
 | I4 | Scoped consumers recover exactly their authorized view | enforced+tested |
-| I5 | Exact replay cannot add external effects or work unless authorized | enforced+tested |
+| I5 | Exact replay cannot add Kiwi-mediated external effects or work unless authorized | enforced+tested |
 | I6 | Graph mutation cannot invalidate committed history | enforced+tested |
 | I7 | Speculative execution has a single winner | pre-committed, surface absent |
 | I8 | Cancellation/terminal monotonicity (idempotent cancel/approve) | enforced+tested |
 | I9 | Credentials never exceed the execution that requested them | enforced+tested |
 | I10 | Untrusted execution cannot populate a trusted cache namespace | enforced+tested |
+
+## Evidence map (deterministic / randomized / chaos / fuzz)
+
+Every status above is backed by executable evidence in at least one of four
+classes. This table names that evidence per invariant. A `—` is an honest
+gap in that class, not a claim of coverage; the residual risk of a gap is
+stated in the Notes column. The assurance vocabulary
+([effect classes and levels](evidence-contract.md#4-execution-assurance-and-effect-classes))
+and the precise
+[what Kiwi does not guarantee](evidence-contract.md#8-what-kiwi-does-not-guarantee)
+boundary live in [docs/evidence-contract.md](evidence-contract.md).
+
+| ID | Deterministic regression | Randomized / property | Chaos / fault injection | Fuzz | Notes |
+|---|---|---|---|---|---|
+| I1 | Completion-receipt suite and race matrix (`TestCompletionReplayV2RuntimeEvidence`, `TestCompletionReceiptReplayMatchesVersionMatrix`, `TestPostgresIntegrationCompleteJobReceiptHashConflict`, `TestPostgresIntegrationServerCompletionRaceDifferingResults`); idempotent cancel/approve suite | `TestPropertySchedulerModelMachine` (per-step single completion, terminal monotonicity; observed 71 completions over 20 seeds) | `TestLeaseFenceChaosMatrixStaleGenerationRejected` (dead-generation completion replay refused; state byte-identical); `TestFaultInjectionEveryMutationEveryPoint` | — | The completion wire body is not fuzzed; malformed completions are covered by handler-validation tests. Status: enforced+tested. |
+| I2 | `TestPostgresIntegrationSemanticEventAppendFailureRollsBack`, `TestPostgresIntegrationExecutionAttestationCommitOnce`, memStore parity tests | — | Blocked-trigger/blocked-journal rollback tests; chaos matrix asserts no dead-generation event exists; `TestFaultInjectionEveryMutationEveryPoint` | — | No randomized sampler of rollback points; the fault-injection matrix is exhaustive per mutation, not random. Status: enforced+tested (canonical PG); fs/memory best-effort by design. |
+| I3 | Lease-commit predicate matrix (`TestIntegrationLeaseCommitPredicatesLive/Revoked`, `TestIntegrationLeaseCommitConcurrentCancel`, `TestIntegrationLeaseCommitRejectsLeaseThatExpiresWhileWaitingForLock`), log-batch/report fences (`TestPostgresIntegrationAppendLogBatchLeaseFence`, `TestTestReportMemoryCommitFenceRejectsExpiredAtCommit`) | `TestPropertySchedulerModelMachine` (stale-generation probes with byte-identical store fingerprints; observed 911 stale probes), `TestPropertySchedulerStaleGenerationRefused` | `TestLeaseFenceChaosMatrixStaleGenerationRejected` (every stale request class: heartbeat, logs, artifact, snapshot, cache manifest, secret, OIDC, report, completion, fragment); `TestFaultInjectionEveryMutationEveryPoint` | `FuzzGeneratedFragmentAdmission` exercises live-lease fragment admission only; stale-generation interleavings are commit-time races and are covered by the property/chaos lanes, not fuzzable as inputs | Status: enforced+tested. |
+| I4 | Scope/authorization suite (`TestEventsRepoScopeIsolationAndScopedResumeMatrix`, `TestEventsCursorScopeBinding`, `TestEventsStreamRepoScopeNeverEmitsOtherRepos`, `TestEventsCursorExpiredList/Stream`) and existence masking (`TestExistenceMaskingReaderCannotDistinguish`, `TestExistenceMaskingCapabilityVariants`, `TestExistenceMaskingAdminAlwaysAllowed`, `TestExistenceMaskingDBMode`, `TestExistenceMaskingNoAuditSideChannel`) | Scope retention matrix: `TestEventsRetentionRacingScopedPagination`, `TestMemStoreScopedRetention`, `TestRepositoryScopedRetentionPersistsFrontier`, `TestFaultyStoreForwardsScopedFrontier`, `TestEventsLatestCursorNeverRegressesUnderPrune` | `TestEventsRetentionReadFailureFailsClosed`, `TestFaultyStoreForwardsScopedFrontier` (fault-injected store) | `FuzzEventCursorParse` (typed/bare/malformed/oversized/control-char cursors: exactly one of {ok, 400, 409 scope-mismatch}; valid-cursor round trip; cross-scope 409) | Status: enforced+tested. |
+| I5 | Exact-replay suite (`TestReplayExactGeneratorNeverSchedulesChildren`, `TestReplayExactRefusesDeclaredExternalEffects`, `TestReplayExactAllowsDeclaredEffectsWithFlag`, `TestReplayExactWarnsAboutUndeclaredEffects`, `TestReplayExactExecutionSemanticsDecisionTable`, `TestReplayExactIgnoresLocalPipelineFile`, `TestReplayExactRefusesMismatchedPayload`) | — | — | — | The claim is scoped to effects Kiwi mediates and surfaces the recorded job declares; undeclared effects a step performs itself are outside it and are warned about. Replay selection is deterministic fixture-driven; no randomized lane applies. Status: enforced+tested. |
+| I6 | Dynamic receipt/algebra/key suites (`TestDynamicFragmentReplayIdempotent`, `TestDynamicFragmentDifferentIDConflicts`, `TestGraphMutation*`, `TestGeneratedFragmentStaleGenerationCannotReplay`, `TestGeneratedFragmentChildKeyCollidesWithExistingRunJob`) | `TestPropertyDynamicFragmentRandomGraphs` (300 random graph seeds), `TestPropertyDynamicFragmentAcyclicAccepted`, `TestPropertyDynamicFragmentKeyConflicts`, `TestPropertyDynamicFragmentCaps` | `TestGeneratedFragmentStaleGenerationCannotReplay`, `TestGeneratedFragmentRacedLeaseLossMaps409Not400`, chaos matrix | `FuzzGeneratedFragmentAdmission` (random JSON/spec shapes: never panics, same input twice => same verdict, rejected mutates nothing; the external_context grammar — printable, control-char, over-limit, wrong type — is exercised too, and the field is digest-excluded) | Status: enforced+tested. |
+| I7 | — | — | — | — | Surface absent. Speculation interleavings are not fuzzable until the surface exists; the pre-committed fence is the I3 commit predicate, and `formal/kiwi_lease.tla` must gain a speculation action plus a single-winner invariant before the surface merges. Status: pre-committed, surface absent. |
+| I8 | `TestCancelRunIdempotentMemory/DB`, `TestApproveJobIdempotentMemory/DB`, `TestMemStoreApproveJobIdempotentReplay`, `TestPostgresIntegrationApproveJobIdempotentReplay`, `TestSqueezeCancelBranches` | `TestPropertySchedulerModelMachine` (observed 420 cancellations; terminal monotonicity), `TestPropertyCancelledJobCannotPublish` | Chaos matrix (cancel leaves authoritative state byte-identical); `TestFaultInjectionEveryMutationEveryPoint` | — | Status: enforced+tested. |
+| I9 | OIDC/secret commit suites (`TestOIDCIssuanceGenerationChangedBeforeCommitReturns409`, `TestSecretGenerationChangedBeforeCommitReturns409`, `TestSecretConcurrentRequestsOnlyOneReturnsEnvelope`, `TestIssueSecretClaimSingleUseAcrossReplicas`, `TestOIDCIssuanceNeverReturnsJWTWithoutDurableAudit`) | — | Chaos matrix replays secret/OIDC requests under a dead generation => refused (OIDC 401 from the cleared credential) | — | Credential wire bodies are validated by handler tests, not fuzzed. Status: enforced+tested. |
+| I10 | `TestJobCacheLeaseNamespacedPutGet`, `TestJobCacheRejectsNamespaceHeaders`, `TestCacheManifestCarriesServerDerivedNamespace`, `TestPruneCacheManifestsTrustDomainIsolationFS`, `TestCacheNamespaceSeparatesSameNameAcrossForges` | — | Chaos matrix cache-manifest replay under a dead generation => refused; trust-domain prune isolation tests | `FuzzCacheManifest` fuzzes the manifest parser, not namespace derivation (which is not parser input) | Status: enforced+tested. |
+
+**Formal mirror.** [`formal/kiwi_lease.tla`](../formal/kiwi_lease.tla) (with
+[`formal/README.md`](../formal/README.md)) is a bounded TLA+ model of the
+job x generation x lease x runner x cancel x retry protocol with `TypeOK`,
+`NoTwoWinners`, `StaleOwnerCannotCommit`, `TerminalityMonotonic` and
+`CancelCannotResurrect`; its mirror table maps every model action to the
+I1/I3/I8 enforcement points and the property/chaos tests named above. Model
+and implementation must be updated together.
+
+**Non-fuzzable residual (stated honestly).** Commit-time interleavings
+(stale generation racing a lease supersede, expiry while waiting for a row
+lock, cancel racing a completion) are state-machine races, not parseable
+inputs; they are covered by the randomized reference-model lane
+(`TestPropertySchedulerModelMachine`) and the fault/chaos lanes, and are
+explicitly NOT claimed as fuzz coverage. Speculation interleavings cannot be
+fuzzed until the I7 surface exists, because there is no speculative request
+surface to feed.
 
 ---
 
@@ -327,7 +374,11 @@ replay; step-declared effects (deployment phases, secrets, OIDC) are refused
 unless `--allow-external-effects` is passed, and the residual undeclared-effect
 risk is always warned about. Exact replay also never silently reinterprets a
 record produced under a different execution-engine semantics: see
-"Reproducibility boundary" below.
+"Reproducibility boundary" below. The claim is scoped to effects Kiwi mediates
+and surfaces the recorded job declares; behavior a step performs itself
+(within the recorded policy) is outside it — see
+[effect classes](evidence-contract.md#4-execution-assurance-and-effect-classes)
+and [what Kiwi does not guarantee](evidence-contract.md#8-what-kiwi-does-not-guarantee).
 
 **Enforcement points.**
 - Replay never sets `GenerateUpload`; a replayed generator executes its step

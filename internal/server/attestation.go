@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/execution"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/provenance"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
@@ -70,6 +71,13 @@ type attestationEvidence struct {
 	// terminal status/error/outputs/runtime by digest only; a legacy (v1)
 	// receipt has no v2 digest to bind and leaves this empty.
 	completionResultDigest string
+	// eventFrontier is the execution-event ledger's latest commit-ordered seq
+	// read at emission time. Zero (no events yet, or the store did not expose
+	// the cursor contract) omits the field instead of fabricating a frontier.
+	eventFrontier int64
+	// graphJobs are the run's durable jobs at emission time, used for the
+	// canonical graph fingerprint.
+	graphJobs []model.Job
 }
 
 // gatherAttestationEvidenceDB loads the attempt's durable evidence through
@@ -152,6 +160,22 @@ func (s *Server) gatherAttestationEvidenceDB(ctx context.Context, jobID string, 
 			ev.completionResultDigest = rec.ResultHash
 		}
 	}
+	// The graph fingerprint is derived from the run's durable jobs at
+	// emission time; a failed read fails the effect closed so the attestation
+	// is retried instead of signed against an unknown graph.
+	jobs, jerr := s.DB.ListJobsByRun(ctx, j.RunID)
+	if jerr != nil {
+		return attestationEvidence{}, false, jerr
+	}
+	ev.graphJobs = jobs
+	// The event frontier is best-effort evidence: the optional cursor
+	// contract is read when the store exposes it, and an absent contract or a
+	// failed read omits the field rather than blocking the attestation.
+	if cs, ok := s.DB.(storage.ExecutionEventCursorStore); ok {
+		if latest, lerr := cs.LatestExecutionEventSeq(ctx); lerr == nil {
+			ev.eventFrontier = latest
+		}
+	}
 	return ev, true, nil
 }
 
@@ -178,6 +202,11 @@ func (s *Server) gatherAttestationEvidenceLocal(jobID string, generation int64) 
 	for _, rec := range s.snapshots {
 		if rec.JobID == jobID && rec.LeaseGeneration == generation {
 			ev.snapshots = append(ev.snapshots, rec)
+		}
+	}
+	for _, jj := range s.jobs {
+		if jj.RunID == j.RunID {
+			ev.graphJobs = append(ev.graphJobs, jj)
 		}
 	}
 	if j.AttemptRunnerID != "" {
@@ -213,8 +242,29 @@ func attestationInput(ev attestationEvidence, generation int64) provenance.Execu
 		// falling back to its run). Legacy records carry the empty string,
 		// which the statement preserves verbatim: it is never guessed.
 		ExecutionSemantics: jobExecutionSemantics(j, ev.run),
+		// The event-ledger frontier and the run's graph fingerprint are read
+		// from durable state at emission time; the frontier is omitted when
+		// the store did not expose the cursor contract.
+		EventFrontier:    ev.eventFrontier,
+		GraphFingerprint: provenance.GraphFingerprint(ev.graphJobs),
+	}
+	// The execution-assurance classification is derived purely from the
+	// persisted job + payload + policy records through the shared
+	// materializer. A record whose execution cannot be re-verified is
+	// classified conservatively (uncontrolled/opaque_external): unproven
+	// executions are never upgraded, and the level/name/class are always
+	// present in the signed block.
+	if eff, ok := execution.MaterializeFromJob(j); ok {
+		in.ExecutionAssurance = eff.Assurance()
+		in.ExternalEffects = eff.EffectsClass()
+	} else {
+		in.ExecutionAssurance = model.AssuranceUncontrolled
+		in.ExternalEffects = model.EffectsOpaqueExternal
 	}
 	if p := j.CompiledJobPayload; p != nil {
+		if d, derr := provenance.EffectivePolicyDigest(p); derr == nil {
+			in.PolicyDigest = d
+		}
 		if d, err := provenance.CapsuleDigest(p); err == nil {
 			in.CapsuleDigest = d
 		}
@@ -405,6 +455,15 @@ func (s *Server) attestExecutionLocal(ctx context.Context, jobID string, generat
 	ev, ok := s.gatherAttestationEvidenceLocal(jobID, generation)
 	if !ok {
 		return nil
+	}
+	// The fs-mode event journal exposes the cursor contract through the
+	// repository; a bare in-memory server has no durable ledger and omits the
+	// frontier. A failed read omits it too: the frontier is best-effort
+	// evidence, never a reason to fail the attestation.
+	if s.store != nil {
+		if latest, err := s.store.LatestExecutionEventSeq(ctx); err == nil {
+			ev.eventFrontier = latest
+		}
 	}
 	envBytes, envelopeDigest, statementDigest, err := s.signAttestationEnvelope(attestationInput(ev, generation))
 	if err != nil {

@@ -15,6 +15,8 @@ internal/testintel:FuzzJUnit
 internal/server:FuzzWebhookGitHub
 internal/server:FuzzWebhookGitLab
 internal/server:FuzzWebhookForgejo
+internal/server:FuzzEventCursorParse
+internal/server:FuzzGeneratedFragmentAdmission
 internal/forge:FuzzCanonicalRepository
 internal/forge:FuzzCacheManifest
 internal/forge:FuzzSnapshotManifest

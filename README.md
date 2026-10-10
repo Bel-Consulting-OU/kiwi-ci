@@ -28,8 +28,9 @@ untrusted code.
   sealed secret delivery, OIDC token issuance, and hardened archive
   extraction. See [docs/security-model.md](docs/security-model.md).
 - **Invariants**: the core correctness invariants (terminal outcomes, atomic
-  ledgers, lease fencing, scoped event recovery, replay safety, graph-history
-  stability, cancellation monotonicity, credential scoping, cache namespaces)
+  ledgers, lease fencing, scoped event recovery, replay effect-safety for
+  Kiwi-mediated effects and declared surfaces, graph-history stability,
+  cancellation monotonicity, credential scoping, cache namespaces)
   are mapped to their enforcing code and regression tests in
   [docs/INVARIANTS.md](docs/INVARIANTS.md). A core change that does not update
   that mapping is treated as a broken invariant. The constrained dynamic-graph
@@ -222,14 +223,25 @@ workspace snapshot. A record that no longer re-verifies is refused.
 old debugging behavior of compiling the CURRENT local `--pipeline` file
 (warning: execution semantics may then differ from the recorded run).
 
+"Exact" is exact about WHAT is re-executed — the recorded compiled job and
+the restored workspace snapshot — not a claim of bit-reproducible outputs:
+external services, clocks, network state and undeclared step behavior stay
+outside Kiwi's view, so a re-run can produce different observable results.
+See [exact replay versus bit-reproducible execution](docs/evidence-contract.md#5-exact-replay-versus-bit-reproducible-execution)
+and [what Kiwi does not guarantee](docs/evidence-contract.md#8-what-kiwi-does-not-guarantee);
+[effect classes](docs/evidence-contract.md#4-execution-assurance-and-effect-classes)
+define which Kiwi-mediated effects exist at all.
+
 Exact replay is historically faithful, not automatically safe to re-execute:
 it enforces the recorded network/sandbox/resource policy but runs the
 historical step scripts with your CURRENT local credentials. A recorded job
 that DECLARES external-effect surfaces (deployment phases, step secrets,
 OIDC audiences) is therefore refused unless `--allow-external-effects` is
-passed, and every exact replay prints the residual-risk warning that Kiwi
-gates only declared effects and cannot see effects a step performs itself.
-Intended for debugging and verification, not for redeploying releases.
+passed. The safety claim is scoped to Kiwi-mediated effects and the surfaces
+the job declares: every exact replay prints the residual-risk warning that
+Kiwi gates only declared effects and cannot see effects a step performs
+itself (whatever the recorded policy otherwise allows). Intended for
+debugging and verification, not for redeploying releases.
 
 ## Repository layout
 

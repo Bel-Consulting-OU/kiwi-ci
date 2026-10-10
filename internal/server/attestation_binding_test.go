@@ -315,6 +315,10 @@ func (w *attestationRunScopedOnlyStore) ListTestReports(ctx context.Context, run
 	return w.inner.ListTestReports(ctx, runID)
 }
 
+func (w *attestationRunScopedOnlyStore) ListJobsByRun(ctx context.Context, runID string) ([]model.Job, error) {
+	return w.inner.ListJobsByRun(ctx, runID)
+}
+
 func (w *attestationRunScopedOnlyStore) InsertSnapshotRecord(ctx context.Context, rec model.SnapshotRecord) error {
 	return w.inner.InsertSnapshotRecord(ctx, rec)
 }

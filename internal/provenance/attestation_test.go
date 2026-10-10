@@ -48,6 +48,14 @@ func attestationTestInput() ExecutionAttestationInput {
 		// The execution-engine semantics the attempt ran under is part of the
 		// signed block and its canonical digest.
 		ExecutionSemantics: model.ExecutionSemanticsVersion,
+		// The execution-assurance classification is a required part of the
+		// signed block: level + stable name, effects class, policy digest,
+		// event frontier and graph fingerprint.
+		ExecutionAssurance: model.AssuranceKiwiMediatedAuthority,
+		ExternalEffects:    model.EffectsKiwiMediated,
+		PolicyDigest:       strings.Repeat("8", 64),
+		EventFrontier:      42,
+		GraphFingerprint:   strings.Repeat("9", 64),
 	}
 }
 
@@ -133,6 +141,14 @@ func TestExecutionAttestationDigestOrderIndependentAndTamperEvident(t *testing.T
 		func(a *ExecutionAttestation) { a.TestReports[0].SuiteDigest = strings.Repeat("f", 64) },
 		func(a *ExecutionAttestation) { a.Snapshots[0].Phase = model.SnapshotPhasePostJob },
 		func(a *ExecutionAttestation) { a.ExecutionSemantics = "kiwi.execution.v-future" },
+		func(a *ExecutionAttestation) {
+			a.ExecutionAssurance = ExecutionAssuranceEvidence{Level: 5, Name: "hermetic"}
+		},
+		func(a *ExecutionAttestation) { a.ExecutionAssurance.Name = "uncontrolled" },
+		func(a *ExecutionAttestation) { a.ExternalEffects = model.EffectsPure },
+		func(a *ExecutionAttestation) { a.PolicyDigest = strings.Repeat("0", 64) },
+		func(a *ExecutionAttestation) { a.EventFrontier = 43 },
+		func(a *ExecutionAttestation) { a.GraphFingerprint = strings.Repeat("0", 64) },
 	}
 	for i, mutate := range mutations {
 		cp := *base.Attestation
@@ -406,6 +422,59 @@ func TestExecutionAttestationBindsExecutionSemantics(t *testing.T) {
 	}
 	if err := VerifyExecutionAttestation(legacy); err != nil {
 		t.Fatalf("legacy (unstamped) statement does not verify: %v", err)
+	}
+}
+
+// TestExecutionAttestationBindsAssuranceClassification proves the v4
+// execution-assurance fields are required, part of the canonical digest and
+// validated by verification: an undefined level or effects class is refused
+// at statement build time, tampering with any new field flips the digest, and
+// a block whose assurance name disagrees with its level (or that carries an
+// unknown class) is rejected even with an intact signature.
+func TestExecutionAttestationBindsAssuranceClassification(t *testing.T) {
+	in := attestationTestInput()
+	base, err := ExecutionAttestationStatement(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	att := base.Attestation
+	if att.ExecutionAssurance.Level != int(model.AssuranceKiwiMediatedAuthority) || att.ExecutionAssurance.Name != model.AssuranceKiwiMediatedAuthority.Name() {
+		t.Fatalf("assurance = %+v, want level 4 kiwi_mediated_authority", att.ExecutionAssurance)
+	}
+	if att.ExternalEffects != model.EffectsKiwiMediated {
+		t.Fatalf("externalEffects = %q, want kiwi_mediated", att.ExternalEffects)
+	}
+	if att.PolicyDigest == "" || att.EventFrontier != 42 || att.GraphFingerprint == "" {
+		t.Fatalf("v4 evidence fields missing: %+v", att)
+	}
+	if err := VerifyExecutionAttestation(base); err != nil {
+		t.Fatalf("intact statement does not verify: %v", err)
+	}
+	// An undefined level or class never gets signed.
+	badLevel := in
+	badLevel.ExecutionAssurance = model.ExecutionAssurance(99)
+	if _, err := ExecutionAttestationStatement(badLevel); err == nil {
+		t.Fatal("undefined assurance level accepted at build time")
+	}
+	badClass := in
+	badClass.ExternalEffects = model.ExternalEffectsClass("bogus")
+	if _, err := ExecutionAttestationStatement(badClass); err == nil {
+		t.Fatal("undefined external effects class accepted at build time")
+	}
+	// A mismatched name (valid level, wrong name) and an unknown class are
+	// refused by verification even though the digest still binds the block.
+	for name, mutate := range map[string]func(a *ExecutionAttestation){
+		"name/level disagreement": func(a *ExecutionAttestation) { a.ExecutionAssurance.Name = "hermetic" },
+		"unknown level":           func(a *ExecutionAttestation) { a.ExecutionAssurance.Level = 99 },
+		"unknown class":           func(a *ExecutionAttestation) { a.ExternalEffects = "bogus" },
+	} {
+		cp := *base.Attestation
+		mutate(&cp)
+		tampered := base
+		tampered.Attestation = &cp
+		if err := VerifyExecutionAttestation(tampered); err == nil {
+			t.Fatalf("%s accepted by verification", name)
+		}
 	}
 }
 

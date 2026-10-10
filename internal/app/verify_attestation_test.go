@@ -33,6 +33,9 @@ func attestationVerifyFixture(t *testing.T) ([]byte, ed25519.PublicKey, string) 
 			{Name: "bin", SHA256: strings.Repeat("1", 64), Size: 3, ProvenanceSHA256: strings.Repeat("2", 64)},
 		},
 		ExecutionSemantics: model.ExecutionSemanticsVersion,
+		ExecutionAssurance: model.AssuranceKiwiMediatedAuthority,
+		ExternalEffects:    model.EffectsKiwiMediated,
+		GraphFingerprint:   strings.Repeat("9", 64),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -139,6 +142,8 @@ func TestVerifyExecutionAttestationModes(t *testing.T) {
 	// verifies.
 	st, err := provenance.ExecutionAttestationStatement(provenance.ExecutionAttestationInput{
 		RunID: "run-1", JobID: "job-1", Generation: 3, Status: "success",
+		ExecutionAssurance: model.AssuranceUncontrolled,
+		ExternalEffects:    model.EffectsOpaqueExternal,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -225,13 +230,23 @@ func TestVerifyPrintsExecutionSemantics(t *testing.T) {
 	if !strings.Contains(out, "execution semantics: "+model.ExecutionSemanticsVersion) {
 		t.Fatalf("verified semantics not printed: %q", out)
 	}
+	if !strings.Contains(out, "execution assurance: level 4 (kiwi_mediated_authority)") {
+		t.Fatalf("verified execution assurance not printed: %q", out)
+	}
+	if !strings.Contains(out, "external effects: kiwi_mediated") {
+		t.Fatalf("verified external effects not printed: %q", out)
+	}
 	if err := VerifyArtifact([]string{"--trusted-key", keyPath, "--attestation-file", attPath, "--execution-semantics", "kiwi.execution.v-future"}); err == nil || !strings.Contains(err.Error(), "execution semantics mismatch") {
 		t.Fatalf("execution-semantics constraint not enforced: %v", err)
 	}
 
 	// A legacy (unstamped) attestation prints the explicit marker.
 	start := time.Unix(1700000000, 0).UTC()
-	legacy, err := provenance.ExecutionAttestationStatement(provenance.ExecutionAttestationInput{RunID: "run-1", JobID: "job-1", Generation: 3, Status: "success", StartedAt: &start})
+	legacy, err := provenance.ExecutionAttestationStatement(provenance.ExecutionAttestationInput{
+		RunID: "run-1", JobID: "job-1", Generation: 3, Status: "success", StartedAt: &start,
+		ExecutionAssurance: model.AssuranceUncontrolled,
+		ExternalEffects:    model.EffectsOpaqueExternal,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -327,6 +327,12 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 	if in.FragmentID != fragmentID {
 		return nil, fmt.Errorf("generated fragment_id does not match the fragment digest")
 	}
+	// The optional external context is bounded opaque correlation data. It is
+	// validated BEFORE the idempotency replay so a malformed request is
+	// rejected regardless of whether its graph was already admitted.
+	if err := v1.ValidateExternalContext(in.ExternalContext); err != nil {
+		return nil, fmt.Errorf("generated fragment external_context: %w", err)
+	}
 	childDepth := parent.DynamicDepth + 1
 	// The logical mutation slot is server-side state, never client-supplied:
 	// today's endpoint has exactly one generated output per parent job, so
@@ -548,6 +554,13 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 			// stamped execution semantics: a graph mutation can never change
 			// the semantics its run was created under.
 			ExecutionSemantics: parent.ExecutionSemantics,
+			// Graph-causality stamping: the child was created by the parent's
+			// mutation slot, identified by the canonical generation-free
+			// mutation key, and carries the request's bounded opaque external
+			// context. Ordinary enqueued jobs leave all three empty.
+			CreatedByNode:     parent.ID,
+			CreatedByMutation: generatedFragmentKey(parent.ID, mutationSlot),
+			ExternalContext:   in.ExternalContext,
 			CompiledJobPayload: &model.CompiledJobPayload{
 				SchemaVersion:   1,
 				CompilerVersion: version.Version,
@@ -601,6 +614,7 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 			Deps:            deps,
 			Contracts:       jobContracts,
 			Children:        children,
+			ExternalContext: in.ExternalContext,
 		}, verify)
 		if err != nil {
 			return nil, err
@@ -657,7 +671,7 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 		// The replay act is journaled best-effort under the same lock
 		// (fs mode is non-canonical by contract; a failed append is logged,
 		// never fails the replay).
-		s.appendExecutionEventLocked(storage.ExecutionEventGraphMutation(true, current, mutationSlot, rec.FragmentID, len(rec.Children)))
+		s.appendExecutionEventLocked(storage.ExecutionEventGraphMutation(true, current, mutationSlot, rec.FragmentID, len(rec.Children), in.ExternalContext))
 		s.mu.Unlock()
 		return replayGeneratedResponse(parent, childDepth, rec), nil
 	}
@@ -708,7 +722,7 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 	}
 	// graph.mutation_committed is appended after the durable snapshot, next
 	// to the mutation it describes (best-effort in fs mode).
-	s.appendExecutionEventLocked(storage.ExecutionEventGraphMutation(false, current, mutationSlot, fragmentID, len(created)))
+	s.appendExecutionEventLocked(storage.ExecutionEventGraphMutation(false, current, mutationSlot, fragmentID, len(created), in.ExternalContext))
 	s.mu.Unlock()
 	return &generatedResponse{ParentJobID: parent.ID, RunID: parent.RunID, Depth: childDepth, JobIDs: ids, Keys: keys}, nil
 }
