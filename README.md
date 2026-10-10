@@ -214,6 +214,15 @@ workspace snapshot. A record that no longer re-verifies is refused.
 old debugging behavior of compiling the CURRENT local `--pipeline` file
 (warning: execution semantics may then differ from the recorded run).
 
+Exact replay is historically faithful, not automatically safe to re-execute:
+it enforces the recorded network/sandbox/resource policy but runs the
+historical step scripts with your CURRENT local credentials. A recorded job
+that DECLARES external-effect surfaces (deployment phases, step secrets,
+OIDC audiences) is therefore refused unless `--allow-external-effects` is
+passed, and every exact replay prints the residual-risk warning that Kiwi
+gates only declared effects and cannot see effects a step performs itself.
+Intended for debugging and verification, not for redeploying releases.
+
 ## Repository layout
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the component map and

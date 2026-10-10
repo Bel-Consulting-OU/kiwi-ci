@@ -580,3 +580,119 @@ func TestReplayExactRefusesPostJobOnlyAndEscapeHatch(t *testing.T) {
 		t.Fatalf("missing post-execution warning: %q", string(warned))
 	}
 }
+
+// TestReplayExactRefusesDeclaredExternalEffects: exact replay is historically
+// faithful, not automatically safe to re-execute. A recorded job that
+// DECLARES deployment phases, step secrets or OIDC audiences must be refused
+// unless the operator passes --allow-external-effects, because replay would
+// otherwise repeat irreversible external effects with CURRENT credentials.
+func TestReplayExactRefusesDeclaredExternalEffects(t *testing.T) {
+	cases := []struct {
+		name   string
+		text   string
+		key    string
+		mutate func(*model.CompiledJobPayload)
+		want   string
+	}{
+		{
+			name: "deployment phases",
+			text: "version: 1\njobs:\n  release:\n    steps:\n      - run: echo build\n    deployment:\n      canary:\n        - run: echo deploy\n",
+			key:  "release",
+			want: "deployment phases (1 step(s): canary=1 verify=0 rollback=0)",
+		},
+		{
+			name: "secret injection",
+			text: "version: 1\njobs:\n  build:\n    steps:\n      - run: echo \"$TOKEN\"\n        secrets: [TOKEN]\n",
+			key:  "build",
+			want: "secret injection: TOKEN",
+		},
+		{
+			name: "OIDC issuance",
+			text: "version: 1\njobs:\n  build:\n    steps:\n      - run: echo oidc\n",
+			key:  "build",
+			mutate: func(p *model.CompiledJobPayload) {
+				p.EffectivePolicy = map[string]any{"OIDC": []string{"aud-x"}, "Enforced": true}
+			},
+			want: "OIDC issuance (audiences: aud-x)",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newExactReplayEnv(t,
+				recordedExport(t, tc.text, tc.key, tc.mutate),
+				[][]model.SnapshotRecord{exactPage(model.SnapshotRecord{ID: "snap1", JobKey: tc.key, LeaseGeneration: 1, Phase: model.SnapshotPhasePreJob, CreatedAt: time.Now().UTC()})},
+				nil,
+				map[string][]byte{"snap1": snapshotArchive(t)},
+			)
+			err := Replay(context.Background(), []string{"--server", env.srv.URL, "run1", tc.key})
+			if err == nil || !strings.Contains(err.Error(), "--allow-external-effects") || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("declared-effect replay = %v, want a refusal naming %q and the flag", err, tc.want)
+			}
+			if len(env.downloads) != 0 {
+				t.Fatalf("downloaded %v despite the refusal", env.downloads)
+			}
+		})
+	}
+}
+
+// TestReplayExactAllowsDeclaredEffectsWithFlag: the explicit opt-in re-runs
+// the recorded effect surfaces and warns loudly about what it is about to do.
+func TestReplayExactAllowsDeclaredEffectsWithFlag(t *testing.T) {
+	text := "version: 1\njobs:\n  release:\n    steps:\n      - run: echo build\n    deployment:\n      canary:\n        - run: echo deploy\n"
+	env := newExactReplayEnv(t,
+		recordedExport(t, text, "release", nil),
+		[][]model.SnapshotRecord{exactPage(model.SnapshotRecord{ID: "snap1", JobKey: "release", LeaseGeneration: 1, Phase: model.SnapshotPhasePreJob, CreatedAt: time.Now().UTC()})},
+		nil,
+		map[string][]byte{"snap1": snapshotArchive(t)},
+	)
+	origStderr := os.Stderr
+	pipeR, pipeW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = pipeW
+	replayErr := Replay(context.Background(), []string{"--server", env.srv.URL, "--allow-external-effects", "run1", "release"})
+	_ = pipeW.Close()
+	os.Stderr = origStderr
+	warned, _ := io.ReadAll(pipeR)
+	if replayErr != nil {
+		t.Fatalf("opt-in replay: %v", replayErr)
+	}
+	if !strings.Contains(string(warned), "--allow-external-effects") || !strings.Contains(string(warned), "deployment phases") {
+		t.Fatalf("missing the declared-effects warning: %q", string(warned))
+	}
+	if !strings.Contains(string(warned), "cannot see effects a step performs itself") {
+		t.Fatalf("missing the residual-risk warning: %q", string(warned))
+	}
+}
+
+// TestReplayExactWarnsAboutUndeclaredEffects: even a job with no declared
+// effect surfaces replays under the residual-risk warning, because step
+// scripts run with the recorded network policy and current local credentials.
+func TestReplayExactWarnsAboutUndeclaredEffects(t *testing.T) {
+	env := newExactReplayEnv(t,
+		recordedExport(t, "version: 1\njobs:\n  build:\n    steps:\n      - run: echo plain\n", "build", nil),
+		[][]model.SnapshotRecord{exactPage(model.SnapshotRecord{ID: "snap1", JobKey: "build", LeaseGeneration: 1, Phase: model.SnapshotPhasePreJob, CreatedAt: time.Now().UTC()})},
+		nil,
+		map[string][]byte{"snap1": snapshotArchive(t)},
+	)
+	origStderr := os.Stderr
+	pipeR, pipeW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = pipeW
+	replayErr := Replay(context.Background(), []string{"--server", env.srv.URL, "run1", "build"})
+	_ = pipeW.Close()
+	os.Stderr = origStderr
+	if replayErr != nil {
+		t.Fatalf("plain replay: %v", replayErr)
+	}
+	warned, _ := io.ReadAll(pipeR)
+	if !strings.Contains(string(warned), "cannot see effects a step performs itself") {
+		t.Fatalf("missing the residual-risk warning: %q", string(warned))
+	}
+	if strings.Contains(string(warned), "--allow-external-effects:") {
+		t.Fatalf("plain job should not claim declared external effects were replayed: %q", string(warned))
+	}
+}

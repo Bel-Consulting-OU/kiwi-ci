@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/execution"
@@ -20,6 +22,61 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secrets"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/snapshot"
 )
+
+// replayDeclaredEffects names the recorded job's DECLARED irreversible
+// external-effect surfaces. Kiwi can only gate what the pipeline declares:
+// deployment phases run external rollout steps, step secrets are injected
+// from the operator's CURRENT provider, and OIDC audiences mint fresh
+// credentials. Undeclared effects inside a step script remain invisible and
+// are covered by the residual-risk warning exact replay always prints.
+func replayDeclaredEffects(eff execution.EffectiveExecution) []string {
+	var out []string
+	dep := eff.CompiledJob.Job.Deployment
+	if n := len(dep.Canary) + len(dep.Verify) + len(dep.Rollback); n > 0 {
+		out = append(out, fmt.Sprintf("deployment phases (%d step(s): canary=%d verify=%d rollback=%d)", n, len(dep.Canary), len(dep.Verify), len(dep.Rollback)))
+	}
+	seen := map[string]bool{}
+	var secretNames []string
+	addSecrets := func(names []string) {
+		for _, name := range names {
+			if name != "" && !seen[name] {
+				seen[name] = true
+				secretNames = append(secretNames, name)
+			}
+		}
+	}
+	for _, st := range eff.CompiledJob.Job.Steps {
+		addSecrets(st.Secrets)
+	}
+	for _, phase := range [][]pipeline.Step{dep.Canary, dep.Verify, dep.Rollback} {
+		for _, st := range phase {
+			addSecrets(st.Secrets)
+		}
+	}
+	if len(secretNames) > 0 {
+		sort.Strings(secretNames)
+		out = append(out, "secret injection: "+strings.Join(secretNames, ", "))
+	}
+	// Capabilities.Secrets nil means unrestricted (trusted default) and is not
+	// itself a declaration; only an explicit allowlist is reported when it
+	// names secrets the steps did not already declare.
+	var policySecrets []string
+	for name := range eff.Capabilities.Secrets {
+		if name != "" && !seen[name] {
+			policySecrets = append(policySecrets, name)
+		}
+	}
+	if len(policySecrets) > 0 {
+		sort.Strings(policySecrets)
+		out = append(out, "policy secret allowlist: "+strings.Join(policySecrets, ", "))
+	}
+	if len(eff.Capabilities.OIDC) > 0 {
+		aud := append([]string(nil), eff.Capabilities.OIDC...)
+		sort.Strings(aud)
+		out = append(out, "OIDC issuance (audiences: "+strings.Join(aud, ", ")+")")
+	}
+	return out
+}
 
 // recordedJobPipeline mirrors the control plane's exact-replay export
 // (GET /api/v1/runs/{run}/jobs/{job}/pipeline): the persisted canonical
@@ -101,7 +158,16 @@ var replayWorkspaceDiskQuotaSetup = executor.WorkspaceDiskQuotaSetup
 //
 // Secrets are freshly authorized from the local provider — never captured.
 //
-// Usage: kiwi replay RUN JOB [STEP] --server URL --token TOKEN [--attempt N] [--debug-rerun] [--allow-unbounded-workspace] [--allow-post-job-snapshot] [--pipeline FILE]
+// Exact replay is historically FAITHFUL, not automatically SAFE to
+// re-execute: it runs the recorded network/sandbox/resource policy with the
+// operator's CURRENT credentials, so a deployment/release job can repeat
+// irreversible external effects. Replay therefore refuses a recorded job
+// that DECLARES external-effect surfaces (deployment phases, secret
+// injection, OIDC issuance) unless --allow-external-effects is passed, and
+// always prints the residual-risk warning that a step can perform effects
+// Kiwi cannot see.
+//
+// Usage: kiwi replay RUN JOB [STEP] --server URL --token TOKEN [--attempt N] [--debug-rerun] [--allow-unbounded-workspace] [--allow-post-job-snapshot] [--allow-external-effects] [--pipeline FILE]
 func Replay(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("replay", flag.ContinueOnError)
 	server := fs.String("server", os.Getenv("KIWI_SERVER"), "control plane URL")
@@ -111,12 +177,13 @@ func Replay(ctx context.Context, args []string) error {
 	debugRerun := fs.Bool("debug-rerun", false, "run against the CURRENT local pipeline file instead of the recorded pipeline (execution semantics may differ)")
 	allowUnbounded := fs.Bool("allow-unbounded-workspace", false, "replay an untrusted recorded job even when no OS-level hard workspace quota can be established (hostile recorded code can then fill the operator filesystem; prints a warning)")
 	allowPostJob := fs.Bool("allow-post-job-snapshot", false, "replay from the post-execution (post_job) snapshot when the attempt has no pre-execution checkpoint (execution starts from post-execution workspace state)")
+	allowExternalEffects := fs.Bool("allow-external-effects", false, "exact replay may re-execute the recorded job's DECLARED external effects (deployment phases, secret injection, OIDC issuance) with your CURRENT credentials and network; without it replay refuses a job declaring any of them")
 	rest, err := parseFlagsAndPositionals(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(rest) != 2 && len(rest) != 3 {
-		return fmt.Errorf("usage: kiwi replay RUN JOB [STEP] --server URL --token TOKEN [--attempt N] [--debug-rerun] [--allow-unbounded-workspace] [--allow-post-job-snapshot] [--pipeline FILE]")
+		return fmt.Errorf("usage: kiwi replay RUN JOB [STEP] --server URL --token TOKEN [--attempt N] [--debug-rerun] [--allow-unbounded-workspace] [--allow-post-job-snapshot] [--allow-external-effects] [--pipeline FILE]")
 	}
 	if *server == "" {
 		return fmt.Errorf("--server (or KIWI_SERVER) is required")
@@ -244,6 +311,12 @@ func Replay(ctx context.Context, args []string) error {
 		materialized = &eff
 		matchJob = eff.CompiledJob
 		snapshotKey = rec.Key
+		if effects := replayDeclaredEffects(eff); len(effects) > 0 && !*allowExternalEffects {
+			return fmt.Errorf("refusing exact replay of job %q in run %s: the recorded job declares external-effect surfaces (%s); re-executing them with your CURRENT credentials and network can repeat irreversible actions (deployments, releases, credential minting) — re-run with --allow-external-effects to accept that risk, or use --debug-rerun for current local semantics", rec.Key, runID, strings.Join(effects, "; "))
+		} else if len(effects) > 0 {
+			fmt.Fprintf(os.Stderr, "warning: --allow-external-effects: exact replay will re-execute the recorded external effects (%s) with your CURRENT credentials and network\n", strings.Join(effects, "; "))
+		}
+		fmt.Fprintf(os.Stderr, "warning: exact replay executes historical step scripts with the recorded network policy and your CURRENT local credentials; Kiwi gates only DECLARED effect surfaces and cannot see effects a step performs itself\n")
 	}
 
 	recs, err := listReplaySnapshots(ctx, client, auth, *server, runID)
