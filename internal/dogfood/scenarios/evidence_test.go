@@ -133,6 +133,9 @@ func TestDFEVID001GenerationAndVerify(t *testing.T) {
 // graph fingerprint, execution semantics, assurance facts, external effects
 // and the event frontier — the audit's full tamper surface.
 func TestDFEVID002TamperMatrix(t *testing.T) {
+	if _, ok := Lookup(ScenarioEvidenceTamperMatrix); !ok {
+		t.Fatal("scenario DF-EVID-002 missing from the registry")
+	}
 	base, err := provenance.ExecutionAttestationStatement(evidenceInput())
 	if err != nil {
 		t.Fatalf("build statement: %v", err)
@@ -214,6 +217,9 @@ func TestDFEVID002TamperMatrix(t *testing.T) {
 // The pinned contradiction: effective network=none on a container while the
 // observed receipt reports a connected container namespace.
 func TestDFEVID003EffectiveObservedMismatch(t *testing.T) {
+	if _, ok := Lookup(ScenarioEvidenceObservedMismatch); !ok {
+		t.Fatal("scenario DF-EVID-003 missing from the registry")
+	}
 	receipt := &model.ExecutionControlReceipt{
 		Runtime:         "docker",
 		SandboxStarted:  true,
@@ -260,6 +266,9 @@ func TestDFEVID003EffectiveObservedMismatch(t *testing.T) {
 // is ONLY ever true from an observed hard-quota receipt. The table pins the
 // four observation paths and the admission consequence of the fifth.
 func TestDFEVID004QuotaTruthfulness(t *testing.T) {
+	if _, ok := Lookup(ScenarioEvidenceQuotaTruth); !ok {
+		t.Fatal("scenario DF-EVID-004 missing from the registry")
+	}
 	cases := []struct {
 		name string
 		// configured is the plan's requested bound (WorkspaceQuotaConfigured).
@@ -348,6 +357,9 @@ func TestDFEVID004QuotaTruthfulness(t *testing.T) {
 // carry credential material. The scan is over the exact envelope bytes a
 // consumer would fetch.
 func TestDFEVID005SecretAbsence(t *testing.T) {
+	if _, ok := Lookup(ScenarioEvidenceSecretAbsence); !ok {
+		t.Fatal("scenario DF-EVID-005 missing from the registry")
+	}
 	markers := []string{
 		"AKIA0000000000000000",
 		"-----BEGIN RSA PRIVATE KEY-----",

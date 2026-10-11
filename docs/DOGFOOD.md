@@ -329,6 +329,24 @@ make dogfood-all
 CI providers invoke these targets rather than duplicating orchestration, so
 GitHub Actions, Woodpecker and Kiwi itself exercise the same implementation.
 
+### Suite contracts are name-complete, not filter-complete
+
+Each target runs through `scripts/dogfood-run.sh`, which takes an explicit
+`--require` list of the tests that suite **owns**. The suite is green only
+if every required name actually executed — not merely if the `-run` regexp
+matched something. Losing `TestDFUPGRADE001` reddens `dogfood-upgrade` even
+when another alternative in the same filter still runs.
+
+Two static guards keep the contract honest:
+
+- `TestMakefileRequiresOnlyExistingTests` — every `--require` name must
+  match a real `func Test…` (prefix match, same rule as the runner).
+- `TestEveryRegistryScenarioHasATest` — every closed-registry scenario ID
+  must be `Lookup`'d by at least one test.
+
+Together they make the dogfood matrix a release contract: a documented
+scenario cannot silently lose its proof.
+
 ## Independent workload
 
 One canonical dogfood workload knows nothing about Faktor, Tangerine, AI

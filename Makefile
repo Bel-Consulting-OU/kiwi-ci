@@ -74,52 +74,128 @@ test-antagonistic: test-unit test-race test-adversarial test-stress test-single-
 	dogfood-upgrade dogfood-scale dogfood-release dogfood-all
 
 # Every dogfood target runs through scripts/dogfood-run.sh, which FAILS
-# CLOSED when the -run filter matches zero tests. Vacuous green is a defect,
-# not a quiet success. Scenario tests live under ./internal/dogfood/scenarios
-# as TestDFBOOT*/TestDFEVID*/TestDFLEASE*/TestDFQUOTA*/TestDFEFFECT*/TestDFSELF*.
+# CLOSED unless every --require test actually executed. A suite that
+# matches "some" test is not green if one of its owned scenarios is missing
+# — that is the release-contract check, not a filter smoke test.
 #
-# Suites whose scenarios are not yet implemented name their planned filter
-# anyway: the target goes red until the tests exist. That is the contract.
+# --require lists the tests each suite OWNS. Removing or renaming one of
+# those tests reddens the suite until the contract is updated deliberately.
 
-# PR gate: DF0 (CI runs .kiwi/pipeline.yaml itself) + DF1 critical path
-# (boot, evidence, lease, quota). Keep this filter small — it blocks every PR.
+# PR gate: DF0 (CI runs .kiwi/pipeline.yaml itself) + the critical product
+# proofs that block every PR. Keep this set small but complete.
 dogfood-fast:
-	./scripts/dogfood-run.sh 20m 'TestDFBOOT|TestDFEVID|TestDFLEASE|TestDFQUOTA'
+	./scripts/dogfood-run.sh 20m \
+		--run 'TestDFBOOT|TestDFEVID|TestDFLEASE|TestDFQUOTA' \
+		--require TestDFBOOT001 \
+		--require TestDFEVID001 \
+		--require TestDFEVID002 \
+		--require TestDFEVID003 \
+		--require TestDFEVID004 \
+		--require TestDFEVID005 \
+		--require TestDFLEASE001 \
+		--require TestDFLEASE002 \
+		--require TestDFQUOTA001
 
-# DF1 local product lifecycle (harness-level boot/restart/evidence/lease/
-# quota plus the oracle and no-hidden-retry guards).
+# DF1 local product lifecycle: boot/restart, evidence family, lease family,
+# quota gate, external-effect counts, self-host generation limit, scale
+# harness workload, plus the oracle / no-hidden-retry / namespace guards.
 dogfood-local:
-	./scripts/dogfood-run.sh 60m 'TestDFBOOT|TestDFEVID|TestDFLEASE|TestDFQUOTA|TestDFEFFECT|TestDFSELF|TestDFSCALE|TestEightOracle|TestNoHiddenRetries|TestNamespace|TestFaultPoints|TestDogfoodResult|TestScenarioResult'
+	./scripts/dogfood-run.sh 60m \
+		--run 'TestDFBOOT|TestDFEVID|TestDFLEASE|TestDFQUOTA|TestDFEFFECT|TestDFSELF|TestDFSCALE|TestEightOracle|TestNoHiddenRetries|TestNamespace|TestFaultPoints|TestDogfoodResult|TestScenarioResult' \
+		--require TestDFBOOT001 \
+		--require TestDFEVID001 \
+		--require TestDFEVID002 \
+		--require TestDFEVID003 \
+		--require TestDFEVID004 \
+		--require TestDFEVID005 \
+		--require TestDFLEASE001 \
+		--require TestDFLEASE002 \
+		--require TestDFQUOTA001 \
+		--require TestDFEFFECT001 \
+		--require TestDFEFFECT002 \
+		--require TestDFSELF001 \
+		--require TestDFSCALE001 \
+		--require TestEightOracleDisagreementFails \
+		--require TestNoHiddenRetries \
+		--require TestNamespaceIsolationSurfaces \
+		--require TestDogfoodResultJSONShape \
+		--require TestScenarioResultRejectsHiddenRetries
 
-# DF2 distributed topology: the harness topology checks plus every
-# multi-party scenario that does not require a live external process.
-# Live multi-process DF2 (real postgres/objectstore/two runners) is the
-# next implementation wave — see docs/DOGFOOD.md "Implemented vs planned".
+# DF2 distributed topology: harness topology shapes plus every multi-party
+# proof that does not need a live external process. Live multi-process DF2
+# (real postgres/objectstore/two runners) is the next wave — see
+# docs/DOGFOOD.md "Implemented vs planned".
 dogfood-distributed:
-	./scripts/dogfood-run.sh 90m 'TestDFBOOT|TestDFLEASE|TestDFEVID|TestDFQUOTA|TestDFEFFECT|TestTopology'
+	./scripts/dogfood-run.sh 90m \
+		--run 'TestDFBOOT|TestDFLEASE|TestDFEVID|TestDFQUOTA|TestDFEFFECT|TestTopology' \
+		--require TestDFBOOT001 \
+		--require TestDFLEASE001 \
+		--require TestDFLEASE002 \
+		--require TestDFEVID001 \
+		--require TestDFEVID003 \
+		--require TestDFEVID004 \
+		--require TestDFQUOTA001 \
+		--require TestDFEFFECT001 \
+		--require TestDFEFFECT002 \
+		--require TestTopologyValidate \
+		--require TestTopologyShapes
 
-# DF3 nightly chaos: lease races, hostile-runner receipts, deterministic
-# fault windows. Safety AND liveness (stale rejected, live holder completes).
+# DF3 nightly chaos: lease races, hostile-runner modes, deterministic fault
+# windows, evidence mismatch. Safety AND liveness.
 dogfood-adversarial:
-	./scripts/dogfood-run.sh 180m 'TestDFLEASE|TestDFEVID|TestDFQUOTA|TestDFEFFECT|TestEightOracle|TestNoHiddenRetries|TestFaultPoints|TestNewModeMatrix|TestExpectationsAreLayered' ./internal/dogfood/...
+	./scripts/dogfood-run.sh 180m \
+		--run 'TestDFLEASE|TestDFEVID|TestDFQUOTA|TestDFEFFECT|TestEightOracle|TestNoHiddenRetries|TestFaultPoints|TestNewModeMatrix|TestExpectationsAreLayered' \
+		--require TestDFLEASE001 \
+		--require TestDFLEASE002 \
+		--require TestDFEVID002 \
+		--require TestDFEVID003 \
+		--require TestDFEVID004 \
+		--require TestDFQUOTA001 \
+		--require TestDFEFFECT002 \
+		--require TestNewModeMatrix \
+		--require TestExpectationsAreLayered \
+		--require TestEightOracleDisagreementFails \
+		--require TestNoHiddenRetries \
+		--require TestFaultPointsAreDeterministic
 
-# DF4 cross-version: schema/semantics compatibility checks the verifier and
-# engine already pin. Live N-1 binary matrix is the next wave.
+# DF4 cross-version: evidence schema compatibility the verifier already
+# pins. Live N-1 binary matrix is the next wave.
 dogfood-upgrade:
-	./scripts/dogfood-run.sh 90m 'TestDFUPGRADE|TestVerifyExecutionAttestationSchema|TestExecutionAttestationAcceptsLegacy' ./internal/dogfood/... ./internal/provenance/
+	./scripts/dogfood-run.sh 90m \
+		--run 'TestDFUPGRADE|TestVerifyExecutionAttestationSchema|TestExecutionAttestationAcceptsLegacy|TestVerifyExecutionAttestationV4' \
+		--require TestDFUPGRADE001 \
+		--require TestExecutionAttestationAcceptsLegacyV4 \
+		--require TestVerifyExecutionAttestationSchemaVersionError \
+		--require TestVerifyExecutionAttestationV4WithFactsStillValidates \
+		-- ./internal/dogfood/... ./internal/provenance/
 
-# DF6 fixed-workload soak: harness-level high-volume lifecycle and churn.
-# The 10000-job / multi-process constants live in docs/DOGFOOD.md as the
-# target workload for the live soak once DF2 is online.
+# DF6 fixed-workload soak at harness scale. The live 10k-job soak is the
+# DF2/DF6 wave (docs/DOGFOOD.md).
 dogfood-scale:
-	./scripts/dogfood-run.sh 240m 'TestDFSCALE|TestDogfoodResult|TestScenarioResult|TestNamespace'
+	./scripts/dogfood-run.sh 240m \
+		--run 'TestDFSCALE|TestDogfoodResult|TestScenarioResult|TestNamespace' \
+		--require TestDFSCALE001 \
+		--require TestDogfoodResultJSONShape \
+		--require TestScenarioResultRejectsHiddenRetries \
+		--require TestNamespaceIsolationSurfaces
 
-# DF7 release-candidate closure: evidence + quota truthfulness + hostile
-# rejection + result-bundle seal — the pieces that gate a release today.
-# Install-from-artifact and G0→G1→G2 self-build require a packaged binary
-# and are the next wave (docs/DOGFOOD.md).
+# DF7 release-candidate closure for the pieces that gate a release today:
+# evidence truthfulness, quota, effects, self-host generation limit.
+# Install-from-artifact and full G0→G1→G2 binary self-build are next wave.
 dogfood-release:
-	./scripts/dogfood-run.sh 180m 'TestDFEVID|TestDFQUOTA|TestDFEFFECT|TestDFSELF|TestDFBOOT|TestDogfoodResult|TestScenarioResult'
+	./scripts/dogfood-run.sh 180m \
+		--run 'TestDFEVID|TestDFQUOTA|TestDFEFFECT|TestDFSELF|TestDFBOOT|TestDogfoodResult|TestScenarioResult' \
+		--require TestDFEVID001 \
+		--require TestDFEVID002 \
+		--require TestDFEVID003 \
+		--require TestDFEVID004 \
+		--require TestDFEVID005 \
+		--require TestDFQUOTA001 \
+		--require TestDFEFFECT001 \
+		--require TestDFEFFECT002 \
+		--require TestDFSELF001 \
+		--require TestDFBOOT001 \
+		--require TestDogfoodResultJSONShape
 
 # Full product dogfood (DF1–DF7). dogfood-fast is a strict subset of
 # dogfood-local and is not repeated here; DF0 is .kiwi/pipeline.yaml.
