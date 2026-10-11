@@ -394,8 +394,21 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 		SandboxStarted:         true,
 		NetworkEnforced:        networkEnforced,
 		RootFilesystemReadOnly: b.ReadOnlyRootFS,
+		WorkspaceQuotaEnforced: b.hardWorkspaceQuota(),
 	}
 	return nil
+}
+
+// hardWorkspaceQuota reports whether this attempt actually established a hard
+// OS-level workspace bound: the caller's preinstalled DiskQuotaStatus.Hard, or
+// the capability probe's retained cleanup (proof the XFS project quota was
+// applied). Fallback step-boundary accounting is NOT a hard quota and reports
+// false — the receipt must never claim enforcement the kernel did not apply.
+func (b *ContainerBackend) hardWorkspaceQuota() bool {
+	if b.WorkspaceQuota != nil {
+		return b.WorkspaceQuota.Hard
+	}
+	return b.quotaCleanup != nil
 }
 
 // containerInitEPERM reports whether a docker run failure is the specific

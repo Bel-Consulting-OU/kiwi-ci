@@ -21,13 +21,19 @@ Files:
 TLC is not installed by this repository and is not part of the default build
 or CI. To check the model locally:
 
-1. Download `tla2tools.jar` from the official TLA+ releases:
-   <https://github.com/tlaplus/tlaplus/releases> (any recent stable release;
-   requires Java 11+).
+1. Fetch the **pinned, SHA-256-verified** `tla2tools.jar` (v1.7.4; requires
+   Java 11+):
+
+   ```bash
+   ./scripts/fetch-tla2tools.sh ~/.cache/kiwi/tla2tools.jar
+   ```
+
+   Do not download "any recent stable release" by hand: the expected digest
+   lives in `scripts/fetch-tla2tools.sh` and is what CI executes.
 2. From the repository root:
 
    ```bash
-   java -jar /path/to/tla2tools.jar \
+   java -jar ~/.cache/kiwi/tla2tools.jar \
        -config formal/kiwi_lease.cfg \
        formal/kiwi_lease.tla
    ```

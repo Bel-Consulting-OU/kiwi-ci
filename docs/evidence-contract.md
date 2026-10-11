@@ -149,19 +149,27 @@ with its signed facts.
 |---|---|
 | `runtime` | closed vocabulary: `native` / `container` / `tart` / `unknown` |
 | `filesystem_isolated` | a REAL confinement boundary (container or Tart sandbox). A workspace quota does NOT set this: a quota bounds disk consumption, it does not confine the process's filesystem view |
-| `workspace_quota_enforced` | a hard OS-level workspace quota was installed before the workspace was populated; orthogonal to isolation |
+| `workspace_quota_configured` | the execution plan requested a workspace quota bound (declared `resources.disk` or the mandatory untrusted default). Configuration only — never an enforcement claim |
+| `workspace_quota_enforced` | a hard OS-level workspace quota was **proven installed** before the workspace was populated (the attempt's `DiskQuotaStatus.Hard` / observed receipt `workspace_quota_enforced`). Derived ONLY from that observation, never from the requested limit: fallback step-boundary accounting, a failed setup, or no request all sign `false`. Orthogonal to isolation |
 | `kiwi_secrets_injected` | true when the effective secret allowlist could admit at least one secret (nil policy or a non-empty allowlist). The complementary fact is "no INJECTED credentials" — deliberately narrower than "no ambient credentials" |
 | `host_environment_inherited` | the runner host environment is inherited (false in the distributed model, whose runner always starts from a clean environment) |
 | `network_mode` | closed vocabulary: `none` / `services` / `default` / `internet` / `unknown` |
 | `declared_authority_mediated` | every DECLARED external effect (deployments, OIDC, artifacts, downloads) is covered by a Kiwi capability, on a sandboxed runtime |
 | `images_digest_pinned` | every declared executable image (container image, service images, Tart VM reference) is digest-pinned |
-| `observed` | executor-observed ENFORCEMENT receipt, present only when the attempt captured one: `runtime` (native/docker/tart), `sandbox_started`, `network_enforced` (`none` / `container-namespace` / `vm-nat` / `host`), `root_filesystem_read_only`. It corroborates the effective vector; it never replaces it and cannot upgrade it |
+| `observed` | executor-observed ENFORCEMENT receipt, present only when the attempt captured one: `runtime` (native/docker/tart), `sandbox_started`, `network_enforced` (`none` / `container-namespace` / `vm-nat` / `host`), `root_filesystem_read_only`, `workspace_quota_enforced` (the attempt's hard-quota result). It corroborates the effective vector; it never replaces it and cannot upgrade it |
 
 Requested → effective → observed: the job's declaration is the REQUESTED
 control set, the facts above are the EFFECTIVE (policy-intersected) controls
 provable from durable records, and `observed` is what the concrete runtime
 reported it entered. Normally all three agree; evidence keeps them
-distinguishable.
+distinguishable. Before signing and during verification the effective vector
+and the observed receipt are **cross-validated**
+(`ExecutionFacts.ValidateObservedConsistency`): runtime correspondence,
+network-none agreement on sandboxed runtimes, filesystem isolation against
+sandbox start, and workspace-quota enforcement against the hard-quota
+observation. A contradictory pair is refused — Kiwi will not sign (or accept)
+an attestation that claims network denial over a receipt reporting host
+networking.
 
 Profiles are derived labels, **not an ordinal lattice** — profile 4
 (`kiwi_mediated_authority`) may allow networking while profile 3

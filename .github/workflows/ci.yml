@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+# Action refs are pinned to full commit SHAs (mutable major tags are not an
+# acceptable trust root for a verification product). Re-resolve with:
+#   git ls-remote https://github.com/actions/<name>.git 'refs/tags/v*'
+# and update the trailing tag comment together with the SHA.
 jobs:
   unit:
     name: unit (${{ matrix.os }})
@@ -17,8 +21,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
       - name: gofmt
@@ -36,8 +40,8 @@ jobs:
     name: race (server/store/runner)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
       - name: race-sensitive packages
@@ -47,8 +51,8 @@ jobs:
     name: fuzz smoke
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
       - name: fuzz smoke (5s per target)

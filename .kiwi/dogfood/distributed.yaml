@@ -1,0 +1,123 @@
+# DF2 — Distributed topology (dogfood tier 2 of DF0–DF7).
+#
+# Cadence: every merge to main. DF0 remains .kiwi/pipeline.yaml (source
+# integrity) and is not replaced; DF1 (.kiwi/dogfood/local.yaml) is the
+# local lifecycle this suite generalizes to a real multi-process topology.
+#
+# Question: does a real multi-process topology work — separate server,
+# production storage, multiple runners, a docker executor and an external
+# client — when none of them share a process with the harness?
+#
+# Topology under test (constructed by internal/dogfood/topology, described
+# here so reviewers can see the shape without reading Go):
+#
+#   external client ──HTTP──► server ──SQL──► postgres (authoritative store)
+#                                 │
+#                                 ├──HTTP──► objectstore (artifacts/cache)
+#                                 │
+#                                 ├──claim──► runnerA (native executor)
+#                                 └──claim──► runnerB (docker executor)
+#
+# Job steps below name those roles; the work itself is ONE harness
+# invocation (`make dogfood-distributed`) so Makefile and pipeline cannot
+# drift on scenario filters and the suite is not run once per role.
+#
+# WHY the topology lives in the suite, not in pipeline services: services
+# share a job's network namespace and lifetime, which is not a distributed
+# system. The harness starts real child processes (server, two runners,
+# objectstore, external client) under DOGFOOD_RUN_ID and speaks only the
+# public CLI/API/protocol surfaces, with direct DB access limited to a
+# read-only secondary oracle (docs/DOGFOOD.md "Three actors").
+#
+# Generation limit G0/G1/G2 — do not recurse self-dogfooding:
+#   G0  this DF2 suite runs as the outer harness (the only generation that
+#       may start a dogfood pipeline).
+#   G1  product work G0 submits through the external client (compiles,
+#       tests, fanout, artifact, deploy-to-fake-service). G1 runs are real
+#       Kiwi runs and must NOT be given the dogfood pipeline as input.
+#   G2  a G1 run that itself schedules dogfood work. Forbidden: the harness
+#       records G0/G1/G2 and refuses unintended recursion.
+#   Self-build closure (DF-SELF-001/002) is an explicit, time-bounded
+#   exception that builds the same source as G1/G2 without scheduling
+#   another DF suite; it is exercised in DF7 (release.yaml), not here.
+#
+# Hermetic: fake forge / OIDC / deployment sinks only. No real provider
+# credentials, no real forge webhooks, no real deploy targets. DF5 canaries
+# are a separate scheduled lane and are never part of DF2.
+version: 1
+name: kiwi-dogfood-df2-distributed
+
+defaults:
+  shell: bash
+
+inputs:
+  # Unique namespace for this suite run. CI passes its run id (or any
+  # value unique across concurrent and retried runs). The harness derives
+  # every fixture store, object key, lease holder and fake-sink counter
+  # from this input via DOGFOOD_RUN_ID and refuses an empty or colliding
+  # id — a shared namespace would let two suite runs observe each other.
+  dogfood_run_id:
+    type: string
+    required: true
+    description: Unique per-run namespace for dogfood fixtures and evidence.
+
+env:
+  GOTOOLCHAIN: local
+  # Unique namespace: server store, objectstore keys, runner identities,
+  # lease holders and the external client's fake-sink counter are all
+  # derived from DOGFOOD_RUN_ID so parallel main-branch runs cannot collide.
+  DOGFOOD_RUN_ID: "${{ inputs.dogfood_run_id }}"
+
+concurrency:
+  # Main-branch DF2 is allowed to queue behind itself (merge trains), but a
+  # newer merge cancels an in-flight older one: the newer commit is the one
+  # that must be proven, and the harness namespace keeps them isolated.
+  group: "dogfood-df2:${{ git.branch }}"
+  cancel_in_progress: true
+
+jobs:
+  # One job = one topology. Splitting server/runnerA/runnerB into separate
+  # pipeline jobs would fake distribution (shared workspace, shared lifetime)
+  # and would re-encode the topology in YAML; the suite starts real processes.
+  df2-distributed-topology:
+    runtime: container
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    timeout: 90m
+    infra_retries: 1
+    env:
+      GOCACHE: /workspace/.kiwi/cache/df2-distributed
+      GOMODCACHE: /workspace/.kiwi/cache/df2-distributed/gomod
+    sandbox:
+      # Module downloads only; the topology the suite starts is local
+      # (loopback HTTP, local objectstore, local docker-or-native exec).
+      rootless: true
+      network: internet
+    cache:
+      - name: go-build-df2-distributed
+        key: go-build-df2-distributed
+        hash_files: [go.sum]
+        paths: [.kiwi/cache/df2-distributed]
+    steps:
+      # Step names mirror the topology roles so the Kiwi UI shows what the
+      # suite is responsible for. CI invokes the Makefile target rather than
+      # duplicating orchestration (docs/DOGFOOD.md "Makefile entry points").
+      - name: dogfood-distributed
+        # Covers: server + postgres + objectstore readiness, runnerA (native
+        # executor) + runnerB (docker executor) claiming, external client
+        # submit/query/evidence/replay. Scenario IDs DF-DIST-*, DF-SCHED-*,
+        # DF-RUNNER-*, DF-EXEC-*, DF-SELF-* (G0→G1 only; see G-limits above).
+        run: make dogfood-distributed
+    artifacts:
+      - name: dogfood-result
+        paths:
+          - dogfood-result.json
+          - scenario-results/
+          - kiwi-evidence/
+          - server-version.json
+          - runner-versions.json
+          - environment.json
+          - failure-seeds.json
+          - metrics-summary.json
+        if: always()
+        required: false
+        retention: 168h

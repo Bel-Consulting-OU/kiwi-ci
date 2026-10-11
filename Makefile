@@ -1,6 +1,7 @@
 .PHONY: build test test-unit test-race test-integration integration test-adversarial test-shuffle test-stress \
 	fuzz coverage coverage-ci coverage-floor coverage-package-floor staticcheck govulncheck cross schema-check surface-check dockerfile-buildargs-check docs-check license-check license-notice repro-build \
-	toolchain-check fmt lint run clean protect-branch
+	toolchain-check tla2tools fmt lint run clean protect-branch \
+	dogfood-fast dogfood-local dogfood-distributed dogfood-adversarial dogfood-upgrade dogfood-scale dogfood-release dogfood-all
 
 VERSION ?= 0.1.0-dev
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -58,6 +59,60 @@ test-checkptr:
 
 # The antagonistic battery run before every release.
 test-antagonistic: test-unit test-race test-adversarial test-stress test-single-p test-checkptr
+
+# ---------------------------------------------------------------------------
+# Dogfood suite entry points (DF1–DF7). DF0 (source integrity) remains
+# .kiwi/pipeline.yaml and is not re-encoded here. CI providers invoke these
+# targets rather than duplicating orchestration: the .kiwi/dogfood/*.yaml
+# suite definitions only describe tier/cadence/topology and call into this
+# Makefile (see docs/DOGFOOD.md "Makefile entry points"). Scenario tests
+# live under ./internal/dogfood/... as TestDFBOOT*/TestDFEVID*/TestDFLEASE*/
+# TestDFQUOTA*/...; the -run filters below match those names
+# the stable contract with that package (scenario IDs in docs/DOGFOOD.md).
+# ---------------------------------------------------------------------------
+.PHONY: dogfood-fast dogfood-local dogfood-distributed dogfood-adversarial \
+	dogfood-upgrade dogfood-scale dogfood-release dogfood-all
+
+# PR gate: DF0 (CI runs .kiwi/pipeline.yaml itself) + DF1 critical path
+# (boot, evidence, lease). Keep this filter small — it blocks every PR.
+dogfood-fast:
+	go test ./internal/dogfood/... -run 'TestDFBOOT|TestDFEVID|TestDFLEASE|TestDFQUOTA' -count=1 -timeout=20m
+
+# DF1 local product lifecycle: fresh up → auth → submit → execute → logs →
+# artifact → cache → evidence → verify → restart → historical query →
+# replay → clean shutdown.
+dogfood-local:
+	go test ./internal/dogfood/... -run 'TestDFBOOT|TestDFEVID|TestDFLEASE|TestDFQUOTA|TestEightOracle|TestNoHiddenRetries|TestNamespaceIsolation|TestFaultPoints' -count=1 -timeout=60m
+
+# DF2 distributed topology: server + postgres + objectstore + runnerA/B +
+# docker executor + external client (see .kiwi/dogfood/distributed.yaml).
+dogfood-distributed:
+	go test ./internal/dogfood/... -run 'TestDFBOOT|TestDFLEASE|TestDFEVID|TestDFQUOTA' -count=1 -timeout=90m
+
+# DF3 nightly chaos: kill server/runner/PG/objectstore, partition, lease
+# expiry, duplicate messages, hostile-runner receipts. Safety AND liveness.
+dogfood-adversarial:
+	go test ./internal/dogfood/... -run 'TestDFLEASE|TestDFEVID|TestDFQUOTA|TestEightOracle|TestNoHiddenRetries|TestFaultPoints' -count=1 -timeout=180m
+
+# DF4 cross-version: server N + runner N/N-1, verifier N vs evidence N/N-1,
+# DB migrated from N-1 (see .kiwi/dogfood/upgrade.yaml).
+dogfood-upgrade:
+	go test ./internal/dogfood/... -run 'TestDFUPGRADE|TestDFBOOT' -count=1 -timeout=90m
+
+# DF6 fixed-workload soak: 10000 short jobs, 1000 DAGs, 100 reconnects,
+# 100 restarts. The constants live in internal/dogfood/scenarios so this
+# target and the result bundle cannot disagree.
+dogfood-scale:
+	go test ./internal/dogfood/... -run 'TestDFSCALE|TestDFBOOT' -count=1 -timeout=240m
+
+# DF7 release-candidate closure: install the exact release artifact,
+# self-build G0→G1→G2, distributed, evidence, replay, upgrade, DR, uninstall.
+dogfood-release:
+	go test ./internal/dogfood/... -run 'TestDF_RELEASE|TestDF_SELF|TestDF_DR|TestDFUPGRADE|TestDFBOOT|TestDF_DIST|TestDF_EVID|TestDF_REPLAY' -count=1 -timeout=180m
+
+# Full product dogfood (DF1–DF7). dogfood-fast is a strict subset of
+# dogfood-local and is not repeated here; DF0 is .kiwi/pipeline.yaml.
+dogfood-all: dogfood-local dogfood-distributed dogfood-adversarial dogfood-upgrade dogfood-scale dogfood-release
 
 # staticcheck-all is the CI check: it is exactly the pinned command run by
 # .woodpecker/linux-amd64.yml. `staticcheck` runs the same pinned command
@@ -148,6 +203,13 @@ dockerfile-buildargs-check:
 toolchain-check:
 	./scripts/toolchain-check.sh --selftest
 	./scripts/toolchain-check.sh
+
+# Fetch the SHA-256-pinned TLA+ tla2tools.jar used by the formal model check
+# (formal/README.md, .github/workflows/formal.yml). The script refuses to
+# install an artifact whose digest does not match the pin in the script.
+tla2tools:
+	./scripts/fetch-tla2tools.sh --selftest
+	./scripts/fetch-tla2tools.sh
 
 schema-check: toolchain-check
 	go test -run Schema ./internal/pipeline

@@ -9,4 +9,15 @@ updates:
     labels:
       - "dependencies"
     open-pull-requests-limit: 5
+  # Keep SHA-pinned GitHub Actions current. Dependabot rewrites the pinned
+  # commit SHA together with the tag comment when a new release ships.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
+    open-pull-requests-limit: 5
 

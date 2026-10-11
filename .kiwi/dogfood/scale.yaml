@@ -1,0 +1,90 @@
+# DF6 — Scale / endurance / recovery (dogfood tier 6 of DF0–DF7).
+#
+# Cadence: scheduled + every RC. DF0 remains .kiwi/pipeline.yaml and is not
+# replaced. (DF5 production-integrations canary is a separate, non-PR lane
+# and is intentionally absent from this directory.)
+#
+# Question: does a FIXED workload finish cleanly and return to baseline?
+# The numbers below are pinned on purpose — a growing "stress" target that
+# nobody can reproduce is not evidence (docs/DOGFOOD.md "No hidden retries",
+# DOGFOOD_MATRIX.md Gate J).
+#
+# Pinned workload (DF-SCALE-001 / DF-SCALE-002):
+#   10000 short jobs          (throughput + ledger volume + event retention)
+#   1000 DAGs                 (scheduler fanout + graph admission)
+#   100 reconnects            (runner/client stream recovery, cursors)
+#   100 restarts              (server/runner crash-restart under load)
+# Success = the workload completes with no correctness failures and no
+# material resource-leak delta (fds, goroutines, disk, objectstore keys).
+#
+# Hermetic: fakes only; no real providers. DF5 canaries are separate.
+# Generation limit G0/G1/G2 (see .kiwi/dogfood/distributed.yaml): scale
+# runs thousands of G1 product jobs and MUST NOT let any of them schedule
+# dogfood work (G2 is refused by the harness).
+version: 1
+name: kiwi-dogfood-df6-scale
+
+defaults:
+  shell: bash
+
+inputs:
+  # Unique namespace for this suite run. CI passes its run id (or any
+  # value unique across concurrent and retried runs). The harness derives
+  # every fixture store, object key, lease holder and fake-sink counter
+  # from this input via DOGFOOD_RUN_ID and refuses an empty or colliding
+  # id — a shared namespace would let two suite runs observe each other.
+  dogfood_run_id:
+    type: string
+    required: true
+    description: Unique per-run namespace for dogfood fixtures and evidence.
+
+env:
+  GOTOOLCHAIN: local
+  # Unique namespace: 10k jobs × concurrent scheduled runs would otherwise
+  # collide on store names, object keys and runner identities.
+  DOGFOOD_RUN_ID: "${{ inputs.dogfood_run_id }}"
+
+concurrency:
+  # Scale needs the machine to itself: a second soak would make the
+  # resource-leak baseline (fds/goroutines/disk) unreadable.
+  group: dogfood-df6-scale
+  cancel_in_progress: true
+
+jobs:
+  df6-fixed-workload-soak:
+    runtime: container
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    # 10000 jobs + 1000 DAGs + 100 restarts is wall-clock bound by design;
+    # shrinking the timeout would silently shrink the workload.
+    timeout: 240m
+    infra_retries: 0
+    env:
+      GOCACHE: /workspace/.kiwi/cache/df6-scale
+      GOMODCACHE: /workspace/.kiwi/cache/df6-scale/gomod
+    sandbox:
+      rootless: true
+      network: internet
+    cache:
+      - name: go-build-df6-scale
+        key: go-build-df6-scale
+        hash_files: [go.sum]
+        paths: [.kiwi/cache/df6-scale]
+    steps:
+      # One harness invocation: the 10000/1000/100/100 constants live in
+      # internal/dogfood/scenarios so Makefile, pipeline and result bundle
+      # cannot disagree. CI invokes `make dogfood-scale` rather than
+      # duplicating the workload definition.
+      - name: dogfood-scale
+        run: make dogfood-scale
+    artifacts:
+      - name: dogfood-result
+        paths:
+          - dogfood-result.json
+          - scenario-results/
+          - kiwi-evidence/
+          - environment.json
+          - failure-seeds.json
+          - metrics-summary.json
+        if: always()
+        required: false
+        retention: 720h

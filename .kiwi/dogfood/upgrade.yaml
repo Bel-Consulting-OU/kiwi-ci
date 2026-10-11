@@ -1,0 +1,90 @@
+# DF4 — Cross-version compatibility (dogfood tier 4 of DF0–DF7).
+#
+# Cadence: nightly + every RC. DF0 remains .kiwi/pipeline.yaml and is not
+# replaced. Upgrade is a compatibility matrix over version PAIRS, not a
+# fuzz target (docs/INVARIANTS.md "Non-fuzzable residual").
+#
+# Question: do the documented compatibility promises hold
+# (docs/upgrades.md)?
+#
+# Matrix under test:
+#   server N   + runner N     (homogeneous fleet — control)
+#   server N   + runner N-1   (rolling upgrade, old runner still claiming)
+#   verifier N + evidence N   (homogeneous evidence — control)
+#   verifier N + evidence N-1 (historical evidence still verifies)
+#   DB from N-1 → server N    (migration path: state survives, jobs resume)
+#   failed migration handling (dirty DB refuses to start, not half-migrated)
+#
+# WHY pairs, not a single upgrade: an old runner against an upgraded server
+# is the rolling-upgrade window every production fleet actually lives in.
+# The suite pins protocol negotiation (TestCheckServerProtocol,
+# TestNextRefusesTaskRequiringNewerProtocol) and asserts the N-1 runner is
+# never asked to do N-only work.
+#
+# Hermetic: fakes only; no real providers. DF5 canaries are separate.
+# Generation limit G0/G1/G2 (see .kiwi/dogfood/distributed.yaml): this
+# suite is G0 and must not recurse self-dogfooding.
+version: 1
+name: kiwi-dogfood-df4-upgrade
+
+defaults:
+  shell: bash
+
+inputs:
+  # Unique namespace for this suite run. CI passes its run id (or any
+  # value unique across concurrent and retried runs). The harness derives
+  # every fixture store, object key, lease holder and fake-sink counter
+  # from this input via DOGFOOD_RUN_ID and refuses an empty or colliding
+  # id — a shared namespace would let two suite runs observe each other.
+  dogfood_run_id:
+    type: string
+    required: true
+    description: Unique per-run namespace for dogfood fixtures and evidence.
+
+env:
+  GOTOOLCHAIN: local
+  # Unique namespace: the N-1 database and objectstore fixtures must not be
+  # shared with any other suite — an upgrade mutates the very state it reads.
+  DOGFOOD_RUN_ID: "${{ inputs.dogfood_run_id }}"
+
+concurrency:
+  group: dogfood-df4-upgrade
+  cancel_in_progress: true
+
+jobs:
+  df4-cross-version:
+    runtime: container
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    timeout: 90m
+    infra_retries: 1
+    env:
+      GOCACHE: /workspace/.kiwi/cache/df4-upgrade
+      GOMODCACHE: /workspace/.kiwi/cache/df4-upgrade/gomod
+    sandbox:
+      rootless: true
+      network: internet
+    cache:
+      - name: go-build-df4-upgrade
+        key: go-build-df4-upgrade
+        hash_files: [go.sum]
+        paths: [.kiwi/cache/df4-upgrade]
+    steps:
+      # One invocation covers the pair matrix; CI calls `make
+      # dogfood-upgrade` rather than duplicating the version-pair list.
+      # Scenario IDs DF-UPGRADE-001 (N-1 state → N), DF-UPGRADE-002
+      # (supported mixed runner/server versions), plus evidence-verify
+      # pairs (DF-EVID-001 against N-1 evidence).
+      - name: dogfood-upgrade
+        run: make dogfood-upgrade
+    artifacts:
+      - name: dogfood-result
+        paths:
+          - dogfood-result.json
+          - scenario-results/
+          - kiwi-evidence/
+          - environment.json
+          - failure-seeds.json
+          - metrics-summary.json
+        if: always()
+        required: false
+        retention: 720h

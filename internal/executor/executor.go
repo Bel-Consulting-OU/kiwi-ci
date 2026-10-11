@@ -824,6 +824,15 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	// The lookup is an optional capability: a backend that captures nothing
 	// leaves the field nil rather than fabricating evidence.
 	res.ObservedRuntime = observedRuntimeOf(backend)
+	// Stamp the attempt-specific hard-quota observation onto the control
+	// receipt. The runner installs the OS-level bound before checkout and
+	// passes the outcome in Options.WorkspaceQuota; native and tart backends
+	// do not probe themselves, so without this stamp their receipts would
+	// under-report a hard quota that was actually installed. Never invent
+	// enforcement: only status.Hard is true.
+	if res.ObservedRuntime != nil && res.ObservedRuntime.Control != nil && e.Opt.WorkspaceQuota != nil && e.Opt.WorkspaceQuota.Hard {
+		res.ObservedRuntime.Control.WorkspaceQuotaEnforced = true
+	}
 	// Register the live backend session so job-scoped reads (generate.path)
 	// resolve through the execution boundary. The session stays registered
 	// until the backend is closed.

@@ -1,5 +1,7 @@
 package model
 
+import "fmt"
+
 // The execution-assurance contract has two layers:
 //
 //  1. ExecutionFacts — the AUTHORITATIVE vector of proven execution controls,
@@ -96,6 +98,13 @@ type ExecutionControlReceipt struct {
 	// root filesystem (container --read-only). False means "not applied",
 	// not "unknown".
 	RootFilesystemReadOnly bool `json:"root_filesystem_read_only,omitempty"`
+	// WorkspaceQuotaEnforced is the attempt-specific hard-quota observation:
+	// true only when a hard OS-level workspace quota (XFS project quota) was
+	// actually installed before the workspace was populated
+	// (executor.DiskQuotaStatus.Hard). It is never a restatement of the
+	// requested limit: a requested bound with fallback step-boundary
+	// accounting, a failed setup, or no request at all all record false.
+	WorkspaceQuotaEnforced bool `json:"workspace_quota_enforced,omitempty"`
 }
 
 // Valid reports whether the receipt is a well-formed closed observation.
@@ -140,9 +149,20 @@ type ExecutionFacts struct {
 	// FilesystemIsolated is true only for a real confinement boundary
 	// (container or Tart sandbox). A workspace quota does NOT set it.
 	FilesystemIsolated bool `json:"filesystem_isolated"`
-	// WorkspaceQuotaEnforced is true when a hard OS-level workspace quota
-	// was installed before the workspace was populated. It is orthogonal to
-	// isolation.
+	// WorkspaceQuotaConfigured is the CONFIGURATION fact: the execution
+	// plan requested a workspace quota bound (a declared resources.disk or
+	// the mandatory untrusted default). It says nothing about whether a
+	// hard OS-level bound was actually installed.
+	WorkspaceQuotaConfigured bool `json:"workspace_quota_configured,omitempty"`
+	// WorkspaceQuotaEnforced is the OBSERVATION fact: true only when the
+	// attempt-specific executor/runner result proves a hard OS-level
+	// workspace quota was installed before the workspace was populated
+	// (status.Hard). The evidence builder takes it from the observed
+	// control receipt and never manufactures it from the requested limit.
+	// It is orthogonal to isolation. Schema note: the field is always
+	// present in canonical JSON (including false) so historical v5
+	// digests stay stable; the meaning changed from "a bound was
+	// requested" to "a hard bound was proven installed".
 	WorkspaceQuotaEnforced bool `json:"workspace_quota_enforced"`
 	// KiwiSecretsInjected is true when the effective secret allowlist could
 	// admit at least one secret (nil policy, or any allowed entry). The
@@ -175,6 +195,9 @@ type ExecutionFacts struct {
 // Valid reports whether the fact vector is a well-formed, internally
 // consistent member of the closed domains. Inconsistent vectors (for example
 // filesystem_isolated on a native runtime) are refused, never interpreted.
+// When an observed receipt is present the pair must also satisfy
+// ValidateObservedConsistency: effective and observed controls are compared
+// semantically before evidence can be signed or accepted.
 func (f ExecutionFacts) Valid() bool {
 	switch f.Runtime {
 	case RuntimeFactUnknown, RuntimeFactNative, RuntimeFactContainer, RuntimeFactTart:
@@ -199,30 +222,115 @@ func (f ExecutionFacts) Valid() bool {
 	if f.ImagesDigestPinned && !sandboxed {
 		return false
 	}
-	if f.Observed != nil {
-		if !f.Observed.Valid() {
-			return false
+	if f.Observed != nil && !f.Observed.Valid() {
+		return false
+	}
+	return f.ValidateObservedConsistency() == nil
+}
+
+// ValidateObservedConsistency is the single authoritative cross-check between
+// the effective control vector and the executor-observed enforcement receipt.
+// It is called before signing and during attestation verification so Kiwi can
+// never emit (or accept) internally contradictory evidence: a statement that
+// claims network denied while its own receipt reports host networking must be
+// refused regardless of how it was produced.
+//
+// Only properties a runtime can unambiguously observe are cross-checked.
+// Native execution cannot deny the network, so a native effective policy of
+// "none" is NOT compared against the always-host receipt: consumers must read
+// Observed for what actually ran. Quota enforcement is always checkable
+// because the receipt carries the attempt-specific hard-quota result.
+func (f ExecutionFacts) ValidateObservedConsistency() error {
+	// Enforcement is observation-only. Claiming a hard quota without a
+	// receipt (or with a receipt that did not observe one) is exactly the
+	// overclaim this contract forbids.
+	observedHard := f.Observed != nil && f.Observed.WorkspaceQuotaEnforced
+	if f.WorkspaceQuotaEnforced != observedHard {
+		return errObservedMismatch("workspace_quota_enforced", f.WorkspaceQuotaEnforced, observedHard)
+	}
+	if f.Observed == nil {
+		return nil
+	}
+	obs := f.Observed
+	// Effective runtime ↔ observed runtime. An UNKNOWN effective runtime may
+	// carry any valid receipt (the receipt is then the only proven runtime
+	// fact and cannot upgrade the effective vector).
+	switch f.Runtime {
+	case RuntimeFactContainer:
+		if obs.Runtime != "docker" {
+			return errObservedMismatch("runtime", f.Runtime, obs.Runtime)
 		}
-		// When the effective runtime is known, the executor-observed receipt
-		// must corroborate it. An UNKNOWN effective runtime may carry any
-		// valid receipt: the receipt is then the only proven runtime fact
-		// (the effective vector stays unproven and cannot be upgraded by it).
-		switch f.Runtime {
-		case RuntimeFactContainer:
-			if f.Observed.Runtime != "docker" {
-				return false
-			}
-		case RuntimeFactTart:
-			if f.Observed.Runtime != "tart" {
-				return false
-			}
-		case RuntimeFactNative:
-			if f.Observed.Runtime != "native" {
-				return false
-			}
+	case RuntimeFactTart:
+		if obs.Runtime != "tart" {
+			return errObservedMismatch("runtime", f.Runtime, obs.Runtime)
+		}
+	case RuntimeFactNative:
+		if obs.Runtime != "native" {
+			return errObservedMismatch("runtime", f.Runtime, obs.Runtime)
 		}
 	}
-	return true
+	// Filesystem isolation ↔ sandbox started. A claimed isolation boundary
+	// the runtime did not start is a contradiction; a started sandbox on an
+	// effective vector that claims none is refused by Valid() already for
+	// native, and is meaningless for unknown.
+	if f.FilesystemIsolated && !obs.SandboxStarted {
+		return errObservedMismatch("filesystem_isolated", true, obs.SandboxStarted)
+	}
+	// Network none is the security-critical direction for runtimes that can
+	// deny networking (container). Claiming none while the runtime entered
+	// a connected namespace would let Kiwi sign "network denied" over a
+	// receipt that says otherwise. Tart cannot deny networking (and refuses
+	// the policy at start), so a tart receipt always reports vm-nat; that
+	// combination is already refused because effective none would demand
+	// observed none.
+	if f.Runtime == RuntimeFactContainer || f.Runtime == RuntimeFactTart {
+		if f.NetworkMode == NetworkModeFactNone && obs.NetworkEnforced != ObservedNetworkNone {
+			return errObservedMismatch("network_mode", f.NetworkMode, obs.NetworkEnforced)
+		}
+		// The reverse direction: a receipt that reports no network must not
+		// sit under an effective claim of unrestricted internet. services is
+		// compatible (services-only with no declared services disables all
+		// egress at the runtime).
+		if obs.NetworkEnforced == ObservedNetworkNone && f.NetworkMode == NetworkModeFactInternet {
+			return errObservedMismatch("network_mode", f.NetworkMode, obs.NetworkEnforced)
+		}
+	}
+	// Read-only root: the receipt is the only surface that records it today.
+	// When the effective vector claims isolation the receipt must be a real
+	// sandbox start (checked above); RootFilesystemReadOnly itself is an
+	// observation with no effective counterpart yet, so it is not compared.
+	return nil
+}
+
+// errObservedMismatch formats a single-field effective↔observed disagreement.
+func errObservedMismatch(field string, effective, observed any) error {
+	return &ObservedConsistencyError{Field: field, Effective: fmt.Sprintf("%v", effective), Observed: fmt.Sprintf("%v", observed)}
+}
+
+// ObservedConsistencyError reports one effective↔observed disagreement.
+type ObservedConsistencyError struct {
+	Field     string
+	Effective string
+	Observed  string
+}
+
+func (e *ObservedConsistencyError) Error() string {
+	return fmt.Sprintf("execution facts: effective %s=%s contradicts observed %s", e.Field, e.Effective, e.Observed)
+}
+
+// ApplyObservedControl attaches the executor-observed enforcement receipt and
+// derives the attempt-specific enforcement facts from it. WorkspaceQuotaEnforced
+// is copied from the receipt's hard-quota observation and is NEVER manufactured
+// from the requested limit. The result is then cross-validated; a contradictory
+// receipt is rejected rather than signed.
+func (f *ExecutionFacts) ApplyObservedControl(r *ExecutionControlReceipt) error {
+	f.Observed = r
+	if r != nil {
+		f.WorkspaceQuotaEnforced = r.WorkspaceQuotaEnforced
+	} else {
+		f.WorkspaceQuotaEnforced = false
+	}
+	return f.ValidateObservedConsistency()
 }
 
 // UnprovenExecutionFacts returns the conservative fact vector for a record

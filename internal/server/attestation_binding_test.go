@@ -57,7 +57,10 @@ func TestAttestationBindsCompletionDigestWithoutRawValues(t *testing.T) {
 	if !ok {
 		t.Fatal("evidence no longer gatherable")
 	}
-	in := attestationInput(ev, 3)
+	in, inErr := attestationInput(ev, 3)
+	if inErr != nil {
+		t.Fatalf("attestationInput: %v", inErr)
+	}
 	if in.EvidenceRootSHA256 != st.Attestation.EvidenceRootSHA256 {
 		t.Fatalf("signed evidence root = %q, recomputed = %q", st.Attestation.EvidenceRootSHA256, in.EvidenceRootSHA256)
 	}

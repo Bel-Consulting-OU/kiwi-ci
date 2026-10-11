@@ -211,3 +211,22 @@ func TestCompleteDBPersistsObservedRuntime(t *testing.T) {
 		t.Fatalf("db-mode observed runtime = %+v", j.ObservedRuntime)
 	}
 }
+
+// TestValidateObservedRuntimeRejectsControlRuntimeMismatch: a receipt whose
+// concrete runtime disagrees with the separately captured RuntimeName is
+// hostile or corrupted and must be refused at completion intake.
+func TestValidateObservedRuntimeRejectsControlRuntimeMismatch(t *testing.T) {
+	obs := &model.ObservedRuntime{
+		OS: "linux", Arch: "amd64", RuntimeName: "docker",
+		Control: &model.ExecutionControlReceipt{Runtime: "native", NetworkEnforced: model.ObservedNetworkHost},
+	}
+	if err := validateObservedRuntime(obs); err == nil {
+		t.Fatal("runtime_name/control.runtime mismatch must be refused")
+	}
+	obs.Control.Runtime = "docker"
+	obs.Control.SandboxStarted = true
+	obs.Control.NetworkEnforced = model.ObservedNetworkNone
+	if err := validateObservedRuntime(obs); err != nil {
+		t.Fatalf("matching receipt refused: %v", err)
+	}
+}

@@ -151,8 +151,35 @@ func VerifyArtifact(args []string) error {
 		signer = env.Signatures[0].KeyID
 	}
 	fmt.Printf("verified artifact %s\n  sha256: %s\n  execution semantics: %s\n  signer: %s\n", id, artifactSHA, displayExecutionSemantics(st.ExecutionSemantics), signer)
+	if err := validateStatementAssurance(st); err != nil {
+		return err
+	}
 	printExecutionAssurance(st)
 	return nil
+}
+
+// validateStatementAssurance cross-checks any signed execution-assurance
+// facts on a verified statement. Execution attestations already run this
+// inside VerifyExecutionAttestation; artifact statements carry a mirrored
+// facts block and must reject the same contradictions so a crafted
+// provenance document can never present effective controls that disagree
+// with its own observed receipt.
+func validateStatementAssurance(st provenance.Statement) error {
+	var facts *model.ExecutionFacts
+	if st.Attestation != nil {
+		if st.Attestation.ExecutionAssurance.Facts != nil {
+			facts = st.Attestation.ExecutionAssurance.Facts
+		}
+	} else if st.ExecutionAssurance != nil && st.ExecutionAssurance.Facts != nil {
+		facts = st.ExecutionAssurance.Facts
+	}
+	if facts == nil {
+		return nil
+	}
+	if !facts.Valid() {
+		return fmt.Errorf("statement carries invalid or self-contradictory execution facts")
+	}
+	return facts.ValidateObservedConsistency()
 }
 
 // printExecutionAssurance prints the signed execution-assurance evidence when
@@ -172,11 +199,11 @@ func printExecutionAssurance(st provenance.Statement) {
 	if evidence != nil {
 		fmt.Printf("  execution assurance: profile %d (%s)\n", evidence.Level, evidence.Name)
 		if f := evidence.Facts; f != nil {
-			fmt.Printf("    runtime: %s, filesystem isolated: %v, workspace quota: %v\n", f.Runtime, f.FilesystemIsolated, f.WorkspaceQuotaEnforced)
+			fmt.Printf("    runtime: %s, filesystem isolated: %v, workspace quota configured: %v, enforced: %v\n", f.Runtime, f.FilesystemIsolated, f.WorkspaceQuotaConfigured, f.WorkspaceQuotaEnforced)
 			fmt.Printf("    kiwi secrets injected: %v, host env inherited: %v, network: %s\n", f.KiwiSecretsInjected, f.HostEnvironmentInherited, f.NetworkMode)
 			fmt.Printf("    declared authority mediated: %v, images digest pinned: %v\n", f.DeclaredAuthorityMediated, f.ImagesDigestPinned)
 			if o := f.Observed; o != nil {
-				fmt.Printf("    observed: sandbox started %v, network enforced %s, read-only root %v\n", o.SandboxStarted, o.NetworkEnforced, o.RootFilesystemReadOnly)
+				fmt.Printf("    observed: sandbox started %v, network enforced %s, read-only root %v, workspace quota hard %v\n", o.SandboxStarted, o.NetworkEnforced, o.RootFilesystemReadOnly, o.WorkspaceQuotaEnforced)
 			}
 		}
 	}

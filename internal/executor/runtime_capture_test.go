@@ -176,3 +176,31 @@ func TestRunJobOmittedObservedRuntimeWithoutObserver(t *testing.T) {
 		t.Fatalf("ObservedRuntime = %+v, want nil for a backend without the capability", res.ObservedRuntime)
 	}
 }
+
+// TestContainerReceiptRecordsHardQuota proves the enforcement receipt carries
+// the attempt-specific hard-quota observation (P1): a caller-installed Hard
+// status stamps true, a soft/fallback status stamps false, and the capability
+// probe's retained cleanup also stamps true.
+func TestContainerReceiptRecordsHardQuota(t *testing.T) {
+	hard := &DiskQuotaStatus{Hard: true, Limit: 1 << 20, Detail: "xfs"}
+	b := &ContainerBackend{Image: "alpine:3.19", Untrusted: true, WorkspaceQuota: hard}
+	// StartJob against a missing docker is fine for this assertion only if we
+	// build the receipt the same way StartJob does after a successful start.
+	// Directly exercise the helper the receipt uses.
+	if !b.hardWorkspaceQuota() {
+		t.Fatal("caller Hard status must record hard quota")
+	}
+	soft := &DiskQuotaStatus{Hard: false, Detail: "step-boundary only"}
+	b.WorkspaceQuota = soft
+	if b.hardWorkspaceQuota() {
+		t.Fatal("soft status must not record hard quota")
+	}
+	b.WorkspaceQuota = nil
+	if b.hardWorkspaceQuota() {
+		t.Fatal("no status and no probe must not record hard quota")
+	}
+	b.quotaCleanup = func() error { return nil }
+	if !b.hardWorkspaceQuota() {
+		t.Fatal("probe-established quota must record hard quota")
+	}
+}

@@ -235,8 +235,14 @@ func TestAttestationAssuranceNativeQuotaNotIsolated(t *testing.T) {
 	if facts.FilesystemIsolated {
 		t.Fatalf("facts = %+v, must not claim filesystem isolation for native", facts)
 	}
-	if !facts.WorkspaceQuotaEnforced {
-		t.Fatalf("facts = %+v, want the enforced workspace quota recorded", facts)
+	// Quota truthfulness (P1): without an observed hard-quota result the
+	// attempt may have CONFIGURED a bound (untrusted default), but must not
+	// claim enforcement.
+	if !facts.WorkspaceQuotaConfigured {
+		t.Fatalf("facts = %+v, want the requested workspace quota recorded as configured", facts)
+	}
+	if facts.WorkspaceQuotaEnforced {
+		t.Fatalf("facts = %+v, must not claim quota enforcement without an observed hard-quota result", facts)
 	}
 	if facts.Runtime != model.RuntimeFactNative {
 		t.Fatalf("facts = %+v, want the native runtime", facts)
@@ -378,5 +384,119 @@ func TestAttestationGraphFingerprintTracksDurableGraph(t *testing.T) {
 	}
 	if one.Subject[0].Digest["sha256"] == two.Subject[0].Digest["sha256"] {
 		t.Fatal("changed graph fingerprint did not change the attestation digest")
+	}
+}
+
+// TestAttestationQuotaEnforcedOnlyFromObservedHardQuota is the P1 end-to-end
+// pin: a signed workspace_quota_enforced=true requires the attempt's observed
+// hard-quota result. A configured bound alone signs false; a hard receipt
+// signs true; a contradictory pair refuses to sign.
+func TestAttestationQuotaEnforcedOnlyFromObservedHardQuota(t *testing.T) {
+	s, err := NewPersistent("token", "token", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Configured bound, soft receipt → configured, not enforced.
+	seedAssuranceAttestationJob(t, s, "job-soft", "run-soft", nativeUntrustedPipeline, 1, false, policy.DefaultUntrustedCapabilities())
+	s.mu.Lock()
+	j := s.jobs["job-soft"]
+	j.ObservedRuntime = &model.ObservedRuntime{
+		OS: "linux", Arch: "amd64", RuntimeName: "native",
+		Control: &model.ExecutionControlReceipt{Runtime: "native", NetworkEnforced: model.ObservedNetworkHost},
+	}
+	s.jobs["job-soft"] = j
+	s.mu.Unlock()
+	if err := s.attestExecution(context.Background(), "job-soft", 1); err != nil {
+		t.Fatalf("attestExecution soft: %v", err)
+	}
+	s.mu.Lock()
+	rec := s.attestations[model.AttemptID("job-soft", 1)]
+	s.mu.Unlock()
+	st, _ := verifyAttestationEnvelope(t, s, rec)
+	facts := st.Attestation.ExecutionAssurance.Facts
+	if facts.WorkspaceQuotaEnforced {
+		t.Fatalf("facts = %+v, soft receipt must not claim enforcement", facts)
+	}
+	if !facts.WorkspaceQuotaConfigured {
+		t.Fatalf("facts = %+v, want configured", facts)
+	}
+
+	// Hard receipt → enforced.
+	seedAssuranceAttestationJob(t, s, "job-hard", "run-hard", nativeUntrustedPipeline, 1, false, policy.DefaultUntrustedCapabilities())
+	s.mu.Lock()
+	j = s.jobs["job-hard"]
+	j.ObservedRuntime = &model.ObservedRuntime{
+		OS: "linux", Arch: "amd64", RuntimeName: "native",
+		Control: &model.ExecutionControlReceipt{Runtime: "native", NetworkEnforced: model.ObservedNetworkHost, WorkspaceQuotaEnforced: true},
+	}
+	s.jobs["job-hard"] = j
+	s.mu.Unlock()
+	if err := s.attestExecution(context.Background(), "job-hard", 1); err != nil {
+		t.Fatalf("attestExecution hard: %v", err)
+	}
+	s.mu.Lock()
+	rec = s.attestations[model.AttemptID("job-hard", 1)]
+	s.mu.Unlock()
+	st, _ = verifyAttestationEnvelope(t, s, rec)
+	facts = st.Attestation.ExecutionAssurance.Facts
+	if !facts.WorkspaceQuotaEnforced {
+		t.Fatalf("facts = %+v, hard receipt must record enforcement", facts)
+	}
+
+	// Contradictory receipt (effective network none vs connected namespace)
+	// must refuse to sign.
+	seedAssuranceAttestationJob(t, s, "job-bad", "run-bad", hermeticUntrustedPipeline, 1, false, policy.DefaultUntrustedCapabilities())
+	s.mu.Lock()
+	j = s.jobs["job-bad"]
+	j.ObservedRuntime = &model.ObservedRuntime{
+		OS: "linux", Arch: "amd64", RuntimeName: "docker",
+		Control: &model.ExecutionControlReceipt{Runtime: "docker", SandboxStarted: true, NetworkEnforced: model.ObservedNetworkContainerNamespace},
+	}
+	s.jobs["job-bad"] = j
+	s.mu.Unlock()
+	if err := s.attestExecution(context.Background(), "job-bad", 1); err == nil {
+		t.Fatal("contradictory effective/observed pair must fail signing")
+	}
+}
+
+// TestAttestationRejectsHostileObservedContradiction: a hostile runner that
+// reports a receipt contradicting the effective vector cannot get that pair
+// signed, and a crafted statement carrying one fails verification.
+func TestAttestationRejectsHostileObservedContradiction(t *testing.T) {
+	s, err := NewPersistent("token", "token", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedAssuranceAttestationJob(t, s, "job-h", "run-h", hermeticUntrustedPipeline, 1, false, policy.DefaultUntrustedCapabilities())
+	s.mu.Lock()
+	j := s.jobs["job-h"]
+	j.ObservedRuntime = &model.ObservedRuntime{
+		OS: "linux", Arch: "amd64", RuntimeName: "docker",
+		Control: &model.ExecutionControlReceipt{Runtime: "docker", SandboxStarted: true, NetworkEnforced: model.ObservedNetworkHost},
+	}
+	s.jobs["job-h"] = j
+	s.mu.Unlock()
+	if err := s.attestExecution(context.Background(), "job-h", 1); err == nil {
+		t.Fatal("hostile receipt (network host under effective none) must fail signing")
+	}
+
+	// A validly signed statement whose facts are then rewritten to a
+	// contradictory pair must fail verification.
+	seedAssuranceAttestationJob(t, s, "job-ok", "run-ok", hermeticUntrustedPipeline, 1, false, policy.DefaultUntrustedCapabilities())
+	if err := s.attestExecution(context.Background(), "job-ok", 1); err != nil {
+		t.Fatalf("attestExecution: %v", err)
+	}
+	s.mu.Lock()
+	rec := s.attestations[model.AttemptID("job-ok", 1)]
+	s.mu.Unlock()
+	st, _ := verifyAttestationEnvelope(t, s, rec)
+	cp := *st.Attestation
+	f := *cp.ExecutionAssurance.Facts
+	f.Observed = &model.ExecutionControlReceipt{Runtime: "docker", SandboxStarted: true, NetworkEnforced: model.ObservedNetworkContainerNamespace}
+	cp.ExecutionAssurance.Facts = &f
+	tampered := st
+	tampered.Attestation = &cp
+	if err := provenance.VerifyExecutionAttestation(tampered); err == nil {
+		t.Fatal("verification accepted contradictory effective/observed pair")
 	}
 }

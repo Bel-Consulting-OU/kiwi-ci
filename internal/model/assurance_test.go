@@ -56,8 +56,14 @@ func TestDeriveAssuranceProfileFromFacts(t *testing.T) {
 		{name: "native with a workspace quota is uncontrolled, never isolated", mut: func(f *ExecutionFacts) {
 			f.Runtime = RuntimeFactNative
 			f.FilesystemIsolated = false
+			f.WorkspaceQuotaConfigured = true
+			f.Observed = &ExecutionControlReceipt{Runtime: "native", NetworkEnforced: ObservedNetworkHost, WorkspaceQuotaEnforced: true}
 			f.WorkspaceQuotaEnforced = true
 		}, want: AssuranceUncontrolled},
+		{name: "quota configured without observation does not claim enforcement", mut: func(f *ExecutionFacts) {
+			f.WorkspaceQuotaConfigured = true
+			f.WorkspaceQuotaEnforced = false
+		}, want: AssuranceNetworkDenied},
 		{name: "sandbox with injected secrets is only isolated", mut: func(f *ExecutionFacts) {
 			f.KiwiSecretsInjected = true
 		}, want: AssuranceIsolatedFilesystem},
@@ -138,5 +144,161 @@ func TestExternalEffectsClassClosedSet(t *testing.T) {
 		if bad.Valid() {
 			t.Fatalf("class %q accepted", bad)
 		}
+	}
+}
+
+// TestValidateObservedConsistencyMatrix pins the P2 cross-check: effective
+// controls and the executor-observed receipt must agree on every property a
+// runtime can unambiguously observe. Contradictory pairs are refused whether
+// they were produced by a bug or a hostile runner, before signing and during
+// verification (both go through Valid()).
+func TestValidateObservedConsistencyMatrix(t *testing.T) {
+	containerBase := ExecutionFacts{
+		Runtime:            RuntimeFactContainer,
+		FilesystemIsolated: true,
+		NetworkMode:        NetworkModeFactNone,
+	}
+	nativeBase := ExecutionFacts{
+		Runtime:     RuntimeFactNative,
+		NetworkMode: NetworkModeFactDefault,
+	}
+	cases := []struct {
+		name    string
+		mut     func(*ExecutionFacts)
+		wantErr bool
+	}{
+		{
+			name: "container network none + observed none agrees",
+			mut: func(f *ExecutionFacts) {
+				f.Observed = &ExecutionControlReceipt{Runtime: "docker", SandboxStarted: true, NetworkEnforced: ObservedNetworkNone}
+			},
+		},
+		{
+			name: "container network none + observed container-namespace is contradictory",
+			mut: func(f *ExecutionFacts) {
+				f.Observed = &ExecutionControlReceipt{Runtime: "docker", SandboxStarted: true, NetworkEnforced: ObservedNetworkContainerNamespace}
+			},
+			wantErr: true,
+		},
+		{
+			name: "container network none + observed host is contradictory",
+			mut: func(f *ExecutionFacts) {
+				f.Observed = &ExecutionControlReceipt{Runtime: "docker", SandboxStarted: true, NetworkEnforced: ObservedNetworkHost}
+			},
+			wantErr: true,
+		},
+		{
+			name: "container isolation without sandbox start is contradictory",
+			mut: func(f *ExecutionFacts) {
+				f.Observed = &ExecutionControlReceipt{Runtime: "docker", SandboxStarted: false, NetworkEnforced: ObservedNetworkNone}
+			},
+			wantErr: true,
+		},
+		{
+			name: "effective container + native receipt is contradictory",
+			mut: func(f *ExecutionFacts) {
+				f.Observed = &ExecutionControlReceipt{Runtime: "native", NetworkEnforced: ObservedNetworkHost}
+			},
+			wantErr: true,
+		},
+		{
+			name: "effective container + tart receipt is contradictory",
+			mut: func(f *ExecutionFacts) {
+				f.Observed = &ExecutionControlReceipt{Runtime: "tart", SandboxStarted: true, NetworkEnforced: ObservedNetworkVMNAT}
+			},
+			wantErr: true,
+		},
+		{
+			name: "observed none under effective internet is contradictory",
+			mut: func(f *ExecutionFacts) {
+				f.NetworkMode = NetworkModeFactInternet
+				f.Observed = &ExecutionControlReceipt{Runtime: "docker", SandboxStarted: true, NetworkEnforced: ObservedNetworkNone}
+			},
+			wantErr: true,
+		},
+		{
+			name: "observed none under effective services is compatible",
+			mut: func(f *ExecutionFacts) {
+				f.NetworkMode = NetworkModeFactServices
+				f.Observed = &ExecutionControlReceipt{Runtime: "docker", SandboxStarted: true, NetworkEnforced: ObservedNetworkNone}
+			},
+		},
+		{
+			name: "quota enforced must match the receipt",
+			mut: func(f *ExecutionFacts) {
+				f.WorkspaceQuotaEnforced = true
+				f.Observed = &ExecutionControlReceipt{Runtime: "docker", SandboxStarted: true, NetworkEnforced: ObservedNetworkNone}
+			},
+			wantErr: true,
+		},
+		{
+			name: "quota enforced matches a hard receipt",
+			mut: func(f *ExecutionFacts) {
+				f.WorkspaceQuotaEnforced = true
+				f.Observed = &ExecutionControlReceipt{Runtime: "docker", SandboxStarted: true, NetworkEnforced: ObservedNetworkNone, WorkspaceQuotaEnforced: true}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := containerBase
+			tc.mut(&f)
+			err := f.ValidateObservedConsistency()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("ValidateObservedConsistency accepted %+v", f)
+				}
+				if f.Valid() {
+					t.Fatalf("Valid() accepted contradictory facts %+v", f)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ValidateObservedConsistency: %v", err)
+			}
+			if !f.Valid() {
+				t.Fatalf("Valid() rejected consistent facts %+v", f)
+			}
+		})
+	}
+
+	// Native cannot deny networking: the always-host receipt is NOT compared
+	// against an effective policy of none (the runtime cannot observe/enforce
+	// it). Quota still is.
+	nativeBase.NetworkMode = NetworkModeFactNone
+	nativeBase.Observed = &ExecutionControlReceipt{Runtime: "native", NetworkEnforced: ObservedNetworkHost}
+	if err := nativeBase.ValidateObservedConsistency(); err != nil {
+		t.Fatalf("native policy-none vs host receipt must not be a cross-check: %v", err)
+	}
+	nativeBase.WorkspaceQuotaEnforced = true
+	if err := nativeBase.ValidateObservedConsistency(); err == nil {
+		t.Fatal("native quota overclaim must still be refused")
+	}
+}
+
+// TestApplyObservedControlNeverManufacturesEnforcement: the helper is the only
+// legal way to fill workspace_quota_enforced, and it always takes the value
+// from the receipt.
+func TestApplyObservedControlNeverManufacturesEnforcement(t *testing.T) {
+	f := ExecutionFacts{Runtime: RuntimeFactNative, NetworkMode: NetworkModeFactDefault, WorkspaceQuotaConfigured: true}
+	if err := f.ApplyObservedControl(nil); err != nil {
+		t.Fatalf("ApplyObservedControl(nil): %v", err)
+	}
+	if f.WorkspaceQuotaEnforced {
+		t.Fatalf("nil receipt manufactured enforcement: %+v", f)
+	}
+	soft := &ExecutionControlReceipt{Runtime: "native", NetworkEnforced: ObservedNetworkHost}
+	if err := f.ApplyObservedControl(soft); err != nil {
+		t.Fatalf("ApplyObservedControl(soft): %v", err)
+	}
+	if f.WorkspaceQuotaEnforced {
+		t.Fatalf("soft receipt manufactured enforcement: %+v", f)
+	}
+	hard := &ExecutionControlReceipt{Runtime: "native", NetworkEnforced: ObservedNetworkHost, WorkspaceQuotaEnforced: true}
+	if err := f.ApplyObservedControl(hard); err != nil {
+		t.Fatalf("ApplyObservedControl(hard): %v", err)
+	}
+	if !f.WorkspaceQuotaEnforced {
+		t.Fatalf("hard receipt dropped enforcement: %+v", f)
 	}
 }

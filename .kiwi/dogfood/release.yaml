@@ -1,0 +1,100 @@
+# DF7 — Release-candidate closure (dogfood tier 7 of DF0–DF7).
+#
+# Cadence: RC-blocking (every release candidate). DF0 remains
+# .kiwi/pipeline.yaml and is not replaced — an RC that skips DF0 is not a
+# candidate. DF5 canaries are separate and never block an RC by themselves.
+#
+# Question: does the EXACT release artifact pass? Not the source tree, not
+# a `go build` of HEAD — the bytes a user will install
+# (docs/DOGFOOD_MATRIX.md Gate K, docs/releases.md).
+#
+# Closure under test, in order:
+#   install exact release artifact → self-build (G0→G1→G2) → distributed
+#   topology → evidence verify → replay → upgrade from N-1 → DR
+#   (backup → destruction → restore → replay) → uninstall clean
+#
+# Generation limit G0/G1/G2 — do not recurse self-dogfooding:
+#   G0  the DF7 harness / the installed artifact's first build of itself.
+#   G1  G0's self-build of the same source (DF-SELF-001). G1 is real product
+#       work; it must NOT be handed the dogfood pipeline as its workload.
+#   G2  G1's self-build of the same source (DF-SELF-002). This is the LAST
+#       permitted generation: G2 must not schedule any further build or
+#       dogfood suite. The harness records G0/G1/G2 and refuses G3+.
+#   Self-build is the only sanctioned multi-generation path; every other
+#   DF7 scenario stays at G0/G1. Do not "just add one more generation" to
+#   prove more — that is the recursion the limit exists to prevent.
+#
+# Hermetic: fakes only (fake forge/OIDC/deploy, fake external-effect sink).
+# No real provider dependencies. Installing the release artifact uses the
+# artifact the RC pipeline produced, never a live registry that can drift.
+version: 1
+name: kiwi-dogfood-df7-release
+
+defaults:
+  shell: bash
+
+inputs:
+  # Unique namespace for this suite run. CI passes its run id (or any
+  # value unique across concurrent and retried runs). The harness derives
+  # every fixture store, object key, lease holder and fake-sink counter
+  # from this input via DOGFOOD_RUN_ID and refuses an empty or colliding
+  # id — a shared namespace would let two suite runs observe each other.
+  dogfood_run_id:
+    type: string
+    required: true
+    description: Unique per-run namespace for dogfood fixtures and evidence.
+
+env:
+  GOTOOLCHAIN: local
+  # Unique namespace: the installed artifact, its DB, its objectstore and
+  # its self-build generations are all namespaced by DOGFOOD_RUN_ID so two
+  # RCs (or an RC retried after a flake) cannot share state.
+  DOGFOOD_RUN_ID: "${{ inputs.dogfood_run_id }}"
+
+concurrency:
+  # One RC suite at a time: install/uninstall and the N-1 upgrade mutate
+  # machine-level state and must not interleave with another candidate.
+  group: dogfood-df7-release
+  cancel_in_progress: true
+
+jobs:
+  df7-release-closure:
+    runtime: container
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    timeout: 180m
+    infra_retries: 0
+    env:
+      GOCACHE: /workspace/.kiwi/cache/df7-release
+      GOMODCACHE: /workspace/.kiwi/cache/df7-release/gomod
+    sandbox:
+      rootless: true
+      network: internet
+    cache:
+      - name: go-build-df7-release
+        key: go-build-df7-release
+        hash_files: [go.sum]
+        paths: [.kiwi/cache/df7-release]
+    steps:
+      # One harness invocation walks install → self-build (G0→G1→G2) →
+      # distributed → evidence → replay → upgrade → DR → uninstall. CI
+      # invokes `make dogfood-release` rather than duplicating that order;
+      # the suite is the only place the generation limit is enforced.
+      # Scenario IDs DF-RELEASE-001, DF-SELF-001/002, DF-DIST-001,
+      # DF-EVID-001/002, DF-REPLAY-001, DF-UPGRADE-001, DF-DR-001.
+      - name: dogfood-release
+        run: make dogfood-release
+    artifacts:
+      - name: dogfood-result
+        paths:
+          - dogfood-result.json
+          - scenario-results/
+          - kiwi-evidence/
+          - server-version.json
+          - runner-versions.json
+          - environment.json
+          - failure-seeds.json
+          - metrics-summary.json
+        if: always()
+        required: false
+        # RC evidence is the audit trail for the release decision.
+        retention: 2160h

@@ -185,12 +185,21 @@ func (e EffectiveExecution) imagesDigestPinned() bool {
 // a secret could be injected). Observed is left nil here; the evidence
 // emitter attaches the executor-observed receipt from the persisted job, so
 // this function stays a pure function of the effective execution.
+//
+// Quota truthfulness (P1): WorkspaceQuotaConfigured records that the plan
+// requested a bound. WorkspaceQuotaEnforced is NEVER derived from the
+// requested limit — it stays false here and is set only from the
+// attempt-specific hard-quota observation on the control receipt
+// (model.ExecutionFacts.ApplyObservedControl). A signed
+// workspace_quota_enforced=true therefore always means an OS-level hard
+// quota was proven installed, not merely that one was asked for.
 func (e EffectiveExecution) Facts() model.ExecutionFacts {
 	caps := e.Capabilities
 	return model.ExecutionFacts{
 		Runtime:                   e.runtimeFact(),
 		FilesystemIsolated:        e.sandboxed(),
-		WorkspaceQuotaEnforced:    e.WorkspaceQuotaLimit > 0,
+		WorkspaceQuotaConfigured:  e.WorkspaceQuotaLimit > 0,
+		WorkspaceQuotaEnforced:    false,
 		KiwiSecretsInjected:       !(caps.Secrets != nil && len(caps.Secrets) == 0),
 		HostEnvironmentInherited:  false, // the distributed model always starts from a clean environment
 		NetworkMode:               e.networkModeFact(),

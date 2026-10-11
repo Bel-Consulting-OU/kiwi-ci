@@ -1,0 +1,126 @@
+# DF1 — Local product lifecycle (dogfood tier 1 of DF0–DF7).
+#
+# Cadence: every PR after DF0. DF0 (source integrity) remains
+# .kiwi/pipeline.yaml and is NOT replaced or re-encoded here — this suite
+# only covers the product-lifecycle dogfood that DF0 deliberately excludes.
+#
+# Question: does a fresh `kiwi up` complete a full local lifecycle against
+# the same CLI/API surfaces real customers use?
+#
+# Lifecycle under test (ordered inside the suite, one invocation):
+#   fresh kiwi up → auth → submit → execute → logs → artifact → cache →
+#   evidence → verify → restart → historical query → replay → clean shutdown
+#
+# WHY a single make target instead of one pipeline step per phase: the
+# phases share one outer-oracle harness and one DOGFOOD_RUN_ID namespace;
+# splitting them across jobs would re-encode the scenario list in YAML and
+# let Makefile and pipeline drift. CI providers invoke `make dogfood-local`
+# (see docs/DOGFOOD.md "Makefile entry points") rather than duplicating
+# orchestration.
+#
+# Hermetic: no real forge/OIDC/deploy providers. Controlled dependencies
+# are the fakes under internal/dogfood/ (fake_forge, fake_oidc,
+# fake_deployment). DF5 production canaries are a separate, non-PR lane.
+#
+# Generation limit: DF1 runs at G0 (the harness itself). It may submit
+# product work as G1; it must never schedule another dogfood pipeline
+# (G2 would recurse self-dogfooding). The harness records G0/G1/G2 and
+# refuses unintended recursion.
+version: 1
+name: kiwi-dogfood-df1-local
+
+defaults:
+  shell: bash
+
+inputs:
+  # Unique namespace for this suite run. CI passes its run id (or any
+  # value unique across concurrent and retried runs). The harness derives
+  # every fixture store, object key, lease holder and fake-sink counter
+  # from this input via DOGFOOD_RUN_ID and refuses an empty or colliding
+  # id — a shared namespace would let two suite runs observe each other.
+  dogfood_run_id:
+    type: string
+    required: true
+    description: Unique per-run namespace for dogfood fixtures and evidence.
+
+env:
+  # Never download a toolchain: the dogfood image is digest-pinned and
+  # matches go.mod (same contract as .kiwi/pipeline.yaml).
+  GOTOOLCHAIN: local
+  # Unique namespace per suite run. Every fixture store, object key, lease
+  # holder, fake-sink counter and evidence subject is derived from this id
+  # so two concurrent dogfood runs (or a retried run) can never observe
+  # each other's state. The harness refuses to start when it is empty.
+  DOGFOOD_RUN_ID: "${{ inputs.dogfood_run_id }}"
+
+concurrency:
+  # One DF1 suite per run id: parallel PRs each get their own namespace,
+  # while a retried run replaces its predecessor instead of racing it.
+  group: "dogfood-df1:${{ inputs.dogfood_run_id }}"
+  cancel_in_progress: true
+
+jobs:
+  # Critical path first (DF-BOOT / DF-EVID / DF-LEASE). This is the half of
+  # `make dogfood-fast` that is NOT already DF0; running it as its own job
+  # fails the PR gate before the longer lifecycle spends its budget.
+  df1-critical:
+    runtime: container
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    timeout: 20m
+    infra_retries: 1
+    env:
+      GOCACHE: /workspace/.kiwi/cache/df1-critical
+      GOMODCACHE: /workspace/.kiwi/cache/df1-critical/gomod
+    sandbox:
+      # The suite only needs module downloads; product processes it starts
+      # are local and hermetic (fake forge/OIDC/deploy, no egress).
+      rootless: true
+      network: internet
+    cache:
+      - name: go-build-df1-critical
+        key: go-build-df1-critical
+        hash_files: [go.sum]
+        paths: [.kiwi/cache/df1-critical]
+    steps:
+      - name: dogfood-fast
+        run: make dogfood-fast
+
+  # Full DF1 lifecycle: boot → auth → submit → execute → logs → artifact →
+  # cache → evidence → verify → restart → historical query → replay →
+  # shutdown. Scenario IDs DF-BOOT-*, DF-AUTH-*, DF-ART-*, DF-CACHE-*,
+  # DF-EVID-*, DF-EVENT-*, DF-REPLAY-*, DF-LIFE-* (docs/DOGFOOD.md).
+  df1-local-lifecycle:
+    needs: [df1-critical]
+    runtime: container
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    timeout: 60m
+    infra_retries: 1
+    env:
+      GOCACHE: /workspace/.kiwi/cache/df1-local
+      GOMODCACHE: /workspace/.kiwi/cache/df1-local/gomod
+    sandbox:
+      rootless: true
+      network: internet
+    cache:
+      - name: go-build-df1-local
+        key: go-build-df1-local
+        hash_files: [go.sum]
+        paths: [.kiwi/cache/df1-local]
+    steps:
+      - name: dogfood-local
+        run: make dogfood-local
+    artifacts:
+      # The execution-dogfood result bundle (docs/DOGFOOD_MATRIX.md). Best
+      # effort: absent when the suite fails before emit, so it must never
+      # fail the dogfood run on its own.
+      - name: dogfood-result
+        paths:
+          - dogfood-result.json
+          - scenario-results/
+          - kiwi-evidence/
+          - environment.json
+          - failure-seeds.json
+          - metrics-summary.json
+        if: always()
+        required: false
+        retention: 168h

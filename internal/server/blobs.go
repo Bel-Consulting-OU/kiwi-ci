@@ -949,17 +949,24 @@ func artifactProvenanceInput(j model.Job, run model.Run, rec model.ArtifactRecor
 	}
 	// The execution-assurance facts (and their derived label) of the
 	// producing attempt are derived from the same persisted job + payload +
-	// policy records the attestation path uses, with the executor-observed
-	// receipt attached when the attempt captured one. When the execution
-	// cannot be re-verified the fields are omitted (never fabricated); an
-	// executed Kiwi upload always carries them.
+	// policy records the attestation path uses. The executor-observed
+	// receipt is attached through ApplyObservedControl, which derives
+	// attempt-specific enforcement (workspace_quota_enforced) from the
+	// receipt's hard-quota observation — never from the requested limit —
+	// and refuses a contradictory pair. When the execution cannot be
+	// re-verified, or the receipt contradicts the effective vector, the
+	// fields are omitted (never fabricated); an executed Kiwi upload always
+	// carries truthful ones.
 	if eff, ok := execution.MaterializeFromJob(j); ok {
 		facts := eff.Facts()
+		var control *model.ExecutionControlReceipt
 		if j.ObservedRuntime != nil {
-			facts.Observed = j.ObservedRuntime.Control
+			control = j.ObservedRuntime.Control
 		}
-		if evidence, aerr := provenance.NewExecutionAssuranceEvidence(facts); aerr == nil {
-			in.ExecutionAssurance = &evidence
+		if aerr := facts.ApplyObservedControl(control); aerr == nil {
+			if evidence, aerr2 := provenance.NewExecutionAssuranceEvidence(facts); aerr2 == nil {
+				in.ExecutionAssurance = &evidence
+			}
 		}
 		in.ExternalEffects = eff.EffectsClass()
 	}

@@ -224,7 +224,7 @@ func (s *Server) gatherAttestationEvidenceLocal(jobID string, generation int64) 
 // full artifact-side graph (sidecars included); the per-item lists stay the
 // human-readable detail, and the completion identity is the durable receipt
 // digest. No raw output or error value is ever embedded in the envelope.
-func attestationInput(ev attestationEvidence, generation int64) provenance.ExecutionAttestationInput {
+func attestationInput(ev attestationEvidence, generation int64) (provenance.ExecutionAttestationInput, error) {
 	j := ev.job
 	in := provenance.ExecutionAttestationInput{
 		RunID:                  j.RunID,
@@ -249,13 +249,17 @@ func attestationInput(ev attestationEvidence, generation int64) provenance.Execu
 		GraphFingerprint: provenance.GraphFingerprint(ev.graphJobs),
 	}
 	// The execution-assurance facts are derived purely from the persisted job
-	// + payload + policy records through the shared materializer, and the
+	// + payload + policy records through the shared materializer. The
 	// executor-observed enforcement receipt (when the attempt captured one)
-	// is attached from the durable job record. A record whose execution
-	// cannot be re-verified gets the CONSERVATIVE unproven fact vector
-	// (unknown runtime, injected credentials not excluded): unproven
-	// executions are never upgraded, and the facts label is always derived
-	// by the shared rule, never passed in.
+	// is attached through ApplyObservedControl, which also derives the
+	// attempt-specific enforcement facts (workspace_quota_enforced) from the
+	// receipt's hard-quota observation — never from the requested limit.
+	// A record whose execution cannot be re-verified gets the CONSERVATIVE
+	// unproven fact vector (unknown runtime, injected credentials not
+	// excluded): unproven executions are never upgraded, and the facts label
+	// is always derived by the shared rule, never passed in. A receipt that
+	// contradicts the effective vector is refused here so the subsequent
+	// sign step (which re-validates) cannot emit contradictory evidence.
 	var facts model.ExecutionFacts
 	if eff, ok := execution.MaterializeFromJob(j); ok {
 		facts = eff.Facts()
@@ -264,8 +268,15 @@ func attestationInput(ev attestationEvidence, generation int64) provenance.Execu
 		facts = model.UnprovenExecutionFacts()
 		in.ExternalEffects = model.EffectsOpaqueExternal
 	}
+	var control *model.ExecutionControlReceipt
 	if j.ObservedRuntime != nil {
-		facts.Observed = j.ObservedRuntime.Control
+		control = j.ObservedRuntime.Control
+	}
+	if err := facts.ApplyObservedControl(control); err != nil {
+		// Contradictory effective/observed pair: refuse to build a statement
+		// rather than sign a lie. The caller surfaces this as an attestation
+		// failure; the job itself is untouched.
+		return provenance.ExecutionAttestationInput{}, err
 	}
 	in.ExecutionAssuranceFacts = facts
 	if p := j.CompiledJobPayload; p != nil {
@@ -331,7 +342,7 @@ func attestationInput(ev attestationEvidence, generation int64) provenance.Execu
 		TestReports: in.TestReports,
 		Snapshots:   in.Snapshots,
 	})
-	return in
+	return in, nil
 }
 
 // signAttestationEnvelope builds the deterministic statement, signs it and
@@ -424,7 +435,11 @@ func (s *Server) attestExecutionDB(ctx context.Context, jobID string, generation
 	if !ok {
 		return fmt.Errorf("attestation: store lacks the ExecutionAttestationStore contract")
 	}
-	envBytes, envelopeDigest, statementDigest, err := s.signAttestationEnvelope(attestationInput(ev, generation))
+	in, inErr := attestationInput(ev, generation)
+	if inErr != nil {
+		return inErr
+	}
+	envBytes, envelopeDigest, statementDigest, err := s.signAttestationEnvelope(in)
 	if err != nil {
 		return err
 	}
@@ -472,7 +487,11 @@ func (s *Server) attestExecutionLocal(ctx context.Context, jobID string, generat
 			ev.eventFrontier = latest
 		}
 	}
-	envBytes, envelopeDigest, statementDigest, err := s.signAttestationEnvelope(attestationInput(ev, generation))
+	in, inErr := attestationInput(ev, generation)
+	if inErr != nil {
+		return inErr
+	}
+	envBytes, envelopeDigest, statementDigest, err := s.signAttestationEnvelope(in)
 	if err != nil {
 		return err
 	}

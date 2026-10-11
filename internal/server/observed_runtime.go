@@ -51,8 +51,17 @@ func validateObservedRuntime(obs *model.ObservedRuntime) error {
 	if err := checkObservedString("main_image_digest", obs.MainImageDigest, maxObservedRuntimeValLen); err != nil {
 		return err
 	}
-	if obs.Control != nil && !obs.Control.Valid() {
-		return fmt.Errorf("observed_runtime.control is not a well-formed enforcement receipt")
+	if obs.Control != nil {
+		if !obs.Control.Valid() {
+			return fmt.Errorf("observed_runtime.control is not a well-formed enforcement receipt")
+		}
+		// The receipt's runtime is the concrete daemon/VM identity (docker,
+		// tart, native); RuntimeName is the same surface captured separately.
+		// A mismatch is a hostile or corrupted observation and is refused at
+		// intake so it can never reach signed evidence.
+		if obs.RuntimeName != "" && obs.Control.Runtime != "" && obs.RuntimeName != obs.Control.Runtime {
+			return fmt.Errorf("observed_runtime.runtime_name %q contradicts control.runtime %q", obs.RuntimeName, obs.Control.Runtime)
+		}
 	}
 	for _, m := range []struct {
 		name string

@@ -1,0 +1,104 @@
+# DF3 — Adversarial distributed / chaos (dogfood tier 3 of DF0–DF7).
+#
+# Cadence: nightly. DF0 remains .kiwi/pipeline.yaml and is not replaced.
+# DF3 is deliberately NOT on the PR path: chaos is randomized with recorded
+# seeds and needs wall-clock budget that would stall every pull request.
+#
+# Question: do safety AND liveness hold under attack? A system that fails
+# closed by becoming permanently wedged has not passed
+# (docs/DOGFOOD.md "Safety and liveness").
+#
+# Faults under test (internal/dogfood/fault; pause hooks, not sleeps):
+#   kill server mid-run · kill runner mid-lease · kill PostgreSQL ·
+#   kill objectstore · network partition (client↔server, server↔runner) ·
+#   lease expiry + reclaim · duplicate messages (completion, artifact
+#   finalize, event append) · stale-generation writes · hostile-runner
+#   receipts (internal/dogfood/hostile)
+#
+# Every adversarial scenario answers both:
+#   1. Did Kiwi prevent the bad thing?   (invariants I1–I10, docs/INVARIANTS.md)
+#   2. Can Kiwi continue doing the good thing afterward? (liveness)
+#
+# Random seeds: chaos scheduling is randomized but every run records seed,
+# scenario, commit, versions and policy digest in failure-seeds.json /
+# environment.json so a red nightly is exactly reproducible.
+#
+# No hidden retries: attempt counts and first-attempt results are part of
+# the result bundle; a scenario that only passes on infra retry is non-green
+# unless the retry itself is the behavior under test.
+#
+# Hermetic: fake forge/OIDC/deploy sinks only. No real providers. DF5
+# canaries are separate. Generation limit G0/G1/G2 (see
+# .kiwi/dogfood/distributed.yaml): this suite is G0 and must not recurse.
+version: 1
+name: kiwi-dogfood-df3-adversarial
+
+defaults:
+  shell: bash
+
+inputs:
+  # Unique namespace for this suite run. CI passes its run id (or any
+  # value unique across concurrent and retried runs). The harness derives
+  # every fixture store, object key, lease holder and fake-sink counter
+  # from this input via DOGFOOD_RUN_ID and refuses an empty or colliding
+  # id — a shared namespace would let two suite runs observe each other.
+  dogfood_run_id:
+    type: string
+    required: true
+    description: Unique per-run namespace for dogfood fixtures and evidence.
+
+env:
+  GOTOOLCHAIN: local
+  # Unique namespace: every kill/partition scenario needs its own store,
+  # objectstore and runner identities so a crashed suite cannot poison the
+  # next nightly's fixtures.
+  DOGFOOD_RUN_ID: "${{ inputs.dogfood_run_id }}"
+
+concurrency:
+  # One chaos suite at a time: parallel nightlies would fight over the same
+  # machine's process/fd budget and make seed reproduction meaningless.
+  group: dogfood-df3-adversarial
+  cancel_in_progress: true
+
+jobs:
+  df3-adversarial-chaos:
+    runtime: container
+    image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
+    # Chaos matrices (kill every component at every pause hook, lease
+    # fencing races, duplicate-message permutations) are the longest DF
+    # suite after scale; the budget is wall-clock, not retries.
+    timeout: 180m
+    infra_retries: 0
+    env:
+      GOCACHE: /workspace/.kiwi/cache/df3-adversarial
+      GOMODCACHE: /workspace/.kiwi/cache/df3-adversarial/gomod
+    sandbox:
+      rootless: true
+      network: internet
+    cache:
+      - name: go-build-df3-adversarial
+        key: go-build-df3-adversarial
+        hash_files: [go.sum]
+        paths: [.kiwi/cache/df3-adversarial]
+    steps:
+      # One harness invocation: the kill/partition/lease/duplicate matrix is
+      # ordered inside the suite (deterministic fault-injection points), and
+      # CI invokes `make dogfood-adversarial` rather than re-encoding the
+      # matrix in YAML. Scenario IDs DF-CHAOS-*, DF-LEASE-*, DF-SPEC-*,
+      # DF-EFFECT-*, DF-EVID-002/003 (tamper / effective-observed mismatch).
+      - name: dogfood-adversarial
+        run: make dogfood-adversarial
+    artifacts:
+      - name: dogfood-result
+        paths:
+          - dogfood-result.json
+          - scenario-results/
+          - kiwi-evidence/
+          - environment.json
+          - failure-seeds.json
+          - metrics-summary.json
+        if: always()
+        required: false
+        # Nightly artifacts outlive a PR's: a red chaos run may be
+        # reproduced days later from the recorded seed.
+        retention: 720h

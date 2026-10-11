@@ -193,17 +193,19 @@ func TestAssuranceAndEffectsClassDecisionTable(t *testing.T) {
 }
 
 // TestFactsKeepQuotaOrthogonalToIsolation is the regression test for the
-// audit's P1: a native execution with an enforced workspace quota must carry
-// workspace_quota_enforced=true and filesystem_isolated=false, and never
-// classify as isolated_filesystem. A quota bounds disk use; it does not
-// confine the process's filesystem view.
+// audit's P1 fact-vector rule AND the quota-truthfulness split: a native
+// execution with a requested workspace quota carries
+// workspace_quota_configured=true and filesystem_isolated=false, and never
+// classifies as isolated_filesystem. Enforcement is separate: without an
+// observed hard-quota result the fact stays false; with one it becomes true
+// and still never implies isolation.
 func TestFactsKeepQuotaOrthogonalToIsolation(t *testing.T) {
 	e := assuranceEff("native", "", emptySecrets(), func(_ *pipeline.CompiledJob, e *EffectiveExecution) {
 		e.WorkspaceQuotaLimit = DefaultUntrustedWorkspaceMaxBytes
 	})
 	f := e.Facts()
-	if !f.WorkspaceQuotaEnforced || f.FilesystemIsolated {
-		t.Fatalf("facts = %+v, want quota enforced without isolation", f)
+	if !f.WorkspaceQuotaConfigured || f.WorkspaceQuotaEnforced || f.FilesystemIsolated {
+		t.Fatalf("facts = %+v, want configured quota without enforcement or isolation", f)
 	}
 	if !f.Valid() {
 		t.Fatalf("facts invalid: %+v", f)
@@ -211,13 +213,115 @@ func TestFactsKeepQuotaOrthogonalToIsolation(t *testing.T) {
 	if got := e.Assurance(); got != model.AssuranceUncontrolled {
 		t.Fatalf("profile = %d (%s), want uncontrolled", got, got.Name())
 	}
+	// A proven hard quota upgrades only the enforcement fact.
+	hard := &model.ExecutionControlReceipt{Runtime: "native", NetworkEnforced: model.ObservedNetworkHost, WorkspaceQuotaEnforced: true}
+	if err := f.ApplyObservedControl(hard); err != nil {
+		t.Fatalf("ApplyObservedControl: %v", err)
+	}
+	if !f.WorkspaceQuotaEnforced || f.FilesystemIsolated {
+		t.Fatalf("facts = %+v, want quota enforced without isolation", f)
+	}
 	// The container counterpart carries the same quota fact WITH isolation.
 	c := assuranceEff("container", "", emptySecrets(), func(_ *pipeline.CompiledJob, e *EffectiveExecution) {
 		e.WorkspaceQuotaLimit = DefaultUntrustedWorkspaceMaxBytes
 	})
 	cf := c.Facts()
+	if !cf.WorkspaceQuotaConfigured || cf.WorkspaceQuotaEnforced || !cf.FilesystemIsolated {
+		t.Fatalf("container facts = %+v, want configured quota, unproven enforcement, isolation", cf)
+	}
+	chook := &model.ExecutionControlReceipt{Runtime: "docker", SandboxStarted: true, NetworkEnforced: model.ObservedNetworkContainerNamespace, WorkspaceQuotaEnforced: true}
+	if err := cf.ApplyObservedControl(chook); err != nil {
+		t.Fatalf("ApplyObservedControl container: %v", err)
+	}
 	if !cf.WorkspaceQuotaEnforced || !cf.FilesystemIsolated {
 		t.Fatalf("container facts = %+v, want quota and isolation", cf)
+	}
+}
+
+// TestQuotaTruthfulnessMatrix pins the P1 evidence contract:
+// workspace_quota_enforced is derived ONLY from the attempt-level hard-quota
+// result on the observed receipt, never from the requested limit.
+func TestQuotaTruthfulnessMatrix(t *testing.T) {
+	cases := []struct {
+		name           string
+		limit          int64
+		receipt        *model.ExecutionControlReceipt
+		wantConfigured bool
+		wantEnforced   bool
+	}{
+		{
+			name:           "quota requested + hard quota succeeds",
+			limit:          DefaultUntrustedWorkspaceMaxBytes,
+			receipt:        &model.ExecutionControlReceipt{Runtime: "native", NetworkEnforced: model.ObservedNetworkHost, WorkspaceQuotaEnforced: true},
+			wantConfigured: true,
+			wantEnforced:   true,
+		},
+		{
+			name:           "quota requested + fallback accounting only",
+			limit:          DefaultUntrustedWorkspaceMaxBytes,
+			receipt:        &model.ExecutionControlReceipt{Runtime: "native", NetworkEnforced: model.ObservedNetworkHost, WorkspaceQuotaEnforced: false},
+			wantConfigured: true,
+			wantEnforced:   false,
+		},
+		{
+			name:           "quota setup fails before execution (no receipt)",
+			limit:          DefaultUntrustedWorkspaceMaxBytes,
+			receipt:        nil,
+			wantConfigured: true,
+			wantEnforced:   false,
+		},
+		{
+			name:           "no quota requested",
+			limit:          0,
+			receipt:        &model.ExecutionControlReceipt{Runtime: "native", NetworkEnforced: model.ObservedNetworkHost},
+			wantConfigured: false,
+			wantEnforced:   false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := assuranceEff("native", "", emptySecrets(), func(_ *pipeline.CompiledJob, e *EffectiveExecution) {
+				e.WorkspaceQuotaLimit = tc.limit
+			})
+			f := e.Facts()
+			if f.WorkspaceQuotaEnforced {
+				t.Fatalf("Facts() manufactured enforcement from the plan: %+v", f)
+			}
+			if err := f.ApplyObservedControl(tc.receipt); err != nil {
+				t.Fatalf("ApplyObservedControl: %v", err)
+			}
+			if f.WorkspaceQuotaConfigured != tc.wantConfigured || f.WorkspaceQuotaEnforced != tc.wantEnforced {
+				t.Fatalf("facts = %+v, want configured=%v enforced=%v", f, tc.wantConfigured, tc.wantEnforced)
+			}
+			if !f.Valid() {
+				t.Fatalf("facts invalid: %+v", f)
+			}
+		})
+	}
+}
+
+// TestQuotaEnforcedWithoutObservationIsRejected: a fact vector that claims a
+// hard quota without an observed receipt (or with a receipt that did not see
+// one) is internally contradictory and must not be signed or accepted.
+func TestQuotaEnforcedWithoutObservationIsRejected(t *testing.T) {
+	f := model.ExecutionFacts{Runtime: model.RuntimeFactNative, NetworkMode: model.NetworkModeFactDefault, WorkspaceQuotaEnforced: true}
+	if f.Valid() {
+		t.Fatal("quota enforced without a receipt must be invalid")
+	}
+	if err := f.ValidateObservedConsistency(); err == nil {
+		t.Fatal("ValidateObservedConsistency accepted unobserved enforcement")
+	}
+	f.Observed = &model.ExecutionControlReceipt{Runtime: "native", NetworkEnforced: model.ObservedNetworkHost}
+	if f.Valid() {
+		t.Fatal("quota enforced contradicted by a non-hard receipt must be invalid")
+	}
+	// The reverse: a receipt that observed a hard quota must not be dropped.
+	f2 := model.ExecutionFacts{Runtime: model.RuntimeFactNative, NetworkMode: model.NetworkModeFactDefault}
+	if err := f2.ApplyObservedControl(&model.ExecutionControlReceipt{Runtime: "native", NetworkEnforced: model.ObservedNetworkHost, WorkspaceQuotaEnforced: true}); err != nil {
+		t.Fatalf("ApplyObservedControl: %v", err)
+	}
+	if !f2.WorkspaceQuotaEnforced {
+		t.Fatalf("facts = %+v, want enforcement taken from the receipt", f2)
 	}
 }
 
