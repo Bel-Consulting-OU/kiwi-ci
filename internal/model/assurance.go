@@ -581,6 +581,43 @@ const (
 // external authority — it is only true when NetworkAccessDenied is proven
 // (never from policy alone). Signing and verification call this so a
 // statement cannot claim pure next to facts that do not prove denial.
+// ValidateExternalEffectsSchema validates the effects class under the
+// frozen semantics of an attestation schema version. Schema 5 (and earlier)
+// classified pure from POLICY network_mode=none; schema 6 requires the
+// proven NetworkAccessDenied fact. Verification MUST use this so a
+// legitimate historical v5 pure attestation keeps verifying.
+func ValidateExternalEffectsSchema(schema int, f ExecutionFacts, c ExternalEffectsClass) error {
+	if schema < 6 {
+		if !c.Valid() {
+			return fmt.Errorf("model: undefined external effects class %q", string(c))
+		}
+		if c == EffectsPure {
+			// Historical: pure = sandbox + clean credentials + POLICY none.
+			if f.KiwiSecretsInjected || f.HostEnvironmentInherited {
+				return fmt.Errorf("model: historical pure requires an empty secret allowlist and a clean environment")
+			}
+			if !f.FilesystemIsolated {
+				return fmt.Errorf("model: historical pure requires filesystem isolation")
+			}
+			if f.NetworkMode != NetworkModeFactNone {
+				return fmt.Errorf("model: historical pure requires network_mode=none")
+			}
+			return nil
+		}
+		if c == EffectsOpaqueExternal {
+			return nil
+		}
+		if !f.FilesystemIsolated {
+			return fmt.Errorf("model: external effects class %s requires filesystem isolation", c)
+		}
+		if f.KiwiSecretsInjected || f.HostEnvironmentInherited {
+			return fmt.Errorf("model: external effects class %s cannot claim mediated/pure effects with injected secrets or inherited host environment", c)
+		}
+		return nil
+	}
+	return ValidateExternalEffects(f, c)
+}
+
 func ValidateExternalEffects(f ExecutionFacts, c ExternalEffectsClass) error {
 	if !c.Valid() {
 		return fmt.Errorf("model: undefined external effects class %q", string(c))

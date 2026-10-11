@@ -119,8 +119,8 @@ func TestCompletionLegacyV1ReceiptComponentReplayDBFake(t *testing.T) {
 	normalized2 := observedRuntimeWithComponents(rawRuntime, job2)
 	v2 := model.CompletionReceipt{
 		JobID: task2.Job.ID, Generation: task2.LeaseGeneration, RunnerID: runner2,
-		ResultHash:        storage.CompletionResultDigestV2(model.StatusSuccess, "", outputs, rawRuntime),
-		ResultHashVersion: storage.CompletionResultHashVersionV2,
+		ResultHash:        storage.CurrentCompletionResultDigest(model.StatusSuccess, "", outputs, rawRuntime),
+		ResultHashVersion: storage.CurrentCompletionResultHashVersion,
 	}
 	if err := f.CompleteJob(ctx, task2.Job.ID, task2.LeaseGeneration, runner2, model.StatusSuccess, "", outputs, v2, normalized2); err != nil {
 		t.Fatalf("v2 completion: %v", err)
@@ -212,8 +212,8 @@ func TestCompletionLegacyV1ReceiptComponentReplayFS(t *testing.T) {
 	s.mu.Lock()
 	s.completions[completionReceiptKey(task.Job.ID, task.LeaseGeneration, runnerID)] = model.CompletionReceipt{
 		JobID: task.Job.ID, Generation: task.LeaseGeneration, RunnerID: runnerID,
-		ResultHash:        storage.CompletionResultDigestV2(model.StatusSuccess, "", map[string]string{"out": "1"}, &model.ObservedRuntime{OS: "linux", Arch: "amd64"}),
-		ResultHashVersion: storage.CompletionResultHashVersionV2,
+		ResultHash:        storage.CurrentCompletionResultDigest(model.StatusSuccess, "", map[string]string{"out": "1"}, &model.ObservedRuntime{OS: "linux", Arch: "amd64"}),
+		ResultHashVersion: storage.CurrentCompletionResultHashVersion,
 	}
 	s.markCompletionReceiptsChangedLocked()
 	s.mu.Unlock()
@@ -319,8 +319,8 @@ func TestPostgresIntegrationServerCompletionLegacyV1ComponentReplay(t *testing.T
 	normalized2 := observedRuntimeWithComponents(rawRuntime, job2)
 	v2 := model.CompletionReceipt{
 		JobID: task2.Job.ID, Generation: task2.LeaseGeneration, RunnerID: job2.LeaseRunnerID,
-		ResultHash:        storage.CompletionResultDigestV2(model.StatusSuccess, "", outputs, rawRuntime),
-		ResultHashVersion: storage.CompletionResultHashVersionV2,
+		ResultHash:        storage.CurrentCompletionResultDigest(model.StatusSuccess, "", outputs, rawRuntime),
+		ResultHashVersion: storage.CurrentCompletionResultHashVersion,
 	}
 	if err := st.CompleteJob(ctx, task2.Job.ID, task2.LeaseGeneration, job2.LeaseRunnerID, model.StatusSuccess, "", outputs, v2, normalized2); err != nil {
 		t.Fatalf("v2 completion: %v", err)

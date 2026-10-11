@@ -97,7 +97,7 @@ func TestCompletionReplayV2RuntimeEvidence(t *testing.T) {
 	rec := s.completions[completionReceiptKey(task.Job.ID, task.LeaseGeneration, runnerID)]
 	job := s.jobs[task.Job.ID]
 	s.mu.Unlock()
-	if rec.ResultHashVersion != storage.CompletionResultHashVersionV2 || rec.ResultHash == "" {
+	if rec.ResultHashVersion != storage.CurrentCompletionResultHashVersion || rec.ResultHash == "" {
 		t.Fatalf("stored receipt = %+v, want the first v2 identity", rec)
 	}
 	if job.Status != model.StatusSuccess || job.ObservedRuntime == nil || job.ObservedRuntime.Arch != "amd64" {

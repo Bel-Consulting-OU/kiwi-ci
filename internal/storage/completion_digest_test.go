@@ -83,41 +83,66 @@ func TestCompletionReceiptReplayMatchesVersionMatrix(t *testing.T) {
 	runtimeB := &model.ObservedRuntime{OS: "linux", Arch: "arm64"}
 
 	v2A := CompletionResultDigestV2(status, errMsg, outs, runtimeA)
-	v2B := CompletionResultDigestV2(status, errMsg, outs, runtimeB)
-	v2Nil := CompletionResultDigestV2(status, errMsg, outs, nil)
 	v1 := CompletionResultDigestV1(status, errMsg, outs)
 
 	storedV2 := model.CompletionReceipt{ResultHash: v2A, ResultHashVersion: CompletionResultHashVersionV2}
 	storedV1 := model.CompletionReceipt{ResultHash: v1, ResultHashVersion: CompletionResultHashVersionLegacy}
 	storedLegacyZero := model.CompletionReceipt{ResultHash: v1} // pre-field record
 
+	// ReplayMatches re-hashes the REQUEST PAYLOAD under the STORED version
+	// (compatibility firewall). Cases therefore vary the payload arguments.
 	cases := []struct {
 		name            string
 		stored          model.CompletionReceipt
-		requestHash     string
-		requestVersion  int
+		reqStatus       model.Status
+		reqErr          string
+		reqOuts         map[string]string
 		requestObserved *model.ObservedRuntime
 		storedObserved  *model.ObservedRuntime
 		want            bool
 	}{
-		{"v2 identical", storedV2, v2A, 0, runtimeA, nil, true},
-		{"v2 changed runtime", storedV2, v2B, 0, runtimeB, nil, false},
-		{"v2 changed outputs", storedV2, CompletionResultDigestV2(status, errMsg, map[string]string{"o": "2"}, runtimeA), 0, runtimeA, nil, false},
-		{"v2 changed error", storedV2, CompletionResultDigestV2(status, "boom", outs, runtimeA), 0, runtimeA, nil, false},
-		{"v1 request matches v1 receipt", storedV1, v1, CompletionResultHashVersionLegacy, nil, nil, true},
-		{"v2 request without evidence matches v1 receipt", storedV1, v2Nil, 0, nil, nil, true},
-		{"v2 request with new evidence conflicts with v1 receipt", storedV1, v2A, 0, runtimeA, nil, false},
-		{"v2 request with equal stored evidence matches v1 receipt", storedV1, v2A, 0, runtimeA, runtimeA, true},
-		{"v2 request with differing stored evidence conflicts", storedV1, v2A, 0, runtimeA, runtimeB, false},
-		{"version-less stored receipt is legacy", storedLegacyZero, v2Nil, 0, nil, nil, true},
-		{"version-less stored receipt rejects new evidence", storedLegacyZero, v2A, 0, runtimeA, nil, false},
-		{"v2 stored receipt rejects a v1-labelled request", storedV2, v1, CompletionResultHashVersionLegacy, nil, nil, false},
+		{"v2 identical", storedV2, status, errMsg, outs, runtimeA, nil, true},
+		{"v2 changed runtime", storedV2, status, errMsg, outs, runtimeB, nil, false},
+		{"v2 changed outputs", storedV2, status, errMsg, map[string]string{"o": "2"}, runtimeA, nil, false},
+		{"v2 changed error", storedV2, status, "boom", outs, runtimeA, nil, false},
+		{"v1 request matches v1 receipt", storedV1, status, errMsg, outs, nil, nil, true},
+		{"v2 request without evidence matches v1 receipt", storedV1, status, errMsg, outs, nil, nil, true},
+		{"v2 request with new evidence conflicts with v1 receipt", storedV1, status, errMsg, outs, runtimeA, nil, false},
+		{"v2 request with equal stored evidence matches v1 receipt", storedV1, status, errMsg, outs, runtimeA, runtimeA, true},
+		{"v2 request with differing stored evidence conflicts", storedV1, status, errMsg, outs, runtimeA, runtimeB, false},
+		{"version-less stored receipt is legacy", storedLegacyZero, status, errMsg, outs, nil, nil, true},
+		{"version-less stored receipt rejects new evidence", storedLegacyZero, status, errMsg, outs, runtimeA, nil, false},
+		{"v2 stored receipt rejects changed payload", storedV2, status, errMsg, map[string]string{"o": "9"}, runtimeA, nil, false},
 	}
 	for _, tc := range cases {
-		got := CompletionReceiptReplayMatches(tc.stored, tc.requestHash, tc.requestVersion, status, errMsg, outs, tc.requestObserved, tc.storedObserved)
+		rh := CurrentCompletionResultDigest(tc.reqStatus, tc.reqErr, tc.reqOuts, tc.requestObserved)
+		got := CompletionReceiptReplayMatches(tc.stored, rh, CurrentCompletionResultHashVersion, tc.reqStatus, tc.reqErr, tc.reqOuts, tc.requestObserved, tc.storedObserved)
 		if got != tc.want {
 			t.Errorf("%s: match = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+// TestCompletionDigestV2IsFrozen: a golden v2 digest for a fixed payload must
+// stay byte-identical forever. If this test fails, an "old" algorithm changed
+// and historical receipts will stop replaying — that is a release blocker.
+func TestCompletionDigestV2IsFrozen(t *testing.T) {
+	obs := &model.ObservedRuntime{
+		OS: "linux", Arch: "amd64", RuntimeName: "docker", RuntimeVersion: "25.0",
+		MainImage: "alpine:3.20", MainImageDigest: "sha256:abc",
+		ServiceImages: map[string]string{"db": "postgres:16"},
+		Components:    map[string]string{"lib": "deadbeef"},
+	}
+	// Golden value computed once under the frozen v2 algorithm (runtime/v1,
+	// no Control). Update ONLY when introducing a new version — never for v2.
+	const golden = "b08fdad5fad5e72fe6fa0624ce81dfd6ff6abc01e8dae0b081ee5fd5044aed36"
+	got := CompletionResultDigestV2(model.StatusSuccess, "err", map[string]string{"b": "2", "a": "1"}, obs)
+	if golden == "PLACEHOLDER" {
+		t.Logf("frozen v2 golden (record this): %s", got)
+		return
+	}
+	if got != golden {
+		t.Fatalf("frozen CompletionResultDigestV2 changed: got %s want %s", got, golden)
 	}
 }
 
@@ -326,15 +351,15 @@ func TestObservedRuntimeDigestBindsControl(t *testing.T) {
 		t.Fatal("presence of Control must change the runtime digest")
 	}
 	if !CompletionReceiptReplayMatches(
-		model.CompletionReceipt{ResultHash: CompletionResultDigestV2(model.StatusSuccess, "", nil, soft), ResultHashVersion: CompletionResultHashVersionV2},
-		CompletionResultDigestV2(model.StatusSuccess, "", nil, soft), CompletionResultHashVersionV2,
+		model.CompletionReceipt{ResultHash: CurrentCompletionResultDigest(model.StatusSuccess, "", nil, soft), ResultHashVersion: CurrentCompletionResultHashVersion},
+		CurrentCompletionResultDigest(model.StatusSuccess, "", nil, soft), CompletionResultHashVersionV2,
 		model.StatusSuccess, "", nil, hard, soft,
 	) {
 		// Matching requires equal digests; hard != soft so this must NOT match.
 	}
 	if CompletionReceiptReplayMatches(
-		model.CompletionReceipt{ResultHash: CompletionResultDigestV2(model.StatusSuccess, "", nil, soft), ResultHashVersion: CompletionResultHashVersionV2},
-		CompletionResultDigestV2(model.StatusSuccess, "", nil, hard), CompletionResultHashVersionV2,
+		model.CompletionReceipt{ResultHash: CurrentCompletionResultDigest(model.StatusSuccess, "", nil, soft), ResultHashVersion: CurrentCompletionResultHashVersion},
+		CurrentCompletionResultDigest(model.StatusSuccess, "", nil, hard), CompletionResultHashVersionV2,
 		model.StatusSuccess, "", nil, hard, soft,
 	) {
 		t.Fatal("contradictory Control must not match the original completion receipt")

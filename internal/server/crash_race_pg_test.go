@@ -132,11 +132,11 @@ func TestPostgresIntegrationServerCompletionRaceDifferingResults(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("durable receipt = %+v ok=%v err=%v", rec, ok, err)
 	}
-	wantHash := storage.CompletionResultDigestV2(job.Status, "", nil, nil)
+	wantHash := storage.CurrentCompletionResultDigest(job.Status, "", nil, nil)
 	if rec.ResultHash != wantHash {
 		t.Fatalf("durable receipt hash = %q, want the winner's %q", rec.ResultHash, wantHash)
 	}
-	if rec.ResultHashVersion != storage.CompletionResultHashVersionV2 {
+	if rec.ResultHashVersion != storage.CurrentCompletionResultHashVersion {
 		t.Fatalf("durable receipt version = %d, want v2", rec.ResultHashVersion)
 	}
 	// The exactly-once usage transition is durable: a replayed effect loses.

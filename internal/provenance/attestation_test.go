@@ -745,3 +745,48 @@ func TestExecutionAttestationRejectsPureWithoutProvenDenial(t *testing.T) {
 		t.Logf("positive pure construction: %v", err)
 	}
 }
+
+// TestVerifyHistoricalV5PureAttestation: a legitimate schema-v5 statement
+// classified pure from POLICY network_mode=none (no network_access_denied
+// field) must keep verifying under frozen v5 semantics. This is the
+// compatibility-firewall fixture: do not regenerate it from HEAD's v6
+// meaning.
+func TestVerifyHistoricalV5PureAttestation(t *testing.T) {
+	base := attestationTestInput()
+	st, err := ExecutionAttestationStatement(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	att := *st.Attestation
+	att.SchemaVersion = 5
+	// Historical v5 pure: sandbox, clean secrets, policy none, no proven
+	// denial field (absent/false), no declared effects.
+	f := model.ExecutionFacts{
+		Runtime:            model.RuntimeFactContainer,
+		FilesystemIsolated: true,
+		NetworkMode:        model.NetworkModeFactNone,
+	}
+	// Historical profile derivation for v5 uses policy.
+	level := model.DeriveAssuranceProfileSchema(5, f)
+	att.ExecutionAssurance = ExecutionAssuranceEvidence{
+		Level: int(level),
+		Name:  level.Name(),
+		Facts: &f,
+	}
+	att.ExternalEffects = model.EffectsPure
+	att.ExternalEffects = model.EffectsPure
+	// Rebuild subject digest so the only checks left are semantic.
+	digest, err := ExecutionAttestationDigest(att)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Attestation = &att
+	st.Subject = []Subject{{Digest: map[string]string{"sha256": digest}}}
+	if err := VerifyExecutionAttestation(st); err != nil {
+		t.Fatalf("historical v5 pure attestation must verify under frozen semantics: %v", err)
+	}
+	// The same facts under v6 must NOT claim pure (no proven denial).
+	if err := model.ValidateExternalEffects(f, model.EffectsPure); err == nil {
+		t.Fatal("v6 pure without network_access_denied must be refused")
+	}
+}

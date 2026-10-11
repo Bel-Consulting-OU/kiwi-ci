@@ -1,7 +1,7 @@
 .PHONY: build test test-unit test-race test-integration integration test-adversarial test-shuffle test-stress \
 	fuzz coverage coverage-ci coverage-floor coverage-package-floor staticcheck govulncheck cross schema-check surface-check dockerfile-buildargs-check docs-check license-check license-notice repro-build \
 	toolchain-check tla2tools fmt lint run clean protect-branch \
-	dogfood-fast dogfood-local dogfood-system dogfood-distributed dogfood-adversarial dogfood-upgrade dogfood-scale dogfood-release dogfood-all
+	dogfood-fast dogfood-local dogfood-system dogfood-distributed dogfood-adversarial dogfood-upgrade dogfood-scale dogfood-release-model dogfood-all
 
 VERSION ?= 0.1.0-dev
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -71,7 +71,7 @@ test-antagonistic: test-unit test-race test-adversarial test-stress test-single-
 # the stable contract with that package (scenario IDs in docs/DOGFOOD.md).
 # ---------------------------------------------------------------------------
 .PHONY: dogfood-fast dogfood-local dogfood-system dogfood-distributed dogfood-adversarial \
-	dogfood-upgrade dogfood-scale dogfood-release dogfood-all
+	dogfood-upgrade dogfood-scale dogfood-release-model dogfood-all
 
 # Every dogfood target runs through scripts/dogfood-run.sh, which FAILS
 # CLOSED unless every --require test actually executed. A suite that
@@ -183,8 +183,10 @@ dogfood-scale:
 # DF7 release-candidate closure for the pieces that gate a release today:
 # evidence truthfulness, quota, effects, self-host generation limit.
 # Install-from-artifact and full G0→G1→G2 binary self-build are next wave.
-dogfood-release:
-	@echo "RELEASE DOGFOOD — remaining production scenarios still MISSING:"
+# dogfood-release-model runs what is implemented today. It is NOT a release
+# gate: production closure scenarios are still missing (see banner).
+dogfood-release-model:
+	@echo "RELEASE DOGFOOD (model+system, NOT a release gate) — production scenarios still MISSING:"
 	@echo "  DF-DIST-001     live multi-process topology (postgres/objectstore/2 runners)"
 	@echo "  DF-UPGRADE-002  N-1 binary matrix"
 	@echo "  DF-SCALE-002    live resource-leak / soak"
@@ -192,7 +194,7 @@ dogfood-release:
 	@echo "  DF-DR-001       backup → destroy → restore"
 	@echo "  DF-SELF-002     G1→G2 binary self-build"
 	@echo "  (DF1 system proofs are real: make dogfood-system — NewPersistent + HTTP + runner)"
-	@echo "Running the implemented model/release-contract suite anyway:"
+	@echo "Running the implemented suite anyway:"
 	./scripts/dogfood-run.sh 180m \
 		--run 'TestDFEVID|TestDFQUOTA|TestDFEFFECT|TestDFSELF|TestDFBOOT|TestDogfoodResult|TestScenarioResult' \
 		--require TestDFEVID001 \
@@ -234,7 +236,23 @@ dogfood-system:
 # multi-process DF2 (postgres/objectstore) stays in docs/DOGFOOD.md
 # "Implemented vs planned". dogfood-fast is a strict subset of dogfood-local
 # and is not repeated here; DF0 is .kiwi/pipeline.yaml.
-dogfood-all: dogfood-local dogfood-system dogfood-distributed dogfood-adversarial dogfood-upgrade dogfood-scale dogfood-release
+dogfood-all: dogfood-local dogfood-system dogfood-distributed dogfood-adversarial dogfood-upgrade dogfood-scale dogfood-release-model
+
+# release-gate FAILS CLOSED until production dogfood closure is complete.
+# Automation that needs "release safe" must use this target, never
+# dogfood-release-model (which is honest about running only what exists).
+.PHONY: release-gate
+release-gate:
+	@echo "RELEASE GATE: production dogfood closure is NOT complete." >&2
+	@echo "missing mandatory scenarios:" >&2
+	@echo "  DF-DIST-001  live multi-process topology" >&2
+	@echo "  DF-UPGRADE-002  N-1 binary matrix" >&2
+	@echo "  DF-SCALE-002  live soak / resource recovery" >&2
+	@echo "  DF-RELEASE-001  packaged artifact lifecycle" >&2
+	@echo "  DF-DR-001  backup → destroy → restore" >&2
+	@echo "  DF-SELF-002  G1→G2 binary self-build" >&2
+	@echo "  untrusted container + hard quota + signed v6 evidence lane" >&2
+	@exit 1
 
 # staticcheck-all is the CI check: it is exactly the pinned command run by
 # .woodpecker/linux-amd64.yml. `staticcheck` runs the same pinned command

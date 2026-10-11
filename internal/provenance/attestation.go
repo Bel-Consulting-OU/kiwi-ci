@@ -612,7 +612,7 @@ func VerifyExecutionAttestation(st Statement) error {
 		return fmt.Errorf("provenance: execution attestation has undefined external effects class %q", string(st.Attestation.ExternalEffects))
 	}
 	if st.Attestation.ExecutionAssurance.Facts != nil {
-		if err := model.ValidateExternalEffects(*st.Attestation.ExecutionAssurance.Facts, st.Attestation.ExternalEffects); err != nil {
+		if err := model.ValidateExternalEffectsSchema(schema, *st.Attestation.ExecutionAssurance.Facts, st.Attestation.ExternalEffects); err != nil {
 			return fmt.Errorf("provenance: execution attestation external effects disagree with facts: %w", err)
 		}
 	}

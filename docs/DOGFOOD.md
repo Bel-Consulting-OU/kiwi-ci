@@ -341,7 +341,8 @@ make dogfood-distributed
 make dogfood-adversarial
 make dogfood-upgrade
 make dogfood-scale
-make dogfood-release
+make dogfood-release-model   # NOT a release gate
+make release-gate           # fails closed until production closure
 make dogfood-all
 ```
 

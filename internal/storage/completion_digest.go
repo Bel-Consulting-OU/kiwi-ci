@@ -22,12 +22,21 @@ const (
 	CompletionResultHashVersionLegacy = 1
 	// CompletionResultHashVersionV2 binds the observed runtime evidence too,
 	// so the same completion identity cannot replay with contradictory
-	// runtime evidence.
+	// runtime evidence. FROZEN: nested observed-runtime/v1 encoding (no
+	// Control receipt). Never change this algorithm — historical receipts
+	// must keep verifying and replaying byte-for-byte.
 	CompletionResultHashVersionV2 = 2
+	// CompletionResultHashVersionV3 binds the observed runtime INCLUDING the
+	// executor-observed enforcement receipt (Control). New completions write
+	// v3. Verification dispatches on the STORED ResultHashVersion so a v2
+	// receipt is always checked with the frozen v2 algorithm.
+	CompletionResultHashVersionV3 = 3
 
 	completionResultDigestV2Version = "kiwi-ci/completion-result/v2"
+	completionResultDigestV3Version = "kiwi-ci/completion-result/v3"
 	completionErrorDigestVersion    = "kiwi-ci/completion-result-error/v1"
-	observedRuntimeDigestVersion    = "kiwi-ci/observed-runtime/v2"
+	observedRuntimeDigestV1Version  = "kiwi-ci/observed-runtime/v1"
+	observedRuntimeDigestV2Version  = "kiwi-ci/observed-runtime/v2"
 )
 
 // CompletionResultDigestV1 returns the LEGACY completion result hash, byte for
@@ -48,9 +57,13 @@ func CompletionResultDigestV1(status model.Status, errMsg string, outputs map[st
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// CompletionResultDigestV2 is the canonical, versioned completion identity
-// digest. It is a SHA-256 over a length-prefixed encoding tagged
-// "kiwi-ci/completion-result/v2" carrying, in stable order:
+// CompletionResultDigestV2 is the FROZEN v2 completion identity digest
+// (tagged "kiwi-ci/completion-result/v2") using the historical
+// observed-runtime/v1 encoding (no Control receipt). New completions must
+// use CompletionResultDigestV3; this function exists so stored v2 receipts
+// can be matched exactly as their producer wrote them.
+//
+// It is a SHA-256 over a length-prefixed encoding carrying, in stable order:
 //
 //   - the status string,
 //   - the digest of the error string (a nested tagged SHA-256, so the raw
@@ -82,6 +95,32 @@ func CompletionResultDigestV2(status model.Status, errMsg string, outputs map[st
 	if observed == nil {
 		writeLenPrefixed(h, "nil")
 	} else {
+		writeLenPrefixed(h, "sha256:"+ObservedRuntimeDigestV1(observed))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// CompletionResultDigestV3 is the current completion identity digest
+// (tagged "kiwi-ci/completion-result/v3"). Same field order as v2 except the
+// nested observed-runtime digest is v2 and therefore binds Control.
+func CompletionResultDigestV3(status model.Status, errMsg string, outputs map[string]string, observed *model.ObservedRuntime) string {
+	h := sha256.New()
+	writeLenPrefixed(h, completionResultDigestV3Version)
+	writeLenPrefixed(h, string(status))
+	writeLenPrefixed(h, completionErrorDigest(errMsg))
+	keys := make([]string, 0, len(outputs))
+	for k := range outputs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	writeUint64(h, uint64(len(keys)))
+	for _, k := range keys {
+		writeLenPrefixed(h, k)
+		writeLenPrefixed(h, outputs[k])
+	}
+	if observed == nil {
+		writeLenPrefixed(h, "nil")
+	} else {
 		writeLenPrefixed(h, "sha256:"+ObservedRuntimeDigest(observed))
 	}
 	return hex.EncodeToString(h.Sum(nil))
@@ -98,17 +137,15 @@ func completionErrorDigest(errMsg string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// ObservedRuntimeDigest is the canonical digest of a NON-NIL observed runtime:
-// a length-prefixed encoding over every field in stable declaration order,
-// with the string maps canonicalized by sorted key. An empty runtime is valid
-// and distinct from a nil one (callers encode nil separately). The same
-// capture always hashes identically, so it can be compared across retries.
-func ObservedRuntimeDigest(observed *model.ObservedRuntime) string {
+// ObservedRuntimeDigestV1 is the FROZEN historical observed-runtime digest
+// ("kiwi-ci/observed-runtime/v1"): every field except the Control receipt.
+// CompletionResultDigestV2 embeds this. Never change it.
+func ObservedRuntimeDigestV1(observed *model.ObservedRuntime) string {
 	if observed == nil {
 		return ""
 	}
 	h := sha256.New()
-	writeLenPrefixed(h, observedRuntimeDigestVersion)
+	writeLenPrefixed(h, observedRuntimeDigestV1Version)
 	writeLenPrefixed(h, observed.OS)
 	writeLenPrefixed(h, observed.Arch)
 	writeLenPrefixed(h, observed.RuntimeName)
@@ -123,10 +160,33 @@ func ObservedRuntimeDigest(observed *model.ObservedRuntime) string {
 	} else {
 		writeLenPrefixed(h, observed.CapturedAt.UTC().Format(time.RFC3339Nano))
 	}
-	// The executor-observed enforcement receipt is part of the completion
-	// identity: a retry must not be able to replay with a contradictory
-	// Control (sandbox/network/quota observations) and still match the
-	// original receipt. v1 omitted this field; v2 binds it.
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// ObservedRuntimeDigest is the current observed-runtime digest
+// ("kiwi-ci/observed-runtime/v2"): v1 fields PLUS the executor-observed
+// enforcement receipt (Control). CompletionResultDigestV3 embeds this so a
+// retry cannot replay with contradictory sandbox/network/quota observations.
+func ObservedRuntimeDigest(observed *model.ObservedRuntime) string {
+	if observed == nil {
+		return ""
+	}
+	h := sha256.New()
+	writeLenPrefixed(h, observedRuntimeDigestV2Version)
+	writeLenPrefixed(h, observed.OS)
+	writeLenPrefixed(h, observed.Arch)
+	writeLenPrefixed(h, observed.RuntimeName)
+	writeLenPrefixed(h, observed.RuntimeVersion)
+	writeLenPrefixed(h, observed.MainImage)
+	writeLenPrefixed(h, observed.MainImageDigest)
+	writeStringMap(h, observed.ServiceImages)
+	writeStringMap(h, observed.ServiceImageDigests)
+	writeStringMap(h, observed.Components)
+	if observed.CapturedAt.IsZero() {
+		writeLenPrefixed(h, "")
+	} else {
+		writeLenPrefixed(h, observed.CapturedAt.UTC().Format(time.RFC3339Nano))
+	}
 	if observed.Control == nil {
 		writeLenPrefixed(h, "")
 	} else {
@@ -158,38 +218,54 @@ func StoredAttemptObservedRuntime(j model.Job, generation int64) *model.Observed
 	return j.ObservedRuntime
 }
 
+// CurrentCompletionResultHashVersion is the version new completion receipts
+// write. Verification always dispatches on the STORED version so an older
+// receipt keeps matching under the algorithm its producer used.
+const CurrentCompletionResultHashVersion = CompletionResultHashVersionV3
+
+// CurrentCompletionResultDigest is the digest new completion receipts store.
+func CurrentCompletionResultDigest(status model.Status, errMsg string, outputs map[string]string, observed *model.ObservedRuntime) string {
+	return CompletionResultDigestV3(status, errMsg, outputs, observed)
+}
+
 // CompletionReceiptReplayMatches reports whether a completion request replays
-// the stored receipt identity (job, generation, runner), applying the
-// versioned compatibility contract:
+// the stored receipt identity (job, generation, runner).
 //
-//   - A stored v2 receipt matches only a v2 request with the identical digest
-//     (the v2 digest already binds status, error, outputs and runtime).
-//   - A stored v1 (or version-less legacy) receipt matches only:
-//     a request whose v1 digest matches (the request hash directly, or the v1
-//     computation over the request's status/error/outputs), AND runtime
-//     evidence that is nil-or-equal: the request captured nothing, or the
-//     stored attempt evidence is present and canonically identical. A
-//     v2-evidence-bearing retry against a legacy receipt with no (or
-//     different) stored evidence is a contradiction and must conflict.
+// The request payload is re-hashed under the STORED ResultHashVersion — never
+// under the current algorithm alone — so a receipt written by an older
+// binary keeps matching across upgrades (compatibility firewall). Version
+// contract:
 //
-// requestVersion of 0 is treated as v2: every production completion caller
-// computes the v2 digest, and only records persisted before the version field
-// existed read back as legacy.
+//   - v3: CompletionResultDigestV3 (status, error, outputs, runtime incl. Control)
+//   - v2: FROZEN CompletionResultDigestV2 (status, error, outputs, runtime/v1)
+//   - v1/legacy: status/error/outputs only, plus nil-or-equal runtime evidence
+//     compared with the FROZEN runtime/v1 encoding (Control was not part of
+//     that contract).
 func CompletionReceiptReplayMatches(stored model.CompletionReceipt, requestHash string, requestVersion int, status model.Status, errMsg string, outputs map[string]string, requestObserved, storedObserved *model.ObservedRuntime) bool {
 	if requestVersion <= 0 {
 		requestVersion = CompletionResultHashVersionV2
 	}
-	if stored.ResultHashVersion >= CompletionResultHashVersionV2 {
-		return requestVersion >= CompletionResultHashVersionV2 && stored.ResultHash == requestHash
+	switch stored.ResultHashVersion {
+	case CompletionResultHashVersionV3:
+		if stored.ResultHash == requestHash && requestVersion >= CompletionResultHashVersionV3 {
+			return true
+		}
+		return stored.ResultHash == CompletionResultDigestV3(status, errMsg, outputs, requestObserved)
+	case CompletionResultHashVersionV2:
+		// Exact identity replay (same request hash at v2 or newer), or a
+		// HEAD recomputation under the FROZEN v2 algorithm so an older
+		// receipt keeps matching across upgrades.
+		if stored.ResultHash == requestHash && requestVersion >= CompletionResultHashVersionV2 {
+			return true
+		}
+		return stored.ResultHash == CompletionResultDigestV2(status, errMsg, outputs, requestObserved)
+	default:
+		matched := stored.ResultHash == CompletionResultDigestV1(status, errMsg, outputs) || stored.ResultHash == requestHash
+		if !matched {
+			return false
+		}
+		return completionLegacyRuntimeEvidenceCompatible(requestObserved, storedObserved)
 	}
-	matched := stored.ResultHash == requestHash
-	if !matched && requestVersion >= CompletionResultHashVersionV2 {
-		matched = stored.ResultHash == CompletionResultDigestV1(status, errMsg, outputs)
-	}
-	if !matched {
-		return false
-	}
-	return completionLegacyRuntimeEvidenceCompatible(requestObserved, storedObserved)
 }
 
 // completionLegacyRuntimeEvidenceCompatible reports whether runtime evidence
@@ -205,7 +281,10 @@ func completionLegacyRuntimeEvidenceCompatible(request, stored *model.ObservedRu
 	if stored == nil {
 		return false
 	}
-	return ObservedRuntimeDigest(request) == ObservedRuntimeDigest(stored)
+	// Legacy receipts bound runtime without Control; compare the frozen v1
+	// encoding so a retry that now carries Control still matches when the
+	// historical fields agree.
+	return ObservedRuntimeDigestV1(request) == ObservedRuntimeDigestV1(stored)
 }
 
 // writeLenPrefixed writes an 8-byte big-endian length followed by the bytes.

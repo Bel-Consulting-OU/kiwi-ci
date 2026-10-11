@@ -80,7 +80,7 @@ job x generation x lease x runner x cancel x retry protocol with `TypeOK`,
 I1/I3/I8 enforcement points and the property/chaos tests named above. Model
 and implementation must be updated together. The shipped instance is
 model-checked manually (TLC2 2.19: complete state graph, no error; see
-`formal/README.md` § Validation status) but not in CI.
+`formal/README.md` § Validation status) and by the scheduled formal workflow (`.github/workflows/formal.yml`).
 
 **Non-fuzzable residual (stated honestly).** Commit-time interleavings
 (stale generation racing a lease supersede, expiry while waiting for a row

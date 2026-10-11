@@ -23,11 +23,11 @@ func TestAttestationBindsCompletionDigestWithoutRawValues(t *testing.T) {
 	seedAttestationJob(t, s, "job-a", "run-a", 3)
 	outputs := map[string]string{"release": "OUTPUT-SENTINEL-9f3a"}
 	runtimeA := &model.ObservedRuntime{OS: "linux", Arch: "amd64"}
-	digestA := storage.CompletionResultDigestV2(model.StatusSuccess, "", outputs, runtimeA)
+	digestA := storage.CurrentCompletionResultDigest(model.StatusSuccess, "", outputs, runtimeA)
 	s.mu.Lock()
 	s.completions[completionReceiptKey("job-a", 3, "runner-a")] = model.CompletionReceipt{
 		JobID: "job-a", Generation: 3, RunnerID: "runner-a",
-		ResultHash: digestA, ResultHashVersion: storage.CompletionResultHashVersionV2,
+		ResultHash: digestA, ResultHashVersion: storage.CurrentCompletionResultHashVersion,
 	}
 	s.mu.Unlock()
 
@@ -68,11 +68,11 @@ func TestAttestationBindsCompletionDigestWithoutRawValues(t *testing.T) {
 	// A different completion payload (changed outputs) changes the completion
 	// digest and therefore the attestation subject digest.
 	seedAttestationJob(t, s, "job-b", "run-b", 1)
-	digestB := storage.CompletionResultDigestV2(model.StatusSuccess, "", map[string]string{"release": "other"}, runtimeA)
+	digestB := storage.CurrentCompletionResultDigest(model.StatusSuccess, "", map[string]string{"release": "other"}, runtimeA)
 	s.mu.Lock()
 	s.completions[completionReceiptKey("job-b", 1, "runner-a")] = model.CompletionReceipt{
 		JobID: "job-b", Generation: 1, RunnerID: "runner-a",
-		ResultHash: digestB, ResultHashVersion: storage.CompletionResultHashVersionV2,
+		ResultHash: digestB, ResultHashVersion: storage.CurrentCompletionResultHashVersion,
 	}
 	s.mu.Unlock()
 	if err := s.attestExecution(context.Background(), "job-b", 1); err != nil {

@@ -4889,7 +4889,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	// The completion identity is the v2 digest: it binds status, error,
 	// outputs AND the observed runtime evidence, so a retried completion can
 	// never replay a receipt with contradictory runtime evidence.
-	hash := storage.CompletionResultDigestV2(in.Status, in.Error, in.Outputs, in.ObservedRuntime)
+	hash := storage.CurrentCompletionResultDigest(in.Status, in.Error, in.Outputs, in.ObservedRuntime)
 	if s.Sched != nil {
 		s.completeDB(w, r, jobID, in, hash)
 		return
@@ -5311,7 +5311,7 @@ func completionResultHash(status model.Status, errMsg string, outputs map[string
 func (s *Server) completionReceiptReplay(ctx context.Context, jobID string, in Complete, rec model.CompletionReceipt, requestHash string) (bool, error) {
 	requestObserved := in.ObservedRuntime
 	var storedObserved *model.ObservedRuntime
-	if rec.ResultHashVersion < storage.CompletionResultHashVersionV2 && in.ObservedRuntime != nil {
+	if rec.ResultHashVersion < storage.CurrentCompletionResultHashVersion && in.ObservedRuntime != nil {
 		j, err := s.DB.GetJob(ctx, jobID)
 		if err != nil && !errors.Is(err, storage.ErrNotFound) {
 			return false, err
@@ -5321,7 +5321,7 @@ func (s *Server) completionReceiptReplay(ctx context.Context, jobID string, in C
 			storedObserved = storage.StoredAttemptObservedRuntime(j, in.LeaseGeneration)
 		}
 	}
-	return storage.CompletionReceiptReplayMatches(rec, requestHash, storage.CompletionResultHashVersionV2, in.Status, in.Error, in.Outputs, requestObserved, storedObserved), nil
+	return storage.CompletionReceiptReplayMatches(rec, requestHash, storage.CurrentCompletionResultHashVersion, in.Status, in.Error, in.Outputs, requestObserved, storedObserved), nil
 }
 
 func completionReceiptKey(jobID string, generation int64, runnerID string) string {
@@ -5339,7 +5339,7 @@ func (s *Server) recordCompletionReceiptLocked(jobID string, generation int64, r
 		delete(s.completionReceiptAt, oldestKey)
 	}
 	key := completionReceiptKey(jobID, generation, runnerID)
-	s.completions[key] = model.CompletionReceipt{JobID: jobID, Generation: generation, RunnerID: runnerID, ResultHash: resultHash, ResultHashVersion: storage.CompletionResultHashVersionV2}
+	s.completions[key] = model.CompletionReceipt{JobID: jobID, Generation: generation, RunnerID: runnerID, ResultHash: resultHash, ResultHashVersion: storage.CurrentCompletionResultHashVersion}
 	s.completionReceiptAt[key] = time.Now().UTC()
 	s.markCompletionReceiptsChangedLocked()
 }
@@ -5687,7 +5687,7 @@ func (s *Server) completionReplayReadyLocked(jobID string, generation int64, run
 		requestObserved = observedRuntimeWithComponents(in.ObservedRuntime, j)
 		storedObserved = storage.StoredAttemptObservedRuntime(j, generation)
 	}
-	if !storage.CompletionReceiptReplayMatches(rec, hash, storage.CompletionResultHashVersionV2, in.Status, in.Error, in.Outputs, requestObserved, storedObserved) {
+	if !storage.CompletionReceiptReplayMatches(rec, hash, storage.CurrentCompletionResultHashVersion, in.Status, in.Error, in.Outputs, requestObserved, storedObserved) {
 		return false, nil
 	}
 	return true, s.persistCheckedErrLocked("job.complete.replay")
