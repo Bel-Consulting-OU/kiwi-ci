@@ -112,9 +112,24 @@ func TestAttestationBindsAssuranceEvidence(t *testing.T) {
 	st, _ := verifyAttestationEnvelope(t, s, rec)
 	att := st.Attestation
 	// Trusted container with the unrestricted trusted default secret policy:
-	// filesystem isolation is enforced, ambient credentials are possible.
+	// filesystem isolation is enforced, credential injection is possible.
+	// The AUTHORITATIVE object is the fact vector; the label must be exactly
+	// what the shared derivation recomputes from it.
 	if att.ExecutionAssurance.Level != int(model.AssuranceIsolatedFilesystem) || att.ExecutionAssurance.Name != "isolated_filesystem" {
 		t.Fatalf("assurance = %+v, want level 1 isolated_filesystem", att.ExecutionAssurance)
+	}
+	facts := att.ExecutionAssurance.Facts
+	if facts == nil {
+		t.Fatal("attestation carries no execution facts")
+	}
+	if facts.Runtime != model.RuntimeFactContainer || !facts.FilesystemIsolated {
+		t.Fatalf("facts = %+v, want an isolated container", facts)
+	}
+	if !facts.KiwiSecretsInjected {
+		t.Fatalf("facts = %+v, want injected credentials possible under the unrestricted trusted policy", facts)
+	}
+	if got := model.DeriveAssuranceProfile(*facts); int(got) != att.ExecutionAssurance.Level {
+		t.Fatalf("profile %d disagrees with its facts (derive %d)", att.ExecutionAssurance.Level, int(got))
 	}
 	if att.ExternalEffects != model.EffectsOpaqueExternal {
 		t.Fatalf("externalEffects = %q, want opaque_external", att.ExternalEffects)
@@ -128,11 +143,17 @@ func TestAttestationBindsAssuranceEvidence(t *testing.T) {
 	if att.GraphFingerprint != wantGraph || att.GraphFingerprint == "" {
 		t.Fatalf("graphFingerprint = %q, want %q", att.GraphFingerprint, wantGraph)
 	}
-	// Tampering with any v4 field breaks internal consistency verification
-	// even though the envelope signature itself still verifies.
+	// Tampering with any evidence field breaks internal consistency
+	// verification even though the envelope signature itself still verifies.
 	for name, mutate := range map[string]func(a *provenance.ExecutionAttestation){
 		"assurance level": func(a *provenance.ExecutionAttestation) {
-			a.ExecutionAssurance = provenance.ExecutionAssuranceEvidence{Level: 5, Name: "hermetic"}
+			a.ExecutionAssurance.Level = 5
+			a.ExecutionAssurance.Name = "sealed_pinned_no_network"
+		},
+		"assurance facts": func(a *provenance.ExecutionAttestation) {
+			f := *a.ExecutionAssurance.Facts
+			f.FilesystemIsolated = false
+			a.ExecutionAssurance.Facts = &f
 		},
 		"external effects": func(a *provenance.ExecutionAttestation) { a.ExternalEffects = model.EffectsPure },
 		"policy digest":    func(a *provenance.ExecutionAttestation) { a.PolicyDigest = strings.Repeat("f", 64) },
@@ -151,10 +172,10 @@ func TestAttestationBindsAssuranceEvidence(t *testing.T) {
 	}
 }
 
-// TestAttestationAssuranceEndToEndUntrustedHermetic proves the derivation
+// TestAttestationAssuranceEndToEndUntrustedSealedPinned proves the derivation
 // reaches the attestation for an untrusted network-none job with an explicit
-// deny-all secret allowlist: pure and hermetic.
-func TestAttestationAssuranceEndToEndUntrustedHermetic(t *testing.T) {
+// deny-all secret allowlist: pure and sealed_pinned_no_network.
+func TestAttestationAssuranceEndToEndUntrustedSealedPinned(t *testing.T) {
 	s, err := NewPersistent("token", "token", t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -167,11 +188,103 @@ func TestAttestationAssuranceEndToEndUntrustedHermetic(t *testing.T) {
 	rec := s.attestations[model.AttemptID("job-a", 1)]
 	s.mu.Unlock()
 	st, _ := verifyAttestationEnvelope(t, s, rec)
-	if st.Attestation.ExecutionAssurance.Level != int(model.AssuranceHermetic) {
-		t.Fatalf("assurance = %+v, want hermetic", st.Attestation.ExecutionAssurance)
+	if st.Attestation.ExecutionAssurance.Level != int(model.AssuranceSealedPinnedNoNetwork) {
+		t.Fatalf("assurance = %+v, want sealed_pinned_no_network", st.Attestation.ExecutionAssurance)
 	}
 	if st.Attestation.ExternalEffects != model.EffectsPure {
 		t.Fatalf("externalEffects = %q, want pure", st.Attestation.ExternalEffects)
+	}
+	facts := st.Attestation.ExecutionAssurance.Facts
+	if facts == nil || facts.NetworkMode != model.NetworkModeFactNone {
+		t.Fatalf("facts = %+v, want network none", facts)
+	}
+	if !facts.FilesystemIsolated || !facts.ImagesDigestPinned || facts.KiwiSecretsInjected {
+		t.Fatalf("facts = %+v, want isolated, pinned and no injected credentials", facts)
+	}
+}
+
+// nativeUntrustedPipeline is a native untrusted job: the runner enforces a
+// workspace quota but no filesystem confinement, so the signed facts must
+// never claim filesystem isolation.
+const nativeUntrustedPipeline = "version: 1\njobs:\n  build:\n    runtime: native\n    steps:\n      - run: echo hi\n"
+
+// TestAttestationAssuranceNativeQuotaNotIsolated is the end-to-end regression
+// test for the audit's P1: an untrusted native job carries an enforced
+// workspace quota AND filesystem_isolated=false, and its signed profile is
+// uncontrolled, never isolated_filesystem.
+func TestAttestationAssuranceNativeQuotaNotIsolated(t *testing.T) {
+	s, err := NewPersistent("token", "token", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedAssuranceAttestationJob(t, s, "job-n", "run-n", nativeUntrustedPipeline, 1, false, policy.DefaultUntrustedCapabilities())
+	if err := s.attestExecution(context.Background(), "job-n", 1); err != nil {
+		t.Fatalf("attestExecution: %v", err)
+	}
+	s.mu.Lock()
+	rec := s.attestations[model.AttemptID("job-n", 1)]
+	s.mu.Unlock()
+	st, _ := verifyAttestationEnvelope(t, s, rec)
+	if st.Attestation.ExecutionAssurance.Level != int(model.AssuranceUncontrolled) || st.Attestation.ExecutionAssurance.Name != "uncontrolled" {
+		t.Fatalf("assurance = %+v, want uncontrolled", st.Attestation.ExecutionAssurance)
+	}
+	facts := st.Attestation.ExecutionAssurance.Facts
+	if facts == nil {
+		t.Fatal("attestation carries no execution facts")
+	}
+	if facts.FilesystemIsolated {
+		t.Fatalf("facts = %+v, must not claim filesystem isolation for native", facts)
+	}
+	if !facts.WorkspaceQuotaEnforced {
+		t.Fatalf("facts = %+v, want the enforced workspace quota recorded", facts)
+	}
+	if facts.Runtime != model.RuntimeFactNative {
+		t.Fatalf("facts = %+v, want the native runtime", facts)
+	}
+	if st.Attestation.ExternalEffects != model.EffectsOpaqueExternal {
+		t.Fatalf("externalEffects = %q, want opaque_external", st.Attestation.ExternalEffects)
+	}
+}
+
+// TestAttestationBindsObservedControlReceipt proves the executor-observed
+// enforcement receipt rides inside the signed facts, is corroborated against
+// the effective vector at verification, and is bound by the digest.
+func TestAttestationBindsObservedControlReceipt(t *testing.T) {
+	s, err := NewPersistent("token", "token", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedAssuranceAttestationJob(t, s, "job-a", "run-a", hermeticUntrustedPipeline, 1, false, policy.DefaultUntrustedCapabilities())
+	s.mu.Lock()
+	j := s.jobs["job-a"]
+	j.ObservedRuntime = &model.ObservedRuntime{
+		OS: "linux", Arch: "amd64", RuntimeName: "docker",
+		Control: &model.ExecutionControlReceipt{Runtime: "docker", SandboxStarted: true, NetworkEnforced: model.ObservedNetworkNone},
+	}
+	s.jobs["job-a"] = j
+	s.mu.Unlock()
+	if err := s.attestExecution(context.Background(), "job-a", 1); err != nil {
+		t.Fatalf("attestExecution: %v", err)
+	}
+	s.mu.Lock()
+	rec := s.attestations[model.AttemptID("job-a", 1)]
+	s.mu.Unlock()
+	st, _ := verifyAttestationEnvelope(t, s, rec)
+	observed := st.Attestation.ExecutionAssurance.Facts.Observed
+	if observed == nil || !observed.SandboxStarted || observed.NetworkEnforced != model.ObservedNetworkNone {
+		t.Fatalf("observed receipt = %+v, want the started docker sandbox with network none", observed)
+	}
+	// The receipt is inside the signed digest: flipping it is rejected.
+	cp := *st.Attestation
+	f := *cp.ExecutionAssurance.Facts
+	obs := *f.Observed
+	obs.NetworkEnforced = model.ObservedNetworkContainerNamespace
+	f.Observed = &obs
+	cp.ExecutionAssurance.Facts = &f
+	tampered := st
+	tampered.Attestation = &cp
+	if err := provenance.VerifyExecutionAttestation(tampered); err == nil {
+		t.Fatal("tampered observed receipt accepted")
 	}
 }
 

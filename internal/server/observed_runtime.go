@@ -51,6 +51,9 @@ func validateObservedRuntime(obs *model.ObservedRuntime) error {
 	if err := checkObservedString("main_image_digest", obs.MainImageDigest, maxObservedRuntimeValLen); err != nil {
 		return err
 	}
+	if obs.Control != nil && !obs.Control.Valid() {
+		return fmt.Errorf("observed_runtime.control is not a well-formed enforcement receipt")
+	}
 	for _, m := range []struct {
 		name string
 		m    map[string]string

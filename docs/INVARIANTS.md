@@ -54,7 +54,7 @@ Every status above is backed by executable evidence in at least one of four
 classes. This table names that evidence per invariant. A `—` is an honest
 gap in that class, not a claim of coverage; the residual risk of a gap is
 stated in the Notes column. The assurance vocabulary
-([effect classes and levels](evidence-contract.md#4-execution-assurance-and-effect-classes))
+([facts and derived profiles](evidence-contract.md#4-execution-assurance-facts-first-profiles-derived))
 and the precise
 [what Kiwi does not guarantee](evidence-contract.md#8-what-kiwi-does-not-guarantee)
 boundary live in [docs/evidence-contract.md](evidence-contract.md).
@@ -385,7 +385,7 @@ record produced under a different execution-engine semantics: see
 "Reproducibility boundary" below. The claim is scoped to effects Kiwi mediates
 and surfaces the recorded job declares; behavior a step performs itself
 (within the recorded policy) is outside it — see
-[effect classes](evidence-contract.md#4-execution-assurance-and-effect-classes)
+[effect classes](evidence-contract.md#4-execution-assurance-facts-first-profiles-derived)
 and [what Kiwi does not guarantee](evidence-contract.md#8-what-kiwi-does-not-guarantee).
 
 **Enforcement points.**

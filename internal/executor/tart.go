@@ -283,6 +283,15 @@ func (b *TartBackend) StartJob(ctx context.Context, workspace string, emit func(
 	// Best-effort runtime evidence: a bounded `tart --version` probe whose
 	// failure only omits the version, never fails the job.
 	b.observed = captureTartObservedRuntime(ctx, tart)
+	// The enforcement receipt records what the started VM actually entered:
+	// a real sandbox boundary whose network is host NAT (tart offers no
+	// isolation modes, which StartJob refuses before booting), and no
+	// read-only-root concept.
+	b.observed.Control = &model.ExecutionControlReceipt{
+		Runtime:         "tart",
+		SandboxStarted:  true,
+		NetworkEnforced: model.ObservedNetworkVMNAT,
+	}
 	emit("Tart VM ready " + b.clone)
 	return nil
 }

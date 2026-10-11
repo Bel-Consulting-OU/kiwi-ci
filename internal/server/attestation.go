@@ -248,19 +248,26 @@ func attestationInput(ev attestationEvidence, generation int64) provenance.Execu
 		EventFrontier:    ev.eventFrontier,
 		GraphFingerprint: provenance.GraphFingerprint(ev.graphJobs),
 	}
-	// The execution-assurance classification is derived purely from the
-	// persisted job + payload + policy records through the shared
-	// materializer. A record whose execution cannot be re-verified is
-	// classified conservatively (uncontrolled/opaque_external): unproven
-	// executions are never upgraded, and the level/name/class are always
-	// present in the signed block.
+	// The execution-assurance facts are derived purely from the persisted job
+	// + payload + policy records through the shared materializer, and the
+	// executor-observed enforcement receipt (when the attempt captured one)
+	// is attached from the durable job record. A record whose execution
+	// cannot be re-verified gets the CONSERVATIVE unproven fact vector
+	// (unknown runtime, injected credentials not excluded): unproven
+	// executions are never upgraded, and the facts label is always derived
+	// by the shared rule, never passed in.
+	var facts model.ExecutionFacts
 	if eff, ok := execution.MaterializeFromJob(j); ok {
-		in.ExecutionAssurance = eff.Assurance()
+		facts = eff.Facts()
 		in.ExternalEffects = eff.EffectsClass()
 	} else {
-		in.ExecutionAssurance = model.AssuranceUncontrolled
+		facts = model.UnprovenExecutionFacts()
 		in.ExternalEffects = model.EffectsOpaqueExternal
 	}
+	if j.ObservedRuntime != nil {
+		facts.Observed = j.ObservedRuntime.Control
+	}
+	in.ExecutionAssuranceFacts = facts
 	if p := j.CompiledJobPayload; p != nil {
 		if d, derr := provenance.EffectivePolicyDigest(p); derr == nil {
 			in.PolicyDigest = d

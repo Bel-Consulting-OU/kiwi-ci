@@ -50,11 +50,17 @@ func Up(ctx context.Context, args []string) error {
 	dataDir := fs.String("data-dir", "", "persistent stack state directory (default: ~/.kiwi/up)")
 	token := fs.String("token", "", "shared admin/runner bearer token (default: generated once and persisted in the state directory)")
 	labels := fs.String("labels", "up-local", "comma-separated labels the local runner registers with")
+	allowRemote := fs.Bool("allow-insecure-remote", false, "allow a non-loopback PLAINTEXT control plane (the bearer token then travels in cleartext; NOT recommended)")
+	showToken := fs.Bool("show-token", false, "print the bearer token even when it was reused from the state directory")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
 		return fmt.Errorf("up takes no arguments (got %d)", fs.NArg())
+	}
+	explicitToken := strings.TrimSpace(*token) != ""
+	if err := upValidateLoopback(*listen, *allowRemote); err != nil {
+		return err
 	}
 
 	dir, err := upStateDir(*dataDir)
@@ -124,12 +130,21 @@ func Up(ctx context.Context, args []string) error {
 	}
 
 	base := upBaseURL(addr)
+	if !upIsLoopbackAddr(addr) {
+		fmt.Fprintf(os.Stdout, "kiwi up: WARNING: control plane %s is exposed beyond loopback over PLAINTEXT HTTP; the bearer token travels in cleartext and anyone who can reach the port can administer this stack\n", addr)
+	}
 	fmt.Fprintf(os.Stdout, "kiwi up: control plane %s (dashboard %s/)\n", base, base)
 	fmt.Fprintf(os.Stdout, "kiwi up: state directory %s\n", dir)
-	if freshToken {
-		fmt.Fprintf(os.Stdout, "kiwi up: generated a bearer token and persisted it at %s\n", filepath.Join(dir, upTokenFile))
+	switch {
+	case freshToken:
+		fmt.Fprintf(os.Stdout, "kiwi up: generated bearer token (stored 0600 at %s): %s\n", filepath.Join(dir, upTokenFile), bearer)
+	case explicitToken:
+		// The operator supplied the token; it is not echoed back.
+	case *showToken:
+		fmt.Fprintf(os.Stdout, "kiwi up: admin/runner token: %s\n", bearer)
+	default:
+		fmt.Fprintf(os.Stdout, "kiwi up: using the stored bearer token at %s (pass --show-token to print it)\n", filepath.Join(dir, upTokenFile))
 	}
-	fmt.Fprintf(os.Stdout, "kiwi up: admin/runner token: %s\n", bearer)
 	fmt.Fprintf(os.Stdout, "kiwi up: runner labels: %s\n", *labels)
 
 	runnerArgs := []string{
@@ -315,6 +330,52 @@ func upBindControlPlane(listen string) (net.Listener, string, error) {
 		return nil, "", fmt.Errorf("bind control plane %s: %w", v, err)
 	}
 	return ln, ln.Addr().String(), nil
+}
+
+// upValidateLoopback refuses a PLAINTEXT control plane reachable beyond
+// loopback unless the operator explicitly opted in: the stack's bearer token
+// (admin + runner) would otherwise travel in cleartext to anyone who can
+// reach the port, and dev-mode has no TLS. A wildcard host (empty or
+// 0.0.0.0/::) binds every interface, so it needs the same opt-in.
+func upValidateLoopback(listen string, allow bool) error {
+	v := strings.TrimSpace(listen)
+	if v == "" || allow {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(v)
+	if err != nil {
+		return nil // upBindControlPlane reports the malformed address
+	}
+	if host == "" {
+		return fmt.Errorf("refusing --listen %q: an empty host binds every interface; use 127.0.0.1:PORT or pass --allow-insecure-remote (the bearer token travels in cleartext)", v)
+	}
+	if upLoopbackHost(host) {
+		return nil
+	}
+	return fmt.Errorf("refusing non-loopback plaintext control plane %q: use a loopback --listen or pass --allow-insecure-remote (the bearer token travels in cleartext)", v)
+}
+
+// upLoopbackHost reports whether a listen host is loopback-only.
+func upLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// upIsLoopbackAddr reports whether a resolved listen address stays on
+// loopback, including the wildcard forms upBaseURL maps for clients.
+func upIsLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	switch host {
+	case "", "0.0.0.0", "::":
+		return false
+	}
+	return upLoopbackHost(host)
 }
 
 // upBaseURL converts a listen address into a client base URL, mapping

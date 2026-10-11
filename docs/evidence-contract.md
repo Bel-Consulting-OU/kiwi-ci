@@ -117,72 +117,102 @@ same durable state differently, and vice versa.
 | Event schema | `model.ExecutionEvent.SchemaVersion` (1) | PostgreSQL `execution_events` rows and the fs event journal | any change to event payload semantics |
 | Snapshot schema | `snapshot.ManifestVersion = 1` | `model.SnapshotRecord.Version` | any change to the workspace manifest encoding |
 | Graph / pipeline schema | pipeline `Spec.Version` (1) and `model.CompiledJobPayload.SchemaVersion` (1) | persisted pipelines, compiled payloads, fragment wire bodies | any change to pipeline or compiled-job semantics |
-| Evidence schema | execution attestation `schemaVersion = 4`; artifact statements use in-toto v1 + SLSA v1 as-is | the signed blocks themselves | any field addition/change to the attestation block (the schema version is inside the digest preimage) |
+| Evidence schema | execution attestation `schemaVersion = 5`; artifact statements use in-toto v1 + SLSA v1 as-is | the signed blocks themselves | any field addition/change to the attestation block (the schema version is inside the digest preimage) |
 
 Evidence-schema history: v2 added the completion identity and the evidence
-root; v3 added execution semantics; **v4 added `executionAssurance`
+root; v3 added execution semantics; v4 added `executionAssurance`
 (level + name), `externalEffects`, `policyDigest`, `eventFrontier` and
-`graphFingerprint`.** An envelope signed under an earlier schema predates the
-later fields and does not verify under the current digest: a v3 attestation is
-refused with an explicit unsupported-schema error, not silently reinterpreted.
-Because the schema version is part of the digest preimage, "same evidence,
-older schema" is by construction a different statement.
+`graphFingerprint`; **v5 makes the authoritative control-fact vector
+(`executionAssurance.facts`) the signed object, renames the derived labels
+`no_ambient_credentials` → `no_injected_credentials` and `hermetic` →
+`sealed_pinned_no_network`, and adds the executor-observed enforcement
+receipt inside the facts.** A v4 statement still verifies against its frozen
+name vocabulary (the legacy map is verification-only); new evidence is only
+ever built under the current version. An envelope signed under an even older
+schema predates the later fields and does not verify under the current digest:
+a v3 attestation is refused with an explicit unsupported-schema error, not
+silently reinterpreted. Because the schema version is part of the digest
+preimage, "same evidence, older schema" is by construction a different
+statement.
 
-## 4. Execution assurance and effect classes
+## 4. Execution assurance: facts first, profiles derived
 
-`model.ExecutionAssurance` is a closed ladder stating what the named controls
-are ENFORCED to do at execution time. It is a statement about Kiwi-enforced
-controls, never about what an arbitrary command does inside them.
+The AUTHORITATIVE signed object is the control-fact vector
+(`model.ExecutionFacts`): an independent vector of proven controls, not a
+score. Security decisions authorize against these facts. The profile label
+(`model.ExecutionAssurance`) is a derived convenience view, and the
+derivation (`model.DeriveAssuranceProfile`) is the single shared rule used by
+both evidence builders and verifiers, so a signed label can never disagree
+with its signed facts.
 
-| Level | Name | Enforces |
+| Fact | Meaning |
+|---|---|
+| `runtime` | closed vocabulary: `native` / `container` / `tart` / `unknown` |
+| `filesystem_isolated` | a REAL confinement boundary (container or Tart sandbox). A workspace quota does NOT set this: a quota bounds disk consumption, it does not confine the process's filesystem view |
+| `workspace_quota_enforced` | a hard OS-level workspace quota was installed before the workspace was populated; orthogonal to isolation |
+| `kiwi_secrets_injected` | true when the effective secret allowlist could admit at least one secret (nil policy or a non-empty allowlist). The complementary fact is "no INJECTED credentials" — deliberately narrower than "no ambient credentials" |
+| `host_environment_inherited` | the runner host environment is inherited (false in the distributed model, whose runner always starts from a clean environment) |
+| `network_mode` | closed vocabulary: `none` / `services` / `default` / `internet` / `unknown` |
+| `declared_authority_mediated` | every DECLARED external effect (deployments, OIDC, artifacts, downloads) is covered by a Kiwi capability, on a sandboxed runtime |
+| `images_digest_pinned` | every declared executable image (container image, service images, Tart VM reference) is digest-pinned |
+| `observed` | executor-observed ENFORCEMENT receipt, present only when the attempt captured one: `runtime` (native/docker/tart), `sandbox_started`, `network_enforced` (`none` / `container-namespace` / `vm-nat` / `host`), `root_filesystem_read_only`. It corroborates the effective vector; it never replaces it and cannot upgrade it |
+
+Requested → effective → observed: the job's declaration is the REQUESTED
+control set, the facts above are the EFFECTIVE (policy-intersected) controls
+provable from durable records, and `observed` is what the concrete runtime
+reported it entered. Normally all three agree; evidence keeps them
+distinguishable.
+
+Profiles are derived labels, **not an ordinal lattice** — profile 4
+(`kiwi_mediated_authority`) may allow networking while profile 3
+(`network_denied`) does not, so a higher number does not contain every
+guarantee of a lower one. Never authorize with `profile >= N`.
+
+| Profile | Name | Derived from |
 |---|---|---|
-| 0 | `uncontrolled` | no enforced execution boundary |
-| 1 | `isolated_filesystem` | a container/Tart runtime sandbox, or an OS-level workspace quota installed before the workspace is populated |
-| 2 | `no_ambient_credentials` | level 1 **plus** an explicitly empty (non-nil, deny-all) effective secret allowlist and no inherited host environment |
-| 3 | `network_denied` | level 2 **plus** effective network none |
-| 4 | `kiwi_mediated_authority` | level 2 **plus** every declared external effect (deployments, OIDC, artifacts, downloads) covered by a Kiwi capability. The network MAY be allowed: unauthenticated egress is then explicitly not constrained |
-| 5 | `hermetic` | level 4 **plus** network none **plus** every declared image (container image, service images, Tart VM reference) digest-pinned |
+| 0 | `uncontrolled` | `!filesystem_isolated` (native or unknown runtime) |
+| 1 | `isolated_filesystem` | a real sandbox boundary, but Kiwi-injected credentials or an inherited host environment are possible |
+| 2 | `no_injected_credentials` | profile 1 **plus** an explicitly empty (non-nil, deny-all) effective secret allowlist and a clean environment. Deliberately narrower than "no ambient credentials": credential surfaces the sandbox does not remove (VM identity, container-runtime metadata endpoints, network-reachable brokers) are not claimed absent |
+| 3 | `network_denied` | profile 2 **plus** effective network none |
+| 4 | `kiwi_mediated_authority` | profile 2 **plus** every declared external effect mediated by a Kiwi capability. The network MAY be allowed: unauthenticated egress is then explicitly not constrained |
+| 5 | `sealed_pinned_no_network` | profile 4 **plus** network none **plus** every declared image digest-pinned. This is NOT a hermeticity or bit-reproducibility claim: clocks, randomness, locale, kernel/runtime state and undeclared inputs remain outside what these controls prove |
 
-Levels 3 and 4 are siblings above level 2: level 3 is the network-denied
-branch, level 4 the mediated-authority branch (a level-4 job may hold allowed
-egress). Level 5 requires both. The pure derivation
-(`(*execution.EffectiveExecution).Assurance` / `.EffectsClass`) reports the
-strongest satisfied control set under that rule, deterministically and
-totally, from the persisted job + compiled payload + trust/policy records —
-never from configuration that is not in the durable evidence.
+The derivation is deterministic and total, runs only over the persisted job +
+compiled payload + trust/policy records, and never upgrades an unprovable
+record: an unmaterializable execution gets the conservative fact vector
+(unknown runtime, credentials not excluded) and derives profile 0 even when a
+runtime receipt exists.
 
 `model.ExternalEffectsClass` classifies where a job's external effects come
 from:
 
 - **`pure`** — network none, explicitly empty secret allowlist, no OIDC
   declaration, no deployment phases. Only Kiwi-collected outputs remain.
-- **`kiwi_mediated`** — not pure, no ambient credentials, and every declared
+- **`kiwi_mediated`** — not pure, no injected credentials, and every declared
   external effect flows through a Kiwi capability. Unauthenticated egress
   (when the network is allowed) and arbitrary command side effects reachable
   with the granted authority are outside mediation and are not covered by
   replay/speculation guarantees.
-- **`opaque_external`** — ambient credentials are possible: the effective
-  secret allowlist is unrestricted (nil policy) or non-empty, the host
-  environment is inherited, or the job runs on the native runtime with host
-  authority (host filesystem, credential files, sockets). Such a job is
-  classified honestly as not attributable to declared Kiwi capabilities.
+- **`opaque_external`** — ambient credentials are possible: no sandbox
+  boundary (native host authority: host filesystem, credential files,
+  sockets), the effective secret allowlist could inject a secret
+  (unrestricted/nil policy or non-empty), or the host environment is
+  inherited. Such a job is classified honestly as not attributable to
+  declared Kiwi capabilities.
 
 Decision table (the derivation's behavior, pinned by
 `internal/execution/assurance_test.go`):
 
-| Execution shape | Effective secret allowlist | Network | Declared effects | Images | Level | Class |
-|---|---|---|---|---|---|---|
-| untrusted container | empty (deny-all) | none | none | pinned | 5 `hermetic` | `pure` |
-| trusted container | unrestricted (trusted default) | allowed | — | — | 1 `isolated_filesystem` | `opaque_external` |
-| trusted container | empty | allowed | deployment, granted | — | 4 `kiwi_mediated_authority` | `kiwi_mediated` |
-| container | empty | none | deployment declared but NOT covered by the effective capability | — | 3 `network_denied` | `kiwi_mediated` |
-| container | empty | none | none | unpinned | 4 `kiwi_mediated_authority` | `pure` |
-| native (any) | — | — | — | — | ≤ 1 (0 without a workspace quota) | `opaque_external` |
-| any | non-empty allowlist | — | — | — | ≤ 1 | `opaque_external` |
+| Execution shape | Effective secret allowlist | Network | Declared effects | Images | Facts | Profile | Class |
+|---|---|---|---|---|---|---|---|
+| untrusted container | empty (deny-all) | none | none | pinned | isolated, clean, none, pinned | 5 `sealed_pinned_no_network` | `pure` |
+| trusted container | unrestricted (trusted default) | allowed | — | — | isolated, secrets injected | 1 `isolated_filesystem` | `opaque_external` |
+| trusted container | empty | allowed | deployment, granted | — | isolated, clean, mediated | 4 `kiwi_mediated_authority` | `kiwi_mediated` |
+| container | empty | none | deployment declared but NOT covered by the effective capability | — | isolated, clean, none, unmediated | 3 `network_denied` | `kiwi_mediated` |
+| container | empty | none | none | unpinned | isolated, clean, none | 4 `kiwi_mediated_authority` | `pure` |
+| native (any) | — | — | — | — | NOT isolated (quota is a separate fact) | 0 `uncontrolled` | `opaque_external` |
+| any | non-empty allowlist | — | — | — | secrets injected | ≤ 1 | `opaque_external` |
 
-A record whose execution cannot be re-materialized (unparseable pipeline, a
-payload that does not bind) is classified conservatively as
-`uncontrolled` / `opaque_external`; unproven executions are never upgraded.
 The event stream carries the same honesty: `graph.mutation_*` events record
 the mutation identity and whether a bounded opaque external context was
 attached (the context itself is caller-supplied correlation data, never
@@ -233,7 +263,7 @@ a weaker trust story.
 | Profile | Contents | Status |
 |---|---|---|
 | **minimal** | execution identity (repo/ref/commit, run/job/attempt), capsule digests, subject artifact digest, signature | available as the identity subset every signed statement already carries; `?profile=minimal` serves that same signed envelope |
-| **standard** | minimal + assurance level/name and effects class, policy digest, evidence root, completion digest, observed runtime, graph fingerprint, event frontier, snapshot/report/suite references | implemented: the current execution attestation block (schema v4); the default profile (`?profile=standard`) |
+| **standard** | minimal + assurance facts and derived profile, effects class, policy digest, evidence root, completion digest, observed runtime and control receipt, graph fingerprint, event frontier, snapshot/report/suite references | implemented: the current execution attestation block (schema v5); the default profile (`?profile=standard`) |
 | **forensic** | standard + bounded event-ledger timeline, artifact sidecar references, report case counts, snapshot records, retention watermarks | implemented: `GET /api/v1/jobs/{id}/attestation?profile=forensic` returns the UNSIGNED `kiwi-ci/execution-evidence-bundle/v1` materialization (the embedded signed envelope plus the run-scoped timeline, digest/ref-only records and watermarks). Requires `execution.events:read` (run-scoped) in addition to `evidence:read`; the timeline is capped (`maxForensicEvents`) and truncation is reported |
 
 **Redaction rule — projection → canonicalization → signature.** A profile is
@@ -248,6 +278,15 @@ not a signed projection: the signed artifact remains the embedded envelope
 (whose digest the bundle carries), and every other bundle field is a digest
 or reference a consumer can recompute or re-fetch through its own authorized
 reads — Kiwi never mints a second statement at retrieval time.
+
+**Integrity scope of the forensic bundle (stated sharply).** Only the
+embedded envelope is signed. The surrounding bundle — the event timeline,
+the record references, the retention watermarks and the bundle's own
+generation timestamp — is an UNSIGNED retrieval wrapper. Kiwi does not sign a
+forensic manifest today. A consumer that needs the wrapper itself to be
+attestable must persist the bundle and anchor its own digest, or treat the
+wrapper as a convenience view and recompute/re-fetch every referenced value
+from its own authorized reads (all of which are digest-anchored).
 
 **Non-goal: secret values are never recorded.** Evidence records references,
 versions and digests — `secret.issued` carries the secret NAME and lease
@@ -295,11 +334,20 @@ boundary of that execution:
   work or fragment uploads, and it refuses declared external effects unless
   explicitly authorized; it cannot promise that a step which declares nothing
   performs nothing outside the recorded policy.
-- **Assurance levels are enforcement statements, not safety verdicts.** A
-  hermetic attempt says every image was pinned and the network was off; it
-  does not say the code was trustworthy, bug-free, or that its outputs are
+- **Assurance facts are enforcement statements, not safety verdicts.** The
+  `observed` receipt inside the facts is the executor's report of what the
+  runtime entered; the effective facts are what the durable records prove the
+  controls were. A `sealed_pinned_no_network` attempt says every image was
+  pinned and the network was off; it does not say the code was trustworthy,
+  bug-free, hermetic in the reproducibility sense, or that its outputs are
   correct. `uncontrolled`/`opaque_external` are honest classifications of
   weaker enforcement, not failures to hide.
+- **The observed receipt is runner-reported evidence.** It is captured by the
+  executor that ran the job, bound into the signature and cross-checked
+  against the effective runtime, but a malicious or compromised runner can
+  report a receipt that misdescribes what it entered. The effective facts
+  (derived from durable control-plane records) are the policy floor; treat
+  the receipt as corroboration, not proof of honesty.
 - **Evidence is not a proof of correctness.** Digests and signatures bind
   identity and integrity of the recorded surfaces; they say nothing about the
   semantic correctness of what the pipeline computed.
@@ -319,11 +367,14 @@ curl -H "Authorization: Bearer $TOKEN" \
 ```
 
 `kiwi verify` prints the verified identity, the execution semantics and the
-assurance classification (`execution assurance: level N (name)`, `external
-effects: class`). Verification recomputes the canonical digest, refuses a
-block whose fields disagree with its own subject digest, refuses an unknown
-assurance level, a name that does not match its level, or an unknown effects
-class, and never prints raw command output.
+assurance evidence (`execution assurance: profile N (name)` followed by the
+proven facts and, when present, the observed receipt; `external effects:
+class`). Verification recomputes the canonical digest, refuses a block whose
+fields disagree with its own subject digest, refuses a facts vector outside
+the closed domains, a profile label that disagrees with the facts it was
+derived from, or an unknown effects class, and never prints raw command
+output. A schema-v4 statement is still verified against its frozen name
+vocabulary.
 
 ## See also
 

@@ -319,6 +319,51 @@ func TestUpBindControlPlaneAndBaseURL(t *testing.T) {
 	}
 }
 
+// TestUpRefusesInsecureRemote pins the plaintext-exposure gate: a loopback
+// listen is always allowed, a wildcard or routable host is refused without
+// the explicit opt-in, and the opt-in admits it. Up itself must refuse before
+// binding anything.
+func TestUpRefusesInsecureRemote(t *testing.T) {
+	for _, l := range []string{"127.0.0.1:8080", "127.0.0.1:0", "localhost:8080", "[::1]:8080"} {
+		if err := upValidateLoopback(l, false); err != nil {
+			t.Fatalf("loopback %q refused: %v", l, err)
+		}
+	}
+	for _, l := range []string{"0.0.0.0:8080", ":8080", "10.0.0.5:8080", "[::]:8080"} {
+		if err := upValidateLoopback(l, false); err == nil {
+			t.Fatalf("non-loopback %q accepted without the opt-in", l)
+		}
+		if err := upValidateLoopback(l, true); err != nil {
+			t.Fatalf("non-loopback %q refused with the opt-in: %v", l, err)
+		}
+	}
+	if err := upValidateLoopback("", false); err != nil {
+		t.Fatalf("default listen refused: %v", err)
+	}
+	if err := upValidateLoopback("not-an-address", false); err != nil {
+		t.Fatalf("malformed address refused before bind reporting: %v", err)
+	}
+	if err := upValidateLoopback("[::1]:0", false); err != nil {
+		t.Fatalf("loopback v6 refused: %v", err)
+	}
+	if err := Up(context.Background(), []string{"--listen", "0.0.0.0:0", "--data-dir", t.TempDir(), "--token", "t"}); err == nil {
+		t.Fatal("Up accepted a non-loopback plaintext listen without --allow-insecure-remote")
+	}
+}
+
+// TestUpIsLoopbackAddr pins the post-bind exposure classifier used for the
+// warning line: wildcard binds are NOT loopback.
+func TestUpIsLoopbackAddr(t *testing.T) {
+	if !upIsLoopbackAddr("127.0.0.1:1") || !upIsLoopbackAddr("[::1]:1") {
+		t.Fatal("loopback address classified as remote")
+	}
+	for _, addr := range []string{"0.0.0.0:1", "[::]:1", "10.0.0.5:1"} {
+		if upIsLoopbackAddr(addr) {
+			t.Fatalf("non-loopback %q classified as loopback", addr)
+		}
+	}
+}
+
 // TestUpRejectsArguments keeps the single-machine command argument-free:
 // positional arguments are a usage error, never silently ignored.
 func TestUpRejectsArguments(t *testing.T) {

@@ -10,6 +10,16 @@ the state of the `main` branch.
 
 ### Added
 
+- Executor-observed enforcement receipts (`model.ExecutionControlReceipt`):
+  the concrete runtime reports what it actually entered (`sandbox_started`,
+  `network_enforced` none/container-namespace/vm-nat/host,
+  `root_filesystem_read_only`), captured by the docker, tart and native
+  backends, validated server-side and bound into the signed execution facts
+  as `observed`.
+- GitHub Actions workflows: `.github/workflows/ci.yml` (gofmt, vet, surface
+  checks, unit suite on ubuntu + macos, a race lane over the race-sensitive
+  packages, fuzz smoke) and `.github/workflows/formal.yml` (nightly TLC
+  regression against the pinned tla2tools release).
 - Execution-assurance levels (`model.ExecutionAssurance`) and
   external-effects classes (`model.ExternalEffectsClass`), derived purely
   from the durable job/payload/policy records. Execution attestation
@@ -43,6 +53,24 @@ the state of the `main` branch.
 
 ### Changed
 
+- Execution assurance is now FACTS-FIRST: `model.ExecutionFacts` is the
+  authoritative signed vector (runtime, filesystem_isolated,
+  workspace_quota_enforced, kiwi_secrets_injected, host_environment_inherited,
+  network_mode, declared_authority_mediated, images_digest_pinned, optional
+  observed receipt) and the profile labels are derived convenience views,
+  recomputed from the facts by every verifier. A workspace quota no longer
+  implies filesystem isolation: native execution with a quota is profile 0
+  `uncontrolled` with `workspace_quota_enforced` recorded separately (a
+  quota bounds disk use; it does not confine the process's filesystem view).
+  The level-2 claim is renamed `no_ambient_credentials` ->
+  `no_injected_credentials` and level 5 `hermetic` ->
+  `sealed_pinned_no_network`, matching what the predicates can actually
+  prove. Execution attestation schema v5 carries the facts; schema-v4
+  statements keep verifying against their frozen name vocabulary.
+- `kiwi up` refuses a non-loopback plaintext listen unless
+  `--allow-insecure-remote` is passed explicitly (with a warning when it
+  proceeds), prints a newly generated token once, and no longer echoes a
+  reused stored token unless `--show-token` is given.
 - Completion receipt replay across the runtime-evidence upgrade: a stored
   legacy (v1) receipt now replays only when the retried completion's
   normalized runtime evidence is nil-or-equal to the evidence the original

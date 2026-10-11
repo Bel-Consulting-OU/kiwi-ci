@@ -14,18 +14,44 @@ import (
 )
 
 // ExecutionAssuranceEvidence is the signed form of the execution-assurance
-// classification of one attempt: the numeric level and its stable public name
-// (model.ExecutionAssurance.Name). Both are bound by the signature so a
-// consumer reads one unambiguous claim; a verifier rejects a block whose name
-// does not match its level.
+// classification of one attempt: the AUTHORITATIVE control-fact vector plus
+// the DERIVED profile label (numeric level and stable public name). The facts
+// are the decision surface; the label is a convenience view. Both are bound
+// by the signature, and a verifier recomputes the label from the facts so a
+// signed profile can never disagree with its signed facts.
+//
+// Facts is a pointer so schema-v4 statements (which carried only level+name)
+// keep their exact canonical JSON shape and still verify: an omitted pointer
+// marshals as no field.
 type ExecutionAssuranceEvidence struct {
-	Level int    `json:"level"`
-	Name  string `json:"name"`
+	Level int                   `json:"level"`
+	Name  string                `json:"name"`
+	Facts *model.ExecutionFacts `json:"facts,omitempty"`
 }
 
-// NewExecutionAssuranceEvidence renders a derived level into its signed form.
-func NewExecutionAssuranceEvidence(level model.ExecutionAssurance) ExecutionAssuranceEvidence {
-	return ExecutionAssuranceEvidence{Level: int(level), Name: level.Name()}
+// NewExecutionAssuranceEvidence renders an authoritative fact vector into its
+// signed form, deriving the profile label with the single shared rule
+// (model.DeriveAssuranceProfile). An invalid vector is refused rather than
+// signed.
+func NewExecutionAssuranceEvidence(facts model.ExecutionFacts) (ExecutionAssuranceEvidence, error) {
+	if !facts.Valid() {
+		return ExecutionAssuranceEvidence{}, fmt.Errorf("provenance: invalid execution facts")
+	}
+	level := model.DeriveAssuranceProfile(facts)
+	f := facts
+	return ExecutionAssuranceEvidence{Level: int(level), Name: level.Name(), Facts: &f}, nil
+}
+
+// legacyAssuranceNamesV4 is the frozen name map of attestation schema v4,
+// retained so previously issued v4 statements keep verifying. It is
+// verification-only: new evidence is always built under the current schema.
+var legacyAssuranceNamesV4 = map[int]string{
+	0: "uncontrolled",
+	1: "isolated_filesystem",
+	2: "no_ambient_credentials",
+	3: "network_denied",
+	4: "kiwi_mediated_authority",
+	5: "hermetic",
 }
 
 // effectivePolicyDigestVersion tags the canonical effective-policy digest

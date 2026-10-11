@@ -155,11 +155,13 @@ func VerifyArtifact(args []string) error {
 	return nil
 }
 
-// printExecutionAssurance prints the signed execution-assurance classification
-// when the statement carries one. Execution attestations carry it in the
-// attestation block; artifact statements carry the mirrored top-level fields.
-// Artifact statements signed by callers that are not a Kiwi execution
-// (release tooling) omit the fields, in which case nothing is printed.
+// printExecutionAssurance prints the signed execution-assurance evidence when
+// the statement carries it. Execution attestations carry it in the attestation
+// block; artifact statements carry the mirrored top-level fields. Artifact
+// statements signed by callers that are not a Kiwi execution (release
+// tooling) omit the fields, in which case nothing is printed. The
+// authoritative object is the control-fact vector; the level/name is its
+// derived label.
 func printExecutionAssurance(st provenance.Statement) {
 	evidence := st.ExecutionAssurance
 	class := st.ExternalEffects
@@ -168,7 +170,15 @@ func printExecutionAssurance(st provenance.Statement) {
 		class = st.Attestation.ExternalEffects
 	}
 	if evidence != nil {
-		fmt.Printf("  execution assurance: level %d (%s)\n", evidence.Level, evidence.Name)
+		fmt.Printf("  execution assurance: profile %d (%s)\n", evidence.Level, evidence.Name)
+		if f := evidence.Facts; f != nil {
+			fmt.Printf("    runtime: %s, filesystem isolated: %v, workspace quota: %v\n", f.Runtime, f.FilesystemIsolated, f.WorkspaceQuotaEnforced)
+			fmt.Printf("    kiwi secrets injected: %v, host env inherited: %v, network: %s\n", f.KiwiSecretsInjected, f.HostEnvironmentInherited, f.NetworkMode)
+			fmt.Printf("    declared authority mediated: %v, images digest pinned: %v\n", f.DeclaredAuthorityMediated, f.ImagesDigestPinned)
+			if o := f.Observed; o != nil {
+				fmt.Printf("    observed: sandbox started %v, network enforced %s, read-only root %v\n", o.SandboxStarted, o.NetworkEnforced, o.RootFilesystemReadOnly)
+			}
+		}
 	}
 	if class != "" {
 		fmt.Printf("  external effects: %s\n", class)

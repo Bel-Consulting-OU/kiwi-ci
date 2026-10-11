@@ -48,14 +48,19 @@ func attestationTestInput() ExecutionAttestationInput {
 		// The execution-engine semantics the attempt ran under is part of the
 		// signed block and its canonical digest.
 		ExecutionSemantics: model.ExecutionSemanticsVersion,
-		// The execution-assurance classification is a required part of the
-		// signed block: level + stable name, effects class, policy digest,
-		// event frontier and graph fingerprint.
-		ExecutionAssurance: model.AssuranceKiwiMediatedAuthority,
-		ExternalEffects:    model.EffectsKiwiMediated,
-		PolicyDigest:       strings.Repeat("8", 64),
-		EventFrontier:      42,
-		GraphFingerprint:   strings.Repeat("9", 64),
+		// The execution-assurance FACTS are the authoritative part of the
+		// signed block (their derived label is level 4 here); effects class,
+		// policy digest, event frontier and graph fingerprint complete it.
+		ExecutionAssuranceFacts: model.ExecutionFacts{
+			Runtime:                   model.RuntimeFactContainer,
+			FilesystemIsolated:        true,
+			NetworkMode:               model.NetworkModeFactDefault,
+			DeclaredAuthorityMediated: true,
+		},
+		ExternalEffects:  model.EffectsKiwiMediated,
+		PolicyDigest:     strings.Repeat("8", 64),
+		EventFrontier:    42,
+		GraphFingerprint: strings.Repeat("9", 64),
 	}
 }
 
@@ -142,7 +147,7 @@ func TestExecutionAttestationDigestOrderIndependentAndTamperEvident(t *testing.T
 		func(a *ExecutionAttestation) { a.Snapshots[0].Phase = model.SnapshotPhasePostJob },
 		func(a *ExecutionAttestation) { a.ExecutionSemantics = "kiwi.execution.v-future" },
 		func(a *ExecutionAttestation) {
-			a.ExecutionAssurance = ExecutionAssuranceEvidence{Level: 5, Name: "hermetic"}
+			a.ExecutionAssurance = ExecutionAssuranceEvidence{Level: 5, Name: "sealed_pinned_no_network"}
 		},
 		func(a *ExecutionAttestation) { a.ExecutionAssurance.Name = "uncontrolled" },
 		func(a *ExecutionAttestation) { a.ExternalEffects = model.EffectsPure },
@@ -425,48 +430,65 @@ func TestExecutionAttestationBindsExecutionSemantics(t *testing.T) {
 	}
 }
 
-// TestExecutionAttestationBindsAssuranceClassification proves the v4
-// execution-assurance fields are required, part of the canonical digest and
-// validated by verification: an undefined level or effects class is refused
-// at statement build time, tampering with any new field flips the digest, and
-// a block whose assurance name disagrees with its level (or that carries an
-// unknown class) is rejected even with an intact signature.
-func TestExecutionAttestationBindsAssuranceClassification(t *testing.T) {
+// TestExecutionAttestationBindsAssuranceFacts proves the v5
+// execution-assurance FACTS are required, part of the canonical digest and
+// validated by verification: invalid facts are refused at statement build
+// time, tampering with any field flips the digest, and a block whose derived
+// label disagrees with its facts (or that carries an unknown class) is
+// rejected even with an intact signature.
+func TestExecutionAttestationBindsAssuranceFacts(t *testing.T) {
 	in := attestationTestInput()
 	base, err := ExecutionAttestationStatement(in)
 	if err != nil {
 		t.Fatal(err)
 	}
 	att := base.Attestation
+	if att.SchemaVersion != 5 {
+		t.Fatalf("schemaVersion = %d, want 5", att.SchemaVersion)
+	}
 	if att.ExecutionAssurance.Level != int(model.AssuranceKiwiMediatedAuthority) || att.ExecutionAssurance.Name != model.AssuranceKiwiMediatedAuthority.Name() {
 		t.Fatalf("assurance = %+v, want level 4 kiwi_mediated_authority", att.ExecutionAssurance)
+	}
+	if att.ExecutionAssurance.Facts == nil {
+		t.Fatal("v5 statement carries no facts")
 	}
 	if att.ExternalEffects != model.EffectsKiwiMediated {
 		t.Fatalf("externalEffects = %q, want kiwi_mediated", att.ExternalEffects)
 	}
 	if att.PolicyDigest == "" || att.EventFrontier != 42 || att.GraphFingerprint == "" {
-		t.Fatalf("v4 evidence fields missing: %+v", att)
+		t.Fatalf("evidence fields missing: %+v", att)
 	}
 	if err := VerifyExecutionAttestation(base); err != nil {
 		t.Fatalf("intact statement does not verify: %v", err)
 	}
-	// An undefined level or class never gets signed.
-	badLevel := in
-	badLevel.ExecutionAssurance = model.ExecutionAssurance(99)
-	if _, err := ExecutionAttestationStatement(badLevel); err == nil {
-		t.Fatal("undefined assurance level accepted at build time")
+	// Invalid or inconsistent facts never get signed.
+	badFacts := in
+	badFacts.ExecutionAssuranceFacts = model.ExecutionFacts{Runtime: "bogus"}
+	if _, err := ExecutionAttestationStatement(badFacts); err == nil {
+		t.Fatal("invalid execution facts accepted at build time")
 	}
 	badClass := in
 	badClass.ExternalEffects = model.ExternalEffectsClass("bogus")
 	if _, err := ExecutionAttestationStatement(badClass); err == nil {
 		t.Fatal("undefined external effects class accepted at build time")
 	}
-	// A mismatched name (valid level, wrong name) and an unknown class are
-	// refused by verification even though the digest still binds the block.
+	// A mismatched name or level, missing/invalid facts and an unknown class
+	// are refused by verification even though the digest still binds the
+	// block.
 	for name, mutate := range map[string]func(a *ExecutionAttestation){
-		"name/level disagreement": func(a *ExecutionAttestation) { a.ExecutionAssurance.Name = "hermetic" },
-		"unknown level":           func(a *ExecutionAttestation) { a.ExecutionAssurance.Level = 99 },
-		"unknown class":           func(a *ExecutionAttestation) { a.ExternalEffects = "bogus" },
+		"name/level disagreement": func(a *ExecutionAttestation) { a.ExecutionAssurance.Name = "sealed_pinned_no_network" },
+		"level/facts disagreement": func(a *ExecutionAttestation) {
+			a.ExecutionAssurance.Level = 5
+			a.ExecutionAssurance.Name = "sealed_pinned_no_network"
+		},
+		"missing facts": func(a *ExecutionAttestation) { a.ExecutionAssurance.Facts = nil },
+		"invalid facts": func(a *ExecutionAttestation) {
+			f := *a.ExecutionAssurance.Facts
+			f.Runtime = "bogus"
+			a.ExecutionAssurance.Facts = &f
+		},
+		"unknown level": func(a *ExecutionAttestation) { a.ExecutionAssurance.Level = 99 },
+		"unknown class": func(a *ExecutionAttestation) { a.ExternalEffects = "bogus" },
 	} {
 		cp := *base.Attestation
 		mutate(&cp)
@@ -475,6 +497,47 @@ func TestExecutionAttestationBindsAssuranceClassification(t *testing.T) {
 		if err := VerifyExecutionAttestation(tampered); err == nil {
 			t.Fatalf("%s accepted by verification", name)
 		}
+	}
+}
+
+// TestExecutionAttestationAcceptsLegacyV4 proves previously issued schema-v4
+// statements keep verifying with their frozen name vocabulary (including the
+// renamed "no_ambient_credentials" and "hermetic"), while a v4 block using a
+// v5 name is refused.
+func TestExecutionAttestationAcceptsLegacyV4(t *testing.T) {
+	base, err := ExecutionAttestationStatement(attestationTestInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	v4 := func(level int, name string) Statement {
+		block := *base.Attestation
+		block.SchemaVersion = 4
+		block.ExecutionAssurance = ExecutionAssuranceEvidence{Level: level, Name: name}
+		d, derr := ExecutionAttestationDigest(block)
+		if derr != nil {
+			t.Fatal(derr)
+		}
+		st := base
+		st.Subject = []Subject{{Name: block.AttemptID, Digest: map[string]string{"sha256": d}}}
+		st.Attestation = &block
+		return st
+	}
+	for _, legacy := range []struct {
+		level int
+		name  string
+	}{
+		{2, "no_ambient_credentials"},
+		{5, "hermetic"},
+	} {
+		if err := VerifyExecutionAttestation(v4(legacy.level, legacy.name)); err != nil {
+			t.Fatalf("legacy v4 level %d (%s) refused: %v", legacy.level, legacy.name, err)
+		}
+	}
+	if err := VerifyExecutionAttestation(v4(2, "no_injected_credentials")); err == nil {
+		t.Fatal("v4 block with a v5 name accepted")
+	}
+	if err := VerifyExecutionAttestation(v4(7, "hermetic")); err == nil {
+		t.Fatal("v4 block with an out-of-range level accepted")
 	}
 }
 

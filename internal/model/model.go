@@ -448,6 +448,12 @@ type ObservedRuntime struct {
 	ServiceImageDigests map[string]string `json:"service_image_digests,omitempty"`
 	Components          map[string]string `json:"components,omitempty"`
 	CapturedAt          time.Time         `json:"captured_at,omitempty"`
+	// Control is the executor-observed ENFORCEMENT receipt of the attempt
+	// (see ExecutionControlReceipt): what the concrete runtime actually
+	// entered when it started, as opposed to what the effective policy
+	// requested. Nil when the backend captured no receipt (legacy records,
+	// runtimes without capture); it is never fabricated.
+	Control *ExecutionControlReceipt `json:"control,omitempty"`
 }
 
 type Runner struct {

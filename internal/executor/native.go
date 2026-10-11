@@ -86,12 +86,22 @@ func (*NativeBackend) Name() string { return "native" }
 // "native", RuntimeVersion is omitted (there is no runner runtime version
 // surface), and no image digests are recorded. The value is constructed on
 // demand: it is a platform fact, not per-job state.
+//
+// The enforcement receipt records what native execution actually entered:
+// no sandbox started, and the process has the host's network. These are the
+// observed counterparts of the effective facts, captured so evidence can
+// tell "no controls were enforced" apart from "no receipt exists".
 func (*NativeBackend) ObservedRuntime() *model.ObservedRuntime {
 	return &model.ObservedRuntime{
 		OS:          runtime.GOOS,
 		Arch:        runtime.GOARCH,
 		RuntimeName: "native",
 		CapturedAt:  time.Now().UTC(),
+		Control: &model.ExecutionControlReceipt{
+			Runtime:         "native",
+			SandboxStarted:  false,
+			NetworkEnforced: model.ObservedNetworkHost,
+		},
 	}
 }
 

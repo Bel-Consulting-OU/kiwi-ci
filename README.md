@@ -11,9 +11,9 @@ evidence infrastructure built for dynamic workloads**: ordinary CI, build
 farms, verification and compliance pipelines are first-class consumers,
 and agent/automation workloads that need trustworthy, replayable,
 evidence-backed execution are another — a major one, not the product's
-identity. The guarantee vocabulary (execution-assurance levels, external
-effect classes, exact replay versus bit-reproducibility, and what Kiwi
-does not guarantee) is public in
+identity. The guarantee vocabulary (execution-assurance facts and their
+derived profiles, external effect classes, exact replay versus
+bit-reproducibility, and what Kiwi does not guarantee) is public in
 [docs/evidence-contract.md](docs/evidence-contract.md).
 
 ## What exists
@@ -183,6 +183,8 @@ environment variable; see
 ./kiwi up                                      # free loopback port, ~/.kiwi/up state
 ./kiwi up --listen 127.0.0.1:8080 --data-dir /tmp/kiwi-stack
 ./kiwi up --token "$MY_TOKEN" --labels local,darwin
+./kiwi up --show-token                         # print the reused stored token
+./kiwi up --listen 0.0.0.0:8080 --allow-insecure-remote  # PLAINTEXT beyond loopback (not recommended)
 ```
 
 One process runs the control plane and one local runner; Ctrl-C drains
@@ -193,7 +195,12 @@ single-machine mode cannot drift into a second, weaker server. The state
 directory holds the durable state, the runner identity/cache tree, and
 (with no `--token`) the generated bearer token; `--listen` with no port
 (`127.0.0.1:0`) binds a concrete free port before startup, so a bare
-`kiwi up` never collides with another service. Both credential paths
+`kiwi up` never collides with another service. A non-loopback
+`--listen` is refused unless `--allow-insecure-remote` is passed
+explicitly: on plaintext HTTP the bearer token travels in cleartext, so
+exposing the stack beyond loopback is a deliberate, warned opt-in. A
+newly generated token is printed once and stored `0600`; a reused token
+is not echoed unless `--show-token` is given. Both credential paths
 fail closed on tampering: the state directory must be a real directory
 owned by you (it is tightened to `0700`), a persisted token is adopted
 only when it is an owned `0600` regular file (a symlink, plantable file
@@ -280,7 +287,7 @@ external services, clocks, network state and undeclared step behavior stay
 outside Kiwi's view, so a re-run can produce different observable results.
 See [exact replay versus bit-reproducible execution](docs/evidence-contract.md#5-exact-replay-versus-bit-reproducible-execution)
 and [what Kiwi does not guarantee](docs/evidence-contract.md#8-what-kiwi-does-not-guarantee);
-[effect classes](docs/evidence-contract.md#4-execution-assurance-and-effect-classes)
+[effect classes](docs/evidence-contract.md#4-execution-assurance-facts-first-profiles-derived)
 define which Kiwi-mediated effects exist at all.
 
 Exact replay is historically faithful, not automatically safe to re-execute:

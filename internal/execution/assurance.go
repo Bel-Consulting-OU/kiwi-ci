@@ -71,53 +71,52 @@ func MaterializeFromJob(j model.Job) (EffectiveExecution, bool) {
 	return eff, true
 }
 
-// nativeRuntime reports whether the effective runtime executes directly on
-// the runner host with host authority ("", "native"). The host filesystem,
-// host credential files and host sockets are reachable from such a job, so it
-// is never classified as isolated or credential-free.
-func (e EffectiveExecution) nativeRuntime() bool {
+// runtimeFact maps the effective runtime onto the closed fact vocabulary. An
+// unrecognized runtime is "unknown", never silently treated as sandboxed.
+func (e EffectiveExecution) runtimeFact() model.ExecutionRuntimeFact {
 	switch e.CompiledJob.Job.Runtime {
 	case "", "native":
+		return model.RuntimeFactNative
+	case "container":
+		return model.RuntimeFactContainer
+	case "tart":
+		return model.RuntimeFactTart
+	default:
+		return model.RuntimeFactUnknown
+	}
+}
+
+// sandboxed reports whether the effective runtime is a real confinement
+// boundary (container or Tart). A workspace quota is NOT a sandbox: it
+// bounds disk consumption without confining the process's filesystem view.
+func (e EffectiveExecution) sandboxed() bool {
+	switch e.runtimeFact() {
+	case model.RuntimeFactContainer, model.RuntimeFactTart:
 		return true
 	default:
 		return false
 	}
 }
 
-// filesystemIsolated reports whether the level-1 control is enforced: a
-// container/Tart runtime boundary, or a hard OS-level workspace quota
-// installed before the workspace is populated.
-func (e EffectiveExecution) filesystemIsolated() bool {
-	switch e.CompiledJob.Job.Runtime {
-	case "container", "tart":
-		return true
+// networkModeFact maps the effective network policy onto the closed fact
+// vocabulary. The legacy shape is preserved (a persisted job whose network
+// field is "none" with a default sandbox network).
+func (e EffectiveExecution) networkModeFact() model.ExecutionNetworkModeFact {
+	if e.CompiledJob.Job.Network == "none" {
+		return model.NetworkModeFactNone
 	}
-	return e.WorkspaceQuotaLimit > 0
-}
-
-// noAmbientCredentials reports whether the level-2 control is enforced: the
-// effective secret allowlist is explicitly empty (non-nil with no entries,
-// which the policy engine verifies denies every secret) and the execution
-// mode has no ambient credential source (no inherited host environment, no
-// native host authority). The materialized execution is the DISTRIBUTED
-// execution model, whose runner always starts from the minimal clean
-// environment; the local `kiwi run` host-environment opt-in is not a
-// distributed attempt and is never represented here.
-func (e EffectiveExecution) noAmbientCredentials() bool {
-	if e.nativeRuntime() {
-		return false
+	switch e.Network {
+	case pipeline.NetworkPolicyNone:
+		return model.NetworkModeFactNone
+	case pipeline.NetworkPolicyServicesOnly:
+		return model.NetworkModeFactServices
+	case pipeline.NetworkPolicyDefault:
+		return model.NetworkModeFactDefault
+	case pipeline.NetworkPolicyInternet:
+		return model.NetworkModeFactInternet
+	default:
+		return model.NetworkModeFactUnknown
 	}
-	return e.Capabilities.Secrets != nil && len(e.Capabilities.Secrets) == 0
-}
-
-// networkDenied reports whether the level-3 control is enforced: the
-// effective network is none. The legacy shape is preserved too (a persisted
-// job whose network field is "none" with a default sandbox network).
-func (e EffectiveExecution) networkDenied() bool {
-	if e.Network == pipeline.NetworkPolicyNone {
-		return true
-	}
-	return e.CompiledJob.Job.Network == "none"
 }
 
 // declaresDeployment reports whether the job declares a deployment effect:
@@ -135,16 +134,14 @@ func (e EffectiveExecution) declaresOIDC() bool {
 	return e.CompiledJob.Job.Permissions.IDToken
 }
 
-// declaredAuthorityMediated reports whether the level-4 control is enforced:
-// no native host authority, and every declared external effect is covered by
-// the effective capability set that admitted the job (deployments by the
-// deployment capability, OIDC by the audience allowlist). Artifacts and
-// downloads always flow through the control-plane API, so they are mediated
-// by construction. A declared effect whose capability is explicitly denied is
-// NOT mediated: the derivation reports the network-denied level instead when
-// that control holds.
+// declaredAuthorityMediated reports whether every DECLARED external effect is
+// covered by the effective capability set that admitted the job (deployments
+// by the deployment capability, OIDC by the audience allowlist) on a
+// sandboxed runtime. Artifacts and downloads always flow through the
+// control-plane API, so they are mediated by construction. A declared effect
+// whose capability is explicitly denied is NOT mediated.
 func (e EffectiveExecution) declaredAuthorityMediated() bool {
-	if e.nativeRuntime() {
+	if !e.sandboxed() {
 		return false
 	}
 	if e.declaresDeployment() && !e.Capabilities.Deployments {
@@ -159,7 +156,7 @@ func (e EffectiveExecution) declaredAuthorityMediated() bool {
 // imagesDigestPinned reports whether every declared executable image
 // reference is digest-pinned: the container image and every service image for
 // the container runtime, the VM reference for the Tart runtime. A runtime
-// with no images (native) is never hermetic.
+// with no images (native) is never pinned.
 func (e EffectiveExecution) imagesDigestPinned() bool {
 	j := e.CompiledJob.Job
 	switch j.Runtime {
@@ -180,38 +177,47 @@ func (e EffectiveExecution) imagesDigestPinned() bool {
 	}
 }
 
-// Assurance derives the execution-assurance level of the materialized
-// execution. The derivation is deterministic and total: every EffectiveExecution
-// maps to exactly one level. It reports the strongest satisfied control set
-// under the documented sibling rule (see model.ExecutionAssurance): the
-// level-4 control outranks the level-3 control when both hold, and level 5
-// additionally requires network denial and digest-pinned images.
+// Facts materializes the AUTHORITATIVE control-fact vector from the durable
+// records this effective execution was built from. The facts are orthogonal
+// by construction: FilesystemIsolated requires a real sandbox boundary and is
+// never implied by the workspace quota; KiwiSecretsInjected is the narrower
+// "no INJECTED credentials" fact (a nil allowlist or any allowed entry means
+// a secret could be injected). Observed is left nil here; the evidence
+// emitter attaches the executor-observed receipt from the persisted job, so
+// this function stays a pure function of the effective execution.
+func (e EffectiveExecution) Facts() model.ExecutionFacts {
+	caps := e.Capabilities
+	return model.ExecutionFacts{
+		Runtime:                   e.runtimeFact(),
+		FilesystemIsolated:        e.sandboxed(),
+		WorkspaceQuotaEnforced:    e.WorkspaceQuotaLimit > 0,
+		KiwiSecretsInjected:       !(caps.Secrets != nil && len(caps.Secrets) == 0),
+		HostEnvironmentInherited:  false, // the distributed model always starts from a clean environment
+		NetworkMode:               e.networkModeFact(),
+		DeclaredAuthorityMediated: e.declaredAuthorityMediated(),
+		ImagesDigestPinned:        e.imagesDigestPinned(),
+	}
+}
+
+// Assurance derives the execution-assurance PROFILE LABEL of the materialized
+// execution from its authoritative facts (model.DeriveAssuranceProfile is the
+// single shared derivation rule). The label is a convenience view; consumers
+// authorize against Facts().
 func (e EffectiveExecution) Assurance() model.ExecutionAssurance {
-	if !e.filesystemIsolated() {
-		return model.AssuranceUncontrolled
-	}
-	if !e.noAmbientCredentials() {
-		return model.AssuranceIsolatedFilesystem
-	}
-	if e.declaredAuthorityMediated() {
-		if e.networkDenied() && e.imagesDigestPinned() {
-			return model.AssuranceHermetic
-		}
-		return model.AssuranceKiwiMediatedAuthority
-	}
-	if e.networkDenied() {
-		return model.AssuranceNetworkDenied
-	}
-	return model.AssuranceNoAmbientCredentials
+	return model.DeriveAssuranceProfile(e.Facts())
 }
 
 // EffectsClass derives the external-effects class of the materialized
-// execution. The derivation is deterministic and total.
+// execution. The derivation is deterministic and total. A native or unknown
+// runtime is always opaque (ambient host credentials are reachable through
+// the unconfined filesystem), as is any execution that could receive an
+// injected secret or inherit the host environment.
 func (e EffectiveExecution) EffectsClass() model.ExternalEffectsClass {
-	if !e.noAmbientCredentials() {
+	f := e.Facts()
+	if !f.FilesystemIsolated || f.KiwiSecretsInjected || f.HostEnvironmentInherited {
 		return model.EffectsOpaqueExternal
 	}
-	if e.networkDenied() && !e.declaresOIDC() && !e.declaresDeployment() {
+	if f.NetworkMode == model.NetworkModeFactNone && !e.declaresOIDC() && !e.declaresDeployment() {
 		return model.EffectsPure
 	}
 	return model.EffectsKiwiMediated

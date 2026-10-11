@@ -381,6 +381,20 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 	// container is up, under the job context and its own bounded pass, and
 	// every failure is an omission that can never fail the job.
 	b.observed = captureContainerObservedRuntime(ctx, b.docker, b.Image, b.ServiceImages)
+	// The enforcement receipt is not best-effort: the container is up, so
+	// the sandbox started and the network mode passed to docker is what the
+	// runtime entered. It records the OBSERVED counterpart of the effective
+	// facts so evidence can distinguish "enforced" from "requested".
+	networkEnforced := model.ObservedNetworkContainerNamespace
+	if network == "none" {
+		networkEnforced = model.ObservedNetworkNone
+	}
+	b.observed.Control = &model.ExecutionControlReceipt{
+		Runtime:                "docker",
+		SandboxStarted:         true,
+		NetworkEnforced:        networkEnforced,
+		RootFilesystemReadOnly: b.ReadOnlyRootFS,
+	}
 	return nil
 }
 

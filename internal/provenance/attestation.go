@@ -31,10 +31,15 @@ const ExecutionAttestationPredicateType = "kiwi-ci/execution-attestation/v1"
 // semantics the attempt ran under); version 4 added the execution-assurance
 // classification (executionAssurance level+name and externalEffects), the
 // canonical effective-policy digest (policyDigest), the event-ledger frontier
-// (eventFrontier) and the run graph fingerprint (graphFingerprint). An
-// envelope signed under an earlier schema predates later fields and no longer
-// verifies under this digest.
-const executionAttestationSchemaVersion = 4
+// (eventFrontier) and the run graph fingerprint (graphFingerprint). Version 5
+// makes the AUTHORITATIVE control-fact vector the signed object
+// (executionAssurance.facts), renames the derived label "hermetic" to
+// "sealed_pinned_no_network" and "no_ambient_credentials" to
+// "no_injected_credentials" (the narrower provable claim), and adds the
+// executor-observed enforcement receipt inside the facts. The verifier still
+// accepts version 4 with its frozen name vocabulary; new evidence is only
+// ever built under the current version.
+const executionAttestationSchemaVersion = 5
 
 // executionAttestationDigestVersion tags the canonical hashing encoding.
 const executionAttestationDigestVersion = "kiwi-ci/execution-attestation-digest/v1"
@@ -121,12 +126,14 @@ type ExecutionAttestation struct {
 	// canonical digest, so a verifier detects any tampering with it. Empty
 	// for attempts that predate semantics stamping.
 	ExecutionSemantics string `json:"executionSemantics,omitempty"`
-	// ExecutionAssurance is the execution-assurance level and its stable name
-	// (see model.ExecutionAssurance) derived purely from the persisted job,
-	// its compiled payload and the trust/policy records. It states what the
-	// execution ENFORCES; a verifier rejects a name that disagrees with the
-	// level. A record whose execution cannot be re-materialized is classified
-	// conservatively as uncontrolled/opaque_external, never upgraded.
+	// ExecutionAssurance is the AUTHORITATIVE execution control-fact vector
+	// and its derived profile label (see model.ExecutionFacts /
+	// model.DeriveAssuranceProfile), derived purely from the persisted job,
+	// its compiled payload and the trust/policy records. The facts are what
+	// consumers authorize against; the label is a convenience view and a
+	// verifier recomputes it from the facts. A record whose execution cannot
+	// be re-materialized is classified conservatively as uncontrolled with
+	// unproven facts, never upgraded.
 	ExecutionAssurance ExecutionAssuranceEvidence `json:"executionAssurance"`
 	// ExternalEffects is the external-effects class (model.ExternalEffectsClass)
 	// derived with the same pure derivation: pure, kiwi_mediated or
@@ -185,13 +192,12 @@ type ExecutionAttestationInput struct {
 	// canonical digest, so a consumer detects any tampering with it. Empty
 	// for attempts that predate semantics stamping; it is never guessed.
 	ExecutionSemantics string
-	// ExecutionAssurance and ExternalEffects are the derived
-	// execution-assurance level and external-effects class of the attempt
-	// (see model.ExecutionAssurance / model.ExternalEffectsClass). They are
-	// required: the statement builder refuses an undefined level or class
-	// rather than signing an unclassifiable claim.
-	ExecutionAssurance model.ExecutionAssurance
-	ExternalEffects    model.ExternalEffectsClass
+	// ExecutionAssuranceFacts is the AUTHORITATIVE control-fact vector of
+	// the attempt (see model.ExecutionFacts). The statement builder derives
+	// the profile label from it with the single shared rule and refuses an
+	// invalid vector rather than signing an unclassifiable claim.
+	ExecutionAssuranceFacts model.ExecutionFacts
+	ExternalEffects         model.ExternalEffectsClass
 	// PolicyDigest is the canonical digest of the payload's effective policy
 	// (provenance.EffectivePolicyDigest); empty when there is no policy to
 	// bind.
@@ -213,8 +219,9 @@ type ExecutionAttestationInput struct {
 // existing provenance constraints (attempt/capsule digests) verify an
 // attestation envelope unchanged.
 func ExecutionAttestationStatement(in ExecutionAttestationInput) (Statement, error) {
-	if !in.ExecutionAssurance.Valid() {
-		return Statement{}, fmt.Errorf("provenance: undefined execution assurance level %d", int(in.ExecutionAssurance))
+	assurance, err := NewExecutionAssuranceEvidence(in.ExecutionAssuranceFacts)
+	if err != nil {
+		return Statement{}, err
 	}
 	if !in.ExternalEffects.Valid() {
 		return Statement{}, fmt.Errorf("provenance: undefined external effects class %q", string(in.ExternalEffects))
@@ -240,7 +247,7 @@ func ExecutionAttestationStatement(in ExecutionAttestationInput) (Statement, err
 		CompletionResultDigest: in.CompletionResultDigest,
 		EvidenceRootSHA256:     in.EvidenceRootSHA256,
 		ExecutionSemantics:     in.ExecutionSemantics,
-		ExecutionAssurance:     NewExecutionAssuranceEvidence(in.ExecutionAssurance),
+		ExecutionAssurance:     assurance,
 		ExternalEffects:        in.ExternalEffects,
 		PolicyDigest:           in.PolicyDigest,
 		EventFrontier:          in.EventFrontier,
@@ -524,11 +531,19 @@ func VerifyExecutionAttestation(st Statement) error {
 		return fmt.Errorf("provenance: execution attestation has no evidence block")
 	}
 	// The digest is schema-tagged (schemaVersion is part of the preimage), so
-	// a v1 envelope would otherwise fail the subject-digest comparison with a
-	// misleading "does not bind its evidence block" error. Refuse an
-	// unsupported schema explicitly, before any digest comparison.
-	if st.Attestation.SchemaVersion != executionAttestationSchemaVersion {
-		return fmt.Errorf("provenance: unsupported attestation schemaVersion %d (want %d)", st.Attestation.SchemaVersion, executionAttestationSchemaVersion)
+	// an unsupported envelope would otherwise fail the subject-digest
+	// comparison with a misleading "does not bind its evidence block" error.
+	// Refuse an unsupported schema explicitly, before any digest comparison.
+	// Schema 5 is current; schema 4 (fact-less level+name classification with
+	// its frozen name vocabulary) is still accepted so previously issued
+	// evidence keeps verifying.
+	legacyV4 := false
+	switch st.Attestation.SchemaVersion {
+	case executionAttestationSchemaVersion:
+	case 4:
+		legacyV4 = true
+	default:
+		return fmt.Errorf("provenance: unsupported attestation schemaVersion %d (want %d or legacy 4)", st.Attestation.SchemaVersion, executionAttestationSchemaVersion)
 	}
 	want, err := ExecutionAttestationDigest(*st.Attestation)
 	if err != nil {
@@ -546,16 +561,34 @@ func VerifyExecutionAttestation(st Statement) error {
 	if st.Attestation.ExecutionSemantics != st.ExecutionSemantics {
 		return fmt.Errorf("provenance: execution attestation execution semantics disagree with the statement")
 	}
-	// The assurance claim is a closed classification: an out-of-range level, a
-	// name that disagrees with its level, or an unknown effects class is
-	// refused so a validly signed but self-contradictory block can never be
-	// accepted.
-	level := model.ExecutionAssurance(st.Attestation.ExecutionAssurance.Level)
-	if !level.Valid() {
-		return fmt.Errorf("provenance: execution attestation has undefined execution assurance level %d", st.Attestation.ExecutionAssurance.Level)
-	}
-	if st.Attestation.ExecutionAssurance.Name != level.Name() {
-		return fmt.Errorf("provenance: execution attestation assurance name %q does not match level %d (%s)", st.Attestation.ExecutionAssurance.Name, level, level.Name())
+	// The assurance claim is a closed classification. A v4 statement is
+	// checked against its frozen name vocabulary; a v5 statement must carry
+	// the authoritative fact vector, and its profile label must be exactly
+	// what the shared derivation recomputes from those facts, so a validly
+	// signed but self-contradictory block can never be accepted.
+	evidence := st.Attestation.ExecutionAssurance
+	if legacyV4 {
+		name, ok := legacyAssuranceNamesV4[evidence.Level]
+		if !ok {
+			return fmt.Errorf("provenance: execution attestation has undefined execution assurance level %d", evidence.Level)
+		}
+		if evidence.Name != name {
+			return fmt.Errorf("provenance: execution attestation assurance name %q does not match legacy level %d (%s)", evidence.Name, evidence.Level, name)
+		}
+	} else {
+		if evidence.Facts == nil {
+			return fmt.Errorf("provenance: execution attestation carries no execution facts")
+		}
+		if !evidence.Facts.Valid() {
+			return fmt.Errorf("provenance: execution attestation carries invalid execution facts")
+		}
+		derived := model.DeriveAssuranceProfile(*evidence.Facts)
+		if evidence.Level != int(derived) {
+			return fmt.Errorf("provenance: execution attestation assurance level %d does not match its facts (derives %d %s)", evidence.Level, int(derived), derived.Name())
+		}
+		if evidence.Name != derived.Name() {
+			return fmt.Errorf("provenance: execution attestation assurance name %q does not match level %d (%s)", evidence.Name, evidence.Level, derived.Name())
+		}
 	}
 	if !st.Attestation.ExternalEffects.Valid() {
 		return fmt.Errorf("provenance: execution attestation has undefined external effects class %q", string(st.Attestation.ExternalEffects))

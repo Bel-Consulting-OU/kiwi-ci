@@ -1,107 +1,350 @@
 package model
 
-// ExecutionAssurance is the closed ladder of execution-assurance guarantees
-// Kiwi can ENFORCE (or fails to enforce) for one attempt. A level states what
-// the named controls are enforced to do at execution time; it is deliberately
-// NOT a claim about what an arbitrary command may do inside those controls,
-// and it never implies secrecy of data the job legitimately receives.
+// The execution-assurance contract has two layers:
 //
-// Levels are cumulative up to 2 and then branch:
+//  1. ExecutionFacts — the AUTHORITATIVE vector of proven execution controls,
+//     derived from the persisted job/payload/policy records and bound into
+//     signed evidence. Consumers that make security decisions must authorize
+//     against these facts, never against a numeric profile.
 //
-//   - Levels 1, 2 are cumulative: level 2 requires every level-1 control and
-//     adds the level-2 control.
-//   - Level 3 (network deny-by-default) and level 4 (all declared external
-//     authority is Kiwi-mediated) are SIBLING branches above level 2: they
-//     share the level-1 and level-2 controls, but neither implies the other.
-//     Level 3 requires the effective network to be none. Level 4 does NOT
-//     require the network to be denied: a level-4 job may hold allowed egress,
-//     and unauthenticated egress is then explicitly outside Kiwi mediation
-//     (documented below).
-//   - Level 5 (hermetic) requires the level-4 control PLUS network denial
-//     PLUS every image digest-pinned.
+//  2. ExecutionAssurance — a small set of DERIVED PROFILE LABELS for humans
+//     and policy shorthands. The labels are not an ordinal lattice: the
+//     network-denied and kiwi-mediated-authority profiles are siblings, so a
+//     higher number does not contain every guarantee of a lower one. The
+//     derivation (DeriveAssuranceProfile) is total and deterministic.
 //
-// Because 3 and 4 are siblings, the pure derivation in internal/execution
-// reports the level by the audit's strength rule: a job that enforces the
-// level-4 control is reported at 4 even when the network is allowed; a job
-// that enforces network denial but not the level-4 control is reported at 3;
-// a job that enforces both and additionally pins every image is reported at 5.
+// Facts state what Kiwi ENFORCED, from durable records. The optional Observed
+// receipt inside the facts states what the concrete runtime REPORTED when it
+// started (executor-observed enforcement), which lets a consumer corroborate
+// the effective vector without replacing it.
 //
-// The exact enforcement of each level:
+// Provenance distinction (requested -> effective -> observed): the
+// requested controls are the job's declaration, the effective facts below
+// are the policy-intersected values Kiwi can prove from durable records, and
+// the observed receipt is what the executor captured from the running
+// runtime. Normally all three agree; evidence keeps them distinguishable.
+
+// ExecutionRuntimeFact is the closed runtime vocabulary of the effective
+// execution facts. "unknown" is the conservative zero value: an execution
+// whose records cannot be re-materialized claims no runtime, and every
+// runtime-dependent fact must then be false.
+type ExecutionRuntimeFact string
+
+const (
+	// RuntimeFactUnknown is the unprovable runtime.
+	RuntimeFactUnknown ExecutionRuntimeFact = "unknown"
+	// RuntimeFactNative is host execution with host authority.
+	RuntimeFactNative ExecutionRuntimeFact = "native"
+	// RuntimeFactContainer is a container sandbox.
+	RuntimeFactContainer ExecutionRuntimeFact = "container"
+	// RuntimeFactTart is a Tart VM sandbox.
+	RuntimeFactTart ExecutionRuntimeFact = "tart"
+)
+
+// ExecutionNetworkModeFact is the closed effective-network vocabulary,
+// mirroring the compiled pipeline policy. "unknown" is the conservative zero
+// value.
+type ExecutionNetworkModeFact string
+
+const (
+	// NetworkModeFactUnknown is the unprovable network mode.
+	NetworkModeFactUnknown ExecutionNetworkModeFact = "unknown"
+	// NetworkModeFactNone is pipeline network none.
+	NetworkModeFactNone ExecutionNetworkModeFact = "none"
+	// NetworkModeFactServices is pipeline services-only egress.
+	NetworkModeFactServices ExecutionNetworkModeFact = "services"
+	// NetworkModeFactDefault is the runtime's default network.
+	NetworkModeFactDefault ExecutionNetworkModeFact = "default"
+	// NetworkModeFactInternet is unrestricted internet egress.
+	NetworkModeFactInternet ExecutionNetworkModeFact = "internet"
+)
+
+// ObservedNetworkMode is the closed executor-observed network enforcement
+// vocabulary: what the concrete runtime actually entered, not what was
+// requested.
+type ObservedNetworkMode string
+
+const (
+	// ObservedNetworkNone: the runtime has no network at all.
+	ObservedNetworkNone ObservedNetworkMode = "none"
+	// ObservedNetworkContainerNamespace: the runtime has its own network
+	// namespace (container), with connectivity per the applied mode.
+	ObservedNetworkContainerNamespace ObservedNetworkMode = "container-namespace"
+	// ObservedNetworkVMNAT: the runtime is a VM attached through host NAT
+	// (Tart), which cannot be denied.
+	ObservedNetworkVMNAT ObservedNetworkMode = "vm-nat"
+	// ObservedNetworkHost: the process runs with the host's network.
+	ObservedNetworkHost ObservedNetworkMode = "host"
+)
+
+// ExecutionControlReceipt is the executor-observed enforcement receipt of one
+// attempt: the sandbox identity, whether a sandbox actually started, the
+// network enforcement the runtime entered, and whether the root filesystem
+// was read-only. It is captured when the concrete runtime starts (best
+// effort) and is deliberately separate from the effective facts: absence
+// means "the executor did not capture a receipt" (legacy attempts, runtimes
+// without capture), never "the controls were absent".
+type ExecutionControlReceipt struct {
+	// Runtime is the runtime that actually started: native, docker or tart.
+	Runtime string `json:"runtime"`
+	// SandboxStarted is true when a real sandbox boundary started. Native
+	// execution reports false.
+	SandboxStarted bool `json:"sandbox_started"`
+	// NetworkEnforced is what the runtime actually entered.
+	NetworkEnforced ObservedNetworkMode `json:"network_enforced"`
+	// RootFilesystemReadOnly is true when the runtime applied a read-only
+	// root filesystem (container --read-only). False means "not applied",
+	// not "unknown".
+	RootFilesystemReadOnly bool `json:"root_filesystem_read_only,omitempty"`
+}
+
+// Valid reports whether the receipt is a well-formed closed observation.
+func (r ExecutionControlReceipt) Valid() bool {
+	switch r.Runtime {
+	case "native", "docker", "tart":
+	default:
+		return false
+	}
+	switch r.NetworkEnforced {
+	case ObservedNetworkNone, ObservedNetworkContainerNamespace, ObservedNetworkVMNAT, ObservedNetworkHost:
+	default:
+		return false
+	}
+	switch r.Runtime {
+	case "native":
+		if r.SandboxStarted {
+			return false
+		}
+	case "docker", "tart":
+		if !r.SandboxStarted {
+			return false
+		}
+	}
+	if r.RootFilesystemReadOnly && r.Runtime != "docker" {
+		return false
+	}
+	return true
+}
+
+// ExecutionFacts is the authoritative vector of proven execution controls of
+// one attempt. Every field is a closed, derivable fact; no field is a claim
+// about what an arbitrary command may attempt inside those controls.
 //
-//	0 (uncontrolled): no execution boundary is established. The job executes
-//	  with whatever authority the runner process has; no filesystem isolation,
-//	  no credential restriction, no network restriction are enforced by Kiwi.
+// Facts are orthogonal by design (the audit's fact-vector rule): a workspace
+// quota bounds disk use but does NOT confine a native process, so
+// WorkspaceQuotaEnforced is separate from FilesystemIsolated and never
+// implies it.
+type ExecutionFacts struct {
+	// Runtime is the effective runtime the control plane selected.
+	Runtime ExecutionRuntimeFact `json:"runtime"`
+	// FilesystemIsolated is true only for a real confinement boundary
+	// (container or Tart sandbox). A workspace quota does NOT set it.
+	FilesystemIsolated bool `json:"filesystem_isolated"`
+	// WorkspaceQuotaEnforced is true when a hard OS-level workspace quota
+	// was installed before the workspace was populated. It is orthogonal to
+	// isolation.
+	WorkspaceQuotaEnforced bool `json:"workspace_quota_enforced"`
+	// KiwiSecretsInjected is true when the effective secret allowlist could
+	// admit at least one secret (nil policy, or any allowed entry). The
+	// complementary fact is "no INJECTED credentials", deliberately narrower
+	// than "no ambient credentials": ambient credential surfaces the
+	// execution boundary does not remove (host filesystem for native, VM
+	// identity, runtime metadata) are not claimed absent here.
+	KiwiSecretsInjected bool `json:"kiwi_secrets_injected"`
+	// HostEnvironmentInherited is true when the execution inherits the
+	// runner host environment. The distributed execution model always
+	// starts from a clean environment, so this is false there; the local
+	// `kiwi run` host-environment opt-in is never represented as a
+	// distributed attempt.
+	HostEnvironmentInherited bool `json:"host_environment_inherited"`
+	// NetworkMode is the effective network policy.
+	NetworkMode ExecutionNetworkModeFact `json:"network_mode"`
+	// DeclaredAuthorityMediated is true when every DECLARED external effect
+	// (deployments, OIDC) is covered by the effective capability set and the
+	// execution is sandboxed. It says nothing about undeclared egress.
+	DeclaredAuthorityMediated bool `json:"declared_authority_mediated"`
+	// ImagesDigestPinned is true when every declared executable image
+	// reference (container image, service images, Tart VM) is digest-pinned.
+	ImagesDigestPinned bool `json:"images_digest_pinned"`
+	// Observed is the executor-observed enforcement receipt when the attempt
+	// captured one. It corroborates the effective vector; it never replaces
+	// it and is nil for records without a receipt.
+	Observed *ExecutionControlReceipt `json:"observed,omitempty"`
+}
+
+// Valid reports whether the fact vector is a well-formed, internally
+// consistent member of the closed domains. Inconsistent vectors (for example
+// filesystem_isolated on a native runtime) are refused, never interpreted.
+func (f ExecutionFacts) Valid() bool {
+	switch f.Runtime {
+	case RuntimeFactUnknown, RuntimeFactNative, RuntimeFactContainer, RuntimeFactTart:
+	default:
+		return false
+	}
+	switch f.NetworkMode {
+	case NetworkModeFactUnknown, NetworkModeFactNone, NetworkModeFactServices, NetworkModeFactDefault, NetworkModeFactInternet:
+	default:
+		return false
+	}
+	sandboxed := f.Runtime == RuntimeFactContainer || f.Runtime == RuntimeFactTart
+	if f.FilesystemIsolated && !sandboxed {
+		return false
+	}
+	if f.Runtime == RuntimeFactUnknown && (f.FilesystemIsolated || f.DeclaredAuthorityMediated || f.ImagesDigestPinned) {
+		return false
+	}
+	if f.DeclaredAuthorityMediated && !sandboxed {
+		return false
+	}
+	if f.ImagesDigestPinned && !sandboxed {
+		return false
+	}
+	if f.Observed != nil {
+		if !f.Observed.Valid() {
+			return false
+		}
+		// When the effective runtime is known, the executor-observed receipt
+		// must corroborate it. An UNKNOWN effective runtime may carry any
+		// valid receipt: the receipt is then the only proven runtime fact
+		// (the effective vector stays unproven and cannot be upgraded by it).
+		switch f.Runtime {
+		case RuntimeFactContainer:
+			if f.Observed.Runtime != "docker" {
+				return false
+			}
+		case RuntimeFactTart:
+			if f.Observed.Runtime != "tart" {
+				return false
+			}
+		case RuntimeFactNative:
+			if f.Observed.Runtime != "native" {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// UnprovenExecutionFacts returns the conservative fact vector for a record
+// whose execution cannot be re-materialized: no runtime, no isolation, no
+// provable credential restriction, no pinned images. It derives profile 0
+// (uncontrolled).
+func UnprovenExecutionFacts() ExecutionFacts {
+	return ExecutionFacts{
+		Runtime:                  RuntimeFactUnknown,
+		NetworkMode:              NetworkModeFactUnknown,
+		KiwiSecretsInjected:      true,
+		HostEnvironmentInherited: true,
+	}
+}
+
+// ExecutionAssurance is the DERIVED profile label of an execution fact
+// vector: a small, stable vocabulary for humans and policy shorthands.
 //
-//	1 (isolated_filesystem): the filesystem the job's steps observe is an
-//	  enforced boundary: a container/Tart runtime sandbox, or a workspace whose
-//	  OS-level quota is installed before the workspace is populated. It does
-//	  NOT enforce anything about credentials, network or external authority.
+// The labels are NOT an ordinal lattice. Levels 1 and 2 are cumulative
+// above 0; level 3 (network_denied) and level 4 (kiwi_mediated_authority)
+// are SIBLING branches above 2: a level-4 job may allow network egress (then
+// unauthenticated egress is explicitly outside Kiwi mediation), while a
+// level-3 job denies the network but has no mediated-authority claim. Level
+// 5 requires the level-4 control PLUS network none PLUS every image
+// digest-pinned. Consumers authorize against ExecutionFacts; a numeric
+// comparison between labels is not a security decision.
 //
-//	2 (no_ambient_credentials): level 1 PLUS the job cannot obtain ambient
-//	  credentials: the effective secret allowlist is explicitly empty (a
-//	  non-nil, empty allowlist, verified to deny every secret) and Kiwi never
-//	  inherits the runner host environment into the job. It does NOT constrain
-//	  the network, OIDC issuance or deployment phases.
+// The exact derivation (DeriveAssuranceProfile):
 //
-//	3 (network_denied): level 2 PLUS the effective network is none: the job
-//	  has no network access at all (no egress, no service network).
+//	0 (uncontrolled): no sandbox boundary (native or unknown runtime).
 //
-//	4 (kiwi_mediated_authority): level 2 PLUS every declared external
-//	  authority flows through a Kiwi capability: deployments are gated by the
-//	  deployment capability, OIDC audiences by the OIDC allowlist, artifacts
-//	  and downloads by the artifact contract/API. It does NOT require network
-//	  denial: when the network is allowed, unauthenticated egress is not
-//	  constrained by Kiwi (any bytes the job can send without a credential are
-//	  outside mediation).
+//	1 (isolated_filesystem): a real sandbox boundary (container/Tart), but
+//	  credentials could still reach the job (Kiwi-injected via a non-empty
+//	  allowlist, or an inherited host environment).
 //
-//	5 (hermetic): level 4 PLUS network none PLUS every declared image
-//	  (container image, service images, Tart VM reference) digest-pinned, so
-//	  no executable content can be resolved by tag at execution time.
+//	2 (no_injected_credentials): level 1 plus an explicitly empty (non-nil,
+//	  deny-all) secret allowlist and no inherited host environment. This is
+//	  "Kiwi injected no credentials", deliberately narrower than "no ambient
+//	  credentials": credential surfaces the sandbox itself does not remove
+//	  (VM identity, container-runtime metadata endpoints, network-reachable
+//	  brokers) are NOT claimed absent.
+//
+//	3 (network_denied): level 2 plus effective network none.
+//
+//	4 (kiwi_mediated_authority): level 2 plus every DECLARED external
+//	  authority covered by a Kiwi capability. The network may be allowed.
+//
+//	5 (sealed_pinned_no_network): level 4 plus network none plus every
+//	  declared image digest-pinned. This is NOT a hermeticity claim: clocks,
+//	  randomness, kernel/runtime state, locale and undeclared host inputs
+//	  are outside what these controls prove, so Kiwi does not call it
+//	  "hermetic".
 type ExecutionAssurance int
 
 const (
-	// AssuranceUncontrolled is level 0: no enforced execution boundary.
+	// AssuranceUncontrolled is profile 0: no sandbox boundary.
 	AssuranceUncontrolled ExecutionAssurance = iota
-	// AssuranceIsolatedFilesystem is level 1: an enforced filesystem boundary
-	// (container/Tart runtime, or a quota-enforced workspace).
+	// AssuranceIsolatedFilesystem is profile 1: a real sandbox boundary.
 	AssuranceIsolatedFilesystem
-	// AssuranceNoAmbientCredentials is level 2: level 1 plus an explicitly
-	// empty secret allowlist and no host-environment inheritance.
-	AssuranceNoAmbientCredentials
-	// AssuranceNetworkDenied is level 3: level 2 plus effective network none.
+	// AssuranceNoInjectedCredentials is profile 2: profile 1 plus an
+	// explicitly empty secret allowlist and a clean environment.
+	AssuranceNoInjectedCredentials
+	// AssuranceNetworkDenied is profile 3: profile 2 plus network none.
 	AssuranceNetworkDenied
-	// AssuranceKiwiMediatedAuthority is level 4: level 2 plus every declared
-	// external authority flowing through Kiwi capabilities. The network may
-	// be allowed; unauthenticated egress is then not constrained.
+	// AssuranceKiwiMediatedAuthority is profile 4: profile 2 plus mediated
+	// declared authority. The network may be allowed.
 	AssuranceKiwiMediatedAuthority
-	// AssuranceHermetic is level 5: level 4 plus network none plus all images
-	// digest-pinned.
-	AssuranceHermetic
+	// AssuranceSealedPinnedNoNetwork is profile 5: profile 4 plus network
+	// none plus digest-pinned images. Not a reproducibility claim.
+	AssuranceSealedPinnedNoNetwork
 )
 
-// ExecutionAssuranceNames maps every level to its stable public name. The
-// names are part of the evidence contract (see docs/evidence-contract.md) and
-// must not change meaning without a schema bump.
+// ExecutionAssuranceNames maps every profile to its stable public name. The
+// names are part of the evidence contract (see docs/evidence-contract.md)
+// and must not change meaning without a schema bump. Schema v4 used the names
+// "no_ambient_credentials" and "hermetic"; schema v5 renamed them to the
+// narrower, provable vocabulary below.
 var ExecutionAssuranceNames = map[ExecutionAssurance]string{
 	AssuranceUncontrolled:          "uncontrolled",
 	AssuranceIsolatedFilesystem:    "isolated_filesystem",
-	AssuranceNoAmbientCredentials:  "no_ambient_credentials",
+	AssuranceNoInjectedCredentials: "no_injected_credentials",
 	AssuranceNetworkDenied:         "network_denied",
 	AssuranceKiwiMediatedAuthority: "kiwi_mediated_authority",
-	AssuranceHermetic:              "hermetic",
+	AssuranceSealedPinnedNoNetwork: "sealed_pinned_no_network",
 }
 
-// Name returns the stable public name of the level, or "" for a value outside
-// the closed set. Evidence builders must not mint names for unknown levels.
+// Name returns the stable public name of the profile, or "" for a value
+// outside the closed set. Evidence builders must not mint names for unknown
+// profiles.
 func (a ExecutionAssurance) Name() string {
 	return ExecutionAssuranceNames[a]
 }
 
-// Valid reports whether a is one of the defined levels. Evidence that carries
-// an out-of-range level is invalid and must be refused, never interpreted.
+// Valid reports whether a is one of the defined profiles. Evidence that
+// carries an out-of-range value is invalid and must be refused, never
+// interpreted.
 func (a ExecutionAssurance) Valid() bool {
 	_, ok := ExecutionAssuranceNames[a]
 	return ok
+}
+
+// DeriveAssuranceProfile derives the profile label from the authoritative
+// fact vector. The function is total and deterministic; it is the ONLY
+// derivation rule, shared by evidence builders and verifiers, so a signed
+// profile can never disagree with its signed facts.
+func DeriveAssuranceProfile(f ExecutionFacts) ExecutionAssurance {
+	if !f.FilesystemIsolated {
+		return AssuranceUncontrolled
+	}
+	if f.KiwiSecretsInjected || f.HostEnvironmentInherited {
+		return AssuranceIsolatedFilesystem
+	}
+	if f.DeclaredAuthorityMediated {
+		if f.NetworkMode == NetworkModeFactNone && f.ImagesDigestPinned {
+			return AssuranceSealedPinnedNoNetwork
+		}
+		return AssuranceKiwiMediatedAuthority
+	}
+	if f.NetworkMode == NetworkModeFactNone {
+		return AssuranceNetworkDenied
+	}
+	return AssuranceNoInjectedCredentials
 }
 
 // ExternalEffectsClass is the closed classification of where a job's external
@@ -109,22 +352,23 @@ func (a ExecutionAssurance) Valid() bool {
 // is evidence, not configuration: a derivation classifies an attempt from its
 // durable records and never upgrades the class.
 //
-//   - pure: the job has network none, no secrets (explicitly empty allowlist),
-//     no OIDC id_token declaration and no deployment phases. The only effects
-//     are files the control plane collects through Kiwi (artifacts, test
-//     reports, snapshots, caches), which are all declared and mediated.
-//   - kiwi_mediated: the job is not pure, has no ambient credentials
-//     (explicitly empty secret allowlist, no host-environment inheritance,
-//     no native host authority) and every declared external effect
+//   - pure: a sandbox boundary, an explicitly empty secret allowlist, a
+//     clean environment, network none, and no OIDC id_token declaration and
+//     no deployment phases. The only effects are files the control plane
+//     collects through Kiwi (artifacts, test reports, snapshots, caches),
+//     all declared and mediated.
+//   - kiwi_mediated: not pure, but sandboxed with an explicitly empty secret
+//     allowlist and a clean environment, and every declared external effect
 //     (deployments, OIDC, artifacts, downloads) flows through a Kiwi
-//     capability. Arbitrary command side effects that are reachable with the
-//     granted authority (for example unauthenticated egress when the network
-//     is allowed) are outside Kiwi mediation and are NOT constrained.
-//   - opaque_external: ambient credentials are possible: the effective secret
-//     allowlist is unrestricted (nil policy) or non-empty, the host
-//     environment is inherited, or the job runs on the native runtime with
-//     host authority. Such a job's effects cannot be attributed to declared
-//     Kiwi capabilities; replay/speculation guarantees do not apply to them.
+//     capability. Arbitrary command side effects reachable with the granted
+//     authority (for example unauthenticated egress when the network is
+//     allowed) are outside Kiwi mediation and are NOT constrained.
+//   - opaque_external: ambient credentials are possible: no sandbox boundary
+//     (Native execution with host authority), the effective secret allowlist
+//     could inject a secret (nil policy or non-empty), or the host
+//     environment is inherited. Such a job's effects cannot be attributed to
+//     declared Kiwi capabilities; replay/speculation guarantees do not apply
+//     to them.
 type ExternalEffectsClass string
 
 const (

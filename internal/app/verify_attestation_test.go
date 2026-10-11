@@ -33,9 +33,14 @@ func attestationVerifyFixture(t *testing.T) ([]byte, ed25519.PublicKey, string) 
 			{Name: "bin", SHA256: strings.Repeat("1", 64), Size: 3, ProvenanceSHA256: strings.Repeat("2", 64)},
 		},
 		ExecutionSemantics: model.ExecutionSemanticsVersion,
-		ExecutionAssurance: model.AssuranceKiwiMediatedAuthority,
-		ExternalEffects:    model.EffectsKiwiMediated,
-		GraphFingerprint:   strings.Repeat("9", 64),
+		ExecutionAssuranceFacts: model.ExecutionFacts{
+			Runtime:                   model.RuntimeFactContainer,
+			FilesystemIsolated:        true,
+			NetworkMode:               model.NetworkModeFactDefault,
+			DeclaredAuthorityMediated: true,
+		},
+		ExternalEffects:  model.EffectsKiwiMediated,
+		GraphFingerprint: strings.Repeat("9", 64),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -142,8 +147,8 @@ func TestVerifyExecutionAttestationModes(t *testing.T) {
 	// verifies.
 	st, err := provenance.ExecutionAttestationStatement(provenance.ExecutionAttestationInput{
 		RunID: "run-1", JobID: "job-1", Generation: 3, Status: "success",
-		ExecutionAssurance: model.AssuranceUncontrolled,
-		ExternalEffects:    model.EffectsOpaqueExternal,
+		ExecutionAssuranceFacts: model.UnprovenExecutionFacts(),
+		ExternalEffects:         model.EffectsOpaqueExternal,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -230,8 +235,11 @@ func TestVerifyPrintsExecutionSemantics(t *testing.T) {
 	if !strings.Contains(out, "execution semantics: "+model.ExecutionSemanticsVersion) {
 		t.Fatalf("verified semantics not printed: %q", out)
 	}
-	if !strings.Contains(out, "execution assurance: level 4 (kiwi_mediated_authority)") {
+	if !strings.Contains(out, "execution assurance: profile 4 (kiwi_mediated_authority)") {
 		t.Fatalf("verified execution assurance not printed: %q", out)
+	}
+	if !strings.Contains(out, "runtime: container") {
+		t.Fatalf("verified execution facts not printed: %q", out)
 	}
 	if !strings.Contains(out, "external effects: kiwi_mediated") {
 		t.Fatalf("verified external effects not printed: %q", out)
@@ -244,8 +252,8 @@ func TestVerifyPrintsExecutionSemantics(t *testing.T) {
 	start := time.Unix(1700000000, 0).UTC()
 	legacy, err := provenance.ExecutionAttestationStatement(provenance.ExecutionAttestationInput{
 		RunID: "run-1", JobID: "job-1", Generation: 3, Status: "success", StartedAt: &start,
-		ExecutionAssurance: model.AssuranceUncontrolled,
-		ExternalEffects:    model.EffectsOpaqueExternal,
+		ExecutionAssuranceFacts: model.UnprovenExecutionFacts(),
+		ExternalEffects:         model.EffectsOpaqueExternal,
 	})
 	if err != nil {
 		t.Fatal(err)

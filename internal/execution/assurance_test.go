@@ -69,9 +69,9 @@ func TestAssuranceAndEffectsClassDecisionTable(t *testing.T) {
 		wantClass model.ExternalEffectsClass
 	}{
 		{
-			name:      "untrusted container network-none no-secrets pinned is pure and hermetic",
+			name:      "untrusted container network-none no-secrets pinned is pure and sealed",
 			eff:       assuranceEff("container", "none", empty, nil),
-			wantLevel: model.AssuranceHermetic,
+			wantLevel: model.AssuranceSealedPinnedNoNetwork,
 			wantClass: model.EffectsPure,
 		},
 		{
@@ -87,19 +87,19 @@ func TestAssuranceAndEffectsClassDecisionTable(t *testing.T) {
 			wantClass: model.EffectsKiwiMediated,
 		},
 		{
-			name: "hermetic container network-none empty-secrets pinned main and service images",
+			name: "sealed container network-none empty-secrets pinned main and service images",
 			eff: assuranceEff("container", "none", empty, func(cj *pipeline.CompiledJob, _ *EffectiveExecution) {
 				cj.Job.Services = []pipeline.Service{{Name: "db", Image: pinnedImage}}
 			}),
-			wantLevel: model.AssuranceHermetic,
+			wantLevel: model.AssuranceSealedPinnedNoNetwork,
 			wantClass: model.EffectsPure,
 		},
 		{
-			name: "native trusted with bounded workspace stays at most level 1 and opaque",
+			name: "native with a workspace quota is uncontrolled and opaque: quota does not isolate",
 			eff: assuranceEff("native", "", trusted, func(_ *pipeline.CompiledJob, e *EffectiveExecution) {
 				e.WorkspaceQuotaLimit = DefaultUntrustedWorkspaceMaxBytes
 			}),
-			wantLevel: model.AssuranceIsolatedFilesystem,
+			wantLevel: model.AssuranceUncontrolled,
 			wantClass: model.EffectsOpaqueExternal,
 		},
 		{
@@ -141,12 +141,12 @@ func TestAssuranceAndEffectsClassDecisionTable(t *testing.T) {
 			wantClass: model.EffectsKiwiMediated,
 		},
 		{
-			name: "tart runtime with a pinned VM and network none is hermetic",
+			name: "tart runtime with a pinned VM and network none is sealed",
 			eff: assuranceEff("tart", "none", empty, func(cj *pipeline.CompiledJob, _ *EffectiveExecution) {
 				cj.Job.Image = ""
 				cj.Job.VM = pinnedImage
 			}),
-			wantLevel: model.AssuranceHermetic,
+			wantLevel: model.AssuranceSealedPinnedNoNetwork,
 			wantClass: model.EffectsPure,
 		},
 		{
@@ -189,6 +189,35 @@ func TestAssuranceAndEffectsClassDecisionTable(t *testing.T) {
 				t.Fatalf("class %q not valid", class)
 			}
 		})
+	}
+}
+
+// TestFactsKeepQuotaOrthogonalToIsolation is the regression test for the
+// audit's P1: a native execution with an enforced workspace quota must carry
+// workspace_quota_enforced=true and filesystem_isolated=false, and never
+// classify as isolated_filesystem. A quota bounds disk use; it does not
+// confine the process's filesystem view.
+func TestFactsKeepQuotaOrthogonalToIsolation(t *testing.T) {
+	e := assuranceEff("native", "", emptySecrets(), func(_ *pipeline.CompiledJob, e *EffectiveExecution) {
+		e.WorkspaceQuotaLimit = DefaultUntrustedWorkspaceMaxBytes
+	})
+	f := e.Facts()
+	if !f.WorkspaceQuotaEnforced || f.FilesystemIsolated {
+		t.Fatalf("facts = %+v, want quota enforced without isolation", f)
+	}
+	if !f.Valid() {
+		t.Fatalf("facts invalid: %+v", f)
+	}
+	if got := e.Assurance(); got != model.AssuranceUncontrolled {
+		t.Fatalf("profile = %d (%s), want uncontrolled", got, got.Name())
+	}
+	// The container counterpart carries the same quota fact WITH isolation.
+	c := assuranceEff("container", "", emptySecrets(), func(_ *pipeline.CompiledJob, e *EffectiveExecution) {
+		e.WorkspaceQuotaLimit = DefaultUntrustedWorkspaceMaxBytes
+	})
+	cf := c.Facts()
+	if !cf.WorkspaceQuotaEnforced || !cf.FilesystemIsolated {
+		t.Fatalf("container facts = %+v, want quota and isolation", cf)
 	}
 }
 
@@ -246,7 +275,7 @@ func TestAssuranceDerivationIsTotal(t *testing.T) {
 
 // TestMaterializeFromJobDerivesAssurance proves the job-level derivation
 // reaches the same effective execution the runner materializes: a persisted
-// job with a verified payload classifies as kiwi_mediated/hermetic for the
+// job with a verified payload classifies as kiwi_mediated/sealed_pinned for the
 // pinned untrusted shape, and a job without a payload still classifies
 // through the documented legacy path.
 func TestMaterializeFromJobDerivesAssurance(t *testing.T) {
@@ -287,8 +316,8 @@ func TestMaterializeFromJobDerivesAssurance(t *testing.T) {
 	if !ok {
 		t.Fatal("materialization failed for a bound payload")
 	}
-	if level := eff.Assurance(); level != model.AssuranceHermetic {
-		t.Fatalf("assurance = %d (%s), want hermetic", level, level.Name())
+	if level := eff.Assurance(); level != model.AssuranceSealedPinnedNoNetwork {
+		t.Fatalf("assurance = %d (%s), want sealed_pinned_no_network", level, level.Name())
 	}
 	if class := eff.EffectsClass(); class != model.EffectsPure {
 		t.Fatalf("effects class = %s, want pure", class)
@@ -304,8 +333,8 @@ func TestMaterializeFromJobDerivesAssurance(t *testing.T) {
 	if !ok {
 		t.Fatal("legacy materialization failed")
 	}
-	if level := effLegacy.Assurance(); level != model.AssuranceHermetic {
-		t.Fatalf("legacy assurance = %d (%s), want hermetic", level, level.Name())
+	if level := effLegacy.Assurance(); level != model.AssuranceSealedPinnedNoNetwork {
+		t.Fatalf("legacy assurance = %d (%s), want sealed_pinned_no_network", level, level.Name())
 	}
 	if class := effLegacy.EffectsClass(); class != model.EffectsPure {
 		t.Fatalf("legacy effects class = %s, want pure", class)
