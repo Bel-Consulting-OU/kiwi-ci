@@ -141,13 +141,16 @@ func TestAssuranceAndEffectsClassDecisionTable(t *testing.T) {
 			wantClass: model.EffectsKiwiMediated,
 		},
 		{
-			name: "tart runtime with a pinned VM and network none is sealed",
+			// Tart cannot deny networking (vm-nat); policy none is intent
+			// only. Proven enforcement therefore cannot claim sealed or
+			// pure — this is the v6 network_access_denied contract.
+			name: "tart runtime with a pinned VM and network-none policy is mediated, not sealed",
 			eff: assuranceEff("tart", "none", empty, func(cj *pipeline.CompiledJob, _ *EffectiveExecution) {
 				cj.Job.Image = ""
 				cj.Job.VM = pinnedImage
 			}),
-			wantLevel: model.AssuranceSealedPinnedNoNetwork,
-			wantClass: model.EffectsPure,
+			wantLevel: model.AssuranceKiwiMediatedAuthority,
+			wantClass: model.EffectsKiwiMediated,
 		},
 		{
 			name: "trusted non-empty secret allowlist is opaque at level 1",
@@ -174,10 +177,31 @@ func TestAssuranceAndEffectsClassDecisionTable(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			level := tc.eff.Assurance()
-			class := tc.eff.EffectsClass()
+			// Proven enforcement (v6) requires the attempt's observed
+			// receipt. The table cases describe what the EXECUTOR would
+			// report for that effective shape; ApplyObservedControl is how
+			// those observations become signed facts.
+			f := tc.eff.Facts()
+			var receipt *model.ExecutionControlReceipt
+			switch tc.eff.runtimeFact() {
+			case model.RuntimeFactContainer:
+				net := model.ObservedNetworkContainerNamespace
+				if tc.eff.networkModeFact() == model.NetworkModeFactNone {
+					net = model.ObservedNetworkNone
+				}
+				receipt = &model.ExecutionControlReceipt{Runtime: "docker", SandboxStarted: true, NetworkEnforced: net}
+			case model.RuntimeFactTart:
+				receipt = &model.ExecutionControlReceipt{Runtime: "tart", SandboxStarted: true, NetworkEnforced: model.ObservedNetworkVMNAT}
+			default:
+				receipt = &model.ExecutionControlReceipt{Runtime: "native", NetworkEnforced: model.ObservedNetworkHost}
+			}
+			if err := f.ApplyObservedControl(receipt); err != nil {
+				t.Fatalf("ApplyObservedControl: %v", err)
+			}
+			level := model.DeriveAssuranceProfile(f)
+			class := EffectsClassFromFacts(f, tc.eff.DeclaresOIDC(), tc.eff.DeclaresDeployment())
 			if level != tc.wantLevel {
-				t.Fatalf("Assurance() = %d (%s), want %d (%s)", level, level.Name(), tc.wantLevel, tc.wantLevel.Name())
+				t.Fatalf("Assurance() = %d (%s), want %d (%s) facts=%+v", level, level.Name(), tc.wantLevel, tc.wantLevel.Name(), f)
 			}
 			if class != tc.wantClass {
 				t.Fatalf("EffectsClass() = %s, want %s", class, tc.wantClass)
@@ -420,10 +444,17 @@ func TestMaterializeFromJobDerivesAssurance(t *testing.T) {
 	if !ok {
 		t.Fatal("materialization failed for a bound payload")
 	}
-	if level := eff.Assurance(); level != model.AssuranceSealedPinnedNoNetwork {
+	// Proven enforcement requires the executor receipt (v6).
+	f := eff.Facts()
+	if err := f.ApplyObservedControl(&model.ExecutionControlReceipt{
+		Runtime: "docker", SandboxStarted: true, NetworkEnforced: model.ObservedNetworkNone,
+	}); err != nil {
+		t.Fatalf("ApplyObservedControl: %v", err)
+	}
+	if level := model.DeriveAssuranceProfile(f); level != model.AssuranceSealedPinnedNoNetwork {
 		t.Fatalf("assurance = %d (%s), want sealed_pinned_no_network", level, level.Name())
 	}
-	if class := eff.EffectsClass(); class != model.EffectsPure {
+	if class := EffectsClassFromFacts(f, eff.DeclaresOIDC(), eff.DeclaresDeployment()); class != model.EffectsPure {
 		t.Fatalf("effects class = %s, want pure", class)
 	}
 
@@ -437,10 +468,16 @@ func TestMaterializeFromJobDerivesAssurance(t *testing.T) {
 	if !ok {
 		t.Fatal("legacy materialization failed")
 	}
-	if level := effLegacy.Assurance(); level != model.AssuranceSealedPinnedNoNetwork {
+	fl := effLegacy.Facts()
+	if err := fl.ApplyObservedControl(&model.ExecutionControlReceipt{
+		Runtime: "docker", SandboxStarted: true, NetworkEnforced: model.ObservedNetworkNone,
+	}); err != nil {
+		t.Fatalf("ApplyObservedControl legacy: %v", err)
+	}
+	if level := model.DeriveAssuranceProfile(fl); level != model.AssuranceSealedPinnedNoNetwork {
 		t.Fatalf("legacy assurance = %d (%s), want sealed_pinned_no_network", level, level.Name())
 	}
-	if class := effLegacy.EffectsClass(); class != model.EffectsPure {
+	if class := EffectsClassFromFacts(fl, effLegacy.DeclaresOIDC(), effLegacy.DeclaresDeployment()); class != model.EffectsPure {
 		t.Fatalf("legacy effects class = %s, want pure", class)
 	}
 

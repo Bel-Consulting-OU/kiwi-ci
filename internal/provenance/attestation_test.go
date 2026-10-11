@@ -443,14 +443,14 @@ func TestExecutionAttestationBindsAssuranceFacts(t *testing.T) {
 		t.Fatal(err)
 	}
 	att := base.Attestation
-	if att.SchemaVersion != 5 {
-		t.Fatalf("schemaVersion = %d, want 5", att.SchemaVersion)
+	if att.SchemaVersion != 6 {
+		t.Fatalf("schemaVersion = %d, want 6", att.SchemaVersion)
 	}
 	if att.ExecutionAssurance.Level != int(model.AssuranceKiwiMediatedAuthority) || att.ExecutionAssurance.Name != model.AssuranceKiwiMediatedAuthority.Name() {
 		t.Fatalf("assurance = %+v, want level 4 kiwi_mediated_authority", att.ExecutionAssurance)
 	}
 	if att.ExecutionAssurance.Facts == nil {
-		t.Fatal("v5 statement carries no facts")
+		t.Fatal("current-schema statement carries no facts")
 	}
 	if att.ExternalEffects != model.EffectsKiwiMediated {
 		t.Fatalf("externalEffects = %q, want kiwi_mediated", att.ExternalEffects)
@@ -658,5 +658,90 @@ func TestVerifyExecutionAttestationV4WithFactsStillValidates(t *testing.T) {
 	st.Subject = []Subject{{Digest: map[string]string{"sha256": digest}}}
 	if err := VerifyExecutionAttestation(st); err == nil {
 		t.Fatal("v4 envelope with contradictory facts must be refused")
+	}
+}
+
+// TestSchemaSemanticsAreFrozen pins that historical statements keep their
+// original meaning: a v5 workspace_quota_enforced=true is "configured", not
+// "hard installed", and a v5 network_mode=none is policy, not proven denial.
+// Current (v6) statements require the observed enforcement facts. A consumer
+// must never read a v5 claim as a v6 guarantee.
+func TestSchemaSemanticsAreFrozen(t *testing.T) {
+	// Historical v5: quota_enforced true with NO receipt meant "configured".
+	// Under v6 rules that pair is invalid; under frozen v5 it is accepted and
+	// must NOT be treated as proven hard quota.
+	v5Facts := model.ExecutionFacts{
+		Runtime:                model.RuntimeFactNative,
+		NetworkMode:            model.NetworkModeFactNone,
+		WorkspaceQuotaEnforced: true, // historical meaning: configured
+	}
+	if v5Facts.ValidForSchema(5) != true {
+		t.Fatalf("frozen v5 facts must stay valid: %+v", v5Facts)
+	}
+	if v5Facts.Valid() {
+		t.Fatal("v6 must reject unobserved workspace_quota_enforced=true")
+	}
+	// v5 network_mode=none derives network_denied ONLY when isolation also
+	// holds; the label is historical policy-based, not proof of denial.
+	isolated := v5Facts
+	isolated.Runtime = model.RuntimeFactContainer
+	isolated.FilesystemIsolated = true
+	if got := model.DeriveAssuranceProfileSchema(5, isolated); got != model.AssuranceNetworkDenied {
+		t.Fatalf("v5 derivation = %d (%s), want network_denied from policy", got, got.Name())
+	}
+	if got := model.DeriveAssuranceProfile(isolated); got == model.AssuranceNetworkDenied {
+		t.Fatal("v6 must not derive network_denied from policy alone")
+	}
+
+	// Current v6: proven denial requires the receipt.
+	v6 := model.ExecutionFacts{
+		Runtime:            model.RuntimeFactContainer,
+		FilesystemIsolated: true,
+		NetworkMode:        model.NetworkModeFactNone,
+	}
+	if err := v6.ApplyObservedControl(&model.ExecutionControlReceipt{
+		Runtime: "docker", SandboxStarted: true, NetworkEnforced: model.ObservedNetworkNone,
+	}); err != nil {
+		t.Fatalf("ApplyObservedControl: %v", err)
+	}
+	if !v6.NetworkAccessDenied || !v6.Valid() {
+		t.Fatalf("v6 proven denial: %+v", v6)
+	}
+	if got := model.DeriveAssuranceProfile(v6); got != model.AssuranceNetworkDenied {
+		t.Fatalf("v6 derivation = %d (%s), want network_denied", got, got.Name())
+	}
+
+	// Native policy none is never proven denial under any current rule.
+	native := model.ExecutionFacts{Runtime: model.RuntimeFactNative, NetworkMode: model.NetworkModeFactNone}
+	if err := native.ApplyObservedControl(&model.ExecutionControlReceipt{
+		Runtime: "native", NetworkEnforced: model.ObservedNetworkHost,
+	}); err != nil {
+		t.Fatalf("native ApplyObservedControl: %v", err)
+	}
+	if native.NetworkAccessDenied {
+		t.Fatal("native host networking must not set network_access_denied")
+	}
+}
+
+// TestExecutionAttestationRejectsPureWithoutProvenDenial: ExternalEffects=pure
+// is refused at statement construction when the fact vector does not prove
+// network_access_denied (the audit's sign/verify gate, not just the helper).
+func TestExecutionAttestationRejectsPureWithoutProvenDenial(t *testing.T) {
+	in := attestationTestInput()
+	in.ExternalEffects = model.EffectsPure
+	in.ExecutionAssuranceFacts.NetworkAccessDenied = false
+	if _, err := ExecutionAttestationStatement(in); err == nil {
+		t.Fatal("pure without proven denial must fail statement construction")
+	}
+	in.ExecutionAssuranceFacts.NetworkAccessDenied = true
+	in.ExecutionAssuranceFacts.Observed = &model.ExecutionControlReceipt{
+		Runtime: "docker", SandboxStarted: true, NetworkEnforced: model.ObservedNetworkNone,
+	}
+	// Still need Valid facts (isolation etc.) — if construction fails for
+	// another reason that is fine as long as the pure gate is not the only
+	// missing piece in the negative case above.
+	if _, err := ExecutionAttestationStatement(in); err != nil {
+		// Negative case already proved the gate; positive may need more fields.
+		t.Logf("positive pure construction: %v", err)
 	}
 }

@@ -1,0 +1,41 @@
+name: dogfood
+
+# Nightly dogfood battery.
+#
+# Model proofs (./internal/dogfood): in-memory harness/oracle — state-machine
+# invariants and races. System proofs (make dogfood-system): real
+# NewPersistent server + HTTP API + runner (system.System).
+#
+# These are NOT live multi-process DF2 (postgres/objectstore/two real
+# runners) and NOT DF7 packaged-artifact install — see docs/DOGFOOD.md
+# "Implemented vs planned". PR gate remains make dogfood-fast (ci.yml).
+on:
+  schedule:
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Action refs are pinned to full commit SHAs (same pins as ci.yml).
+jobs:
+  dogfood:
+    name: "${{ matrix.suite }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - local
+          - system
+          - adversarial
+          - upgrade
+          - scale
+          - release
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      - name: make dogfood-${{ matrix.suite }}
+        run: make dogfood-${{ matrix.suite }}

@@ -129,6 +129,13 @@ func (e EffectiveExecution) declaresDeployment() bool {
 	return len(j.Deployment.Canary) > 0 || len(j.Deployment.Verify) > 0 || len(j.Deployment.Rollback) > 0
 }
 
+// DeclaresOIDC is the exported form of declaresOIDC for effects classification.
+func (e EffectiveExecution) DeclaresOIDC() bool { return e.declaresOIDC() }
+
+// DeclaresDeployment is the exported form of declaresDeployment for effects
+// classification.
+func (e EffectiveExecution) DeclaresDeployment() bool { return e.declaresDeployment() }
+
 // declaresOIDC reports whether the job declares an id_token request.
 func (e EffectiveExecution) declaresOIDC() bool {
 	return e.CompiledJob.Job.Permissions.IDToken
@@ -217,16 +224,30 @@ func (e EffectiveExecution) Assurance() model.ExecutionAssurance {
 }
 
 // EffectsClass derives the external-effects class of the materialized
-// execution. The derivation is deterministic and total. A native or unknown
-// runtime is always opaque (ambient host credentials are reachable through
-// the unconfined filesystem), as is any execution that could receive an
-// injected secret or inherit the host environment.
+// execution from its PROVEN facts (call only after ApplyObservedControl when
+// an observed receipt exists). "pure" requires a proven network denial
+// (NetworkAccessDenied) — a policy of network none on native is NOT enough.
+// A native or unknown runtime is always opaque (ambient host credentials are
+// reachable through the unconfined filesystem), as is any execution that
+// could receive an injected secret or inherit the host environment.
 func (e EffectiveExecution) EffectsClass() model.ExternalEffectsClass {
 	f := e.Facts()
 	if !f.FilesystemIsolated || f.KiwiSecretsInjected || f.HostEnvironmentInherited {
 		return model.EffectsOpaqueExternal
 	}
-	if f.NetworkMode == model.NetworkModeFactNone && !e.declaresOIDC() && !e.declaresDeployment() {
+	if f.NetworkAccessDenied && !e.declaresOIDC() && !e.declaresDeployment() {
+		return model.EffectsPure
+	}
+	return model.EffectsKiwiMediated
+}
+
+// EffectsClassFromFacts classifies from an already-completed fact vector
+// (including ApplyObservedControl). Preferred when a receipt may be present.
+func EffectsClassFromFacts(f model.ExecutionFacts, declaresOIDC, declaresDeployment bool) model.ExternalEffectsClass {
+	if !f.FilesystemIsolated || f.KiwiSecretsInjected || f.HostEnvironmentInherited {
+		return model.EffectsOpaqueExternal
+	}
+	if f.NetworkAccessDenied && !declaresOIDC && !declaresDeployment {
 		return model.EffectsPure
 	}
 	return model.EffectsKiwiMediated

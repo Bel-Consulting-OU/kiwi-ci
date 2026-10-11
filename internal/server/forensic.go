@@ -45,7 +45,13 @@ type forensicBundle struct {
 	Generation  int64     `json:"generation"`
 
 	// Attestation is the signed DSSE envelope (raw bytes) plus the digests a
-	// consumer checks it with; these three fields anchor the whole bundle.
+	// consumer checks it with. Those digests commit the EXECUTION ATTESTATION
+	// only — not the surrounding retrieval-time timeline, report rows or
+	// reference lists in this bundle. The envelope is the signed truth; the
+	// rest of the bundle is unsigned presentation/context (recompute or
+	// re-fetch through your own authorized reads). A consumer that needs
+	// "this exact forensic bundle is complete and untampered" requires a
+	// canonical signed forensic manifest, which Kiwi does not yet mint.
 	Attestation     json.RawMessage `json:"attestation"`
 	EnvelopeSHA256  string          `json:"envelope_sha256"`
 	StatementSHA256 string          `json:"statement_sha256"`

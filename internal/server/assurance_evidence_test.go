@@ -181,6 +181,17 @@ func TestAttestationAssuranceEndToEndUntrustedSealedPinned(t *testing.T) {
 		t.Fatal(err)
 	}
 	seedAssuranceAttestationJob(t, s, "job-a", "run-a", hermeticUntrustedPipeline, 1, false, policy.DefaultUntrustedCapabilities())
+	// Proven network denial (v6) requires the executor receipt.
+	s.mu.Lock()
+	j := s.jobs["job-a"]
+	j.ObservedRuntime = &model.ObservedRuntime{
+		OS: "linux", Arch: "amd64", RuntimeName: "docker",
+		Control: &model.ExecutionControlReceipt{
+			Runtime: "docker", SandboxStarted: true, NetworkEnforced: model.ObservedNetworkNone,
+		},
+	}
+	s.jobs["job-a"] = j
+	s.mu.Unlock()
 	if err := s.attestExecution(context.Background(), "job-a", 1); err != nil {
 		t.Fatalf("attestExecution: %v", err)
 	}
@@ -196,7 +207,10 @@ func TestAttestationAssuranceEndToEndUntrustedSealedPinned(t *testing.T) {
 	}
 	facts := st.Attestation.ExecutionAssurance.Facts
 	if facts == nil || facts.NetworkMode != model.NetworkModeFactNone {
-		t.Fatalf("facts = %+v, want network none", facts)
+		t.Fatalf("facts = %+v, want network none policy", facts)
+	}
+	if !facts.NetworkAccessDenied {
+		t.Fatalf("facts = %+v, want proven network_access_denied", facts)
 	}
 	if !facts.FilesystemIsolated || !facts.ImagesDigestPinned || facts.KiwiSecretsInjected {
 		t.Fatalf("facts = %+v, want isolated, pinned and no injected credentials", facts)

@@ -967,8 +967,14 @@ func artifactProvenanceInput(j model.Job, run model.Run, rec model.ArtifactRecor
 			if evidence, aerr2 := provenance.NewExecutionAssuranceEvidence(facts); aerr2 == nil {
 				in.ExecutionAssurance = &evidence
 			}
+			// Effects class is derived from the COMPLETED fact vector (after
+			// the receipt), matching the execution attestation path. Using
+			// eff.EffectsClass() here would rebuild facts without the receipt
+			// and under-claim pure for a proven network denial.
+			in.ExternalEffects = execution.EffectsClassFromFacts(facts, eff.DeclaresOIDC(), eff.DeclaresDeployment())
+		} else {
+			in.ExternalEffects = model.EffectsOpaqueExternal
 		}
-		in.ExternalEffects = eff.EffectsClass()
 	}
 	if p := j.CompiledJobPayload; p != nil {
 		in.PipelineDigest = p.PipelineDigest

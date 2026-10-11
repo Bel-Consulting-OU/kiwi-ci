@@ -68,100 +68,276 @@ const (
 
 // Entry is one registry row: the stable identity, what each arm proves, and
 // whether the scenario is allowed to retry (only retry-under-test arms may).
+//
+// This registry is the MACHINE-READABLE source of truth for dogfood coverage.
+// Suite membership (suites.go), the Makefile dogfood-* --require lists,
+// DOGFOOD_MATRIX.md and CI wiring must agree with it;
+// TestEveryRegistryScenarioHasATest, TestSuiteMembershipMatchesRegistry,
+// TestDogfoodMatrixMatchesRegistry and TestMakefileRequiresOnlyExistingTests
+// keep that agreement executable.
+//
+// The MandatoryFor* flags mirror the executable Makefile gates
+// (dogfood-fast / dogfood-local / dogfood-adversarial / dogfood-release
+// --require sets). Requires* stay false for every model-species row until a
+// SystemHarness can drive real Docker/Postgres/object-store/forge processes.
 type Entry struct {
 	ID             ScenarioID
 	Name           string
-	PositiveArm    string
-	NegativeArm    string
-	RetryUnderTest bool
+	Tier           string // DF0..DF7
+	Implemented    bool   // true when a Test* in this package exercises it
+	MandatoryForPR bool
+	// MandatoryForMain is the main-branch / DF1 local product lifecycle gate
+	// (Makefile dogfood-local).
+	MandatoryForMain bool
+	// MandatoryForNightly is the nightly DF3 chaos gate
+	// (Makefile dogfood-adversarial). DF4 compatibility runs under the
+	// upgrade suite, which nightly schedules separately.
+	MandatoryForNightly bool
+	// MandatoryForRelease is the release-candidate gate
+	// (Makefile dogfood-release).
+	MandatoryForRelease bool
+	// InvariantIDs names the docs/INVARIANTS.md invariants (I1..I10) this
+	// scenario is a system-dogfood proof for. Empty when the scenario
+	// proves an assurance fact or harness property outside those numbers.
+	InvariantIDs []string
+	// CapabilityIDs names the public-surface capabilities
+	// (docs/DOGFOOD_MATRIX.md "Public-surface → scenario mapping") this
+	// scenario dogfoods.
+	CapabilityIDs []string
+	// RequiresDocker is true when the scenario needs a real container
+	// runtime. False for every model-species row until a SystemHarness
+	// exists.
+	RequiresDocker bool
+	// RequiresPostgres is true when the scenario needs the canonical
+	// PostgreSQL store. False for every model-species row until a
+	// SystemHarness exists.
+	RequiresPostgres bool
+	// RequiresObjectStore is true when the scenario needs a real object
+	// store. False for every model-species row until a SystemHarness
+	// exists.
+	RequiresObjectStore bool
+	// RequiresRealForge is true when the scenario needs a live forge
+	// (webhooks, PR events). False for every model-species row until a
+	// SystemHarness exists.
+	RequiresRealForge bool
+	PositiveArm       string
+	NegativeArm       string
+	RetryUnderTest    bool
+	// Species is "model" (in-memory harness/oracle), "component" (real
+	// packages in-process) or "system" (real NewPersistent + HTTP + runner via internal/dogfood/system).
+	// Do not treat model proofs as product dogfood — see docs/DOGFOOD.md.
+	//
+	// DF-BOOT-001, DF-EVID-001, DF-LEASE-001 and DF-QUOTA-001 ALSO have
+	// SYSTEM-species proofs in internal/dogfood/system (TestSysDFBoot001,
+	// TestSysDFEvid001, TestSysDFLease001, TestSysQuotaGate). Species stays
+	// "model" here until a deliberate registry flip; the system suite is
+	// name-required by `make dogfood-system`.
+	Species string
 }
 
 // Registry is the closed dogfood scenario catalog.
 var Registry = []Entry{
 	{
-		ID:          ScenarioBootCleanLocal,
-		Name:        "clean local bootstrap and restart",
-		PositiveArm: "launch → seed → complete → stop → relaunch; eight oracles agree across the restart",
-		NegativeArm: "a second invocation's namespace must not collide with the first",
+		ID:                  ScenarioBootCleanLocal,
+		Tier:                "DF1",
+		Implemented:         true,
+		MandatoryForPR:      true,
+		MandatoryForMain:    true,
+		MandatoryForNightly: false,
+		MandatoryForRelease: true,
+		Species:             "model",
+		Name:                "clean local bootstrap and restart",
+		PositiveArm:         "launch → seed → complete → stop → relaunch; eight oracles agree across the restart",
+		NegativeArm:         "a second invocation's namespace must not collide with the first",
+		InvariantIDs:        []string{"I1", "I2"},
+		CapabilityIDs:       []string{"run.create"},
 	},
 	{
-		ID:          ScenarioEvidenceGenerationVerify,
-		Name:        "attestation generation and verification",
-		PositiveArm: "signed attestation verifies (signature + self-binding + facts derivation)",
-		NegativeArm: "an unsigned or self-contradictory envelope is refused",
+		ID:                  ScenarioEvidenceGenerationVerify,
+		Tier:                "DF1",
+		Implemented:         true,
+		MandatoryForPR:      true,
+		MandatoryForMain:    true,
+		MandatoryForNightly: false,
+		MandatoryForRelease: true,
+		Species:             "model",
+		Name:                "attestation generation and verification",
+		PositiveArm:         "signed attestation verifies (signature + self-binding + facts derivation)",
+		NegativeArm:         "an unsigned or self-contradictory envelope is refused",
+		CapabilityIDs:       []string{"evidence.verify", "evidence.fetch"},
 	},
 	{
-		ID:          ScenarioEvidenceTamperMatrix,
-		Name:        "attestation tamper matrix",
-		PositiveArm: "untampered evidence verifies",
-		NegativeArm: "every single-field flip fails VerifyExecutionAttestation",
+		ID:                  ScenarioEvidenceTamperMatrix,
+		Tier:                "DF1",
+		Implemented:         true,
+		MandatoryForPR:      true,
+		MandatoryForMain:    true,
+		MandatoryForNightly: true,
+		MandatoryForRelease: true,
+		Species:             "model",
+		Name:                "attestation tamper matrix",
+		PositiveArm:         "untampered evidence verifies",
+		NegativeArm:         "every single-field flip fails VerifyExecutionAttestation",
+		CapabilityIDs:       []string{"evidence.verify"},
 	},
 	{
-		ID:          ScenarioEvidenceObservedMismatch,
-		Name:        "effective/observed consistency",
-		PositiveArm: "a consistent receipt signs and verifies",
-		NegativeArm: "effective network=none + observed container-namespace fails signing AND verification",
+		ID:                  ScenarioEvidenceObservedMismatch,
+		Tier:                "DF1",
+		Implemented:         true,
+		MandatoryForPR:      true,
+		MandatoryForMain:    true,
+		MandatoryForNightly: true,
+		MandatoryForRelease: true,
+		Species:             "model",
+		Name:                "effective/observed consistency",
+		PositiveArm:         "a consistent receipt signs and verifies",
+		NegativeArm:         "effective network=none + observed container-namespace fails signing AND verification",
+		CapabilityIDs:       []string{"evidence.verify", "jobs.complete"},
 	},
 	{
-		ID:          ScenarioEvidenceQuotaTruth,
-		Name:        "workspace quota truthfulness",
-		PositiveArm: "hard-quota success is the only path to workspace_quota_enforced=true",
-		NegativeArm: "fallback accounting, setup failure and no-request all record false; untrusted+require+unavailable rejects",
+		ID:                  ScenarioEvidenceQuotaTruth,
+		Tier:                "DF1",
+		Implemented:         true,
+		MandatoryForPR:      true,
+		MandatoryForMain:    true,
+		MandatoryForNightly: true,
+		MandatoryForRelease: true,
+		Species:             "model",
+		Name:                "workspace quota truthfulness",
+		PositiveArm:         "hard-quota success is the only path to workspace_quota_enforced=true",
+		NegativeArm:         "fallback accounting, setup failure and no-request all record false; untrusted+require+unavailable rejects",
+		CapabilityIDs:       []string{"evidence.verify"},
 	},
 	{
-		ID:          ScenarioEvidenceSecretAbsence,
-		Name:        "secret absence scan",
-		PositiveArm: "evidence serializes without any seeded secret material",
-		NegativeArm: "a planted secret in the evidence surface is detected",
+		ID:                  ScenarioEvidenceSecretAbsence,
+		Tier:                "DF1",
+		Implemented:         true,
+		MandatoryForPR:      true,
+		MandatoryForMain:    true,
+		MandatoryForNightly: false,
+		MandatoryForRelease: true,
+		Species:             "model",
+		Name:                "secret absence scan",
+		PositiveArm:         "evidence serializes without any seeded secret material",
+		NegativeArm:         "a planted secret in the evidence surface is detected",
+		InvariantIDs:        []string{"I9"},
+		CapabilityIDs:       []string{"evidence.verify"},
 	},
 	{
-		ID:          ScenarioLeaseStaleRunner,
-		Name:        "stale runner after reassignment",
-		PositiveArm: "current holder completes and evidence verifies after the stale attempt",
-		NegativeArm: "stale generation / reassigned holder completions are rejected",
+		ID:                  ScenarioLeaseStaleRunner,
+		Tier:                "DF1",
+		Implemented:         true,
+		MandatoryForPR:      true,
+		MandatoryForMain:    true,
+		MandatoryForNightly: true,
+		MandatoryForRelease: false,
+		Species:             "model",
+		Name:                "stale runner after reassignment",
+		PositiveArm:         "current holder completes and evidence verifies after the stale attempt",
+		NegativeArm:         "stale generation / reassigned holder completions are rejected",
+		InvariantIDs:        []string{"I3"},
+		CapabilityIDs:       []string{"jobs.claim"},
 	},
 	{
-		ID:          ScenarioLeaseCompletionExpiry,
-		Name:        "completion vs lease expiry",
-		PositiveArm: "completion under a live lease is accepted",
-		NegativeArm: "completion after expiry (and across the reclaim window) is rejected",
+		ID:                  ScenarioLeaseCompletionExpiry,
+		Tier:                "DF1",
+		Implemented:         true,
+		MandatoryForPR:      true,
+		MandatoryForMain:    true,
+		MandatoryForNightly: true,
+		MandatoryForRelease: false,
+		Species:             "model",
+		Name:                "completion vs lease expiry",
+		PositiveArm:         "completion under a live lease is accepted",
+		NegativeArm:         "completion after expiry (and across the reclaim window) is rejected",
+		InvariantIDs:        []string{"I1"},
+		CapabilityIDs:       []string{"jobs.complete"},
 	},
 	{
-		ID:          ScenarioQuotaUntrustedGate,
-		Name:        "untrusted hard-quota admission gate",
-		PositiveArm: "hard quota available → untrusted container job admitted",
-		NegativeArm: "hard quota required and unavailable → execution rejected before checkout",
+		ID:                  ScenarioQuotaUntrustedGate,
+		Tier:                "DF1",
+		Implemented:         true,
+		MandatoryForPR:      true,
+		MandatoryForMain:    true,
+		MandatoryForNightly: true,
+		MandatoryForRelease: true,
+		Species:             "model",
+		Name:                "untrusted hard-quota admission gate",
+		PositiveArm:         "hard quota available → untrusted container job admitted",
+		NegativeArm:         "hard quota required and unavailable → execution rejected before checkout",
+		CapabilityIDs:       []string{"run.create"},
 	},
 
 	{
-		ID:          ScenarioEffectWinnerOnce,
-		Name:        "authorized winner external effect exactly once",
-		PositiveArm: "winner's capability produces exactly one sink row",
-		NegativeArm: "a second effect without reauthorization is refused",
+		ID:                  ScenarioEffectWinnerOnce,
+		Tier:                "DF1",
+		Implemented:         true,
+		MandatoryForPR:      false,
+		MandatoryForMain:    true,
+		MandatoryForNightly: false,
+		MandatoryForRelease: true,
+		Species:             "model",
+		Name:                "authorized winner external effect exactly once",
+		PositiveArm:         "winner's capability produces exactly one sink row",
+		NegativeArm:         "a second effect without reauthorization is refused",
+		CapabilityIDs:       []string{"deploy.authorize"},
 	},
 	{
-		ID:          ScenarioEffectLoserZero,
-		Name:        "loser and stale runner external effect zero",
-		PositiveArm: "sink ledger stays empty for losers/stale holders",
-		NegativeArm: "eight-oracle agreement on zero effects",
+		ID:                  ScenarioEffectLoserZero,
+		Tier:                "DF1",
+		Implemented:         true,
+		MandatoryForPR:      false,
+		MandatoryForMain:    true,
+		MandatoryForNightly: true,
+		MandatoryForRelease: true,
+		Species:             "model",
+		Name:                "loser and stale runner external effect zero",
+		PositiveArm:         "sink ledger stays empty for losers/stale holders",
+		NegativeArm:         "eight-oracle agreement on zero effects",
+		InvariantIDs:        []string{"I9"},
+		CapabilityIDs:       []string{"deploy.authorize"},
 	},
 	{
-		ID:          ScenarioSelfGenLimit,
-		Name:        "self-host generation limit",
-		PositiveArm: "G0, G1, G2 are recorded",
-		NegativeArm: "G3+ is refused",
+		ID:                  ScenarioSelfGenLimit,
+		Tier:                "DF1",
+		Implemented:         true,
+		MandatoryForPR:      false,
+		MandatoryForMain:    true,
+		MandatoryForNightly: false,
+		MandatoryForRelease: true,
+		Species:             "model",
+		Name:                "self-host generation limit",
+		PositiveArm:         "G0, G1, G2 are recorded",
+		NegativeArm:         "G3+ is refused",
+		CapabilityIDs:       []string{"self-host.build"},
 	},
 	{
-		ID:          ScenarioUpgradeEvidenceCompat,
-		Name:        "cross-version evidence compatibility",
-		PositiveArm: "legacy schema evidence still verifies",
-		NegativeArm: "contradictory facts refused on every schema",
+		ID:                  ScenarioUpgradeEvidenceCompat,
+		Tier:                "DF4",
+		Implemented:         true,
+		MandatoryForPR:      false,
+		MandatoryForMain:    false,
+		MandatoryForNightly: false,
+		MandatoryForRelease: false,
+		Species:             "model",
+		Name:                "cross-version evidence compatibility",
+		PositiveArm:         "legacy schema evidence still verifies",
+		NegativeArm:         "contradictory facts refused on every schema",
+		CapabilityIDs:       []string{"evidence.verify"},
 	},
 	{
-		ID:          ScenarioScaleFixedWorkload,
-		Name:        "fixed high-volume lifecycle",
-		PositiveArm: "N attempts complete under one-attempt accounting",
-		NegativeArm: "hidden retries are non-green",
+		ID:                  ScenarioScaleFixedWorkload,
+		Tier:                "DF6",
+		Implemented:         true,
+		MandatoryForPR:      false,
+		MandatoryForMain:    true,
+		MandatoryForNightly: false,
+		MandatoryForRelease: false,
+		Species:             "model",
+		Name:                "fixed high-volume lifecycle",
+		PositiveArm:         "N attempts complete under one-attempt accounting",
+		NegativeArm:         "hidden retries are non-green",
+		CapabilityIDs:       []string{"run.create"},
 	},
 }
 

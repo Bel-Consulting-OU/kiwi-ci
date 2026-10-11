@@ -55,10 +55,11 @@ func seedForensicAttempt(t *testing.T, s *Server, gen int64) {
 }
 
 // TestForensicProfileMaterializesReferencedStreams proves the forensic
-// profile returns one bundle with the signed envelope (digest-anchored), the
-// run-scoped bounded event timeline, the attempt's artifact/snapshot/report
-// references and the retention watermarks, while minimal/standard keep
-// serving the signed envelope bytes and an unknown profile is refused.
+// profile returns one bundle with the signed envelope (the signed truth; the
+// surrounding bundle is unsigned presentation/context), the run-scoped
+// bounded event timeline, the attempt's artifact/snapshot/report references
+// and the retention watermarks, while minimal/standard keep serving the
+// signed envelope bytes and an unknown profile is refused.
 func TestForensicProfileMaterializesReferencedStreams(t *testing.T) {
 	s, err := NewPersistent("token", "token", t.TempDir())
 	if err != nil {
@@ -81,8 +82,9 @@ func TestForensicProfileMaterializesReferencedStreams(t *testing.T) {
 	if bundle.AttemptID != model.AttemptID("job-a", 3) || bundle.Generation != 3 {
 		t.Fatalf("bundle attempt = %q gen %d", bundle.AttemptID, bundle.Generation)
 	}
-	// The embedded envelope is the signed statement, digest-anchored by the
-	// bundle itself.
+	// The embedded envelope is the signed truth; the bundle only carries its
+	// digests for convenience. Nothing here claims the attestation digest
+	// commits the surrounding timeline, report rows or reference lists.
 	if len(bundle.Attestation) == 0 {
 		t.Fatal("bundle carries no attestation envelope")
 	}

@@ -261,12 +261,13 @@ func attestationInput(ev attestationEvidence, generation int64) (provenance.Exec
 	// contradicts the effective vector is refused here so the subsequent
 	// sign step (which re-validates) cannot emit contradictory evidence.
 	var facts model.ExecutionFacts
-	if eff, ok := execution.MaterializeFromJob(j); ok {
-		facts = eff.Facts()
-		in.ExternalEffects = eff.EffectsClass()
+	var eff execution.EffectiveExecution
+	var haveEff bool
+	if e, ok := execution.MaterializeFromJob(j); ok {
+		eff, haveEff = e, true
+		facts = e.Facts()
 	} else {
 		facts = model.UnprovenExecutionFacts()
-		in.ExternalEffects = model.EffectsOpaqueExternal
 	}
 	var control *model.ExecutionControlReceipt
 	if j.ObservedRuntime != nil {
@@ -277,6 +278,11 @@ func attestationInput(ev attestationEvidence, generation int64) (provenance.Exec
 		// rather than sign a lie. The caller surfaces this as an attestation
 		// failure; the job itself is untouched.
 		return provenance.ExecutionAttestationInput{}, err
+	}
+	if haveEff {
+		in.ExternalEffects = execution.EffectsClassFromFacts(facts, eff.DeclaresOIDC(), eff.DeclaresDeployment())
+	} else {
+		in.ExternalEffects = model.EffectsOpaqueExternal
 	}
 	in.ExecutionAssuranceFacts = facts
 	if p := j.CompiledJobPayload; p != nil {

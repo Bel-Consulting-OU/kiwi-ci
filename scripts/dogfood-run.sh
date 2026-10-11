@@ -96,8 +96,18 @@ if [[ ${#executed[@]} -eq 0 ]]; then
   exit 1
 fi
 
-# Every required test must have executed. A prefix match counts (TestDFEVID001
-# is satisfied by TestDFEVID001GenerationAndVerify); an exact name also works.
+# Every required test must have executed AND not skipped. A prefix match
+# counts (TestDFEVID001 is satisfied by TestDFEVID001GenerationAndVerify).
+# A required test that only t.Skip'd is MISSING: "required present" means the
+# body ran, not that Go emitted === RUN before skipping.
+skipped=()
+for req in "${required[@]}"; do
+  # If every matching === RUN is followed by --- SKIP for that name, treat as missing.
+  if grep -q "^--- SKIP: ${req}" "$out" && ! grep -q "^--- PASS: ${req}" "$out" && ! grep -q "^--- FAIL: ${req}" "$out"; then
+    skipped+=("$req")
+  fi
+done
+
 missing=()
 for req in "${required[@]}"; do
   found=0
@@ -111,9 +121,12 @@ for req in "${required[@]}"; do
     missing+=("$req")
   fi
 done
+for req in ${skipped[@]+"${skipped[@]}"}; do
+  missing+=("$req")
+done
 
 if [[ ${#missing[@]} -gt 0 ]]; then
-  echo "dogfood-run: suite is NOT green — required test(s) did not execute:" >&2
+  echo "dogfood-run: suite is NOT green — required test(s) did not execute (or skipped):" >&2
   for m in "${missing[@]}"; do
     echo "  MISSING  $m" >&2
   done

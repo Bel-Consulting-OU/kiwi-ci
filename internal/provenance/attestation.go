@@ -24,22 +24,26 @@ import (
 const ExecutionAttestationPredicateType = "kiwi-ci/execution-attestation/v1"
 
 // executionAttestationSchemaVersion is the attestation block's schema
-// version. It is part of the canonical digest preimage, so a future field
-// change must bump it. Version 2 added completionResultDigest (the durable v2
-// completion identity) and evidenceRootSha256 (the full artifact-side
-// evidence graph root); version 3 added executionSemantics (the engine
-// semantics the attempt ran under); version 4 added the execution-assurance
-// classification (executionAssurance level+name and externalEffects), the
-// canonical effective-policy digest (policyDigest), the event-ledger frontier
-// (eventFrontier) and the run graph fingerprint (graphFingerprint). Version 5
-// makes the AUTHORITATIVE control-fact vector the signed object
-// (executionAssurance.facts), renames the derived label "hermetic" to
-// "sealed_pinned_no_network" and "no_ambient_credentials" to
-// "no_injected_credentials" (the narrower provable claim), and adds the
-// executor-observed enforcement receipt inside the facts. The verifier still
-// accepts version 4 with its frozen name vocabulary; new evidence is only
-// ever built under the current version.
-const executionAttestationSchemaVersion = 5
+// version. It is part of the canonical digest preimage, so any field
+// meaning or shape change must bump it.
+//
+//	v2 completionResultDigest + evidenceRootSha256
+//	v3 executionSemantics
+//	v4 execution-assurance level+name, policyDigest, eventFrontier, graphFingerprint
+//	v5 AUTHORITATIVE control-fact vector (executionAssurance.facts), narrower
+//	   profile names, executor-observed receipt inside facts.
+//	   FROZEN SEMANTICS for workspace_quota_enforced ("configured/requested")
+//	   and network_mode as the only network field (policy, sometimes read as
+//	   enforcement). Do NOT reinterpret a v5 statement under v6 rules.
+//	v6 splits policy from proven enforcement:
+//	   workspace_quota_enforced = observed hard OS quota only;
+//	   network_access_denied   = proven denial only (never policy alone);
+//	   network_mode            = effective POLICY (kept for digest stability).
+//	   Profile derivation for network_denied/sealed uses network_access_denied.
+//
+// The verifier accepts 4 (frozen name vocabulary), 5 (frozen fact meanings)
+// and 6 (current). New evidence is only ever built under the current version.
+const executionAttestationSchemaVersion = 6
 
 // executionAttestationDigestVersion tags the canonical hashing encoding.
 const executionAttestationDigestVersion = "kiwi-ci/execution-attestation-digest/v1"
@@ -225,6 +229,13 @@ func ExecutionAttestationStatement(in ExecutionAttestationInput) (Statement, err
 	}
 	if !in.ExternalEffects.Valid() {
 		return Statement{}, fmt.Errorf("provenance: undefined external effects class %q", string(in.ExternalEffects))
+	}
+	// Effects class must agree with the proven facts: "pure" claims no
+	// external authority and no egress, which is only true when network
+	// denial is PROVEN (NetworkAccessDenied). Never sign pure from policy
+	// alone, and never sign an effects class that contradicts the vector.
+	if err := model.ValidateExternalEffects(in.ExecutionAssuranceFacts, in.ExternalEffects); err != nil {
+		return Statement{}, err
 	}
 	att := ExecutionAttestation{
 		SchemaVersion:          executionAttestationSchemaVersion,
@@ -534,16 +545,17 @@ func VerifyExecutionAttestation(st Statement) error {
 	// an unsupported envelope would otherwise fail the subject-digest
 	// comparison with a misleading "does not bind its evidence block" error.
 	// Refuse an unsupported schema explicitly, before any digest comparison.
-	// Schema 5 is current; schema 4 (fact-less level+name classification with
-	// its frozen name vocabulary) is still accepted so previously issued
-	// evidence keeps verifying.
+	// Schema 6 is current; 5 and 4 are accepted with FROZEN semantics so
+	// previously issued evidence keeps its original meaning and never gets
+	// upgraded to a stronger claim.
+	schema := st.Attestation.SchemaVersion
 	legacyV4 := false
-	switch st.Attestation.SchemaVersion {
-	case executionAttestationSchemaVersion:
+	switch schema {
+	case executionAttestationSchemaVersion, 5:
 	case 4:
 		legacyV4 = true
 	default:
-		return fmt.Errorf("provenance: unsupported attestation schemaVersion %d (want %d or legacy 4)", st.Attestation.SchemaVersion, executionAttestationSchemaVersion)
+		return fmt.Errorf("provenance: unsupported attestation schemaVersion %d (want %d, 5 or legacy 4)", schema, executionAttestationSchemaVersion)
 	}
 	want, err := ExecutionAttestationDigest(*st.Attestation)
 	if err != nil {
@@ -562,10 +574,9 @@ func VerifyExecutionAttestation(st Statement) error {
 		return fmt.Errorf("provenance: execution attestation execution semantics disagree with the statement")
 	}
 	// The assurance claim is a closed classification. A v4 statement is
-	// checked against its frozen name vocabulary; a v5 statement must carry
-	// the authoritative fact vector, and its profile label must be exactly
-	// what the shared derivation recomputes from those facts, so a validly
-	// signed but self-contradictory block can never be accepted.
+	// checked against its frozen name vocabulary; v5/v6 must carry the
+	// authoritative fact vector, validated and re-derived under THAT
+	// schema's semantics so a historical statement is never reinterpreted.
 	evidence := st.Attestation.ExecutionAssurance
 	if legacyV4 {
 		name, ok := legacyAssuranceNamesV4[evidence.Level]
@@ -576,10 +587,9 @@ func VerifyExecutionAttestation(st Statement) error {
 			return fmt.Errorf("provenance: execution attestation assurance name %q does not match legacy level %d (%s)", evidence.Name, evidence.Level, name)
 		}
 		// A v4 envelope that still carries a facts block must not smuggle a
-		// self-contradictory vector past the consistency gate: validate the
-		// block whenever it is present, regardless of schema version.
+		// self-contradictory vector past the consistency gate.
 		if evidence.Facts != nil {
-			if !evidence.Facts.Valid() {
+			if !evidence.Facts.ValidForSchema(schema) {
 				return fmt.Errorf("provenance: execution attestation carries invalid execution facts")
 			}
 		}
@@ -587,12 +597,12 @@ func VerifyExecutionAttestation(st Statement) error {
 		if evidence.Facts == nil {
 			return fmt.Errorf("provenance: execution attestation carries no execution facts")
 		}
-		if !evidence.Facts.Valid() {
+		if !evidence.Facts.ValidForSchema(schema) {
 			return fmt.Errorf("provenance: execution attestation carries invalid execution facts")
 		}
-		derived := model.DeriveAssuranceProfile(*evidence.Facts)
+		derived := model.DeriveAssuranceProfileSchema(schema, *evidence.Facts)
 		if evidence.Level != int(derived) {
-			return fmt.Errorf("provenance: execution attestation assurance level %d does not match its facts (derives %d %s)", evidence.Level, int(derived), derived.Name())
+			return fmt.Errorf("provenance: execution attestation assurance level %d does not match its facts under schema %d (derives %d %s)", evidence.Level, schema, int(derived), derived.Name())
 		}
 		if evidence.Name != derived.Name() {
 			return fmt.Errorf("provenance: execution attestation assurance name %q does not match level %d (%s)", evidence.Name, evidence.Level, derived.Name())
@@ -600,6 +610,11 @@ func VerifyExecutionAttestation(st Statement) error {
 	}
 	if !st.Attestation.ExternalEffects.Valid() {
 		return fmt.Errorf("provenance: execution attestation has undefined external effects class %q", string(st.Attestation.ExternalEffects))
+	}
+	if st.Attestation.ExecutionAssurance.Facts != nil {
+		if err := model.ValidateExternalEffects(*st.Attestation.ExecutionAssurance.Facts, st.Attestation.ExternalEffects); err != nil {
+			return fmt.Errorf("provenance: execution attestation external effects disagree with facts: %w", err)
+		}
 	}
 	return nil
 }

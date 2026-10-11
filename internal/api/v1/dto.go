@@ -56,6 +56,7 @@ type JobDTO struct {
 	LeaseRunnerID          string                       `json:"lease_runner_id,omitempty"`
 	LeaseGeneration        int64                        `json:"lease_generation,omitempty"`
 	LeaseExpiresAt         *time.Time                   `json:"lease_expires_at,omitempty"`
+	AttemptRunnerID        string                       `json:"attempt_runner_id,omitempty"`
 	ApprovedBy             string                       `json:"approved_by,omitempty"`
 	QueueReason            string                       `json:"queue_reason,omitempty"`
 	PlacementRegions       []string                     `json:"placement_regions,omitempty"`
@@ -177,7 +178,8 @@ func JobDTOFrom(j model.Job) JobDTO {
 		FinishedAt: jsonTimePtr(j.FinishedAt), Error: j.Error, Outputs: j.Outputs,
 		NeedsOutputs: j.NeedsOutputs, Attempts: j.Attempts, LeaseRunnerID: j.LeaseRunnerID,
 		LeaseGeneration: j.LeaseGeneration, LeaseExpiresAt: jsonTimePtr(j.LeaseExpiresAt),
-		ApprovedBy: j.ApprovedBy, QueueReason: j.QueueReason,
+		AttemptRunnerID: j.AttemptRunnerID,
+		ApprovedBy:      j.ApprovedBy, QueueReason: j.QueueReason,
 		PlacementRegions: j.PlacementRegions, ComponentDigest: j.ComponentDigest,
 		CompiledJobPayload: j.CompiledJobPayload, WaitingSince: jsonTimePtr(j.WaitingSince),
 	}

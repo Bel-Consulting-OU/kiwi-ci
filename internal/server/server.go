@@ -839,6 +839,21 @@ func WithRunRetention(d time.Duration, maxRuns int) PersistentOption {
 	}
 }
 
+// WithGitHubAPIBase points the GitHub adapter at a custom API root (GitHub
+// Enterprise, or a local forge stand-in used by webhook dogfood). Empty
+// keeps the api.github.com default. The value is read at each forge call, so
+// it is also safe to install through SetGitHubAPIBase after construction.
+func WithGitHubAPIBase(base string) PersistentOption {
+	return func(s *Server) { s.SetGitHubAPIBase(base) }
+}
+
+// SetGitHubAPIBase sets the GitHub API base URL the webhook pipeline-fetch,
+// changed-files and status-publication paths call. Empty restores the
+// api.github.com default.
+func (s *Server) SetGitHubAPIBase(base string) {
+	s.gitHubAPIBase = strings.TrimRight(strings.TrimSpace(base), "/")
+}
+
 // NewPersistentWithCluster is NewPersistent with an explicit cluster key
 // store. A nil store keeps the legacy data-dir loaders. When the store is
 // non-nil every signing material loads and persists through it.

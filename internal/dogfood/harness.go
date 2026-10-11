@@ -1,3 +1,13 @@
+// Package dogfood is the REFERENCE/MODEL layer of the dogfood program.
+//
+// The in-memory Harness is an executable invariant oracle: it models runs,
+// claims, generations, completions and faults at the state-machine level and
+// is excellent for deterministic race permutation. It is NOT production
+// Kiwi. Product dogfood (DF1+) must drive a real kiwi-server process, real
+// API, real store and real runner through system.System (internal/dogfood/system) (see docs/DOGFOOD.md
+// "Three test species"). Never treat a green model scenario as proof that
+// the HTTP handler → authorization → SQL transaction → generation predicate
+// → ledger path rejected a stale completion.
 package dogfood
 
 import (

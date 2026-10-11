@@ -44,6 +44,11 @@
 # Hermetic: fake forge / OIDC / deployment sinks only. No real provider
 # credentials, no real forge webhooks, no real deploy targets. DF5 canaries
 # are a separate scheduled lane and are never part of DF2.
+# REFERENCE/MODEL CONTRACT: this suite currently drives the in-memory
+# dogfood model/oracle (internal/dogfood). A live multi-process topology
+# (real server + Postgres + object storage + two runner processes) is the
+# next wave — docs/DOGFOOD.md "Implemented vs planned". Do not read a green
+# run of this file as production-system DF2 proof.
 version: 1
 name: kiwi-dogfood-df2-distributed
 
@@ -78,7 +83,7 @@ concurrency:
 jobs:
   # One job = one topology. Splitting server/runnerA/runnerB into separate
   # pipeline jobs would fake distribution (shared workspace, shared lifetime)
-  # and would re-encode the topology in YAML; the suite starts real processes.
+  # and would re-encode the topology in YAML; the planned live suite would start real processes.
   df2-distributed-topology:
     runtime: container
     image: golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
@@ -102,7 +107,7 @@ jobs:
       # suite is responsible for. CI invokes the Makefile target rather than
       # duplicating orchestration (docs/DOGFOOD.md "Makefile entry points").
       - name: dogfood-distributed
-        # Covers: server + postgres + objectstore readiness, runnerA (native
+        # PLANNED coverage: server + postgres + objectstore readiness, runnerA (native
         # executor) + runnerB (docker executor) claiming, external client
         # submit/query/evidence/replay. Scenario IDs DF-DIST-*, DF-SCHED-*,
         # DF-RUNNER-*, DF-EXEC-*, DF-SELF-* (G0→G1 only; see G-limits above).

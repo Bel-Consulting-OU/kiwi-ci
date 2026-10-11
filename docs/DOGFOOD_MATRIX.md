@@ -47,6 +47,28 @@ authority is involved, at least one negative scenario.
 | Scale | large DAG, many parallel jobs, event volume, artifacts |
 | Release | clean install from final package, not source tree |
 
+## Implemented scenario IDs
+
+This list is the doc-side mirror of every `Implemented: true` row in
+`internal/dogfood/scenarios/registry.go`. `TestDogfoodMatrixMatchesRegistry`
+fails on any drift in either direction. IDs outside this list (including the
+planned families below) are roadmap, not executable proofs.
+
+- DF-BOOT-001
+- DF-EVID-001
+- DF-EVID-002
+- DF-EVID-003
+- DF-EVID-004
+- DF-EVID-005
+- DF-LEASE-001
+- DF-LEASE-002
+- DF-QUOTA-001
+- DF-EFFECT-001
+- DF-EFFECT-002
+- DF-SELF-001
+- DF-UPGRADE-001
+- DF-SCALE-001
+
 ## Public-surface → scenario mapping
 
 Scenario IDs use the `DF-<FAMILY>-<NNN>` taxonomy. Families currently in

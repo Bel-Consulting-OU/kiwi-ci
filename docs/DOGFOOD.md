@@ -17,6 +17,23 @@ receive work → authenticate it → admit it → construct the graph → schedu
 
 `.kiwi/pipeline.yaml` remains **DF0 — Source Integrity**. It is not replaced.
 
+## Three test species
+
+Do not call all three "dogfood" — the suite will otherwise look stronger
+than the guarantees it provides.
+
+| Species | What it is | What it proves |
+|---|---|---|
+| **Model** | `internal/dogfood` in-memory harness/oracle | state-machine invariants, combinatorial races, deterministic faults |
+| **Component** | real production packages in-process (store, provenance, executor) | package-level contracts against real implementations |
+| **System** | real `server.NewPersistent` + real HTTP API + real `runner.Runner` (loopback listener / goroutines in-process; multi-process topology is the DF2 wave) | HTTP → auth → store → generation → ledger → artifacts as a whole |
+
+`internal/dogfood/harness.go` is the **reference/model** layer. System
+dogfood lives in `internal/dogfood/system/` (`system.System / system.Launch`: real
+`server.NewPersistent` + HTTP listener + `runner.Runner` / register-next-complete
+over the public API). Model scenarios stay valuable as the differential
+oracle against that system.
+
 ## Three actors
 
 Do not make Kiwi the sole judge of whether Kiwi works.
@@ -255,7 +272,8 @@ zero tests.
 
 | Implemented now | Planned next wave |
 |---|---|
-| DF-BOOT-001, DF-EVID-001..005, DF-LEASE-001/002, DF-QUOTA-001, DF-EFFECT-001/002, DF-SELF-001 (G0/G1/G2 limit), DF-UPGRADE-001 (evidence compat), DF-SCALE-001 (harness workload) | live DF2 multi-process topology, DF3 process/network chaos, DF4 N-1 binary matrix, DF5 real-forge canary, DF6 10k-job soak, DF7 packaged-binary install |
+| DF-BOOT-001, DF-EVID-001..005, DF-LEASE-001/002, DF-QUOTA-001, DF-EFFECT-001/002, DF-SELF-001 (G0/G1/G2 limit), DF-UPGRADE-001 (evidence compat), DF-SCALE-001 (harness workload) — **model species** | live DF2 multi-process topology, DF3 process/network chaos, DF4 N-1 binary matrix, DF5 real-forge canary, DF6 10k-job soak, DF7 packaged-binary install |
+| DF-BOOT-001 / DF-EVID-001 / DF-LEASE-001 / DF-QUOTA-001 — **system species** via `TestSys*` in `internal/dogfood/system/` (real `NewPersistent` + HTTP + runner). Fail-closed arms (stale lease generation → 409, untrusted hard-quota gate, untrusted rootless floor) always run. Boot/restart and evidence success arms run an untrusted container job when rootless Docker satisfies the untrusted policy floor, and otherwise run a TRUSTED native job through the product trusted ingress (`TestSysTrustedIngress` signed GitHub webhook, `TestSysTrustedScheduleIngress` trusted schedule) — so they execute on hosts without rootless Docker instead of skipping. Direct API submissions stay untrusted (the product force-clears `Trusted`); the store is never mutated to fake trust. | postgres/objectstore system topology, real-forge webhook canary |
 | G0/G1/G2 recursion refusal (`Harness.BeginGeneration`) | full G0→G1→G2 self-build of a release binary |
 | `dogfood-result.json` shape (`MarshalResult`, `TestDogfoodResultJSONShape`) | suite-level artifact emission of the result bundle on disk |
 | DF0 `.kiwi/pipeline.yaml` + dogfood YAML schema validation | surfacecheck gate over DOGFOOD_MATRIX.md |
@@ -318,6 +336,7 @@ DF-RELEASE-001  fresh install from final release artifact
 ```text
 make dogfood-fast          # PR gate: DF0 + DF1 + critical evidence + critical lease
 make dogfood-local
+make dogfood-system        # SYSTEM species: real server/HTTP/runner (TestSys*)
 make dogfood-distributed
 make dogfood-adversarial
 make dogfood-upgrade
@@ -418,10 +437,10 @@ with:
     └── release.yaml
 
 internal/dogfood/                 package dogfood (harness/oracle/fault/…)
-├── harness.go oracle.go topology.go fault.go seed.go result.go namespace.go
+├── doc.go harness.go oracle.go topology.go fault.go seed.go result.go namespace.go
 ├── hostile/                      hostile runner modes
 ├── fake_forge/ fake_oidc/ fake_deployment/
-└── scenarios/                    TestDF* scenario implementations + registry
+└── scenarios/                    TestDF* scenario implementations + registry.go + suites.go
 
 scripts/
 └── dogfood-run.sh                fail-closed suite runner (no vacuous green)

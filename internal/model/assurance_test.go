@@ -63,6 +63,8 @@ func TestDeriveAssuranceProfileFromFacts(t *testing.T) {
 		{name: "quota configured without observation does not claim enforcement", mut: func(f *ExecutionFacts) {
 			f.WorkspaceQuotaConfigured = true
 			f.WorkspaceQuotaEnforced = false
+			f.NetworkAccessDenied = true
+			f.Observed = &ExecutionControlReceipt{Runtime: "docker", SandboxStarted: true, NetworkEnforced: ObservedNetworkNone}
 		}, want: AssuranceNetworkDenied},
 		{name: "sandbox with injected secrets is only isolated", mut: func(f *ExecutionFacts) {
 			f.KiwiSecretsInjected = true
@@ -70,7 +72,10 @@ func TestDeriveAssuranceProfileFromFacts(t *testing.T) {
 		{name: "sandbox clean credentials network none is profile 2", mut: func(f *ExecutionFacts) {
 			f.NetworkMode = NetworkModeFactInternet
 		}, want: AssuranceNoInjectedCredentials},
-		{name: "sandbox clean network none without mediation is network denied", mut: func(f *ExecutionFacts) {}, want: AssuranceNetworkDenied},
+		{name: "sandbox clean proven network denial without mediation is network denied", mut: func(f *ExecutionFacts) {
+			f.NetworkAccessDenied = true
+			f.Observed = &ExecutionControlReceipt{Runtime: "docker", SandboxStarted: true, NetworkEnforced: ObservedNetworkNone}
+		}, want: AssuranceNetworkDenied},
 		{name: "mediated authority with allowed network is profile 4", mut: func(f *ExecutionFacts) {
 			f.NetworkMode = NetworkModeFactInternet
 			f.DeclaredAuthorityMediated = true
@@ -78,9 +83,11 @@ func TestDeriveAssuranceProfileFromFacts(t *testing.T) {
 		{name: "mediated authority with network none and unpinned images is profile 4", mut: func(f *ExecutionFacts) {
 			f.DeclaredAuthorityMediated = true
 		}, want: AssuranceKiwiMediatedAuthority},
-		{name: "mediated authority network none pinned images is sealed pinned", mut: func(f *ExecutionFacts) {
+		{name: "mediated authority proven denial pinned images is sealed pinned", mut: func(f *ExecutionFacts) {
 			f.DeclaredAuthorityMediated = true
 			f.ImagesDigestPinned = true
+			f.NetworkAccessDenied = true
+			f.Observed = &ExecutionControlReceipt{Runtime: "docker", SandboxStarted: true, NetworkEnforced: ObservedNetworkNone}
 		}, want: AssuranceSealedPinnedNoNetwork},
 		{name: "unknown runtime with isolation claimed is inconsistent", mut: func(f *ExecutionFacts) {
 			f.Runtime = RuntimeFactUnknown
@@ -93,6 +100,7 @@ func TestDeriveAssuranceProfileFromFacts(t *testing.T) {
 			f.Observed = &ExecutionControlReceipt{Runtime: "native", NetworkEnforced: ObservedNetworkHost}
 		}, invalid: true},
 		{name: "observed sandbox receipt corroborates a sandboxed execution", mut: func(f *ExecutionFacts) {
+			f.NetworkAccessDenied = true
 			f.Observed = &ExecutionControlReceipt{Runtime: "docker", SandboxStarted: true, NetworkEnforced: ObservedNetworkNone}
 		}, want: AssuranceNetworkDenied},
 	}
@@ -170,8 +178,17 @@ func TestValidateObservedConsistencyMatrix(t *testing.T) {
 		{
 			name: "container network none + observed none agrees",
 			mut: func(f *ExecutionFacts) {
+				f.NetworkAccessDenied = true
 				f.Observed = &ExecutionControlReceipt{Runtime: "docker", SandboxStarted: true, NetworkEnforced: ObservedNetworkNone}
 			},
+		},
+		{
+			name: "policy none without proven denial is not network_access_denied",
+			mut: func(f *ExecutionFacts) {
+				f.NetworkAccessDenied = false
+				f.Observed = &ExecutionControlReceipt{Runtime: "docker", SandboxStarted: true, NetworkEnforced: ObservedNetworkNone}
+			},
+			wantErr: true,
 		},
 		{
 			name: "container network none + observed container-namespace is contradictory",
@@ -220,6 +237,7 @@ func TestValidateObservedConsistencyMatrix(t *testing.T) {
 			name: "observed none under effective services is compatible",
 			mut: func(f *ExecutionFacts) {
 				f.NetworkMode = NetworkModeFactServices
+				f.NetworkAccessDenied = true
 				f.Observed = &ExecutionControlReceipt{Runtime: "docker", SandboxStarted: true, NetworkEnforced: ObservedNetworkNone}
 			},
 		},
@@ -235,6 +253,7 @@ func TestValidateObservedConsistencyMatrix(t *testing.T) {
 			name: "quota enforced matches a hard receipt",
 			mut: func(f *ExecutionFacts) {
 				f.WorkspaceQuotaEnforced = true
+				f.NetworkAccessDenied = true
 				f.Observed = &ExecutionControlReceipt{Runtime: "docker", SandboxStarted: true, NetworkEnforced: ObservedNetworkNone, WorkspaceQuotaEnforced: true}
 			},
 		},
@@ -266,10 +285,21 @@ func TestValidateObservedConsistencyMatrix(t *testing.T) {
 	// against an effective policy of none (the runtime cannot observe/enforce
 	// it). Quota still is.
 	nativeBase.NetworkMode = NetworkModeFactNone
+	nativeBase.NetworkAccessDenied = false
 	nativeBase.Observed = &ExecutionControlReceipt{Runtime: "native", NetworkEnforced: ObservedNetworkHost}
 	if err := nativeBase.ValidateObservedConsistency(); err != nil {
 		t.Fatalf("native policy-none vs host receipt must not be a cross-check: %v", err)
 	}
+	// Policy none on native is NOT proven denial.
+	if nativeBase.NetworkAccessDenied {
+		t.Fatal("native host networking must not claim network_access_denied")
+	}
+	// Claiming proven denial while the receipt reports host is refused.
+	nativeBase.NetworkAccessDenied = true
+	if err := nativeBase.ValidateObservedConsistency(); err == nil {
+		t.Fatal("network_access_denied without observed none must be refused")
+	}
+	nativeBase.NetworkAccessDenied = false
 	nativeBase.WorkspaceQuotaEnforced = true
 	if err := nativeBase.ValidateObservedConsistency(); err == nil {
 		t.Fatal("native quota overclaim must still be refused")
@@ -318,5 +348,38 @@ func TestValidateObservedConsistencyIsolationBidirectional(t *testing.T) {
 	}
 	if f.Valid() {
 		t.Fatal("Valid() must refuse sandbox-started without FilesystemIsolated on container")
+	}
+}
+
+// TestValidateExternalEffectsPureRequiresProvenDenial: the effects gate at
+// sign and verify refuses pure next to facts that do not prove network
+// denial (policy none is not enough) and refuses pure with injected secrets.
+func TestValidateExternalEffectsPureRequiresProvenDenial(t *testing.T) {
+	policyOnly := ExecutionFacts{
+		Runtime:            RuntimeFactContainer,
+		FilesystemIsolated: true,
+		NetworkMode:        NetworkModeFactNone,
+	}
+	if err := ValidateExternalEffects(policyOnly, EffectsPure); err == nil {
+		t.Fatal("pure from policy alone must be refused")
+	}
+	proven := policyOnly
+	if err := proven.ApplyObservedControl(&ExecutionControlReceipt{
+		Runtime: "docker", SandboxStarted: true, NetworkEnforced: ObservedNetworkNone,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateExternalEffects(proven, EffectsPure); err != nil {
+		t.Fatalf("proven denial + pure: %v", err)
+	}
+	if err := ValidateExternalEffects(proven, EffectsKiwiMediated); err != nil {
+		t.Fatalf("proven denial + kiwi_mediated: %v", err)
+	}
+	native := ExecutionFacts{Runtime: RuntimeFactNative, NetworkMode: NetworkModeFactNone}
+	if err := ValidateExternalEffects(native, EffectsPure); err == nil {
+		t.Fatal("native cannot claim pure")
+	}
+	if err := ValidateExternalEffects(proven, EffectsOpaqueExternal); err != nil {
+		t.Fatalf("opaque is always allowed: %v", err)
 	}
 }

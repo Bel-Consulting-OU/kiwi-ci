@@ -154,15 +154,11 @@ type ExecutionFacts struct {
 	// the mandatory untrusted default). It says nothing about whether a
 	// hard OS-level bound was actually installed.
 	WorkspaceQuotaConfigured bool `json:"workspace_quota_configured,omitempty"`
-	// WorkspaceQuotaEnforced is the OBSERVATION fact: true only when the
-	// attempt-specific executor/runner result proves a hard OS-level
-	// workspace quota was installed before the workspace was populated
-	// (status.Hard). The evidence builder takes it from the observed
-	// control receipt and never manufactures it from the requested limit.
-	// It is orthogonal to isolation. Schema note: the field is always
-	// present in canonical JSON (including false) so historical v5
-	// digests stay stable; the meaning changed from "a bound was
-	// requested" to "a hard bound was proven installed".
+	// WorkspaceQuotaEnforced meaning is SCHEMA-FROZEN:
+	//   schema v5 (historical): "a workspace quota bound was configured/requested"
+	//   schema v6 (current):    "a hard OS-level quota was proven installed"
+	// The verifier must interpret the field under the statement's schema
+	// version and never upgrade a v5 claim to the stronger v6 meaning.
 	WorkspaceQuotaEnforced bool `json:"workspace_quota_enforced"`
 	// KiwiSecretsInjected is true when the effective secret allowlist could
 	// admit at least one secret (nil policy, or any allowed entry). The
@@ -177,8 +173,21 @@ type ExecutionFacts struct {
 	// `kiwi run` host-environment opt-in is never represented as a
 	// distributed attempt.
 	HostEnvironmentInherited bool `json:"host_environment_inherited"`
-	// NetworkMode is the effective network policy.
+	// NetworkMode is the EFFECTIVE NETWORK POLICY (requested/effective
+	// intent). It is NOT a proven enforcement fact. The wire name is
+	// historically "network_mode"; schema v6 keeps that name so canonical
+	// digests of already-issued statements stay stable. Consumers that
+	// authorize on "network was denied" MUST use NetworkAccessDenied, never
+	// this field: native execution can be asked for network none and still
+	// run with host networking.
 	NetworkMode ExecutionNetworkModeFact `json:"network_mode"`
+	// NetworkAccessDenied is the PROVEN enforcement fact: true only when the
+	// attempt's executor-observed receipt shows the runtime entered a state
+	// with no network (ObservedNetworkNone). Absent/false on schema v5
+	// statements (the field did not exist) and on any attempt that cannot
+	// prove denial. Schema v6 refuses to sign or accept a true value that
+	// the receipt does not corroborate.
+	NetworkAccessDenied bool `json:"network_access_denied,omitempty"`
 	// DeclaredAuthorityMediated is true when every DECLARED external effect
 	// (deployments, OIDC) is covered by the effective capability set and the
 	// execution is sandboxed. It says nothing about undeclared egress.
@@ -192,13 +201,17 @@ type ExecutionFacts struct {
 	Observed *ExecutionControlReceipt `json:"observed,omitempty"`
 }
 
-// Valid reports whether the fact vector is a well-formed, internally
-// consistent member of the closed domains. Inconsistent vectors (for example
-// filesystem_isolated on a native runtime) are refused, never interpreted.
-// When an observed receipt is present the pair must also satisfy
-// ValidateObservedConsistency: effective and observed controls are compared
-// semantically before evidence can be signed or accepted.
+// Valid reports whether the fact vector is well-formed under SCHEMA v6
+// semantics (the only schema new evidence is built with).
 func (f ExecutionFacts) Valid() bool {
+	return f.ValidForSchema(6)
+}
+
+// ValidForSchema reports whether the fact vector is well-formed under the
+// semantics of the given attestation schema version. Historical v5 is
+// frozen: its workspace_quota_enforced meant "configured", and it had no
+// network_access_denied field, so those cross-checks do not apply.
+func (f ExecutionFacts) ValidForSchema(schema int) bool {
 	switch f.Runtime {
 	case RuntimeFactUnknown, RuntimeFactNative, RuntimeFactContainer, RuntimeFactTart:
 	default:
@@ -225,28 +238,77 @@ func (f ExecutionFacts) Valid() bool {
 	if f.Observed != nil && !f.Observed.Valid() {
 		return false
 	}
-	return f.ValidateObservedConsistency() == nil
+	if schema >= 6 {
+		return f.ValidateObservedConsistency() == nil
+	}
+	return f.validateObservedConsistencyLegacy(schema) == nil
+}
+
+// validateObservedConsistencyLegacy applies the FROZEN historical cross-checks.
+// v5's workspace_quota_enforced is "configured" (not observation), and
+// network_access_denied did not exist — neither is compared to the receipt.
+// Runtime correspondence and isolation↔sandbox-started still apply whenever a
+// receipt is present: those fields kept their meaning.
+func (f ExecutionFacts) validateObservedConsistencyLegacy(schema int) error {
+	if f.Observed == nil {
+		return nil
+	}
+	obs := f.Observed
+	switch f.Runtime {
+	case RuntimeFactContainer:
+		if obs.Runtime != "docker" {
+			return errObservedMismatch("runtime", f.Runtime, obs.Runtime)
+		}
+	case RuntimeFactTart:
+		if obs.Runtime != "tart" {
+			return errObservedMismatch("runtime", f.Runtime, obs.Runtime)
+		}
+	case RuntimeFactNative:
+		if obs.Runtime != "native" {
+			return errObservedMismatch("runtime", f.Runtime, obs.Runtime)
+		}
+	}
+	if f.FilesystemIsolated && !obs.SandboxStarted {
+		return errObservedMismatch("filesystem_isolated", true, obs.SandboxStarted)
+	}
+	if obs.SandboxStarted && !f.FilesystemIsolated {
+		if f.Runtime == RuntimeFactContainer || f.Runtime == RuntimeFactTart {
+			return errObservedMismatch("filesystem_isolated", false, obs.SandboxStarted)
+		}
+	}
+	// A policy-none claim sitting next to a receipt that reports a connected
+	// namespace is contradictory under every schema. (What is frozen on v5 is
+	// the MEANING of workspace_quota_enforced and the absence of
+	// network_access_denied — not permission to sign nonsense.)
+	if f.Runtime == RuntimeFactContainer {
+		if f.NetworkMode == NetworkModeFactNone && obs.NetworkEnforced != ObservedNetworkNone {
+			return errObservedMismatch("network_mode", f.NetworkMode, obs.NetworkEnforced)
+		}
+	}
+	return nil
 }
 
 // ValidateObservedConsistency is the single authoritative cross-check between
-// the effective control vector and the executor-observed enforcement receipt.
-// It is called before signing and during attestation verification so Kiwi can
-// never emit (or accept) internally contradictory evidence: a statement that
-// claims network denied while its own receipt reports host networking must be
-// refused regardless of how it was produced.
+// the effective control vector and the executor-observed enforcement receipt
+// under SCHEMA v6 semantics. It is called before signing and during
+// attestation verification so Kiwi can never emit (or accept) internally
+// contradictory evidence.
 //
 // Only properties a runtime can unambiguously observe are cross-checked.
-// Native execution cannot deny the network, so a native effective policy of
-// "none" is NOT compared against the always-host receipt: consumers must read
-// Observed for what actually ran. Quota enforcement is always checkable
-// because the receipt carries the attempt-specific hard-quota result.
+// Native execution cannot deny the network, so a native effective POLICY of
+// "none" is NOT compared against the always-host receipt: the POLICY field
+// stays "none" while NetworkAccessDenied stays false. That split is the
+// point — authorization on "network denied" uses the proven fact only.
 func (f ExecutionFacts) ValidateObservedConsistency() error {
-	// Enforcement is observation-only. Claiming a hard quota without a
-	// receipt (or with a receipt that did not observe one) is exactly the
-	// overclaim this contract forbids.
+	// Quota enforcement is observation-only (v6 meaning).
 	observedHard := f.Observed != nil && f.Observed.WorkspaceQuotaEnforced
 	if f.WorkspaceQuotaEnforced != observedHard {
 		return errObservedMismatch("workspace_quota_enforced", f.WorkspaceQuotaEnforced, observedHard)
+	}
+	// Network denial is observation-only (v6 meaning).
+	observedDenied := f.Observed != nil && f.Observed.NetworkEnforced == ObservedNetworkNone
+	if f.NetworkAccessDenied != observedDenied {
+		return errObservedMismatch("network_access_denied", f.NetworkAccessDenied, observedDenied)
 	}
 	if f.Observed == nil {
 		return nil
@@ -270,10 +332,7 @@ func (f ExecutionFacts) ValidateObservedConsistency() error {
 		}
 	}
 	// Filesystem isolation ↔ sandbox started (both directions on a known
-	// sandboxed runtime). A claimed isolation boundary the runtime did not
-	// start is an overclaim; a started sandbox the effective vector denies
-	// is the matching underclaim/contradiction. Native is already refused by
-	// Valid() when it claims isolation; unknown cannot claim isolation.
+	// sandboxed runtime).
 	if f.FilesystemIsolated && !obs.SandboxStarted {
 		return errObservedMismatch("filesystem_isolated", true, obs.SandboxStarted)
 	}
@@ -282,29 +341,18 @@ func (f ExecutionFacts) ValidateObservedConsistency() error {
 			return errObservedMismatch("filesystem_isolated", false, obs.SandboxStarted)
 		}
 	}
-	// Network none is the security-critical direction for runtimes that can
-	// deny networking (container). Claiming none while the runtime entered
-	// a connected namespace would let Kiwi sign "network denied" over a
-	// receipt that says otherwise. Tart cannot deny networking (and refuses
-	// the policy at start), so a tart receipt always reports vm-nat; that
-	// combination is already refused because effective none would demand
-	// observed none.
-	if f.Runtime == RuntimeFactContainer || f.Runtime == RuntimeFactTart {
+	// Policy none on a runtime that CAN deny networking (container) must be
+	// corroborated by the receipt. Tart cannot deny networking (and refuses
+	// the policy at start). Native policy none is allowed and is NOT proof of
+	// denial — NetworkAccessDenied already stays false for native/host.
+	if f.Runtime == RuntimeFactContainer {
 		if f.NetworkMode == NetworkModeFactNone && obs.NetworkEnforced != ObservedNetworkNone {
 			return errObservedMismatch("network_mode", f.NetworkMode, obs.NetworkEnforced)
 		}
-		// The reverse direction: a receipt that reports no network must not
-		// sit under an effective claim of unrestricted internet. services is
-		// compatible (services-only with no declared services disables all
-		// egress at the runtime).
 		if obs.NetworkEnforced == ObservedNetworkNone && f.NetworkMode == NetworkModeFactInternet {
 			return errObservedMismatch("network_mode", f.NetworkMode, obs.NetworkEnforced)
 		}
 	}
-	// Read-only root: the receipt is the only surface that records it today.
-	// When the effective vector claims isolation the receipt must be a real
-	// sandbox start (checked above); RootFilesystemReadOnly itself is an
-	// observation with no effective counterpart yet, so it is not compared.
 	return nil
 }
 
@@ -325,16 +373,19 @@ func (e *ObservedConsistencyError) Error() string {
 }
 
 // ApplyObservedControl attaches the executor-observed enforcement receipt and
-// derives the attempt-specific enforcement facts from it. WorkspaceQuotaEnforced
-// is copied from the receipt's hard-quota observation and is NEVER manufactured
-// from the requested limit. The result is then cross-validated; a contradictory
-// receipt is rejected rather than signed.
+// derives the attempt-specific PROVEN enforcement facts from it (schema v6):
+// WorkspaceQuotaEnforced and NetworkAccessDenied are copied from the receipt's
+// observations and are NEVER manufactured from the requested policy or limit.
+// The result is then cross-validated; a contradictory receipt is rejected
+// rather than signed.
 func (f *ExecutionFacts) ApplyObservedControl(r *ExecutionControlReceipt) error {
 	f.Observed = r
 	if r != nil {
 		f.WorkspaceQuotaEnforced = r.WorkspaceQuotaEnforced
+		f.NetworkAccessDenied = r.NetworkEnforced == ObservedNetworkNone
 	} else {
 		f.WorkspaceQuotaEnforced = false
+		f.NetworkAccessDenied = false
 	}
 	return f.ValidateObservedConsistency()
 }
@@ -439,10 +490,41 @@ func (a ExecutionAssurance) Valid() bool {
 }
 
 // DeriveAssuranceProfile derives the profile label from the authoritative
-// fact vector. The function is total and deterministic; it is the ONLY
-// derivation rule, shared by evidence builders and verifiers, so a signed
-// profile can never disagree with its signed facts.
+// fact vector under SCHEMA v6 semantics. Network-denied and sealed profiles
+// require the PROVEN NetworkAccessDenied fact — never the policy field alone.
+// The function is total and deterministic; it is the ONLY derivation rule for
+// current evidence, shared by builders and verifiers.
 func DeriveAssuranceProfile(f ExecutionFacts) ExecutionAssurance {
+	if !f.FilesystemIsolated {
+		return AssuranceUncontrolled
+	}
+	if f.KiwiSecretsInjected || f.HostEnvironmentInherited {
+		return AssuranceIsolatedFilesystem
+	}
+	if f.DeclaredAuthorityMediated {
+		if f.NetworkAccessDenied && f.ImagesDigestPinned {
+			return AssuranceSealedPinnedNoNetwork
+		}
+		return AssuranceKiwiMediatedAuthority
+	}
+	if f.NetworkAccessDenied {
+		return AssuranceNetworkDenied
+	}
+	return AssuranceNoInjectedCredentials
+}
+
+// DeriveAssuranceProfileSchema derives the profile under the semantics of a
+// specific attestation schema version. Schema 5 froze "network denied" as the
+// POLICY field (network_mode == none); schema 6 requires the proven
+// NetworkAccessDenied fact. Verifiers MUST use this so a historical v5
+// statement is never reinterpreted under the stronger v6 rule (and vice
+// versa).
+func DeriveAssuranceProfileSchema(schema int, f ExecutionFacts) ExecutionAssurance {
+	if schema >= 6 {
+		return DeriveAssuranceProfile(f)
+	}
+	// Historical v5 (and the v4 name-only block, which never carried facts):
+	// the policy field is what the profile was derived from at signing time.
 	if !f.FilesystemIsolated {
 		return AssuranceUncontrolled
 	}
@@ -493,6 +575,33 @@ const (
 	// EffectsOpaqueExternal is the opaque_external class.
 	EffectsOpaqueExternal ExternalEffectsClass = "opaque_external"
 )
+
+// ValidateExternalEffects checks that a signed effects class is consistent
+// with the proven fact vector. "pure" asserts no egress and no declared
+// external authority — it is only true when NetworkAccessDenied is proven
+// (never from policy alone). Signing and verification call this so a
+// statement cannot claim pure next to facts that do not prove denial.
+func ValidateExternalEffects(f ExecutionFacts, c ExternalEffectsClass) error {
+	if !c.Valid() {
+		return fmt.Errorf("model: undefined external effects class %q", string(c))
+	}
+	if c == EffectsPure {
+		if !f.NetworkAccessDenied {
+			return fmt.Errorf("model: external effects class pure requires proven network_access_denied (policy none is not enough)")
+		}
+		if f.KiwiSecretsInjected || f.HostEnvironmentInherited {
+			return fmt.Errorf("model: external effects class pure requires an empty secret allowlist and a clean environment")
+		}
+	}
+	if c == EffectsOpaqueExternal {
+		return nil
+	}
+	// kiwi_mediated / pure both require a sandbox boundary.
+	if !f.FilesystemIsolated {
+		return fmt.Errorf("model: external effects class %s requires filesystem isolation", c)
+	}
+	return nil
+}
 
 // Valid reports whether c is one of the defined classes.
 func (c ExternalEffectsClass) Valid() bool {

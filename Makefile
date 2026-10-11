@@ -1,7 +1,7 @@
 .PHONY: build test test-unit test-race test-integration integration test-adversarial test-shuffle test-stress \
 	fuzz coverage coverage-ci coverage-floor coverage-package-floor staticcheck govulncheck cross schema-check surface-check dockerfile-buildargs-check docs-check license-check license-notice repro-build \
 	toolchain-check tla2tools fmt lint run clean protect-branch \
-	dogfood-fast dogfood-local dogfood-distributed dogfood-adversarial dogfood-upgrade dogfood-scale dogfood-release dogfood-all
+	dogfood-fast dogfood-local dogfood-system dogfood-distributed dogfood-adversarial dogfood-upgrade dogfood-scale dogfood-release dogfood-all
 
 VERSION ?= 0.1.0-dev
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -70,7 +70,7 @@ test-antagonistic: test-unit test-race test-adversarial test-stress test-single-
 # TestDFQUOTA*/...; the -run filters below match those names
 # the stable contract with that package (scenario IDs in docs/DOGFOOD.md).
 # ---------------------------------------------------------------------------
-.PHONY: dogfood-fast dogfood-local dogfood-distributed dogfood-adversarial \
+.PHONY: dogfood-fast dogfood-local dogfood-system dogfood-distributed dogfood-adversarial \
 	dogfood-upgrade dogfood-scale dogfood-release dogfood-all
 
 # Every dogfood target runs through scripts/dogfood-run.sh, which FAILS
@@ -121,10 +121,11 @@ dogfood-local:
 		--require TestDogfoodResultJSONShape \
 		--require TestScenarioResultRejectsHiddenRetries
 
-# DF2 distributed topology: harness topology shapes plus every multi-party
-# proof that does not need a live external process. Live multi-process DF2
-# (real postgres/objectstore/two runners) is the next wave — see
-# docs/DOGFOOD.md "Implemented vs planned".
+# DF2 distributed topology — MODEL proofs only (internal/dogfood harness).
+# These are topology shapes plus every multi-party proof that does not need
+# a live external process; they are NOT live multi-process DF2. Live
+# multi-process DF2 (real postgres/objectstore/two runners) is the next wave
+# and is NOT run here — see docs/DOGFOOD.md "Implemented vs planned".
 dogfood-distributed:
 	./scripts/dogfood-run.sh 90m \
 		--run 'TestDFBOOT|TestDFLEASE|TestDFEVID|TestDFQUOTA|TestDFEFFECT|TestTopology' \
@@ -183,6 +184,15 @@ dogfood-scale:
 # evidence truthfulness, quota, effects, self-host generation limit.
 # Install-from-artifact and full G0→G1→G2 binary self-build are next wave.
 dogfood-release:
+	@echo "RELEASE DOGFOOD — remaining production scenarios still MISSING:"
+	@echo "  DF-DIST-001     live multi-process topology (postgres/objectstore/2 runners)"
+	@echo "  DF-UPGRADE-002  N-1 binary matrix"
+	@echo "  DF-SCALE-002    live resource-leak / soak"
+	@echo "  DF-RELEASE-001  exact packaged artifact lifecycle"
+	@echo "  DF-DR-001       backup → destroy → restore"
+	@echo "  DF-SELF-002     G1→G2 binary self-build"
+	@echo "  (DF1 system proofs are real: make dogfood-system — NewPersistent + HTTP + runner)"
+	@echo "Running the implemented model/release-contract suite anyway:"
 	./scripts/dogfood-run.sh 180m \
 		--run 'TestDFEVID|TestDFQUOTA|TestDFEFFECT|TestDFSELF|TestDFBOOT|TestDogfoodResult|TestScenarioResult' \
 		--require TestDFEVID001 \
@@ -197,9 +207,34 @@ dogfood-release:
 		--require TestDFBOOT001 \
 		--require TestDogfoodResultJSONShape
 
-# Full product dogfood (DF1–DF7). dogfood-fast is a strict subset of
-# dogfood-local and is not repeated here; DF0 is .kiwi/pipeline.yaml.
-dogfood-all: dogfood-local dogfood-distributed dogfood-adversarial dogfood-upgrade dogfood-scale dogfood-release
+# SYSTEM-species product dogfood: real NewPersistent server, real HTTP API,
+# real runner.Run (or real register/next/complete) — not the in-memory model
+# harness. Fail-closed arms (stale lease generation, untrusted hard-quota
+# gate, untrusted rootless floor) always run. Success-path arms (boot/restart,
+# evidence) run untrusted container work when rootless Docker satisfies the
+# untrusted policy floor, and otherwise run TRUSTED native work through the
+# product trusted ingress (signed GitHub webhook / trusted schedule) — so
+# they execute on this host rather than skipping. They are name-required so
+# the suite cannot silently lose them.
+dogfood-system:
+	./scripts/dogfood-run.sh 120s \
+		--run 'TestSys' \
+		--require TestSysDFBoot001 \
+		--require TestSysDFEvid001 \
+		--require TestSysDFLease001 \
+		--require TestSysQuotaGate \
+		--require TestSysRootlessEnforced \
+		--require TestSysTrustedIngress \
+		--require TestSysTrustedScheduleIngress \
+		-- ./internal/dogfood/system/
+
+# All currently implemented dogfood suites (DF1–DF7 entry points) plus the
+# SYSTEM-species product proofs. Model suites remain the state-machine
+# oracle; dogfood-system is the production HTTP/store/runner path. Live
+# multi-process DF2 (postgres/objectstore) stays in docs/DOGFOOD.md
+# "Implemented vs planned". dogfood-fast is a strict subset of dogfood-local
+# and is not repeated here; DF0 is .kiwi/pipeline.yaml.
+dogfood-all: dogfood-local dogfood-system dogfood-distributed dogfood-adversarial dogfood-upgrade dogfood-scale dogfood-release
 
 # staticcheck-all is the CI check: it is exactly the pinned command run by
 # .woodpecker/linux-amd64.yml. `staticcheck` runs the same pinned command
