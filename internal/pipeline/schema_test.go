@@ -453,7 +453,10 @@ func TestKnownFieldTablesMatchStructTags(t *testing.T) {
 }
 
 func TestRepoPipelineFilesSatisfySchema(t *testing.T) {
-	for _, path := range []string{"../../.kiwi/pipeline.yaml", "../../examples/kiwi.yaml"} {
+	for _, path := range []string{"../../.kiwi/pipeline.yaml", "../../examples/kiwi.yaml",
+		"../../.kiwi/dogfood/local.yaml", "../../.kiwi/dogfood/distributed.yaml",
+		"../../.kiwi/dogfood/adversarial.yaml", "../../.kiwi/dogfood/upgrade.yaml",
+		"../../.kiwi/dogfood/scale.yaml", "../../.kiwi/dogfood/release.yaml"} {
 		b, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatalf("reading %s: %v", path, err)

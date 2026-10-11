@@ -38,6 +38,10 @@ type Harness struct {
 	ledger  []LedgerEntry
 	events  []EventEntry
 	clock   func() time.Time
+	// generation is the dogfood self-host generation (G0/G1/G2). The
+	// harness refuses anything past MaxDogfoodGeneration so a self-hosting
+	// pipeline cannot recurse without bound.
+	generation string
 }
 
 // Repo is a seeded source repository.
@@ -185,6 +189,45 @@ func (h *Harness) Restart() error {
 }
 
 // Namespace returns the invocation's isolation identity.
+// MaxDogfoodGeneration is the highest self-host generation the harness
+// records. G0 is the external bootstrap; each subsequent generation is a
+// Kiwi-built Kiwi. G3+ is unintended recursion and is refused.
+const MaxDogfoodGeneration = "G2"
+
+// BeginGeneration records the self-host generation under test. The first
+// call must be G0; later calls must be the next generation and must not
+// exceed MaxDogfoodGeneration (DF-SELF-001).
+func (h *Harness) BeginGeneration(gen string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	switch gen {
+	case "G0":
+		if h.generation != "" {
+			return fmt.Errorf("dogfood: generation already started at %s", h.generation)
+		}
+	case "G1":
+		if h.generation != "G0" {
+			return fmt.Errorf("dogfood: G1 requires G0 (have %q)", h.generation)
+		}
+	case "G2":
+		if h.generation != "G1" {
+			return fmt.Errorf("dogfood: G2 requires G1 (have %q)", h.generation)
+		}
+	default:
+		return fmt.Errorf("dogfood: generation %q is past the %s limit (refusing self-host recursion)", gen, MaxDogfoodGeneration)
+	}
+	h.generation = gen
+	h.ledger = append(h.ledger, LedgerEntry{Kind: "dogfood-generation", JobID: gen, At: h.clock()})
+	return nil
+}
+
+// Generation returns the current self-host generation ("" before Begin).
+func (h *Harness) Generation() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.generation
+}
+
 func (h *Harness) Namespace() Namespace { return h.ns }
 
 // Topology returns the declared shape under test.

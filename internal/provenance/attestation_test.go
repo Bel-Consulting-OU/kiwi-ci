@@ -604,3 +604,59 @@ func TestTestReportSuiteDigestBindsCases(t *testing.T) {
 		t.Fatal("delivery metadata leaked into the suite digest")
 	}
 }
+
+// TestVerifyExecutionAttestationV4WithFactsStillValidates: a legacy v4 block
+// that carries a facts object must not bypass the consistency gate.
+func TestVerifyExecutionAttestationV4WithFactsStillValidates(t *testing.T) {
+	// Build a v5 statement, then force schema 4 and a contradictory facts
+	// pair; the subject digest is recomputed so the only failure left is the
+	// semantic one.
+	in := attestationTestInput()
+	in.ExecutionAssuranceFacts = model.ExecutionFacts{
+		Runtime:            model.RuntimeFactContainer,
+		FilesystemIsolated: true,
+		NetworkMode:        model.NetworkModeFactNone,
+		Observed: &model.ExecutionControlReceipt{
+			Runtime:         "docker",
+			SandboxStarted:  true,
+			NetworkEnforced: model.ObservedNetworkContainerNamespace,
+		},
+	}
+	// Contradictory pair: signing must already refuse.
+	if _, err := ExecutionAttestationStatement(in); err == nil {
+		t.Fatal("contradictory facts must fail statement construction")
+	}
+
+	// Craft a v4-shaped envelope whose facts block is contradictory and
+	// whose subject digest is rebuilt so only the semantic check can catch it.
+	base := attestationTestInput()
+	st, err := ExecutionAttestationStatement(base)
+	if err != nil {
+		t.Fatalf("statement: %v", err)
+	}
+	att := *st.Attestation
+	att.SchemaVersion = 4
+	f := *att.ExecutionAssurance.Facts
+	f.NetworkMode = model.NetworkModeFactNone
+	f.Observed = &model.ExecutionControlReceipt{
+		Runtime:         "docker",
+		SandboxStarted:  true,
+		NetworkEnforced: model.ObservedNetworkContainerNamespace,
+	}
+	// Keep level/name as the v4 legacy vocabulary for level 0/1 so the name
+	// check can pass and the facts check is the one that fires.
+	att.ExecutionAssurance = ExecutionAssuranceEvidence{
+		Level: 1,
+		Name:  legacyAssuranceNamesV4[1],
+		Facts: &f,
+	}
+	digest, err := ExecutionAttestationDigest(att)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	st.Attestation = &att
+	st.Subject = []Subject{{Digest: map[string]string{"sha256": digest}}}
+	if err := VerifyExecutionAttestation(st); err == nil {
+		t.Fatal("v4 envelope with contradictory facts must be refused")
+	}
+}

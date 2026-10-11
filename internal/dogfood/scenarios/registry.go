@@ -44,6 +44,26 @@ const (
 	// requires a hard workspace quota is REJECTED when no hard quota is
 	// available (table-driven unit of the gate).
 	ScenarioQuotaUntrustedGate ScenarioID = "DF-QUOTA-001"
+
+	// ScenarioEffectWinnerOnce is DF-EFFECT-001: the authorized winner's
+	// external effect lands exactly once (fake sink ledger is the authority).
+	ScenarioEffectWinnerOnce ScenarioID = "DF-EFFECT-001"
+	// ScenarioEffectLoserZero is DF-EFFECT-002: speculative losers and
+	// stale-generation holders produce zero external effects.
+	ScenarioEffectLoserZero ScenarioID = "DF-EFFECT-002"
+
+	// ScenarioSelfGenLimit is DF-SELF-001: the harness records G0/G1/G2 and
+	// refuses unintended recursion past the explicit generation limit.
+	ScenarioSelfGenLimit ScenarioID = "DF-SELF-001"
+
+	// ScenarioUpgradeEvidenceCompat is DF-UPGRADE-001: evidence from an
+	// older schema still verifies; contradictory facts are refused on every
+	// schema.
+	ScenarioUpgradeEvidenceCompat ScenarioID = "DF-UPGRADE-001"
+
+	// ScenarioScaleFixedWorkload is DF-SCALE-001: a fixed high-volume
+	// lifecycle with attempt accounting and no hidden retries.
+	ScenarioScaleFixedWorkload ScenarioID = "DF-SCALE-001"
 )
 
 // Entry is one registry row: the stable identity, what each arm proves, and
@@ -111,6 +131,37 @@ var Registry = []Entry{
 		Name:        "untrusted hard-quota admission gate",
 		PositiveArm: "hard quota available → untrusted container job admitted",
 		NegativeArm: "hard quota required and unavailable → execution rejected before checkout",
+	},
+
+	{
+		ID:          ScenarioEffectWinnerOnce,
+		Name:        "authorized winner external effect exactly once",
+		PositiveArm: "winner's capability produces exactly one sink row",
+		NegativeArm: "a second effect without reauthorization is refused",
+	},
+	{
+		ID:          ScenarioEffectLoserZero,
+		Name:        "loser and stale runner external effect zero",
+		PositiveArm: "sink ledger stays empty for losers/stale holders",
+		NegativeArm: "eight-oracle agreement on zero effects",
+	},
+	{
+		ID:          ScenarioSelfGenLimit,
+		Name:        "self-host generation limit",
+		PositiveArm: "G0, G1, G2 are recorded",
+		NegativeArm: "G3+ is refused",
+	},
+	{
+		ID:          ScenarioUpgradeEvidenceCompat,
+		Name:        "cross-version evidence compatibility",
+		PositiveArm: "legacy schema evidence still verifies",
+		NegativeArm: "contradictory facts refused on every schema",
+	},
+	{
+		ID:          ScenarioScaleFixedWorkload,
+		Name:        "fixed high-volume lifecycle",
+		PositiveArm: "N attempts complete under one-attempt accounting",
+		NegativeArm: "hidden retries are non-green",
 	},
 }
 

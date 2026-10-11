@@ -1,0 +1,74 @@
+{
+  "name": "Kiwi CI",
+  "tagline": "Execution, with evidence.",
+  "campaign": "Run. Record. Verify.",
+  "productName": "Kiwi CI",
+  "shortName": "kiwi",
+  "colors": {
+    "ink": "#08110C",
+    "forest": "#143D2B",
+    "kiwi": "#68DC93",
+    "paper": "#F3F5EF",
+    "sage": "#92AA99"
+  },
+  "contrastPairs": {
+    "paperOnInk": "17.45:1",
+    "kiwiOnInk": "11.18:1",
+    "sageOnInk": "7.69:1",
+    "forestOnPaper": "11.04:1",
+    "kiwiOnPaper": "1.56:1",
+    "sageOnPaper": "2.27:1"
+  },
+  "typography": {
+    "sans": ["Inter", "400", "600", "700", "800"],
+    "mono": ["IBM Plex Mono", "400", "500"],
+    "roles": {
+      "marketingHero": { "size": 56, "lineHeight": 60, "weight": "700-800" },
+      "pageTitle": { "size": 32, "lineHeight": 38, "weight": 700 },
+      "sectionTitle": { "size": 24, "lineHeight": 30, "weight": 600 },
+      "body": { "size": 16, "lineHeight": 24, "weight": 400 },
+      "label": { "size": 13, "lineHeight": 18, "weight": "400-600" },
+      "technical": { "size": 14, "lineHeight": 21, "weight": "400-500", "family": "IBM Plex Mono" }
+    }
+  },
+  "layout": {
+    "subgrid": 4,
+    "baseRhythm": 8,
+    "panelPadding": "16-24px",
+    "radii": "8-12px",
+    "focusRing": 2,
+    "hitArea": "44x44px"
+  },
+  "voice": {
+    "verbs": ["Run pipeline", "View evidence", "Replay job", "Verify signature"],
+    "statusLabels": ["success", "failure", "queued", "running", "cancelled", "blocked"],
+    "rules": [
+      "Keep a test result separate from evidence integrity",
+      "Keep requested controls separate from effective facts and observed receipts",
+      "Signature verified and tests passed are two distinct results"
+    ]
+  },
+  "mark": {
+    "birdMinWidthPx": 32,
+    "lockupMinWidthPx": 160,
+    "faviconSizes": [16, 24, 32, 48],
+    "clearSpace": "H/4 around complete lockup (H = bird height including feet)",
+    "prohibitions": [
+      "gradients",
+      "outlines",
+      "glow",
+      "busy photography",
+      "UI status symbols inside the logo",
+      "recreating the wordmark by typing the name in the interface font"
+    ]
+  },
+  "motif": {
+    "name": "execution trace",
+    "description": "Sparse orthogonal trace lines outside the mark; a few nodes suggest records and causality. Decorative unless tied to real execution data."
+  },
+  "source": {
+    "document": "docs/brand/Kiwi_CI_Visual_Identity.pdf",
+    "date": "2026-10-11",
+    "baseline": "Bel-Consulting-OU/kiwi-ci @ d00ede206f17760ca3aac34851a6517b13ea3af9"
+  }
+}

@@ -269,12 +269,18 @@ func (f ExecutionFacts) ValidateObservedConsistency() error {
 			return errObservedMismatch("runtime", f.Runtime, obs.Runtime)
 		}
 	}
-	// Filesystem isolation ↔ sandbox started. A claimed isolation boundary
-	// the runtime did not start is a contradiction; a started sandbox on an
-	// effective vector that claims none is refused by Valid() already for
-	// native, and is meaningless for unknown.
+	// Filesystem isolation ↔ sandbox started (both directions on a known
+	// sandboxed runtime). A claimed isolation boundary the runtime did not
+	// start is an overclaim; a started sandbox the effective vector denies
+	// is the matching underclaim/contradiction. Native is already refused by
+	// Valid() when it claims isolation; unknown cannot claim isolation.
 	if f.FilesystemIsolated && !obs.SandboxStarted {
 		return errObservedMismatch("filesystem_isolated", true, obs.SandboxStarted)
+	}
+	if obs.SandboxStarted && !f.FilesystemIsolated {
+		if f.Runtime == RuntimeFactContainer || f.Runtime == RuntimeFactTart {
+			return errObservedMismatch("filesystem_isolated", false, obs.SandboxStarted)
+		}
 	}
 	// Network none is the security-critical direction for runtimes that can
 	// deny networking (container). Claiming none while the runtime entered

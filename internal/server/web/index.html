@@ -3,14 +3,21 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Kiwi CI — Execution, with evidence.">
+<meta name="theme-color" content="#08110C">
 <title>Kiwi CI</title>
+<link rel="icon" href="/static/favicon.png" type="image/png">
 <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
 <header>
-  <div class="mark">K</div>
-  <div class="brand">Kiwi CI</div>
-  <div class="subtitle">control plane dashboard</div>
+  <a class="brand-lockup" href="/" aria-label="Kiwi CI">
+    <!-- Primary lockup artwork from docs/brand/Kiwi_CI_Visual_Identity.pdf.
+         Do not redraw or retype the wordmark. -->
+    <img class="mark" src="/static/logo-lockup-dark.png" width="172" height="37" alt="kiwi CI">
+    <div class="brand-tagline">Execution, with evidence.</div>
+  </a>
+  <div class="subtitle">control plane</div>
   <div class="spacer"></div>
   <span id="conn" class="pill hidden">offline</span>
   <form id="login" class="login">

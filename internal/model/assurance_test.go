@@ -302,3 +302,21 @@ func TestApplyObservedControlNeverManufacturesEnforcement(t *testing.T) {
 		t.Fatalf("hard receipt dropped enforcement: %+v", f)
 	}
 }
+
+// TestValidateObservedConsistencyIsolationBidirectional: a started sandbox
+// under an effective vector that denies isolation is the matching reverse
+// contradiction and must be refused on container/tart.
+func TestValidateObservedConsistencyIsolationBidirectional(t *testing.T) {
+	f := ExecutionFacts{
+		Runtime:            RuntimeFactContainer,
+		FilesystemIsolated: false,
+		NetworkMode:        NetworkModeFactNone,
+		Observed:           &ExecutionControlReceipt{Runtime: "docker", SandboxStarted: true, NetworkEnforced: ObservedNetworkNone},
+	}
+	if err := f.ValidateObservedConsistency(); err == nil {
+		t.Fatal("sandbox started under a non-isolated effective claim must be refused")
+	}
+	if f.Valid() {
+		t.Fatal("Valid() must refuse sandbox-started without FilesystemIsolated on container")
+	}
+}

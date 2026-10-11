@@ -49,8 +49,19 @@ authority is involved, at least one negative scenario.
 
 ## Public-surface → scenario mapping
 
-Machine-readable form is checked by `surfacecheck`. A new public capability
-must map to dogfood scenario IDs or carry an explicit exemption.
+Scenario IDs use the `DF-<FAMILY>-<NNN>` taxonomy. Families currently in
+the registry: `BOOT`, `EVID`, `LEASE`, `QUOTA`, `EFFECT`, `SELF`, `UPGRADE`,
+`SCALE`. Matrix rows may also name planned families (`LIFE`, `RACE`, `ART`,
+`CACHE`, `REPLAY`, `POLICY`, `SNAP`, `CAP`, `CHAOS`, `DIST`, `DR`, `RELEASE`,
+`FORGE`, `AUTH`, `DAG`, `SCHED`, `RUNNER`, `EXEC`, `EVENT`, `SPEC`) — those
+are roadmap IDs and are not yet executable proofs.
+
+
+A new public capability must map to dogfood scenario IDs or carry an
+explicit exemption. Review enforces this today; an automated surfacecheck
+gate over this file is planned. IDs below that are not yet in
+`internal/dogfood/scenarios/registry.go` are **planned** rows — the
+implemented registry is the source of truth for what runs green.
 
 ```yaml
 run.create:
@@ -191,12 +202,12 @@ Example top-level:
   "commit": "...",
   "release_artifact_digest": "...",
   "suite": "DF3",
-  "scenarios_total": 84,
-  "passed": 84,
+  "scenarios_total": 15,
+  "passed": 15,
   "failed": 0,
   "flaky_retries": 0,
-  "invariants_covered": 10,
-  "public_surfaces_covered": 57,
+  "invariants_covered": 8,
+  "public_surfaces_covered": 12,
   "evidence_verified": true
 }
 ```

@@ -73,42 +73,53 @@ test-antagonistic: test-unit test-race test-adversarial test-stress test-single-
 .PHONY: dogfood-fast dogfood-local dogfood-distributed dogfood-adversarial \
 	dogfood-upgrade dogfood-scale dogfood-release dogfood-all
 
+# Every dogfood target runs through scripts/dogfood-run.sh, which FAILS
+# CLOSED when the -run filter matches zero tests. Vacuous green is a defect,
+# not a quiet success. Scenario tests live under ./internal/dogfood/scenarios
+# as TestDFBOOT*/TestDFEVID*/TestDFLEASE*/TestDFQUOTA*/TestDFEFFECT*/TestDFSELF*.
+#
+# Suites whose scenarios are not yet implemented name their planned filter
+# anyway: the target goes red until the tests exist. That is the contract.
+
 # PR gate: DF0 (CI runs .kiwi/pipeline.yaml itself) + DF1 critical path
-# (boot, evidence, lease). Keep this filter small — it blocks every PR.
+# (boot, evidence, lease, quota). Keep this filter small — it blocks every PR.
 dogfood-fast:
-	go test ./internal/dogfood/... -run 'TestDFBOOT|TestDFEVID|TestDFLEASE|TestDFQUOTA' -count=1 -timeout=20m
+	./scripts/dogfood-run.sh 20m 'TestDFBOOT|TestDFEVID|TestDFLEASE|TestDFQUOTA'
 
-# DF1 local product lifecycle: fresh up → auth → submit → execute → logs →
-# artifact → cache → evidence → verify → restart → historical query →
-# replay → clean shutdown.
+# DF1 local product lifecycle (harness-level boot/restart/evidence/lease/
+# quota plus the oracle and no-hidden-retry guards).
 dogfood-local:
-	go test ./internal/dogfood/... -run 'TestDFBOOT|TestDFEVID|TestDFLEASE|TestDFQUOTA|TestEightOracle|TestNoHiddenRetries|TestNamespaceIsolation|TestFaultPoints' -count=1 -timeout=60m
+	./scripts/dogfood-run.sh 60m 'TestDFBOOT|TestDFEVID|TestDFLEASE|TestDFQUOTA|TestDFEFFECT|TestDFSELF|TestDFSCALE|TestEightOracle|TestNoHiddenRetries|TestNamespace|TestFaultPoints|TestDogfoodResult|TestScenarioResult'
 
-# DF2 distributed topology: server + postgres + objectstore + runnerA/B +
-# docker executor + external client (see .kiwi/dogfood/distributed.yaml).
+# DF2 distributed topology: the harness topology checks plus every
+# multi-party scenario that does not require a live external process.
+# Live multi-process DF2 (real postgres/objectstore/two runners) is the
+# next implementation wave — see docs/DOGFOOD.md "Implemented vs planned".
 dogfood-distributed:
-	go test ./internal/dogfood/... -run 'TestDFBOOT|TestDFLEASE|TestDFEVID|TestDFQUOTA' -count=1 -timeout=90m
+	./scripts/dogfood-run.sh 90m 'TestDFBOOT|TestDFLEASE|TestDFEVID|TestDFQUOTA|TestDFEFFECT|TestTopology'
 
-# DF3 nightly chaos: kill server/runner/PG/objectstore, partition, lease
-# expiry, duplicate messages, hostile-runner receipts. Safety AND liveness.
+# DF3 nightly chaos: lease races, hostile-runner receipts, deterministic
+# fault windows. Safety AND liveness (stale rejected, live holder completes).
 dogfood-adversarial:
-	go test ./internal/dogfood/... -run 'TestDFLEASE|TestDFEVID|TestDFQUOTA|TestEightOracle|TestNoHiddenRetries|TestFaultPoints' -count=1 -timeout=180m
+	./scripts/dogfood-run.sh 180m 'TestDFLEASE|TestDFEVID|TestDFQUOTA|TestDFEFFECT|TestEightOracle|TestNoHiddenRetries|TestFaultPoints|TestNewModeMatrix|TestExpectationsAreLayered' ./internal/dogfood/...
 
-# DF4 cross-version: server N + runner N/N-1, verifier N vs evidence N/N-1,
-# DB migrated from N-1 (see .kiwi/dogfood/upgrade.yaml).
+# DF4 cross-version: schema/semantics compatibility checks the verifier and
+# engine already pin. Live N-1 binary matrix is the next wave.
 dogfood-upgrade:
-	go test ./internal/dogfood/... -run 'TestDFUPGRADE|TestDFBOOT' -count=1 -timeout=90m
+	./scripts/dogfood-run.sh 90m 'TestDFUPGRADE|TestVerifyExecutionAttestationSchema|TestExecutionAttestationAcceptsLegacy' ./internal/dogfood/... ./internal/provenance/
 
-# DF6 fixed-workload soak: 10000 short jobs, 1000 DAGs, 100 reconnects,
-# 100 restarts. The constants live in internal/dogfood/scenarios so this
-# target and the result bundle cannot disagree.
+# DF6 fixed-workload soak: harness-level high-volume lifecycle and churn.
+# The 10000-job / multi-process constants live in docs/DOGFOOD.md as the
+# target workload for the live soak once DF2 is online.
 dogfood-scale:
-	go test ./internal/dogfood/... -run 'TestDFSCALE|TestDFBOOT' -count=1 -timeout=240m
+	./scripts/dogfood-run.sh 240m 'TestDFSCALE|TestDogfoodResult|TestScenarioResult|TestNamespace'
 
-# DF7 release-candidate closure: install the exact release artifact,
-# self-build G0→G1→G2, distributed, evidence, replay, upgrade, DR, uninstall.
+# DF7 release-candidate closure: evidence + quota truthfulness + hostile
+# rejection + result-bundle seal — the pieces that gate a release today.
+# Install-from-artifact and G0→G1→G2 self-build require a packaged binary
+# and are the next wave (docs/DOGFOOD.md).
 dogfood-release:
-	go test ./internal/dogfood/... -run 'TestDF_RELEASE|TestDF_SELF|TestDF_DR|TestDFUPGRADE|TestDFBOOT|TestDF_DIST|TestDF_EVID|TestDF_REPLAY' -count=1 -timeout=180m
+	./scripts/dogfood-run.sh 180m 'TestDFEVID|TestDFQUOTA|TestDFEFFECT|TestDFSELF|TestDFBOOT|TestDogfoodResult|TestScenarioResult'
 
 # Full product dogfood (DF1–DF7). dogfood-fast is a strict subset of
 # dogfood-local and is not repeated here; DF0 is .kiwi/pipeline.yaml.
@@ -231,6 +242,13 @@ docs-check:
 	test -f SECURITY.md
 	test -f CONTRIBUTING.md
 	test -f docs/production-deployment.md
+	test -f docs/brand/Kiwi_CI_Visual_Identity.pdf
+	test -f docs/brand/README.md
+	test -f docs/brand/assets/brand-tokens.json
+	test -f docs/brand/assets/logo-mark.png
+	test -f docs/brand/assets/logo-lockup.png
+	test -f docs/brand/assets/logo-lockup-dark.png
+	test -f docs/brand/assets/favicon.png
 	@# No stale references to abandoned CI systems.
 	@! grep -rn "github/workflows/native" README.md docs/ CONTRIBUTING.md .woodpecker/ 2>/dev/null
 	@! grep -rn "placeholder address" SECURITY.md 2>/dev/null

@@ -575,6 +575,14 @@ func VerifyExecutionAttestation(st Statement) error {
 		if evidence.Name != name {
 			return fmt.Errorf("provenance: execution attestation assurance name %q does not match legacy level %d (%s)", evidence.Name, evidence.Level, name)
 		}
+		// A v4 envelope that still carries a facts block must not smuggle a
+		// self-contradictory vector past the consistency gate: validate the
+		// block whenever it is present, regardless of schema version.
+		if evidence.Facts != nil {
+			if !evidence.Facts.Valid() {
+				return fmt.Errorf("provenance: execution attestation carries invalid execution facts")
+			}
+		}
 	} else {
 		if evidence.Facts == nil {
 			return fmt.Errorf("provenance: execution attestation carries no execution facts")

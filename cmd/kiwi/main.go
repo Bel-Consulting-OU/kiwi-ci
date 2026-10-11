@@ -311,7 +311,10 @@ func configCommand(ctx context.Context, args []string) error {
 
 func usage() {
 	out := flag.CommandLine.Output()
-	fmt.Fprintln(out, `Kiwi CI — local-first CI/CD for fast, reproducible builds.
+	fmt.Fprintln(out, `Kiwi CI — Execution, with evidence.
+Run. Record. Verify.
+
+Local-first CI/CD engine: one binary is the CLI, control plane, and runner.
 
 Usage:
   kiwi init     [--force] [-f .kiwi/pipeline.yaml]
@@ -350,5 +353,6 @@ Design goals:
   • native/container/Tart backends
   • first-class cache, artifacts, retries, cancellation, secrets and provenance
   • explainable scheduling instead of opaque YAML behavior
+  • signed execution records: a signature verifies the record, tests report outcomes
   • no mandatory cloud service`)
 }

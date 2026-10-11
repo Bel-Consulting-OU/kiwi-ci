@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 )
@@ -168,5 +169,53 @@ func TestDashboardStaleResponseGuards(t *testing.T) {
 	}
 	if strings.Contains(js, ".innerHTML") || strings.Contains(js, "outerHTML") {
 		t.Error("app.js assigns innerHTML/outerHTML; the dashboard renders via textContent/createElement")
+	}
+}
+
+// TestDashboardBrandAssets pins the visual-identity surface of the dashboard:
+// the primary lockup artwork, favicon, and palette tokens from
+// docs/brand/Kiwi_CI_Visual_Identity.pdf are embedded, linked, and used with
+// the documented descriptor. The wordmark is the selected document artwork
+// (PNG), never redrawn or retyped in the interface font.
+func TestDashboardBrandAssets(t *testing.T) {
+	// Brand marks are the selected artwork extracted from the identity PDF.
+	for _, asset := range []string{"logo-mark.png", "logo-lockup-dark.png", "favicon.png"} {
+		raw, err := Assets.ReadFile(asset)
+		if err != nil {
+			t.Fatalf("read embedded %s: %v", asset, err)
+		}
+		if len(raw) < 100 || !bytes.HasPrefix(raw, []byte("\x89PNG")) {
+			t.Errorf("%s is not a PNG extracted from the identity document", asset)
+		}
+	}
+	read := func(name string) string {
+		t.Helper()
+		raw, err := Assets.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read embedded %s: %v", name, err)
+		}
+		return string(raw)
+	}
+	// Identity palette solids must appear in the stylesheet.
+	css := read("app.css")
+	for _, hex := range []string{"#08110c", "#143d2b", "#68dc93", "#f3f5ef", "#92aa99"} {
+		if !strings.Contains(strings.ToLower(css), hex) {
+			t.Errorf("app.css does not define brand color %s", hex)
+		}
+	}
+	html := read("index.html")
+	for _, want := range []string{
+		"/static/logo-lockup-dark.png",
+		"/static/favicon.png",
+		"Execution, with evidence.",
+	} {
+		if !strings.Contains(html, want) {
+			t.Errorf("index.html does not reference %q", want)
+		}
+	}
+	// Lockup artwork carries the wordmark; the page must not retype it as
+	// heading/body copy next to the image.
+	if strings.Contains(html, ">kiwi CI<") {
+		t.Error("index.html retypes the kiwi CI wordmark; use the lockup artwork")
 	}
 }

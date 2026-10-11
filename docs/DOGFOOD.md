@@ -121,9 +121,11 @@ modes live in `internal/dogfood/hostile`:
 ```text
 stale-generation · duplicate completion · wrong-runtime receipt
 contradictory assurance · artifact hash liar · late logger
-never-heartbeat · completion-before-artifact · artifact-after-completion
-wrong job · protocol downgrade
+never-heartbeat · completion-before-artifact · wrong job · protocol downgrade
 ```
+
+(`artifact-after-completion` is a planned mode; the implemented closed set is
+the ten names above, exercised by `TestNewModeMatrix`.)
 
 The server signature means: *Kiwi validated and accepted this evidence
 according to its trust model.* Malformed or self-contradictory runner
@@ -183,7 +185,7 @@ after-lease-expiration-before-reclaim
 Hooks pause; they never alter production semantics. Compiled/enabled only for
 dogfood.
 
-## Eighteen invariants get executable proofs
+## Invariants get executable proofs
 
 See `docs/INVARIANTS.md`. Each invariant gets:
 
@@ -204,7 +206,10 @@ exceed execution authority; untrusted execution cannot poison trusted cache.
 Machine-readable mapping: `public capability → dogfood scenario IDs`
 (`docs/DOGFOOD_MATRIX.md`). A new CLI/API/schema feature requires dogfood
 coverage or an explicit `dogfood_not_applicable: <reason>` that code review
-can challenge. `surfacecheck` enforces the mapping.
+can challenge. Enforce the mapping in review today; an automated
+`surfacecheck` gate for the matrix is planned (the existing surfacecheck
+guards cover DF0 pipeline markers, package test presence, and script
+inventory).
 
 ## Scenario IDs
 
@@ -238,6 +243,22 @@ DF-RELEASE-*    packaging
 
 IDs appear in scenario implementation, `DOGFOOD_MATRIX.md`, invariant mapping,
 CI output, and failure reports.
+
+## Implemented vs planned
+
+The harness, oracle, hostile runner, fakes and the scenario kernel below are
+**implemented and green** under `make dogfood-*`. Suites whose live
+multi-process topology (real postgres/objectstore, packaged-binary install,
+10k-job soak) is not yet online still run their harness-level proofs through
+`scripts/dogfood-run.sh`, which **fails closed** on a filter that matches
+zero tests.
+
+| Implemented now | Planned next wave |
+|---|---|
+| DF-BOOT-001, DF-EVID-001..005, DF-LEASE-001/002, DF-QUOTA-001, DF-EFFECT-001/002, DF-SELF-001 (G0/G1/G2 limit), DF-UPGRADE-001 (evidence compat), DF-SCALE-001 (harness workload) | live DF2 multi-process topology, DF3 process/network chaos, DF4 N-1 binary matrix, DF5 real-forge canary, DF6 10k-job soak, DF7 packaged-binary install |
+| G0/G1/G2 recursion refusal (`Harness.BeginGeneration`) | full G0→G1→G2 self-build of a release binary |
+| `dogfood-result.json` shape (`MarshalResult`, `TestDogfoodResultJSONShape`) | suite-level artifact emission of the result bundle on disk |
+| DF0 `.kiwi/pipeline.yaml` + dogfood YAML schema validation | surfacecheck gate over DOGFOOD_MATRIX.md |
 
 ## Highest-value initial set
 
@@ -378,18 +399,14 @@ with:
     ├── scale.yaml
     └── release.yaml
 
-internal/
-└── dogfood/
-    ├── harness/
-    ├── oracle/
-    ├── topology/
-    ├── fault/
-    ├── scenarios/
-    ├── hostile/
-    ├── fake_forge/
-    ├── fake_oidc/
-    ├── fake_deployment/
-    └── fixtures/
+internal/dogfood/                 package dogfood (harness/oracle/fault/…)
+├── harness.go oracle.go topology.go fault.go seed.go result.go namespace.go
+├── hostile/                      hostile runner modes
+├── fake_forge/ fake_oidc/ fake_deployment/
+└── scenarios/                    TestDF* scenario implementations + registry
+
+scripts/
+└── dogfood-run.sh                fail-closed suite runner (no vacuous green)
 
 docs/
 ├── DOGFOOD.md                    this file

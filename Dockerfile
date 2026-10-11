@@ -122,7 +122,7 @@ ARG COMMIT=unknown
 USER 65532:65532
 
 LABEL org.opencontainers.image.title="Kiwi CI" \
-      org.opencontainers.image.description="Single-binary CI/CD engine: CLI, control plane, and runner" \
+      org.opencontainers.image.description="Execution, with evidence. Single-binary CI/CD engine: CLI, control plane, and runner" \
       org.opencontainers.image.url="https://github.com/Bel-Consulting-OU/kiwi-ci" \
       org.opencontainers.image.source="https://github.com/Bel-Consulting-OU/kiwi-ci" \
       org.opencontainers.image.licenses="Apache-2.0" \
