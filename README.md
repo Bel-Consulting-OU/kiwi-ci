@@ -6,6 +6,16 @@ pipeline DAG locally and remotely, with first-class caches, artifacts,
 retries, cancellation, secrets, and an auditable execution boundary for
 untrusted code.
 
+Architecturally Kiwi is **deterministic execution, verification and
+evidence infrastructure built for dynamic workloads**: ordinary CI, build
+farms, verification and compliance pipelines are first-class consumers,
+and agent/automation workloads that need trustworthy, replayable,
+evidence-backed execution are another — a major one, not the product's
+identity. The guarantee vocabulary (execution-assurance levels, external
+effect classes, exact replay versus bit-reproducibility, and what Kiwi
+does not guarantee) is public in
+[docs/evidence-contract.md](docs/evidence-contract.md).
+
 ## What exists
 
 - **Pipeline language v1**: jobs with `needs` dependencies, matrices,
@@ -71,6 +81,21 @@ Check the host, then validate and run the example pipeline:
 
 `kiwi init` scaffolds a `.kiwi/pipeline.yaml` in the current
 repository.
+
+Or bring up the entire stack on one machine with zero configuration:
+
+```bash
+./kiwi up
+```
+
+`kiwi up` runs the control plane AND a local runner in one process, with
+the execution-event ledger, caches, artifacts, snapshots and signed
+evidence rooted in a single state directory (`~/.kiwi/up` by default; a
+bearer token is generated once and persisted there). It is dev-mode
+sugar over the same `kiwi server` + `kiwi runner` entry points — useful
+for local development, demos, and the local-model development loop —
+and deliberately not a production contract. See
+[Single-machine mode](#single-machine-mode-kiwi-up) for the flags.
 
 ## Server
 
@@ -152,6 +177,31 @@ ceilings are configurable under `[quota]` (`untrusted_cpu_ceiling`,
 environment variable; see
 [docs/pipeline-reference.md](docs/pipeline-reference.md#untrusted-ceilings).
 
+## Single-machine mode (`kiwi up`)
+
+```bash
+./kiwi up                                      # free loopback port, ~/.kiwi/up state
+./kiwi up --listen 127.0.0.1:8080 --data-dir /tmp/kiwi-stack
+./kiwi up --token "$MY_TOKEN" --labels local,darwin
+```
+
+One process runs the control plane and one local runner; Ctrl-C drains
+both. The command is intentionally minimal: no TLS, no PostgreSQL, no
+mTLS, no remote runners. It starts the SAME `app.Server` and
+`app.Runner` implementations the dedicated commands use, so the
+single-machine mode cannot drift into a second, weaker server. The state
+directory holds the durable state, the runner identity/cache tree, and
+(with no `--token`) the generated bearer token; `--listen` with no port
+(`127.0.0.1:0`) binds a concrete free port before startup, so a bare
+`kiwi up` never collides with another service. Both credential paths
+fail closed on tampering: the state directory must be a real directory
+owned by you (it is tightened to `0700`), a persisted token is adopted
+only when it is an owned `0600` regular file (a symlink, plantable file
+or wrong mode is refused with an actionable error), and the
+control-plane listener is bound by `kiwi up` itself before the server
+starts, so no other local process can take the port and receive the
+runner's bearer token.
+
 ## Runner
 
 ```bash
@@ -194,6 +244,7 @@ Manual dispatch:
 
 ```
 kiwi init | run | validate | explain [--why JOB] | doctor
+kiwi up [--listen ADDR] [--data-dir DIR] [--token TOKEN] [--labels L]
 kiwi server [--mode dev|production] [--config kiwi.toml]
 kiwi config check | kiwi database migrate|status
 kiwi runner [--server URL --token TOKEN] | kiwi runner list|drain|disable|enable
@@ -253,8 +304,12 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the component map and
 
 v0.1 development series. The core is a compiling, tested engine rather
 than a claim of feature parity with GitHub Actions or GitLab CI; the
-parts that exist are built as security boundaries first. See
-[ROADMAP.md](ROADMAP.md) for what is done and what remains.
+parts that exist are built as security boundaries first. The core
+abstractions are frozen (see
+[ROADMAP.md](ROADMAP.md#core-abstraction-freeze)): further work is
+performance, operability, UX and deployment quality rather than new
+core concepts. See [ROADMAP.md](ROADMAP.md) for what is done and what
+remains.
 
 ## Install
 

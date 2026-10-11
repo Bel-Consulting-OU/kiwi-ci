@@ -232,9 +232,9 @@ a weaker trust story.
 
 | Profile | Contents | Status |
 |---|---|---|
-| **minimal** | execution identity (repo/ref/commit, run/job/attempt), capsule digests, subject artifact digest, signature | available: the identities every statement already carries |
-| **standard** | minimal + assurance level/name and effects class, policy digest, evidence root, completion digest, observed runtime, graph fingerprint, event frontier, snapshot/report/suite references | implemented: the current execution attestation block (schema v4) |
-| **forensic** | standard + full event-ledger timeline reconstruction, artifact sidecar documents (provenance/SBOM/sigstore), report case digests, material hashes, retention watermarks | roadmap: the streams exist (`/api/v1/events`, artifact sidecar refs, suite digests) but are not yet materialized into one envelope |
+| **minimal** | execution identity (repo/ref/commit, run/job/attempt), capsule digests, subject artifact digest, signature | available as the identity subset every signed statement already carries; `?profile=minimal` serves that same signed envelope |
+| **standard** | minimal + assurance level/name and effects class, policy digest, evidence root, completion digest, observed runtime, graph fingerprint, event frontier, snapshot/report/suite references | implemented: the current execution attestation block (schema v4); the default profile (`?profile=standard`) |
+| **forensic** | standard + bounded event-ledger timeline, artifact sidecar references, report case counts, snapshot records, retention watermarks | implemented: `GET /api/v1/jobs/{id}/attestation?profile=forensic` returns the UNSIGNED `kiwi-ci/execution-evidence-bundle/v1` materialization (the embedded signed envelope plus the run-scoped timeline, digest/ref-only records and watermarks). Requires `execution.events:read` (run-scoped) in addition to `evidence:read`; the timeline is capped (`maxForensicEvents`) and truncation is reported |
 
 **Redaction rule — projection → canonicalization → signature.** A profile is
 a PROJECTION of durable evidence chosen BEFORE canonicalization. The
@@ -243,7 +243,11 @@ what the signature covers is exactly what the profile declares. There is no
 post-signature redaction: a statement with fields removed or altered is a
 different statement and no longer verifies against the original subject
 digest. A consumer that requires an unprojected field must fetch a richer
-profile, not strip one.
+profile, not strip one. The forensic bundle is a RETRIEVAL materialization,
+not a signed projection: the signed artifact remains the embedded envelope
+(whose digest the bundle carries), and every other bundle field is a digest
+or reference a consumer can recompute or re-fetch through its own authorized
+reads — Kiwi never mints a second statement at retrieval time.
 
 **Non-goal: secret values are never recorded.** Evidence records references,
 versions and digests — `secret.issued` carries the secret NAME and lease
@@ -309,6 +313,9 @@ kiwi verify --server https://kiwi.example.com --attestation <job-id>
 kiwi verify --trusted-key provenance.pub --attestation-file attestation.json
 # Verify artifact provenance by artifact ID and constrain the execution semantics.
 kiwi verify --server https://kiwi.example.com --execution-semantics kiwi.execution.v2 <artifact-id>
+# Fetch the forensic materialization (signed envelope + referenced streams).
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://kiwi.example.com/api/v1/jobs/<job-id>/attestation?profile=forensic"
 ```
 
 `kiwi verify` prints the verified identity, the execution semantics and the

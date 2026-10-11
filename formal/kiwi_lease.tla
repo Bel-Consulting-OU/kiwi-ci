@@ -28,12 +28,12 @@ EXTENDS Naturals, FiniteSets
 
 CONSTANTS
     Jobs,      \* bounded set of job identifiers, e.g. {"job-a", "job-b"}
-    Runners    \* bounded set of runner identifiers, e.g. {"runner-1"}
+    Runners,   \* bounded set of runner identifiers, e.g. {"runner-1", "runner-2"}
+    MaxGen     \* attempt bound: at most MaxGen generations per job
 
 \* MaxGen bounds the model: at most MaxGen attempts per job, so TLC's state
 \* space is finite. Cancel may bump a generation once past the last attempt,
 \* hence CancelRun is guarded by the same bound.
-MaxGen == 3
 
 VARIABLES
     gen,          \* gen[j]: newest issued generation of job j (attempt identity)
@@ -105,18 +105,28 @@ Complete(j, r, g, o) ==
 (* recorded so StaleOwnerCannotCommit can state that it can never later     *)
 (* appear in the committed ledger.                                          *)
 (*                                                                          *)
-(* `g <= gen[j]` is the attempt-identity abstraction: a request can only    *)
+(* `g <= gen[j]` is the attempt-identity abstraction: a request can only   *)
 (* carry a generation that was already issued. Forged FUTURE generations    *)
 (* are refused by the same fence in the implementation but are out of this  *)
 (* model's abstraction (like token hashes): recording them would let a      *)
 (* future lease legitimately issue the same generation and make a refused   *)
 (* record later commit, which is an artifact of the abstraction, not of the *)
 (* protocol.                                                                *)
+(*                                                                          *)
+(* The record must not already be committed: a late duplicate of the        *)
+(* attempt that DID commit is a receipt replay (idempotent acknowledgment,  *)
+(* I1), not a stale-owner refusal. Recording it as a refusal would make the *)
+(* refused set intersect the committed ledger through a representation      *)
+(* artifact while the protocol behaved correctly. The guard keeps `refused` *)
+(* to attempts that were refused INSTEAD of committing; those can never     *)
+(* later appear in `commits` because a generation that left the live state  *)
+(* is never re-created (Lease/Retry only advance the generation).           *)
 (***************************************************************************)
 StaleAttempt(j, r, g, o) ==
     /\ o \in Outcomes
     /\ g <= gen[j]
     /\ ~(status[j] = "running" /\ lease[j] = r /\ gen[j] = g)
+    /\ [job |-> j, runner |-> r, gen |-> g, outcome |-> o] \notin commits
     /\ refused' = refused \cup {[job |-> j, runner |-> r, gen |-> g, outcome |-> o]}
     /\ UNCHANGED <<gen, lease, status, commits, runCancelled>>
 

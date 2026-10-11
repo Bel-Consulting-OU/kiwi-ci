@@ -256,6 +256,86 @@ func TestNoStubMarkersInProductionCode(t *testing.T) {
 	}
 }
 
+// vendorSemanticsRe matches the names of external products that consume Kiwi
+// evidence but must never become part of Kiwi's own domain model, schemas,
+// wire types or vocabulary. The architectural rule is one-directional: Kiwi
+// exposes neutral execution/evidence contracts, and a consumer's concepts
+// (its planning, cognition, economics or business semantics) stay outside
+// this repository entirely. A comment or identifier naming such a product is
+// how that coupling starts, so the literal name itself is the failure.
+var vendorSemanticsRe = regexp.MustCompile(`(?i)\bfaktor\b|\btangerine\b`)
+
+// TestNoVendorSemanticsInProductionCode fails when a non-test Go file under
+// internal/ or cmd/ names an external consumer product. Documentation that
+// RECORDS a past integration decision (for example the historical rows of
+// ADVERSARIAL_TEST_MATRIX.md) is out of scope: the guard protects the code
+// surface, where a name would otherwise become an identifier, a JSON field or
+// a behavior the public contract is tempted to depend on.
+func TestNoVendorSemanticsInProductionCode(t *testing.T) {
+	root := repoRoot(t)
+	var hits []string
+	scanned := 0
+	for _, top := range []string{"internal", "cmd"} {
+		base := filepath.Join(root, top)
+		if _, err := os.Stat(base); err != nil {
+			continue
+		}
+		walkDir(t, base, func(rel string, d fs.DirEntry) {
+			if !strings.HasSuffix(rel, ".go") || strings.HasSuffix(rel, "_test.go") {
+				return
+			}
+			repoRel := top + "/" + rel
+			data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(repoRel)))
+			if err != nil {
+				t.Errorf("surfacecheck: read %s: %v", repoRel, err)
+				return
+			}
+			scanned++
+			for i, line := range strings.Split(string(data), "\n") {
+				if vendorSemanticsRe.MatchString(line) {
+					hits = append(hits, fmt.Sprintf("%s:%d: %s", repoRel, i+1, strings.TrimSpace(line)))
+				}
+			}
+		})
+	}
+	if scanned == 0 {
+		t.Fatal("vendor neutrality: scanned no production Go files; the detector would pass vacuously")
+	}
+	if len(hits) > 0 {
+		t.Fatalf("vendor neutrality: %d production reference(s) to an external consumer product (the domain model must stay neutral):\n  %s\nUse neutral vocabulary (for example \"evidence consumer\" or \"external controller\"); consumer-specific names belong outside this repository.",
+			len(hits), strings.Join(hits, "\n  "))
+	}
+}
+
+// TestVendorSemanticsDetectorMechanism proves the detector itself: the
+// regex matches the product names in ordinary prose and identifiers, and does
+// not match innocuous spelling variants.
+func TestVendorSemanticsDetectorMechanism(t *testing.T) {
+	positive := []string{
+		"// a Faktor-style consumer",
+		"// tangerine runtime",
+		"FAKTOR",
+		"Tangerine",
+	}
+	for _, s := range positive {
+		if !vendorSemanticsRe.MatchString(s) {
+			t.Errorf("vendorSemanticsRe did not match %q", s)
+		}
+	}
+	negative := []string{
+		"factory",
+		"Factorio",
+		"tangent",
+		"faktoriell",
+		"",
+	}
+	for _, s := range negative {
+		if vendorSemanticsRe.MatchString(s) {
+			t.Errorf("vendorSemanticsRe unexpectedly matched %q", s)
+		}
+	}
+}
+
 // posOf formats a token.Pos as file:line (absolute path is fine for failure
 // output; the repository root is visible in the surrounding test context).
 func posOf(fset *token.FileSet, pos token.Pos) string {

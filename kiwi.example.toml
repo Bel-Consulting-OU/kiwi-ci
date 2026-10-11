@@ -241,7 +241,7 @@ admin_token = "change-me"
 #
 # {
 #   "0123456789abcdef...": {
-#     "subject": "faktor",
+#     "subject": "evidence-controller",
 #     "capabilities": ["evidence:read"],
 #     "repository_capabilities": {
 #       "r1:Z2l0aHViLmNvbQ:YWNtZS9yZXBvLWE": ["checkpoints:read", "execution.events:read", "runs:cancel"]

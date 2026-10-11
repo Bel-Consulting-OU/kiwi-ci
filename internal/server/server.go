@@ -1523,7 +1523,7 @@ func (s *Server) auth(next http.Handler) http.Handler {
 			return
 		case tierCapability:
 			// Controller capability routes: external controllers (for example
-			// a Faktor-style evidence consumer) read execution history and
+			// an evidence/reporting consumer) read execution history and
 			// evidence without the admin role. Web sessions, the admin token
 			// and the legacy open mode keep their existing behavior; a store
 			// principal must carry the addressed capability somewhere (global

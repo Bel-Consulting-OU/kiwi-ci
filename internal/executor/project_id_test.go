@@ -14,6 +14,11 @@ import (
 // between tests.
 func resetProjectIDPools(t *testing.T) {
 	t.Helper()
+	// The allocator serializes through the host-global lock directory, whose
+	// production default (/run/lock) does not exist on every unix host (for
+	// example a read-only /run on macOS). Tests drive the portable core, so
+	// they pin the documented test/unprivileged-dev seam to a temp dir.
+	t.Setenv("KIWI_XFS_LOCK_DIR", t.TempDir())
 	clearProjectIDPools := func() {
 		xfsProjectIDPools.mu.Lock()
 		xfsProjectIDPools.m = map[string]*projectIDPool{}

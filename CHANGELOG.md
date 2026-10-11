@@ -8,6 +8,39 @@ the state of the `main` branch.
 
 ## [Unreleased]
 
+### Added
+
+- Execution-assurance levels (`model.ExecutionAssurance`) and
+  external-effects classes (`model.ExternalEffectsClass`), derived purely
+  from the durable job/payload/policy records. Execution attestation
+  schema v4 binds the level, name, effects class, effective-policy digest,
+  event-ledger frontier and run-graph fingerprint into the canonical
+  digest; undefined values are refused at build and verification.
+- Graph causality for dynamically generated jobs: `CreatedByNode`,
+  `CreatedByMutation` and a bounded opaque `ExternalContext`, echoed in
+  `graph.mutation_*` events and deliberately excluded from the fragment
+  digest.
+- Public evidence contract ([docs/evidence-contract.md](docs/evidence-contract.md)):
+  the DSSE/in-toto evidence envelope, its field map, the six independent
+  version dimensions, the assurance ladder, exact replay versus
+  bit-reproducibility, evidence profiles and an explicit "what Kiwi does
+  not guarantee" boundary.
+- Forensic evidence materialization: `GET /api/v1/jobs/{id}/attestation?profile=forensic`
+  returns the unsigned `kiwi-ci/execution-evidence-bundle/v1` bundle — the
+  signed envelope plus the bounded run-scoped event timeline, digest/reference-only
+  artifact, snapshot and report records, and retention watermarks.
+- `kiwi up`: single-machine mode running the control plane and one local
+  runner in one process, with the ledger, caches, artifacts and evidence
+  rooted in one state directory. The state directory and persisted bearer
+  token are verified before use (real directory owned by the current user,
+  tightened to 0700; token file must be an owned 0600 regular file, created
+  exclusively), and the control-plane listener is bound before the server
+  starts so a local port squatter can never receive the runner credential.
+- Formal TLA+ mirror of the lease/commit/retry/cancel protocol
+  (`formal/kiwi_lease.tla`, bounded TLC instance, model-to-test mapping).
+- Fuzz lanes for the completion wire body, secret issuance and OIDC
+  issuance, registered in the fuzz smoke script.
+
 ### Changed
 
 - Completion receipt replay across the runtime-evidence upgrade: a stored
@@ -16,6 +49,24 @@ the state of the `main` branch.
   attempt persisted (the server owns and re-fills the `Components` map from
   the job's component digest), exactly as before the v1 receipt was written.
   A retry whose runtime evidence genuinely differs still conflicts.
+
+### Fixed
+
+- The executor's privileged-tool proof now lives on unix rather than Linux
+  and the platform-specific XFS/cgroup tests are tagged, so executor test
+  binaries build and run on macOS and Windows.
+- The cache namespace-lock helper process parks on a timer instead of
+  `select{}`, so Go's deadlock detector can no longer kill it and silently
+  release the lock mid-test; the cross-process lock test is deterministic.
+- Runner test isolation pins the developer's Docker CLI context
+  (`DOCKER_CONFIG`) and makes the maintenance tests hermetic, so runner
+  lifecycle tests no longer depend on the host's container-runtime
+  configuration.
+- The enrollment-grant liveness fixture seeds an expired record directly
+  instead of racing a one-nanosecond TTL against coarse host clocks.
+- The staging canonical-dir fallback test skips with a documented reason
+  on hosts (macOS) that resolve the path of a removed working directory,
+  where `filepath.Abs` cannot fail.
 
 ## [0.1.0] - unreleased
 

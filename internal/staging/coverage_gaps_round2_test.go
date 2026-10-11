@@ -268,6 +268,13 @@ func TestCanonicalDirFallbackWhenGetwdFails(t *testing.T) {
 	if err := os.RemoveAll(dir); err != nil {
 		t.Fatal(err)
 	}
+	// macOS resolves the path of a removed working directory (fcntl
+	// F_GETPATH), so filepath.Abs cannot fail there and the fallback branch
+	// is unreachable; the test's premise only holds where getcwd(3) fails
+	// (Linux). Skip loudly instead of asserting a platform-dependent fact.
+	if wd, werr := os.Getwd(); werr == nil {
+		t.Skipf("host still resolves the removed working directory %q; the filepath.Abs fallback is unreachable here", wd)
+	}
 	if got, want := canonicalDir("rel/../staging"), filepath.Clean("rel/../staging"); got != want {
 		t.Fatalf("canonicalDir fallback = %q, want %q", got, want)
 	}

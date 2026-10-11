@@ -591,16 +591,45 @@ func (s *Server) getJobAttestation(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// Evidence profile selection (docs/evidence-contract.md §6). "minimal"
+	// and "standard" both serve the signed envelope: the minimal profile's
+	// identities are exactly the fields every statement already carries, and
+	// a separate unsigned projection would be a weaker trust story. The
+	// forensic profile materializes the referenced streams ONLY for a
+	// principal that also holds the execution-event capability for the run;
+	// without it the request fails before any part of the bundle is built.
+	switch profile := strings.TrimSpace(r.URL.Query().Get("profile")); profile {
+	case "", "minimal", "standard":
+	case "forensic":
+		if !s.requireRunCapability(w, r, auth.CapExecutionEventsRead, run.ID) {
+			return
+		}
+		s.writeForensicBundle(w, r, j, generation, rec)
+		return
+	default:
+		http.Error(w, "unknown evidence profile (want minimal, standard or forensic)", http.StatusBadRequest)
+		return
+	}
 	envBytes, err := s.readExecutionAttestationEnvelope(r.Context(), rec)
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	sum := sha256.Sum256(envBytes)
 	w.Header().Set("Content-Type", "application/vnd.dsse.envelope.v1+json")
-	w.Header().Set("X-Kiwi-Content-SHA256", hex.EncodeToString(sum[:]))
-	w.Header().Set("X-Kiwi-Statement-SHA256", rec.StatementSHA256)
+	writeEnvelopeDigestHeaders(w, envBytes, rec.StatementSHA256)
 	_, _ = w.Write(envBytes)
+}
+
+// writeEnvelopeDigestHeaders emits the signed-envelope digest headers every
+// evidence profile serving the same envelope must advertise, and returns the
+// envelope digest. One shared emitter keeps the standard and forensic
+// profiles from drifting apart on the client-visible digest contract.
+func writeEnvelopeDigestHeaders(w http.ResponseWriter, envBytes []byte, statementSHA string) string {
+	sum := sha256.Sum256(envBytes)
+	digest := hex.EncodeToString(sum[:])
+	w.Header().Set("X-Kiwi-Content-SHA256", digest)
+	w.Header().Set("X-Kiwi-Statement-SHA256", statementSHA)
+	return digest
 }
 
 // readExecutionAttestationEnvelope reads the envelope bytes of a record: CAS

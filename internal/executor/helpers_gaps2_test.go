@@ -28,73 +28,6 @@ func TestSetupWorkspaceDiskQuotaUnsupportedFilesystem(t *testing.T) {
 	}
 }
 
-// TestSetupXFSProjectQuotaRequiresRoot covers the privilege refusal with a
-// synthetic prjquota mount entry.
-func TestSetupXFSProjectQuotaRequiresRoot(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("running as root: the privilege refusal cannot trigger")
-	}
-	entry := mountInfoEntry{fsType: "xfs", mountPoint: "/mnt/xfs", superOptions: "rw,prjquota"}
-	status, cleanup, err := setupXFSProjectQuotaWithHook(t.TempDir(), entry, 1<<20, nil)
-	if err != nil || cleanup != nil {
-		t.Fatalf("status = %+v cleanupNil=%v err=%v", status, cleanup == nil, err)
-	}
-	if !strings.Contains(status.Detail, "requires root") {
-		t.Fatalf("detail = %q, want the privilege refusal", status.Detail)
-	}
-}
-
-// TestValidateQuotaAssignmentRefusals covers the not-currently-mounted and
-// non-XFS mount refusals that gate privileged cleanup.
-func TestValidateQuotaAssignmentRefusals(t *testing.T) {
-	err := validateQuotaAssignment(WorkspaceQuotaAssignment{MountPoint: "/definitely-not-mounted-xyz", XQ: "/bin/true"})
-	if err == nil || !strings.Contains(err.Error(), "not currently mounted") {
-		t.Fatalf("unmounted assignment = %v", err)
-	}
-	err = validateQuotaAssignment(WorkspaceQuotaAssignment{MountPoint: "/", XQ: "/bin/true"})
-	if err == nil || !strings.Contains(err.Error(), "prjquota XFS") {
-		t.Fatalf("root assignment = %v", err)
-	}
-}
-
-// TestValidatePrivilegedToolRefusals covers the path-shape, stat and
-// ownership gates.
-func TestValidatePrivilegedToolRefusals(t *testing.T) {
-	if err := validatePrivilegedTool("relative/tool"); err == nil {
-		t.Fatal("relative tool accepted")
-	}
-	if err := validatePrivilegedTool("/usr/bin/../bin/true"); err == nil {
-		t.Fatal("dot-dot tool accepted")
-	}
-	if err := validatePrivilegedTool(filepath.Join(t.TempDir(), "missing")); err == nil {
-		t.Fatal("missing tool accepted")
-	}
-	if err := validatePrivilegedTool("/dev/null"); err == nil {
-		t.Fatal("non-regular tool accepted")
-	}
-	if os.Geteuid() != 0 {
-		if err := validatePrivilegedTool("/bin/sh"); err == nil || !strings.Contains(err.Error(), "not owned by the runner") {
-			t.Fatalf("foreign-owned tool = %v", err)
-		}
-	}
-}
-
-// TestReclaimJobCgroupMalformed covers the path-shape refusal.
-func TestReclaimJobCgroupMalformed(t *testing.T) {
-	if err := ReclaimJobCgroup(""); err != nil {
-		t.Fatalf("empty cgroup = %v, want nil", err)
-	}
-	if err := ReclaimJobCgroup("relative/path"); err == nil {
-		t.Fatal("relative cgroup accepted")
-	}
-	if err := ReclaimJobCgroup("/job/../escape"); err == nil {
-		t.Fatal("dot-dot cgroup accepted")
-	}
-	if err := ReclaimJobCgroup("/kiwi-nonexistent-cgroup-xyz"); err != nil {
-		t.Fatalf("already-gone cgroup = %v, want nil", err)
-	}
-}
-
 // TestClampObservedBounds covers the truncation and the drop-unsafe arms.
 func TestClampObservedBounds(t *testing.T) {
 	if got := clampObserved("  value  ", 64); got != "value" {
@@ -155,27 +88,5 @@ func TestWriteOwnerOnlyUndeletablePath(t *testing.T) {
 	}
 	if _, err := WriteOwnerOnly(dir, []byte("secret")); err == nil {
 		t.Fatal("undeletable key path accepted")
-	}
-}
-
-// TestJobCgroupBaseFailures covers the missing-docker and non-cgroupfs driver
-// refusals plus the walk-to-root refusal.
-func TestJobCgroupBaseFailures(t *testing.T) {
-	t.Setenv("PATH", t.TempDir())
-	if err := dockerAcceptsCgroupPath(context.Background()); err == nil {
-		t.Fatal("missing docker accepted")
-	}
-
-	installFakeBins(t)
-	t.Setenv("FAKE_DOCKER_INFO", "systemd")
-	if err := dockerAcceptsCgroupPath(context.Background()); err == nil || !strings.Contains(err.Error(), "systemd") {
-		t.Fatalf("systemd driver = %v, want the refusal", err)
-	}
-
-	if _, err := jobCgroupBase(t.TempDir(), []string{"memory"}, ""); err == nil {
-		t.Fatal("undelegatable cgroup base accepted")
-	}
-	if _, err := jobCgroupBase(t.TempDir(), []string{"memory"}, filepath.Join(t.TempDir(), "missing")); err == nil {
-		t.Fatal("missing override cgroup accepted")
 	}
 }

@@ -34,10 +34,10 @@ func capabilityServer(t *testing.T) (*Server, model.Run, model.Run) {
 		t.Fatal(err)
 	}
 	keys := map[string]auth.Principal{
-		"events-a": {Subject: "faktor", RepositoryCapabilities: map[string][]auth.Capability{
+		"events-a": {Subject: "controller", RepositoryCapabilities: map[string][]auth.Capability{
 			capabilityRepoKey(t, "github.com/acme/repo-a"): {auth.CapExecutionEventsRead},
 		}},
-		"events-b": {Subject: "faktor-b", RepositoryCapabilities: map[string][]auth.Capability{
+		"events-b": {Subject: "controller-b", RepositoryCapabilities: map[string][]auth.Capability{
 			capabilityRepoKey(t, "github.com/acme/repo-b"): {auth.CapExecutionEventsRead},
 		}},
 		"global-events":   {Subject: "feed", Capabilities: []auth.Capability{auth.CapExecutionEventsRead}},

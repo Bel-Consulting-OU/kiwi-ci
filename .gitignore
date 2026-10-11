@@ -17,6 +17,9 @@
 # Fuzz corpus/crash artifacts
 testdata/fuzz/
 
+# TLC model-checker state output (formal/kiwi_lease.tla)
+/states/
+
 # Generated coverage profiles and local tool binaries
 /coverage.out
 /integration-coverage.out

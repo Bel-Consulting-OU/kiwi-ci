@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 )
 
@@ -100,24 +99,4 @@ func validateQuotaAssignment(a WorkspaceQuotaAssignment) error {
 		return fmt.Errorf("recorded mount %s is not currently mounted", a.MountPoint)
 	}
 	return validatePrivilegedTool(a.XQ)
-}
-
-// validatePrivilegedTool proves a recorded helper before executing it as the
-// runner (root for XFS): absolute path, regular executable file, owned by the
-// effective user.
-func validatePrivilegedTool(path string) error {
-	if !filepath.IsAbs(path) || strings.Contains(path, "..") {
-		return fmt.Errorf("recorded tool path %q is not a safe absolute path", path)
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return fmt.Errorf("stat recorded tool %s: %w", path, err)
-	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
-		return fmt.Errorf("recorded tool %s is not an executable regular file", path)
-	}
-	if !lockFileOwnerOK(info) {
-		return fmt.Errorf("recorded tool %s is not owned by the runner", path)
-	}
-	return nil
 }

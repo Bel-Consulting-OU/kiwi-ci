@@ -14,7 +14,7 @@ Files:
 | File | Purpose |
 |---|---|
 | `kiwi_lease.tla` | The TLA+ module: variables, actions (`Lease`, `Complete`, `StaleAttempt`, `Retry`, `CancelRun`), state invariants and temporal properties. Hand-written TLA+; no PlusCal toolchain is required. |
-| `kiwi_lease.cfg` | TLC configuration: the bounded instance (`Jobs = {"job-a","job-b"}`, `Runners = {"runner-1","runner-2"}`, `MaxGen = 3`) and the invariant/property list. |
+| `kiwi_lease.cfg` | TLC configuration: the bounded instance (`Jobs = {"job-a"}`, `Runners = {"runner-1","runner-2"}`, `MaxGen = 3`) and the invariant/property list. |
 
 ## Running TLC
 
@@ -33,13 +33,43 @@ or CI. To check the model locally:
    ```
 
    TLC prints the number of distinct states explored and a violation trace if
-   any invariant or property fails. The Toolbox GUI and the VS Code TLA+
-   extension accept the same two files.
+   any invariant or property fails. It writes its temporary state output to
+   `states/` in the working directory (gitignored). The Toolbox GUI and the
+   VS Code TLA+ extension accept the same two files.
 
-The bounded instance is intentionally small (2 jobs × 2 runners × 3
-generations): exhaustive checking finishes in seconds. Raising `MaxGen` or the
-constant sets grows the state space quickly; that is a deliberate limit, not a
+The bounded instance is intentionally small so TLC can EXHAUST it: the
+refusal ledger is a record set (`refused`, `commits`), so the state space is
+exponential in `|Jobs| x |Runners| x (MaxGen+1) x |Outcomes|` — doubling any
+bound roughly squares the work (a 2-job instance did not finish in minutes).
+Raising `MaxGen` or the constant sets is a deliberate tuning decision, not a
 claim that larger instances are equivalent.
+
+## Validation status
+
+The shipped instance (`Jobs = {"job-a"}`, `Runners = {"runner-1",
+"runner-2"}`, `MaxGen = 3`) was model-checked on 2026-10-11 with TLC2 2.19 on
+Java 17 (`java -jar tla2tools.jar -workers auto -config formal/kiwi_lease.cfg
+formal/kiwi_lease.tla`): **model checking completed, no error found** —
+5,426,161 states generated, 370,064 distinct states, complete state graph
+(depth 21) explored in 29s, all invariants and temporal properties checked.
+Running the check for the first time found three shipped defects, all fixed:
+
+1. the config used a `CONSTANT` / `<-` assignment form TLC rejects (now
+   `CONSTANTS` with `=`; `MaxGen` became a real constant so instances are
+   tunable without editing the module);
+2. `StaleAttempt` recorded a late duplicate of an ALREADY-COMMITTED attempt
+   as a refusal, so the record-set encoding of `StaleOwnerCannotCommit`
+   intersected `commits` through a representation artifact; the action now
+   models a refusal only for a record that was not already committed (a
+   duplicate of a committed attempt is the I1 receipt replay);
+3. the advertised instance (2 jobs x MaxGen 3) was not exhaustible in
+   practical time — the refusal ledger is a record set, so the state space is
+   exponential in jobs x runners x generations x outcomes. The shipped
+   instance is the 1-job configuration validated above.
+
+TLC is still not part of the default build or CI (no Java/TLC dependency in
+this repository); re-run the invocation above after any change to
+lease/commit/retry/cancel semantics.
 
 ## Invariants
 

@@ -86,6 +86,63 @@ extensions not yet implemented.
   check`, `database migrate|status`.
 - Queue reason codes surfaced to the API, UI, and explain output.
 
+## Done (audit closure rounds 19-22)
+
+- Runner wire-semantic protocol v2 with an explicit negotiation floor and
+  a rolling-upgrade protocol (`docs/production-deployment.md`).
+- Execution-semantics versioning (`model.ExecutionSemanticsVersion`),
+  distinct from every wire/schema version, stamped at enqueue and bound
+  into signed evidence.
+- Scoped execution-event retention/recovery with typed cursors and
+  snapshot parity (`docs/INVARIANTS.md` I4).
+- Written invariant contract (`docs/INVARIANTS.md`): I1-I10 with
+  enforcement points, regression tests and a per-class evidence map.
+- Formal lease/commit/retry/cancel mirror (`formal/kiwi_lease.tla`).
+- Execution assurance levels and external-effects classes
+  (`model.ExecutionAssurance`, `model.ExternalEffectsClass`), derived
+  from durable records and bound into execution attestation schema v4.
+- Public, neutral evidence contract (`docs/evidence-contract.md`):
+  in-toto v1 + DSSE envelopes, SLSA-v1 artifact provenance, exact-replay
+  versus bit-reproducibility, assurance/effect vocabulary, profiles
+  (minimal/standard/forensic) and an explicit "what Kiwi does not
+  guarantee" boundary.
+- Bounded graph-causality stamp for dynamically generated jobs
+  (`CreatedByNode`, `CreatedByMutation`, opaque `ExternalContext`).
+- Adversarial fuzz lanes at the wire boundaries: event cursors, generated
+  fragments, completion bodies, secret issuance, OIDC issuance.
+- Single-machine mode: `kiwi up` runs the control plane, a local runner,
+  the ledger, caches, artifacts and evidence from one command.
+
+## Core abstraction freeze
+
+The audit's closure rule applies from this point: the core concepts are
+FROZEN. New features must not change the MEANING of:
+
+```text
+runs, graphs, nodes, jobs, attempts, events, claims, capabilities,
+artifacts, caches, replay, evidence, execution assurance, effect classes
+```
+
+Changes that need no architecture round:
+
+- additive, version-gated fields (each with its own schema-version bump);
+- new values in the closed sets that already define a bump rule;
+- performance, operability, UX and deployment improvements.
+
+Changes that REQUIRE an explicit semantics bump
+(`model.ExecutionSemanticsVersion` and/or the evidence schema), an update
+to `docs/INVARIANTS.md` and `docs/evidence-contract.md`, and mirrored
+tests:
+
+- changing how durable state is interpreted by the scheduler, runner or
+  executor;
+- changing the assurance ladder, the effect classes or the replay
+  definition;
+- adding a speculative/parallel-attempt surface (which additionally
+  requires extending `formal/kiwi_lease.tla` with the speculation action
+  and the single-winner invariant before the surface merges, per
+  `formal/README.md` and I7).
+
 ## P1 — remaining
 
 - Concurrency groups beyond supersession (queue serialization of

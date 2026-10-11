@@ -29,6 +29,20 @@ func TestMain(m *testing.M) {
 				pin("GOPATH", filepath.Join(realHome, "go"))
 				pin("GOMODCACHE", filepath.Join(realHome, "go", "pkg", "mod"))
 				pin("GOCACHE", filepath.Join(realHome, ".cache", "go-build"))
+				// Docker CLI context resolution also lives under HOME:
+				// colima and Docker Desktop keep ~/.docker/config.json (and
+				// the selected context's absolute socket path) there, so an
+				// isolated HOME silently points `docker` at the default
+				// /var/run/docker.sock. On a host where the real daemon uses
+				// another socket every runner-startup runtime reconciliation
+				// would then fail closed and the lifecycle tests would fail
+				// for the wrong reason. Pin the developer's context when one
+				// exists; on hosts without ~/.docker the behavior is
+				// unchanged.
+				dockerConfig := filepath.Join(realHome, ".docker")
+				if _, derr := os.Stat(filepath.Join(dockerConfig, "config.json")); derr == nil {
+					pin("DOCKER_CONFIG", dockerConfig)
+				}
 			}
 			code := m.Run()
 			_ = os.RemoveAll(dir)

@@ -7,8 +7,8 @@ import (
 )
 
 // Capability names one fine-grained permission an external controller
-// principal (for example a Faktor-style consumer) can hold without the Kiwi
-// admin role. Capabilities are deliberately SEPARATE from roles and
+// principal (for example an evidence/reporting consumer) can hold without the
+// Kiwi admin role. Capabilities are deliberately SEPARATE from roles and
 // RepositoryPermission:
 //
 //   - a capability never substitutes for an Action decision; it is an

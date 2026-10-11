@@ -114,8 +114,14 @@ func TestCacheNamespaceHelperProcess(t *testing.T) {
 		_, _ = f.WriteString("live")
 		fmt.Println("READY")
 		os.Stdout.Sync()
-		// Hold the lock and the live temp until killed.
-		select {}
+		// Hold the lock and the live temp until killed. A bare `select {}`
+		// would make the runtime declare the helper deadlocked ("all
+		// goroutines are asleep") and kill it, silently releasing the lock
+		// before the second process competes; a pending timer keeps the
+		// process parked without ever tripping the detector.
+		for {
+			time.Sleep(time.Hour)
+		}
 	case "try-manager":
 		m, err := NewManager(root, RetentionPolicy{MaxBytes: 1 << 20})
 		if err != nil {

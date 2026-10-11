@@ -274,3 +274,43 @@ func TestReclaimJobCgroupRemovesEmptyAndRetainsBusy(t *testing.T) {
 		t.Fatal("traversal cgroup path accepted")
 	}
 }
+
+// TestReclaimJobCgroupMalformedPaths covers the path-shape refusals and the
+// already-gone no-op on Linux (the platform where the path has semantics).
+func TestReclaimJobCgroupMalformedPaths(t *testing.T) {
+	if err := ReclaimJobCgroup(""); err != nil {
+		t.Fatalf("empty cgroup = %v, want nil", err)
+	}
+	if err := ReclaimJobCgroup("relative/path"); err == nil {
+		t.Fatal("relative cgroup accepted")
+	}
+	if err := ReclaimJobCgroup("/job/../escape"); err == nil {
+		t.Fatal("dot-dot cgroup accepted")
+	}
+	if err := ReclaimJobCgroup("/kiwi-nonexistent-cgroup-xyz"); err != nil {
+		t.Fatalf("already-gone cgroup = %v, want nil", err)
+	}
+}
+
+// TestJobCgroupBaseFailures covers the missing-docker and non-cgroupfs driver
+// refusals plus the walk-to-root refusal. It lives on Linux because the
+// cgroup path probe is Linux-only.
+func TestJobCgroupBaseFailures(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	if err := dockerAcceptsCgroupPath(context.Background()); err == nil {
+		t.Fatal("missing docker accepted")
+	}
+
+	installFakeBins(t)
+	t.Setenv("FAKE_DOCKER_INFO", "systemd")
+	if err := dockerAcceptsCgroupPath(context.Background()); err == nil || !strings.Contains(err.Error(), "systemd") {
+		t.Fatalf("systemd driver = %v, want the refusal", err)
+	}
+
+	if _, err := jobCgroupBase(t.TempDir(), []string{"memory"}, ""); err == nil {
+		t.Fatal("undelegatable cgroup base accepted")
+	}
+	if _, err := jobCgroupBase(t.TempDir(), []string{"memory"}, filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("missing override cgroup accepted")
+	}
+}

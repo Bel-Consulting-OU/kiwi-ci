@@ -17,6 +17,9 @@ internal/server:FuzzWebhookGitLab
 internal/server:FuzzWebhookForgejo
 internal/server:FuzzEventCursorParse
 internal/server:FuzzGeneratedFragmentAdmission
+internal/server:FuzzCompletionRequest
+internal/server:FuzzSecretIssueRequest
+internal/server:FuzzOIDCRequest
 internal/forge:FuzzCanonicalRepository
 internal/forge:FuzzCacheManifest
 internal/forge:FuzzSnapshotManifest

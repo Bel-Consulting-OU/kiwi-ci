@@ -654,6 +654,9 @@ func TestFinalRunExecutesTaskAndDrains(t *testing.T) {
 		}
 	}))
 	defer ts.Close()
+	// Hermetic host probes (see runMaintenance): the startup reconciliation
+	// must not depend on the developer machine's container runtimes.
+	t.Setenv("PATH", t.TempDir())
 	r := &Runner{ID: "runner-1", Cfg: Config{Server: ts.URL, Poll: time.Millisecond, Concurrency: 1,
 		WorkDir: t.TempDir(), GCInterval: time.Hour, PrewarmInterval: time.Hour, IdentityDir: t.TempDir()},
 		Client: ts.Client(), Metrics: NewMetrics()}
@@ -672,6 +675,14 @@ func TestFinalRunExecutesTaskAndDrains(t *testing.T) {
 // deterministically.
 func runMaintenance(t *testing.T, cfg Config, n int32) error {
 	t.Helper()
+	// Hermetic host probes: Run's startup reconciliation consults the docker
+	// and tart CLIs. An empty PATH makes LookPath fail for both, which the
+	// reconciler documents as "this host has no such runtime subsystem" — the
+	// lifecycle under test (maintenance cadence, staging ownership) must not
+	// depend on which container runtimes the developer machine happens to
+	// expose (a macOS/colima docker CLI, for example, fails without a
+	// ~/.docker context).
+	t.Setenv("PATH", t.TempDir())
 	var calls atomic.Int32
 	reached := make(chan struct{})
 	var once sync.Once

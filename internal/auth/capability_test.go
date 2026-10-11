@@ -250,7 +250,7 @@ func TestTokenStoreLoadValidatesCapabilities(t *testing.T) {
 
 	// The valid controller principal loads with both scopes intact.
 	p := Principal{
-		Subject:                "faktor",
+		Subject:                "controller",
 		Capabilities:           []Capability{CapEvidenceRead},
 		RepositoryCapabilities: map[string][]Capability{"o/repo-a": {CapExecutionEventsRead, CapRunsCancel}},
 	}
@@ -271,7 +271,7 @@ func TestTokenStoreLoadValidatesCapabilities(t *testing.T) {
 func TestTokenStoreSaveNormalizesCapabilities(t *testing.T) {
 	store := NewTokenStore()
 	if err := store.AddToken("tok", Principal{
-		Subject:                "faktor",
+		Subject:                "controller",
 		Capabilities:           []Capability{CapRunsCancel, CapEvidenceRead, CapRunsCancel},
 		RepositoryCapabilities: map[string][]Capability{"github.com/o/repo-a": {CapExecutionEventsRead, CapExecutionEventsRead}},
 	}); err != nil {

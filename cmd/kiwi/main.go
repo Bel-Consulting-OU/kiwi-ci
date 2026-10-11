@@ -62,6 +62,8 @@ func dispatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return app.Explain(args[1:])
 	case "doctor":
 		return app.Doctor(args[1:])
+	case "up":
+		return app.Up(ctx, args[1:])
 	case "server":
 		return app.Server(ctx, args[1:])
 	case "runner":
@@ -317,6 +319,7 @@ Usage:
   kiwi validate [-f .kiwi/pipeline.yaml]
   kiwi explain  [-f .kiwi/pipeline.yaml] [--input k=v] [--why JOB]
   kiwi doctor
+  kiwi up       [--listen ADDR] [--data-dir DIR] [--token TOKEN] [--labels L]
   kiwi server   [--listen :8080] [--mode dev|production] [--database-url URL]
                 [--config kiwi.toml]
   kiwi config check --config kiwi.toml

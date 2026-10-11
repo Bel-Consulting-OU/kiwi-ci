@@ -140,16 +140,16 @@ func scopedEventsServer(t *testing.T) (*Server, *eventsRetentionFakeStore, model
 		t.Fatal(err)
 	}
 	principals := map[string]auth.Principal{
-		"events-a": {Subject: "faktor-a", RepositoryCapabilities: map[string][]auth.Capability{
+		"events-a": {Subject: "controller-a", RepositoryCapabilities: map[string][]auth.Capability{
 			capabilityRepoKey(t, scopeRepoA): {auth.CapExecutionEventsRead},
 		}},
-		"events-a-rot": {Subject: "faktor-a-rot", RepositoryCapabilities: map[string][]auth.Capability{
+		"events-a-rot": {Subject: "controller-a-rot", RepositoryCapabilities: map[string][]auth.Capability{
 			capabilityRepoKey(t, scopeRepoA): {auth.CapExecutionEventsRead},
 		}},
-		"events-b": {Subject: "faktor-b", RepositoryCapabilities: map[string][]auth.Capability{
+		"events-b": {Subject: "controller-b", RepositoryCapabilities: map[string][]auth.Capability{
 			capabilityRepoKey(t, scopeRepoB): {auth.CapExecutionEventsRead},
 		}},
-		"events-a-lost": {Subject: "faktor-a-lost", RepositoryCapabilities: map[string][]auth.Capability{
+		"events-a-lost": {Subject: "controller-a-lost", RepositoryCapabilities: map[string][]auth.Capability{
 			capabilityRepoKey(t, scopeRepoB): {auth.CapExecutionEventsRead},
 		}},
 		"global-events": {Subject: "feed", Capabilities: []auth.Capability{auth.CapExecutionEventsRead}},
@@ -507,7 +507,7 @@ func TestEventsRepoAccessLossForbidden(t *testing.T) {
 	}
 	// Rotate the token to a principal that holds only repo B: the repo A
 	// routes (and the unscoped snapshot) must now be forbidden.
-	if err := s.AuthStore.AddToken("events-a", auth.Principal{Subject: "faktor-a", RepositoryCapabilities: map[string][]auth.Capability{
+	if err := s.AuthStore.AddToken("events-a", auth.Principal{Subject: "controller-a", RepositoryCapabilities: map[string][]auth.Capability{
 		capabilityRepoKey(t, scopeRepoB): {auth.CapExecutionEventsRead},
 	}}); err != nil {
 		t.Fatal(err)

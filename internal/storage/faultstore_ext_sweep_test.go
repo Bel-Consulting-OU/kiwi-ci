@@ -130,9 +130,18 @@ func TestMemStoreClockLivenessAndRetentionSurface(t *testing.T) {
 	if live, err := m.EnrollGrantLive(ctx, "digest-live"); err != nil || live {
 		t.Fatalf("EnrollGrantLive(consumed) = (%v, %v), want false/nil", live, err)
 	}
-	if _, err := m.PutEnrollGrantWithTTL(ctx, "digest-expired", time.Nanosecond, nil); err != nil {
+	// The expired case seeds the record directly: a nanosecond TTL races the
+	// host clock's resolution (on microsecond-granularity clocks the
+	// immediate re-read legitimately still observes now < expiry), so the
+	// fixture must pin the expiry, not race it.
+	if _, err := m.PutEnrollGrantWithTTL(ctx, "digest-expired", time.Hour, nil); err != nil {
 		t.Fatal(err)
 	}
+	m.mu.Lock()
+	rec := m.grants["digest-expired"]
+	rec.ExpiresAt = time.Now().UTC().Add(-time.Minute)
+	m.grants["digest-expired"] = rec
+	m.mu.Unlock()
 	if live, err := m.EnrollGrantLive(ctx, "digest-expired"); err != nil || live {
 		t.Fatalf("EnrollGrantLive(expired) = (%v, %v), want false/nil", live, err)
 	}
