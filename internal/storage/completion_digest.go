@@ -27,7 +27,7 @@ const (
 
 	completionResultDigestV2Version = "kiwi-ci/completion-result/v2"
 	completionErrorDigestVersion    = "kiwi-ci/completion-result-error/v1"
-	observedRuntimeDigestVersion    = "kiwi-ci/observed-runtime/v1"
+	observedRuntimeDigestVersion    = "kiwi-ci/observed-runtime/v2"
 )
 
 // CompletionResultDigestV1 returns the LEGACY completion result hash, byte for
@@ -123,7 +123,27 @@ func ObservedRuntimeDigest(observed *model.ObservedRuntime) string {
 	} else {
 		writeLenPrefixed(h, observed.CapturedAt.UTC().Format(time.RFC3339Nano))
 	}
+	// The executor-observed enforcement receipt is part of the completion
+	// identity: a retry must not be able to replay with a contradictory
+	// Control (sandbox/network/quota observations) and still match the
+	// original receipt. v1 omitted this field; v2 binds it.
+	if observed.Control == nil {
+		writeLenPrefixed(h, "")
+	} else {
+		writeLenPrefixed(h, observed.Control.Runtime)
+		writeLenPrefixed(h, boolToken(observed.Control.SandboxStarted))
+		writeLenPrefixed(h, string(observed.Control.NetworkEnforced))
+		writeLenPrefixed(h, boolToken(observed.Control.RootFilesystemReadOnly))
+		writeLenPrefixed(h, boolToken(observed.Control.WorkspaceQuotaEnforced))
+	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+func boolToken(b bool) string {
+	if b {
+		return "1"
+	}
+	return "0"
 }
 
 // StoredAttemptObservedRuntime returns the runtime evidence a job row carries

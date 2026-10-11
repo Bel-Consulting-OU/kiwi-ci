@@ -361,7 +361,12 @@ func (s *Server) pruneRunsLocked(now time.Time) []string {
 
 // pruneJobLocksLocked drops the per-job upload mutexes for jobs that no
 // longer exist, so the lock map stays bounded over a long-lived process.
+// jobLocks is owned by jobLocksMu (see jobLock in blobs.go), NOT by s.mu:
+// this function is called with s.mu held to read s.jobs, and must take
+// jobLocksMu to mutate the lock map.
 func (s *Server) pruneJobLocksLocked() {
+	s.jobLocksMu.Lock()
+	defer s.jobLocksMu.Unlock()
 	for id := range s.jobLocks {
 		if _, ok := s.jobs[id]; !ok {
 			delete(s.jobLocks, id)

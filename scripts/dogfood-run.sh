@@ -112,7 +112,10 @@ missing=()
 for req in "${required[@]}"; do
   found=0
   for name in "${executed[@]}"; do
-    if [[ "$name" == "$req" || "$name" == "$req"* ]]; then
+    # Exact, or a longer name that continues with an uppercase letter
+    # (TestDFEVID001 matches TestDFEVID001GenerationAndVerify but NOT
+    # TestDFEVID0010).
+    if [[ "$name" == "$req" || "$name" == "$req"[A-Z]* ]]; then
       found=1
       break
     fi

@@ -596,9 +596,14 @@ func ValidateExternalEffects(f ExecutionFacts, c ExternalEffectsClass) error {
 	if c == EffectsOpaqueExternal {
 		return nil
 	}
-	// kiwi_mediated / pure both require a sandbox boundary.
+	// kiwi_mediated / pure both require a sandbox boundary and a clean
+	// credential surface (no Kiwi-injected secrets, no inherited host env).
+	// Anything less is opaque_external by the shared derivation.
 	if !f.FilesystemIsolated {
 		return fmt.Errorf("model: external effects class %s requires filesystem isolation", c)
+	}
+	if f.KiwiSecretsInjected || f.HostEnvironmentInherited {
+		return fmt.Errorf("model: external effects class %s cannot claim mediated/pure effects with injected secrets or inherited host environment", c)
 	}
 	return nil
 }

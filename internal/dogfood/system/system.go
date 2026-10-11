@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
@@ -53,10 +54,11 @@ type System struct {
 	// maintainDone is closed when Maintain returns, so Close can join it.
 	maintainDone chan struct{}
 
+	runnerMu     sync.Mutex
 	runnerCancel context.CancelFunc
 	runnerDone   chan struct{}
 	runnerErr    error
-	runnerInst   *runner.Runner
+	runnerID     string
 
 	// trusted ingress (webhook stand-in); nil when not enabled.
 	trustedForge    *trustedForge
@@ -443,49 +445,81 @@ func (s *System) StartRunner(name string, extraLabels []string) error {
 	r := &runner.Runner{Cfg: cfg}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
+	s.runnerMu.Lock()
 	s.runnerCancel = cancel
 	s.runnerDone = done
-	s.runnerInst = r
+	s.runnerMu.Unlock()
 	go func() {
 		defer close(done)
-		s.runnerErr = r.Run(ctx)
+		err := r.Run(ctx)
+		s.runnerMu.Lock()
+		s.runnerErr = err
+		s.runnerMu.Unlock()
 	}()
-	// Registration is part of Run; give the poll loop a moment so the first
-	// lease can be claimed without the caller racing a cold start.
+	// Registration is part of Run. Observe it through the PUBLIC API (never
+	// by reading r.ID from this goroutine — Runner.Run writes that field and
+	// the race detector rightly flags it).
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if r.ID != "" {
+		if id := s.registeredRunnerID(name); id != "" {
+			s.runnerMu.Lock()
+			s.runnerID = id
+			s.runnerMu.Unlock()
 			return nil
 		}
 		select {
 		case <-done:
-			if s.runnerErr != nil {
-				return fmt.Errorf("runner exited during start: %w", s.runnerErr)
+			s.runnerMu.Lock()
+			rerr := s.runnerErr
+			s.runnerMu.Unlock()
+			if rerr != nil {
+				return fmt.Errorf("runner exited during start: %w", rerr)
 			}
 			return fmt.Errorf("runner exited during start")
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
-	return nil
+	return fmt.Errorf("runner %q did not register within 5s", name)
+}
+
+// registeredRunnerID returns the server-side runner id for name via the
+// public runners API ("" when not yet registered).
+func (s *System) registeredRunnerID(name string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var out []struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	if err := s.getJSON(ctx, s.AdminToken, "/api/v1/runners", &out); err != nil {
+		return ""
+	}
+	for _, r := range out {
+		if r.Name == name {
+			return r.ID
+		}
+	}
+	return ""
 }
 
 // RunnerID returns the live runner's registered identity ("" before register).
 func (s *System) RunnerID() string {
-	if s.runnerInst == nil {
-		return ""
-	}
-	return s.runnerInst.ID
+	s.runnerMu.Lock()
+	defer s.runnerMu.Unlock()
+	return s.runnerID
 }
 
 // stopRunner cancels the runner and joins it. Safe when no runner is live.
 func (s *System) stopRunner() {
-	if s.runnerCancel == nil {
+	s.runnerMu.Lock()
+	cancel, done := s.runnerCancel, s.runnerDone
+	s.runnerCancel, s.runnerDone = nil, nil
+	s.runnerMu.Unlock()
+	if cancel == nil {
 		return
 	}
-	s.runnerCancel()
-	<-s.runnerDone
-	s.runnerCancel = nil
-	s.runnerDone = nil
+	cancel()
+	<-done
 }
 
 // StopRunner exposes the join for tests that need the runner gone before a

@@ -4707,21 +4707,11 @@ func (s *Server) logBatch(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		for _, l := range in.Lines {
-			if err := s.logDBWrite(r.Context(), j, in.RunnerID, l, now); err != nil {
-				if leaseCommitRefused(err) {
-					s.writeLeaseAuthError(w, r, errStaleLease)
-					return
-				}
-				if errors.Is(err, errLeaseCommitUnsupported) {
-					http.Error(w, "store does not support transactional lease commits", http.StatusServiceUnavailable)
-					return
-				}
-				http.Error(w, "log append failed", 500)
-				return
-			}
-		}
-		w.WriteHeader(http.StatusNoContent)
+		// No LogBatchStore: a per-line fallback is not batch-atomic and has
+		// no (job, generation, batch_id) dedup, so a runner retry of a
+		// partially-written batch duplicates log lines. Fail closed rather
+		// than corrupt the log stream (same posture as lease commits).
+		http.Error(w, "store does not support transactional log batches", http.StatusServiceUnavailable)
 		return
 	}
 	s.mu.Lock()
@@ -5082,8 +5072,30 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		// is retained, readiness stays degraded until a same-directory
 		// persist reconciles, and the runner's idempotent replay re-enters
 		// through the receipt to run the effects.
+		// rollbackCompletionUnlessPublished returns true when the error is
+		// post-rename (fsutil.Renamed): the terminal state is already
+		// published and must NOT be rolled back. It returns false after a
+		// real rollback (pre-rename failure).
 		if s.rollbackCompletionUnlessPublished(rollback, perr) {
+			// Published-but-uncertain: state is visible. effectUsageAccount
+			// short-circuits on UsageRecorded, so metrics/audit/events must
+			// run now or they are lost (daily budget fail-open).
+			s.auditLocked("job.completed", in.RunnerID, runID, j.ID, string(j.Status), map[string]string{"job": j.Key})
+			if completionFrom != j.Status {
+				payload := map[string]string{"job": j.Key, "runner": in.RunnerID}
+				for k, v := range storage.ExecutionEventTimingPayload(j.StartedAt, j.FinishedAt) {
+					payload[k] = v
+				}
+				s.appendJobEventLocked(j, completionFrom, j.Status, in.RunnerID, payload)
+			}
+			if j.StartedAt != nil && j.FinishedAt != nil {
+				s.metricObserve("kiwi_job_duration_seconds", j.FinishedAt.Sub(*j.StartedAt).Seconds(), nil)
+			}
+			if usageOK {
+				s.accountJobUsageMetrics(usageCost, usageEnergy, now)
+			}
 			s.mu.Unlock()
+			_ = s.enqueueCompletionEffects(r.Context(), j, run)
 			s.serverError(w, r, http.StatusServiceUnavailable, perr, "state not durable")
 			return
 		}
@@ -5608,6 +5620,16 @@ func (s *Server) rollbackUnlessPublished(rb stateRollback, err error) bool {
 // the generic stateRollback does not). It returns true when the published
 // (terminal) state was retained after a post-rename directory-fsync failure,
 // false when the snapshot was rolled back. The caller holds s.mu.
+// rollbackCompletionUnlessPublished reports whether the completion state is
+// ALREADY PUBLISHED (post-rename / fsutil.Renamed) and must be retained.
+// True  → published-but-uncertain: do NOT roll back; run idempotent side
+//
+//	metrics/effects so UsageRecorded cannot fail-open the daily budget.
+//
+// False → pre-rename failure: the capture was rolled back; move no metrics.
+//
+// (The name reads like "did we roll back?"; the return value is the opposite.
+// Call sites must branch on "published", not "rolled back".)
 func (s *Server) rollbackCompletionUnlessPublished(rb completionRollback, err error) bool {
 	if fsutil.Renamed(err) {
 		return true

@@ -288,3 +288,55 @@ func TestMemAttemptScopedEvidenceQueries(t *testing.T) {
 		t.Fatalf("missing generation artifacts = %+v err=%v, want empty", none, err)
 	}
 }
+
+// TestObservedRuntimeDigestBindsControl pins that the executor-observed
+// enforcement receipt is part of the completion identity: a retry with a
+// contradictory Control (sandbox/network/quota) must not match the original
+// receipt digest.
+func TestObservedRuntimeDigestBindsControl(t *testing.T) {
+	base := &model.ObservedRuntime{OS: "linux", Arch: "amd64", RuntimeName: "docker"}
+	soft := &model.ObservedRuntime{
+		OS: "linux", Arch: "amd64", RuntimeName: "docker",
+		Control: &model.ExecutionControlReceipt{
+			Runtime: "docker", SandboxStarted: true,
+			NetworkEnforced: model.ObservedNetworkNone, WorkspaceQuotaEnforced: false,
+		},
+	}
+	hard := &model.ObservedRuntime{
+		OS: "linux", Arch: "amd64", RuntimeName: "docker",
+		Control: &model.ExecutionControlReceipt{
+			Runtime: "docker", SandboxStarted: true,
+			NetworkEnforced: model.ObservedNetworkNone, WorkspaceQuotaEnforced: true,
+		},
+	}
+	connected := &model.ObservedRuntime{
+		OS: "linux", Arch: "amd64", RuntimeName: "docker",
+		Control: &model.ExecutionControlReceipt{
+			Runtime: "docker", SandboxStarted: true,
+			NetworkEnforced: model.ObservedNetworkContainerNamespace, WorkspaceQuotaEnforced: false,
+		},
+	}
+	if ObservedRuntimeDigest(soft) == ObservedRuntimeDigest(hard) {
+		t.Fatal("quota-enforced bit is not bound by the runtime digest")
+	}
+	if ObservedRuntimeDigest(soft) == ObservedRuntimeDigest(connected) {
+		t.Fatal("network_enforced is not bound by the runtime digest")
+	}
+	if ObservedRuntimeDigest(base) == ObservedRuntimeDigest(soft) {
+		t.Fatal("presence of Control must change the runtime digest")
+	}
+	if !CompletionReceiptReplayMatches(
+		model.CompletionReceipt{ResultHash: CompletionResultDigestV2(model.StatusSuccess, "", nil, soft), ResultHashVersion: CompletionResultHashVersionV2},
+		CompletionResultDigestV2(model.StatusSuccess, "", nil, soft), CompletionResultHashVersionV2,
+		model.StatusSuccess, "", nil, hard, soft,
+	) {
+		// Matching requires equal digests; hard != soft so this must NOT match.
+	}
+	if CompletionReceiptReplayMatches(
+		model.CompletionReceipt{ResultHash: CompletionResultDigestV2(model.StatusSuccess, "", nil, soft), ResultHashVersion: CompletionResultHashVersionV2},
+		CompletionResultDigestV2(model.StatusSuccess, "", nil, hard), CompletionResultHashVersionV2,
+		model.StatusSuccess, "", nil, hard, soft,
+	) {
+		t.Fatal("contradictory Control must not match the original completion receipt")
+	}
+}

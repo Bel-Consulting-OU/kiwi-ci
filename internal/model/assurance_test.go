@@ -383,3 +383,26 @@ func TestValidateExternalEffectsPureRequiresProvenDenial(t *testing.T) {
 		t.Fatalf("opaque is always allowed: %v", err)
 	}
 }
+
+// TestValidateExternalEffectsMediatedRequiresCleanCredentials: kiwi_mediated
+// is not allowed next to injected secrets or an inherited host environment —
+// those are opaque_external by the shared derivation.
+func TestValidateExternalEffectsMediatedRequiresCleanCredentials(t *testing.T) {
+	f := ExecutionFacts{
+		Runtime:             RuntimeFactContainer,
+		FilesystemIsolated:  true,
+		KiwiSecretsInjected: true,
+	}
+	if err := ValidateExternalEffects(f, EffectsKiwiMediated); err == nil {
+		t.Fatal("kiwi_mediated with injected secrets must be refused")
+	}
+	f.KiwiSecretsInjected = false
+	f.HostEnvironmentInherited = true
+	if err := ValidateExternalEffects(f, EffectsKiwiMediated); err == nil {
+		t.Fatal("kiwi_mediated with inherited host env must be refused")
+	}
+	f.HostEnvironmentInherited = false
+	if err := ValidateExternalEffects(f, EffectsKiwiMediated); err != nil {
+		t.Fatalf("clean isolated mediated: %v", err)
+	}
+}
