@@ -365,3 +365,22 @@ func TestObservedRuntimeDigestBindsControl(t *testing.T) {
 		t.Fatal("contradictory Control must not match the original completion receipt")
 	}
 }
+
+// TestReplayRequiresHistoricalObservedRuntimeOnlyForLegacy: frozen v2 and
+// current v3 receipts are self-sufficient; only true legacy v1 may read the
+// job row. This is the compatibility-firewall rule that keeps an identical
+// v2/v3 replay from depending on unrelated subsystems.
+func TestReplayRequiresHistoricalObservedRuntimeOnlyForLegacy(t *testing.T) {
+	if !ReplayRequiresHistoricalObservedRuntime(CompletionResultHashVersionLegacy) {
+		t.Fatal("legacy v1 must require historical observed-runtime recovery")
+	}
+	if ReplayRequiresHistoricalObservedRuntime(CompletionResultHashVersionV2) {
+		t.Fatal("frozen v2 must NOT require historical recovery (its hash binds runtime)")
+	}
+	if ReplayRequiresHistoricalObservedRuntime(CompletionResultHashVersionV3) {
+		t.Fatal("current v3 must NOT require historical recovery")
+	}
+	if ReplayRequiresHistoricalObservedRuntime(CurrentCompletionResultHashVersion) {
+		t.Fatal("CurrentCompletionResultHashVersion must not require historical recovery")
+	}
+}

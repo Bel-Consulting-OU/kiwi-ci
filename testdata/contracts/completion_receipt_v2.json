@@ -1,0 +1,41 @@
+{
+  "comment": "FROZEN v2 completion receipt contract fixture (nested observed-runtime/v1, no Control). Immutable historical compatibility corpus; do not regenerate without updating the golden constants in internal/storage/contract_corpus_test.go.",
+  "hash_version": 2,
+  "receipt": {
+    "job_id": "contract-fixture-job-v2",
+    "generation": 1,
+    "runner_id": "contract-fixture-runner",
+    "result_hash": "d59a8c99e366ac49dff7370bddefdef6ea4d81e05f49522e73eacd6745bee21b",
+    "result_hash_version": 2
+  },
+  "completion": {
+    "status": "success",
+    "outputs": {
+      "artifact": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "url": "https://example.invalid/dist/app"
+    },
+    "observed_runtime": {
+      "os": "linux",
+      "arch": "amd64",
+      "runtime_name": "docker",
+      "runtime_version": "25.0.3",
+      "main_image": "alpine:3.20",
+      "main_image_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "service_images": {
+        "db": "postgres:16"
+      },
+      "service_image_digests": {
+        "db": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "components": {
+        "libfoo": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "captured_at": "2026-01-02T03:04:05Z"
+    }
+  },
+  "golden": {
+    "result_hash": "d59a8c99e366ac49dff7370bddefdef6ea4d81e05f49522e73eacd6745bee21b",
+    "observed_runtime_digest": "843e54d6abc51804f85e1e867362ce2a31cd79c6345e1993b193c477f54802b4",
+    "observed_runtime_tag": "kiwi-ci/observed-runtime/v1"
+  }
+}

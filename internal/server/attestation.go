@@ -65,11 +65,12 @@ type attestationEvidence struct {
 	artifacts []model.ArtifactRecord
 	reports   []model.TestReport
 	snapshots []model.SnapshotRecord
-	// completionResultDigest is the job's durable v2 completion identity
-	// digest (storage.CompletionResultDigestV2), present only when the
-	// completion receipt was written under the v2 encoding. It binds the
-	// terminal status/error/outputs/runtime by digest only; a legacy (v1)
-	// receipt has no v2 digest to bind and leaves this empty.
+	// completionResultDigest is the job's durable completion identity
+	// digest (historical frozen v2 or current v3), present only when the
+	// completion receipt was written under a versioned encoding (v2+). It
+	// binds the terminal status/error/outputs/runtime by digest only; a
+	// legacy (v1) receipt has no versioned digest to bind and leaves this
+	// empty.
 	completionResultDigest string
 	// eventFrontier is the execution-event ledger's latest commit-ordered seq
 	// read at emission time. Zero (no events yet, or the store did not expose
@@ -148,9 +149,9 @@ func (s *Server) gatherAttestationEvidenceDB(ctx context.Context, jobID string, 
 		}
 	}
 	// The completion identity the attestation binds: the durable receipt's
-	// digest, only when it was written under the v2 encoding. The receipt is
-	// keyed by the completing runner identity the completion transaction
-	// preserved in AttemptRunnerID.
+	// digest, only when it was written under the historical frozen v2 or
+	// current v3 encoding. The receipt is keyed by the completing runner
+	// identity the completion transaction preserved in AttemptRunnerID.
 	if j.AttemptRunnerID != "" {
 		rec, has, rerr := s.DB.HasCompletionReceipt(ctx, jobID, generation, j.AttemptRunnerID)
 		if rerr != nil {

@@ -632,6 +632,11 @@ func (j Job) ReservedResources() ResourceCapacity {
 	return AddResourceCapacity(j.ResourceRequest(), j.ServiceEnvelopeRequest)
 }
 
+// CompiledJobPayloadSchemaVersion is the schema version stamped on every
+// CompiledJobPayload. version.ContractVersions binds its compiled_job_schema
+// row to this constant.
+const CompiledJobPayloadSchemaVersion = 1
+
 // CompiledJobPayload is the enqueue-time compilation record persisted on a
 // job. PipelineDigest and JobDigest are content addresses the runner can
 // verify against its own recompilation; EffectiveJob is the canonical JSON
@@ -801,6 +806,11 @@ const (
 // the runner name or principal that drove the event when known. Payload is
 // small and non-secret by contract. Additive and self-describing: unknown
 // fields/event types must be ignored by consumers.
+// ExecutionEventSchemaVersion is the schema version stamped on every
+// ExecutionEvent. version.ContractVersions binds its event_schema row to
+// this constant.
+const ExecutionEventSchemaVersion = 1
+
 type ExecutionEvent struct {
 	Seq           int64             `json:"seq"`
 	SchemaVersion int               `json:"schema_version"`

@@ -1,0 +1,21 @@
+{
+  "comment": "FROZEN legacy (hash v1) completion receipt contract fixture. Immutable historical compatibility corpus; do not regenerate without updating the golden constants in internal/storage/contract_corpus_test.go.",
+  "hash_version": 1,
+  "receipt": {
+    "job_id": "contract-fixture-job-v1",
+    "generation": 1,
+    "runner_id": "contract-fixture-runner",
+    "result_hash": "fed0dffe1dc5e52fd166181dc6fa2b2a7fbff6aa2a4cbdc4af80db4fad76bb81",
+    "result_hash_version": 1
+  },
+  "completion": {
+    "status": "success",
+    "outputs": {
+      "artifact": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "url": "https://example.invalid/dist/app"
+    }
+  },
+  "golden": {
+    "result_hash": "fed0dffe1dc5e52fd166181dc6fa2b2a7fbff6aa2a4cbdc4af80db4fad76bb81"
+  }
+}

@@ -2725,9 +2725,9 @@ func (m *memStore) CompleteJob(ctx context.Context, jobID string, generation int
 	j.ObservedRuntime = observed
 	m.jobs[jobID] = j
 	// The written receipt records the identity semantic it was computed
-	// with: a version-less incoming receipt is the current v2 digest (every
-	// production caller computes it), unless the caller explicitly labeled
-	// it legacy.
+	// with: a version-less incoming receipt is recorded under the
+	// historical frozen v2 digest (the unlabeled default), unless the
+	// caller explicitly labeled it (current v3 or legacy v1).
 	if receipt.ResultHashVersion <= 0 {
 		receipt.ResultHashVersion = CompletionResultHashVersionV2
 	}
@@ -3595,7 +3595,7 @@ func (m *memStore) AppendExecutionEvent(_ context.Context, e model.ExecutionEven
 // (directly or through the job), mirroring the PostgreSQL triggers.
 func (m *memStore) appendExecutionEventLocked(e model.ExecutionEvent) {
 	if e.SchemaVersion <= 0 {
-		e.SchemaVersion = 1
+		e.SchemaVersion = model.ExecutionEventSchemaVersion
 	}
 	if e.CreatedAt.IsZero() {
 		e.CreatedAt = time.Now().UTC()

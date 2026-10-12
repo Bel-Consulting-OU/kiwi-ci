@@ -1,7 +1,7 @@
 .PHONY: build test test-unit test-race test-integration integration test-adversarial test-shuffle test-stress \
 	fuzz coverage coverage-ci coverage-floor coverage-package-floor staticcheck govulncheck cross schema-check surface-check dockerfile-buildargs-check docs-check license-check license-notice repro-build \
 	toolchain-check tla2tools fmt lint run clean protect-branch \
-	dogfood-fast dogfood-local dogfood-system dogfood-distributed dogfood-adversarial dogfood-upgrade dogfood-scale dogfood-release-model dogfood-all
+	dogfood-fast dogfood-local dogfood-system dogfood-production dogfood-release-artifacts dogfood-distributed dogfood-adversarial dogfood-upgrade dogfood-scale dogfood-release-model dogfood-all
 
 VERSION ?= 0.1.0-dev
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -70,7 +70,7 @@ test-antagonistic: test-unit test-race test-adversarial test-stress test-single-
 # TestDFQUOTA*/...; the -run filters below match those names
 # the stable contract with that package (scenario IDs in docs/DOGFOOD.md).
 # ---------------------------------------------------------------------------
-.PHONY: dogfood-fast dogfood-local dogfood-system dogfood-distributed dogfood-adversarial \
+.PHONY: dogfood-fast dogfood-local dogfood-system dogfood-production dogfood-release-artifacts dogfood-distributed dogfood-adversarial \
 	dogfood-upgrade dogfood-scale dogfood-release-model dogfood-all
 
 # Every dogfood target runs through scripts/dogfood-run.sh, which FAILS
@@ -182,17 +182,14 @@ dogfood-scale:
 
 # DF7 release-candidate closure for the pieces that gate a release today:
 # evidence truthfulness, quota, effects, self-host generation limit.
-# Install-from-artifact and full G0→G1→G2 binary self-build are next wave.
 # dogfood-release-model runs what is implemented today. It is NOT a release
 # gate: production closure scenarios are still missing (see banner).
 dogfood-release-model:
 	@echo "RELEASE DOGFOOD (model+system, NOT a release gate) — production scenarios still MISSING:"
 	@echo "  DF-DIST-001     live multi-process topology (postgres/objectstore/2 runners)"
-	@echo "  DF-UPGRADE-002  N-1 binary matrix"
 	@echo "  DF-SCALE-002    live resource-leak / soak"
-	@echo "  DF-RELEASE-001  exact packaged artifact lifecycle"
 	@echo "  DF-DR-001       backup → destroy → restore"
-	@echo "  DF-SELF-002     G1→G2 binary self-build"
+	@echo "  (binary proofs DF-UPGRADE-002 / DF-SELF-002 / DF-RELEASE-001: make dogfood-release-artifacts)"
 	@echo "  (DF1 system proofs are real: make dogfood-system — NewPersistent + HTTP + runner)"
 	@echo "Running the implemented suite anyway:"
 	./scripts/dogfood-run.sh 180m \
@@ -209,6 +206,20 @@ dogfood-release-model:
 		--require TestDFBOOT001 \
 		--require TestDogfoodResultJSONShape
 
+# Release-artifact proofs (SYSTEM species, real product binaries):
+#   DF-UPGRADE-002  N-1 binary → HEAD binary on one state directory
+#   DF-SELF-002     G1 → G2 binary self-build from the same source tree
+#   DF-RELEASE-001  exact packaged bytes install → serve → work → evidence
+# Name-required so the suite cannot silently lose them. Skip is allowed only
+# for a git worktree/N-1 build failure inside TestSysDFUpgrade002NMinusOne.
+dogfood-release-artifacts:
+	./scripts/dogfood-run.sh 15m \
+		--run 'TestSysDFUpgrade|TestSysDFSelf|TestSysDFRelease' \
+		--require TestSysDFUpgrade002NMinusOne \
+		--require TestSysDFSelf002G1ToG2 \
+		--require TestSysDFRelease001PackagedArtifact \
+		-- ./internal/dogfood/system/
+
 # SYSTEM-species product dogfood: real NewPersistent server, real HTTP API,
 # real runner.Run (or real register/next/complete) — not the in-memory model
 # harness. Fail-closed arms (stale lease generation, untrusted hard-quota
@@ -219,8 +230,8 @@ dogfood-release-model:
 # they execute on this host rather than skipping. They are name-required so
 # the suite cannot silently lose them.
 dogfood-system:
-	./scripts/dogfood-run.sh 120s \
-		--run 'TestSys' \
+	./scripts/dogfood-run.sh 180s \
+		--run 'TestSysDFBoot|TestSysDFEvid|TestSysDFLease|TestSysQuota|TestSysRootless|TestSysTrusted' \
 		--require TestSysDFBoot001 \
 		--require TestSysDFEvid001 \
 		--require TestSysDFLease001 \
@@ -230,29 +241,34 @@ dogfood-system:
 		--require TestSysTrustedScheduleIngress \
 		-- ./internal/dogfood/system/
 
-# All currently implemented dogfood suites (DF1–DF7 entry points) plus the
-# SYSTEM-species product proofs. Model suites remain the state-machine
-# oracle; dogfood-system is the production HTTP/store/runner path. Live
-# multi-process DF2 (postgres/objectstore) stays in docs/DOGFOOD.md
-# "Implemented vs planned". dogfood-fast is a strict subset of dogfood-local
-# and is not repeated here; DF0 is .kiwi/pipeline.yaml.
-dogfood-all: dogfood-local dogfood-system dogfood-distributed dogfood-adversarial dogfood-upgrade dogfood-scale dogfood-release-model
+# Production-closure SYSTEM species: live resource-leak/soak (DF-SCALE-002),
+# the untrusted container + hard quota + signed v6 evidence lane, the live
+# multi-process topology (DF-DIST-001), and backup→destroy→restore
+# (DF-DR-001). These are name-required so the production suite cannot
+# silently lose them.
+dogfood-production:
+	./scripts/dogfood-run.sh 20m \
+		--run 'TestSysDFScale002|TestSysUntrusted|TestSysDFDist|TestSysDFDr' \
+		--require TestSysDFScale002Soak \
+		--require TestSysUntrustedContainerEvidenceLane \
+		--require TestSysDFDist001 \
+		--require TestSysDFDr001 \
+		-- ./internal/dogfood/system/ ./internal/dogfood/dist/
 
-# release-gate FAILS CLOSED until production dogfood closure is complete.
-# Automation that needs "release safe" must use this target, never
-# dogfood-release-model (which is honest about running only what exists).
+# All dogfood suites including production proofs. release-gate is the
+# authoritative safe-to-release target and runs the production set.
+# dogfood-fast is a strict subset of dogfood-local and is not repeated here;
+# DF0 is .kiwi/pipeline.yaml.
+dogfood-all: dogfood-local dogfood-system dogfood-production dogfood-release-artifacts dogfood-distributed dogfood-adversarial dogfood-upgrade dogfood-scale dogfood-release-model
+
+# release-gate is the production dogfood closure: live dist topology, soak,
+# DR restore, N-1 binary upgrade, G1→G2 self-build, packaged artifact, and
+# the untrusted-container evidence lane, plus the critical model/system
+# contracts. Automation that needs "release safe" uses THIS target.
+# dogfood-release-model is the faster model-only subset.
 .PHONY: release-gate
-release-gate:
-	@echo "RELEASE GATE: production dogfood closure is NOT complete." >&2
-	@echo "missing mandatory scenarios:" >&2
-	@echo "  DF-DIST-001  live multi-process topology" >&2
-	@echo "  DF-UPGRADE-002  N-1 binary matrix" >&2
-	@echo "  DF-SCALE-002  live soak / resource recovery" >&2
-	@echo "  DF-RELEASE-001  packaged artifact lifecycle" >&2
-	@echo "  DF-DR-001  backup → destroy → restore" >&2
-	@echo "  DF-SELF-002  G1→G2 binary self-build" >&2
-	@echo "  untrusted container + hard quota + signed v6 evidence lane" >&2
-	@exit 1
+release-gate: dogfood-fast dogfood-system dogfood-production dogfood-release-artifacts
+	@echo "RELEASE GATE green: dist topology, soak, DR restore, N-1 upgrade, G1→G2 self-build, packaged artifact, untrusted-container evidence lane."
 
 # staticcheck-all is the CI check: it is exactly the pinned command run by
 # .woodpecker/linux-amd64.yml. `staticcheck` runs the same pinned command

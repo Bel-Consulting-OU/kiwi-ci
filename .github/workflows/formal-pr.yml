@@ -1,0 +1,58 @@
+name: formal-pr
+
+# Path-sensitive formal-model gate on pull requests. The TLA+ mirror is
+# checked with TLC only when a PR touches a state-machine surface (lease,
+# completion, cancel, scheduler, storage of those, or the invariants doc).
+# README/wording-only PRs must not pay the Java + tla2tools cost.
+#
+# The nightly scheduled run lives in formal.yml (same pins, same model).
+on:
+  pull_request:
+    paths:
+      - "formal/**"
+      - "internal/server/*lease*"
+      - "internal/server/*completion*"
+      - "internal/server/*cancel*"
+      - "internal/scheduler/**"
+      - "internal/storage/*lease*"
+      - "internal/storage/*completion*"
+      - "internal/storage/*cancel*"
+      - "internal/storage/**/*lease*"
+      - "internal/storage/**/*completion*"
+      - "internal/storage/**/*cancel*"
+      - "docs/INVARIANTS.md"
+      - "scripts/fetch-tla2tools.sh"
+      - ".github/workflows/formal-pr.yml"
+
+permissions:
+  contents: read
+
+# Action refs are pinned to full commit SHAs. tla2tools.jar is fetched through
+# scripts/fetch-tla2tools.sh, which verifies the expected SHA-256 before the
+# jar is cached or executed. Re-resolve action SHAs with:
+#   git ls-remote https://github.com/actions/<name>.git 'refs/tags/v*'
+jobs:
+  tlc:
+    name: formal model check (path-sensitive)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: restore tla2tools.jar
+        id: cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/kiwi/tla2tools.jar
+          # The key includes the jar version; fetch-tla2tools.sh re-verifies
+          # the SHA-256 on every run so a poisoned cache entry cannot execute.
+          key: tla2tools-v1.7.4-936a262061c91469
+      - name: fetch tla2tools.jar (sha256-verified)
+        run: ./scripts/fetch-tla2tools.sh ~/.cache/kiwi/tla2tools.jar
+      - name: model check
+        run: |
+          java -Xmx4g -jar ~/.cache/kiwi/tla2tools.jar -workers auto \
+            -config formal/kiwi_lease.cfg formal/kiwi_lease.tla | tee tlc.log
+          grep -q "Model checking completed. No error has been found" tlc.log

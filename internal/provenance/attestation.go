@@ -54,6 +54,29 @@ const executionAttestationDigestVersion = "kiwi-ci/execution-attestation-digest/
 // snapshot identity), not just the human-readable per-item lists.
 const executionEvidenceRootVersion = "kiwi-ci/execution-evidence-root/v1"
 
+// ExecutionAttestationSchemaVersion returns the attestation block schema
+// version new evidence is built under. version.ContractVersions binds its
+// evidence_schema row to this value (via TestContractVersionsMatchProducers;
+// a compile-time reference would import-cycle because this package imports
+// version).
+func ExecutionAttestationSchemaVersion() int {
+	return executionAttestationSchemaVersion
+}
+
+// ExecutionAttestationDigestVersion returns the canonical attestation-digest
+// encoding tag. Exported so version.ContractVersions can pin its
+// attestation_digest row to the producer instead of copying the string.
+func ExecutionAttestationDigestVersion() string {
+	return executionAttestationDigestVersion
+}
+
+// ExecutionEvidenceRootVersion returns the canonical evidence-root encoding
+// tag. Exported so version.ContractVersions can pin its evidence_root_digest
+// row to the producer instead of copying the string.
+func ExecutionEvidenceRootVersion() string {
+	return executionEvidenceRootVersion
+}
+
 // ExecutionAttestationArtifact is one artifact committed under the attempt:
 // the payload digest/size and the digest of its signed provenance statement
 // (empty when the contract did not require and the upload did not publish

@@ -562,7 +562,7 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 			CreatedByMutation: generatedFragmentKey(parent.ID, mutationSlot),
 			ExternalContext:   in.ExternalContext,
 			CompiledJobPayload: &model.CompiledJobPayload{
-				SchemaVersion:   1,
+				SchemaVersion:   model.CompiledJobPayloadSchemaVersion,
 				CompilerVersion: version.Version,
 				PipelineDigest:  pipelineDigest,
 				JobDigest:       hex.EncodeToString(digestSum[:]),

@@ -2089,7 +2089,7 @@ func (s *Server) enqueueID(ctx context.Context, in SubmitRun, preRunID string) (
 			// graph can never carry mixed versions.
 			ExecutionSemantics: run.ExecutionSemantics,
 			CompiledJobPayload: &model.CompiledJobPayload{
-				SchemaVersion:   1,
+				SchemaVersion:   model.CompiledJobPayloadSchemaVersion,
 				CompilerVersion: version.Version,
 				PipelineDigest:  pipelineDigest,
 				JobDigest:       jobDigest,
@@ -4886,9 +4886,11 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "runner session superseded by a newer registration", http.StatusConflict)
 		return
 	}
-	// The completion identity is the v2 digest: it binds status, error,
-	// outputs AND the observed runtime evidence, so a retried completion can
-	// never replay a receipt with contradictory runtime evidence.
+	// The completion identity is the current v3 digest: it binds status,
+	// error, outputs AND the observed runtime evidence (including Control),
+	// so a retried completion can never replay a receipt with contradictory
+	// runtime evidence. Historical frozen v2 receipts stay verifiable under
+	// their stored version.
 	hash := storage.CurrentCompletionResultDigest(in.Status, in.Error, in.Outputs, in.ObservedRuntime)
 	if s.Sched != nil {
 		s.completeDB(w, r, jobID, in, hash)
@@ -5285,17 +5287,19 @@ func (s *Server) completeDB(w http.ResponseWriter, r *http.Request, jobID string
 }
 
 // completionResultHash is the LEGACY (v1) completion identity: it binds only
-// status, error and outputs. Production completions use
-// storage.CompletionResultDigestV2, which also binds the observed runtime
-// evidence; the v1 computation is retained for the v1-receipt compatibility
-// path (a receipt persisted before the version field existed) and for tests.
+// status, error and outputs. Production completions write the CURRENT
+// storage.CurrentCompletionResultDigest (v3). The v1 computation is retained
+// for the v1-receipt compatibility path (a receipt persisted before the
+// version field existed) and for tests. Frozen v2 is never rewritten.
 func completionResultHash(status model.Status, errMsg string, outputs map[string]string) string {
 	return storage.CompletionResultDigestV1(status, errMsg, outputs)
 }
 
 // completionReceiptReplay resolves whether the incoming DB-mode completion
-// (whose v2 digest is requestHash) replays the durable receipt rec. A stored
-// v2 receipt is compared by digest alone. A stored legacy (v1) receipt needs
+// (whose digest is requestHash under the current algorithm) replays the
+// durable receipt rec. A stored frozen-v2 or current-v3 receipt is compared
+// by digest alone (or by re-hashing the request under the stored version).
+// A stored legacy (v1) receipt needs
 // the stored attempt's runtime evidence to decide the nil-or-equal rule, so
 // the job row is read ONLY when the request actually carries runtime evidence
 // and the payback (a v2-evidence-bearing retry) is exactly what must be
@@ -5311,7 +5315,11 @@ func completionResultHash(status model.Status, errMsg string, outputs map[string
 func (s *Server) completionReceiptReplay(ctx context.Context, jobID string, in Complete, rec model.CompletionReceipt, requestHash string) (bool, error) {
 	requestObserved := in.ObservedRuntime
 	var storedObserved *model.ObservedRuntime
-	if rec.ResultHashVersion < storage.CurrentCompletionResultHashVersion && in.ObservedRuntime != nil {
+	// Historical recovery is ONLY for the true legacy v1 receipt. Frozen
+	// v2 and current v3 hashes already bind runtime evidence; reading the
+	// job here would couple an identical v2/v3 replay to unrelated
+	// subsystems (the audit's provenance dependency).
+	if storage.ReplayRequiresHistoricalObservedRuntime(rec.ResultHashVersion) && in.ObservedRuntime != nil {
 		j, err := s.DB.GetJob(ctx, jobID)
 		if err != nil && !errors.Is(err, storage.ErrNotFound) {
 			return false, err
@@ -5664,8 +5672,9 @@ func (s *Server) rollbackStateLocked(rb stateRollback) {
 // matched but the snapshot write failed, so the replay must be refused with
 // 503 instead of acking effects against state the disk does not contain.
 //
-// Matching is versioned (storage.CompletionReceiptReplayMatches): a v2 receipt
-// must equal the request's v2 digest, while a legacy (version-less/v1)
+// Matching is versioned (storage.CompletionReceiptReplayMatches): a
+// historical frozen v2 receipt must equal the request's frozen v2 digest,
+// while a legacy (version-less/v1)
 // receipt replays only against the request's v1 digest and only when the
 // request's runtime evidence is nil-or-equal against the stored attempt's
 // evidence. The stored evidence is only attributable while the live job row

@@ -11,11 +11,12 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
-// Completion result digest versions. New completions always write version 2
-// (see model.CompletionReceipt.ResultHashVersion); version 1 is the legacy
-// computation that bound only status, error and outputs. A stored receipt
-// without the version column (or a pre-field fs record) reads as version 1,
-// the semantic it had when it was written.
+// Completion result digest versions. Current completions write version 3
+// (see model.CompletionReceipt.ResultHashVersion); version 2 is the
+// historical frozen format that first bound observed runtime evidence;
+// version 1 is the legacy computation that bound only status, error and
+// outputs. A stored receipt without the version column (or a pre-field fs
+// record) reads as version 1, the semantic it had when it was written.
 const (
 	// CompletionResultHashVersionLegacy is the pre-runtime-evidence completion
 	// result hash: status/error/outputs only.
@@ -35,9 +36,15 @@ const (
 	completionResultDigestV2Version = "kiwi-ci/completion-result/v2"
 	completionResultDigestV3Version = "kiwi-ci/completion-result/v3"
 	completionErrorDigestVersion    = "kiwi-ci/completion-result-error/v1"
-	observedRuntimeDigestV1Version  = "kiwi-ci/observed-runtime/v1"
-	observedRuntimeDigestV2Version  = "kiwi-ci/observed-runtime/v2"
 )
+
+// ObservedRuntimeDigestV1Version tags the FROZEN historical observed-runtime
+// digest encoding (every field except the Control receipt).
+const ObservedRuntimeDigestV1Version = "kiwi-ci/observed-runtime/v1"
+
+// ObservedRuntimeDigestV2Version tags the current observed-runtime digest
+// encoding (v1 fields PLUS the executor-observed Control receipt).
+const ObservedRuntimeDigestV2Version = "kiwi-ci/observed-runtime/v2"
 
 // CompletionResultDigestV1 returns the LEGACY completion result hash, byte for
 // byte the computation every server wrote before the versioned digest: SHA-256
@@ -45,7 +52,7 @@ const (
 // the outputs (encoding/json sorts map keys and the marshal error is ignored,
 // exactly like the historical completionResultHash helper). It exists so a
 // stored v1 receipt can be resolved against a retried completion after the
-// upgrade; new completions must use CompletionResultDigestV2.
+// upgrade; current completions must use CompletionResultDigestV3.
 func CompletionResultDigestV1(status model.Status, errMsg string, outputs map[string]string) string {
 	outJSON, _ := jsonMarshal(outputs)
 	h := sha256.New()
@@ -145,7 +152,7 @@ func ObservedRuntimeDigestV1(observed *model.ObservedRuntime) string {
 		return ""
 	}
 	h := sha256.New()
-	writeLenPrefixed(h, observedRuntimeDigestV1Version)
+	writeLenPrefixed(h, ObservedRuntimeDigestV1Version)
 	writeLenPrefixed(h, observed.OS)
 	writeLenPrefixed(h, observed.Arch)
 	writeLenPrefixed(h, observed.RuntimeName)
@@ -172,7 +179,7 @@ func ObservedRuntimeDigest(observed *model.ObservedRuntime) string {
 		return ""
 	}
 	h := sha256.New()
-	writeLenPrefixed(h, observedRuntimeDigestV2Version)
+	writeLenPrefixed(h, ObservedRuntimeDigestV2Version)
 	writeLenPrefixed(h, observed.OS)
 	writeLenPrefixed(h, observed.Arch)
 	writeLenPrefixed(h, observed.RuntimeName)
@@ -222,6 +229,19 @@ func StoredAttemptObservedRuntime(j model.Job, generation int64) *model.Observed
 // write. Verification always dispatches on the STORED version so an older
 // receipt keeps matching under the algorithm its producer used.
 const CurrentCompletionResultHashVersion = CompletionResultHashVersionV3
+
+// ReplayRequiresHistoricalObservedRuntime reports whether replay matching a
+// stored receipt of this version needs historical observed-runtime recovery
+// (reading the job row / attempt evidence). Only the true legacy v1 path
+// needs it: v1 bound only status/error/outputs, so the nil-or-equal runtime
+// rule must be checked against the stored attempt. Frozen v2 already binds
+// runtime (observed-runtime/v1) and v3 binds runtime+Control — their
+// receipts are self-sufficient and must not depend on another subsystem
+// (provenance, DB) for an identical replay. Adding v4 must use this helper,
+// never `version < Current`.
+func ReplayRequiresHistoricalObservedRuntime(storedVersion int) bool {
+	return storedVersion < CompletionResultHashVersionV2
+}
 
 // CurrentCompletionResultDigest is the digest new completion receipts store.
 func CurrentCompletionResultDigest(status model.Status, errMsg string, outputs map[string]string, observed *model.ObservedRuntime) string {

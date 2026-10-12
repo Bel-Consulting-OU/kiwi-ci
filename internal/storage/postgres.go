@@ -2403,9 +2403,10 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 	if receipt.JobID != jobID || receipt.Generation != generation || receipt.RunnerID != runnerID {
 		return fmt.Errorf("storage: completion receipt identity mismatch")
 	}
-	// Incoming receipt version: every production caller computes the v2
-	// digest, so a version-less receipt means "current". Explicit v1 callers
-	// (legacy compatibility tests and repair tooling) keep legacy semantics.
+	// Incoming receipt version: production callers label the current v3
+	// digest. A version-less receipt falls back to the historical frozen
+	// v2 default. Explicit v1 callers (legacy compatibility tests and
+	// repair tooling) keep legacy semantics.
 	receiptVersion := receipt.ResultHashVersion
 	if receiptVersion <= 0 {
 		receiptVersion = CompletionResultHashVersionV2

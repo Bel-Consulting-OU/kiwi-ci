@@ -98,6 +98,35 @@ type testingT interface {
 	TempDir() string
 }
 
+// Attach builds a client-only System against an already-running control
+// plane (a packaged binary, an N-1 binary, or any other out-of-process
+// server). It never constructs a server.Server: BaseURL and the tokens are
+// the only authority, so every request the harness issues is the real HTTP
+// surface of that binary. runnerWorkRoot is the harness-local directory for
+// runner workspaces/identity/cache — it is NOT the server's --data-dir.
+func Attach(baseURL, adminToken, runnerToken, runnerWorkRoot string) (*System, error) {
+	if baseURL == "" {
+		return nil, fmt.Errorf("system.Attach: baseURL is required")
+	}
+	if runnerToken == "" {
+		return nil, fmt.Errorf("system.Attach: runnerToken is required")
+	}
+	if adminToken == "" {
+		adminToken = runnerToken
+	}
+	if runnerWorkRoot == "" {
+		return nil, fmt.Errorf("system.Attach: runnerWorkRoot is required")
+	}
+	return &System{
+		AdminToken:   adminToken,
+		RunnerToken:  runnerToken,
+		BaseURL:      strings.TrimRight(baseURL, "/"),
+		DataDir:      runnerWorkRoot,
+		client:       &http.Client{Timeout: 30 * time.Second},
+		maintainDone: make(chan struct{}),
+	}, nil
+}
+
 // Launch builds a persistent server on cfg.DataDir and serves Handler() on
 // 127.0.0.1. The Maintain loop is started immediately: without it the
 // completion outbox never dispatches execution attestations.

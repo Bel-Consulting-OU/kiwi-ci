@@ -261,6 +261,21 @@ DF-RELEASE-*    packaging
 IDs appear in scenario implementation, `DOGFOOD_MATRIX.md`, invariant mapping,
 CI output, and failure reports.
 
+## Production closure (release-gate)
+
+`make release-gate` is the authoritative safe-to-release target. It runs and
+requires:
+
+| Proof | Test |
+|---|---|
+| DF-DIST-001 live topology (server + 2 runners + client) | `TestSysDFDist001` |
+| DF-DR-001 backup → destroy → restore | `TestSysDFDr001` |
+| DF-SCALE-002 soak + runner churn / resource recovery | `TestSysDFScale002Soak` |
+| DF-UPGRADE-002 N-1 binary → HEAD on same state | `TestSysDFUpgrade002NMinusOne` |
+| DF-SELF-002 G0→G1→G2 binary self-build | `TestSysDFSelf002G1ToG2` |
+| DF-RELEASE-001 exact packaged artifact lifecycle | `TestSysDFRelease001PackagedArtifact` |
+| Untrusted-container / evidence lane | `TestSysUntrustedContainerEvidenceLane` |
+
 ## Implemented vs planned
 
 The harness, oracle, hostile runner, fakes and the scenario kernel below are
@@ -272,7 +287,7 @@ zero tests.
 
 | Implemented now | Planned next wave |
 |---|---|
-| DF-BOOT-001, DF-EVID-001..005, DF-LEASE-001/002, DF-QUOTA-001, DF-EFFECT-001/002, DF-SELF-001 (G0/G1/G2 limit), DF-UPGRADE-001 (evidence compat), DF-SCALE-001 (harness workload) — **model species** | live DF2 multi-process topology, DF3 process/network chaos, DF4 N-1 binary matrix, DF5 real-forge canary, DF6 10k-job soak, DF7 packaged-binary install |
+| DF-BOOT-001, DF-EVID-001..005, DF-LEASE-001/002, DF-QUOTA-001, DF-EFFECT-001/002, DF-SELF-001 (G0/G1/G2 limit), DF-UPGRADE-001 (evidence compat), DF-SCALE-001 (harness workload) — **model species** | DF3 process/network chaos at scale, DF5 real-forge canary, long multi-hour soak |
 | DF-BOOT-001 / DF-EVID-001 / DF-LEASE-001 / DF-QUOTA-001 — **system species** via `TestSys*` in `internal/dogfood/system/` (real `NewPersistent` + HTTP + runner). Fail-closed arms (stale lease generation → 409, untrusted hard-quota gate, untrusted rootless floor) always run. Boot/restart and evidence success arms run an untrusted container job when rootless Docker satisfies the untrusted policy floor, and otherwise run a TRUSTED native job through the product trusted ingress (`TestSysTrustedIngress` signed GitHub webhook, `TestSysTrustedScheduleIngress` trusted schedule) — so they execute on hosts without rootless Docker instead of skipping. Direct API submissions stay untrusted (the product force-clears `Trusted`); the store is never mutated to fake trust. | postgres/objectstore system topology, real-forge webhook canary |
 | G0/G1/G2 recursion refusal (`Harness.BeginGeneration`) | full G0→G1→G2 self-build of a release binary |
 | `dogfood-result.json` shape (`MarshalResult`, `TestDogfoodResultJSONShape`) | suite-level artifact emission of the result bundle on disk |

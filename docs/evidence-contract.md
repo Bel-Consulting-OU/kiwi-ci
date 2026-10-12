@@ -135,6 +135,36 @@ silently reinterpreted. Because the schema version is part of the digest
 preimage, "same evidence, older schema" is by construction a different
 statement.
 
+### Historical compatibility corpus (immutable fixtures)
+
+The N-2/N-1 **producer bytes** are the contract — not a HEAD-reconstructed
+struct. `testdata/contracts/` holds the actual byte artifacts of previously
+issued encodings:
+
+| Fixture | What it freezes |
+|---|---|
+| `completion_receipt_v1.json` | legacy (hash v1) completion identity over status/error/outputs |
+| `completion_receipt_v2.json` | frozen v2 completion identity, nested `observed-runtime/v1`, **no Control receipt** |
+| `observed_runtime_v1.json` | the bare observed-runtime wire bytes (no Control) |
+| `attestation_v4.json` | schema-v4 statement (frozen name vocabulary, level+name only) |
+| `attestation_v5.json` | schema-v5 statement (frozen fact meanings) |
+| `attestation_v6.json` | current schema-v6 statement bytes |
+
+Consumers load these files from disk and must accept them byte-for-byte:
+replay matching for the receipts (`storage.CompletionReceiptReplayMatches`),
+digest recomputation for both, and `provenance.VerifyExecutionAttestation`
+for the statements. The tests in `internal/storage/contract_corpus_test.go`
+and `internal/provenance/contract_corpus_test.go` pin the golden digests as
+Go constants, so changing a frozen v2/v4/v5 encoding fails CI even if the
+fixtures themselves were regenerated.
+
+**The fixtures are committed and immutable.** An optional regeneration
+entry point exists (`KIWI_GEN_CONTRACT_FIXTURES=1 go test ./internal/provenance
+-run TestGenerateContractFixtures`) for an audit refresh; regenerating
+without updating the golden test constants is expected to fail, by design.
+Never "fix" a frozen fixture to make a consumer pass — introduce a new
+version instead (see `version.ContractVersions`).
+
 ## 4. Execution assurance: facts first, profiles derived
 
 The AUTHORITATIVE signed object is the control-fact vector

@@ -841,7 +841,7 @@ func (r *Repository) AppendExecutionEvent(ctx context.Context, e model.Execution
 		return err
 	}
 	if e.SchemaVersion <= 0 {
-		e.SchemaVersion = 1
+		e.SchemaVersion = model.ExecutionEventSchemaVersion
 	}
 	if e.CreatedAt.IsZero() {
 		e.CreatedAt = time.Now().UTC()

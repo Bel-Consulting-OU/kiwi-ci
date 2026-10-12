@@ -347,6 +347,22 @@ builder identity, so a keyless signature can be added alongside or replace
 the Ed25519 signature. Until that lands, `--trusted-key` verification against
 the published release key is the supported path.
 
+## 7. Release governance on `main`
+
+Canonical release gates (the fail-closed `make release-gate`, the formal
+model checks, the supply-chain verification in `scripts/release.sh`) must not
+be admin-bypassable on `main`: no force-merge past a red required check, and
+no "required" gate that a repository admin can silently skip to publish.
+GitHub branch-protection settings live outside this repository and cannot be
+enforced from here — this section is the policy those settings must match.
+
+If a break-glass bypass is ever used (outage, stuck release, compromised
+runner), treat it as an incident: record who bypassed, which gate, the full
+commit SHA, the justification, and the follow-up, in the release notes of the
+affected version and in the audit log. Re-establish every canonical gate
+before the next release is cut. An unaudited bypass voids the release's
+supply-chain claims.
+
 ## Dependency licenses
 
 Third-party licensing is gated by `scripts/license-check.sh`

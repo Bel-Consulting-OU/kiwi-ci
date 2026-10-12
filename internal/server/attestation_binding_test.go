@@ -11,7 +11,8 @@ import (
 )
 
 // TestAttestationBindsCompletionDigestWithoutRawValues proves the signed
-// attestation binds the durable v2 completion identity by DIGEST only: the
+// attestation binds the durable completion identity (current v3 /
+// historical frozen v2) by DIGEST only: the
 // envelope carries completionResultDigest and the full evidence root, never a
 // raw output or error value, and a different output set produces a different
 // digest and therefore a different attestation subject.
