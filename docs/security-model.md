@@ -78,7 +78,7 @@ key never leaves the runner. Runners also negotiate a protocol version
 (currently v3); incompatible runners are rejected, not silently
 accepted.
 
-## Secrets
+## Security-model secrets
 
 - Secrets are declared in the pipeline; values are resolved by the
   server-side broker only for jobs holding an active lease, under the
@@ -120,11 +120,11 @@ acknowledged loopback development instance). See
 When a provider and static entries are both configured, resolution forms a fail-closed chain.
 `secret_broker.fallback_on` (a TOML array, default `["not_found"]`) lists the provider error classes that permit advancing to the next broker; only `not_found` and `unavailable` are accepted.
 Authorization (`401`), policy (`403`), malformed-response, and cancellation failures always fail closed.
- The authoritative error is returned (classified and with the provider named) and the later broker is never consulted, so a Vault denial or outage can never be masked by delivering a static secret.
+The authoritative error is returned (classified and with the provider named) and the later broker is never consulted, so a Vault denial or outage can never be masked by delivering a static secret.
 Provider failures are classified as `not_found` (absent secret), `unavailable` (5xx, network/TLS failure, timeout, invalid endpoint, cancellation), `unauthorized`, `forbidden`, or `malformed`; provider response bodies are never copied into error messages.
 
 
-## OIDC
+## Security-model OIDC
 
 The control plane is an OIDC issuer (Ed25519 key ring) with discovery
 at `/.well-known/openid-configuration` and JWKS at

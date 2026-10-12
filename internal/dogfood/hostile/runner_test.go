@@ -81,6 +81,17 @@ func TestNewModeMatrix(t *testing.T) {
 				if traffic.ArtifactUploaded {
 					t.Fatal("completion-before-artifact uploaded the artifact")
 				}
+			case ModeArtifactAfterCompletion:
+				if traffic.ArtifactsAfterCompletion == 0 {
+					t.Fatal("artifact-after-completion emitted no post-terminal artifact write")
+				}
+				if !traffic.ArtifactUploaded {
+					t.Fatal("artifact-after-completion never uploaded the artifact")
+				}
+				c := traffic.Completions[0]
+				if c.ArtifactSHA256 != base.ArtifactSHA256 {
+					t.Fatal("artifact-after-completion falsified the artifact hash; the lie is the ordering")
+				}
 			case ModeWrongJob:
 				c := traffic.Completions[0]
 				if c.AttemptID == base.JobID {

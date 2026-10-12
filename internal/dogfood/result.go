@@ -3,6 +3,9 @@ package dogfood
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -141,4 +144,98 @@ func (d DogfoodResult) Seal() (DogfoodResult, error) {
 func (d DogfoodResult) MarshalResult() ([]byte, error) {
 	sealed, _ := d.Seal()
 	return json.MarshalIndent(sealed, "", "  ")
+}
+
+// ResultDirEnv names the environment variable that selects the result-bundle
+// output directory for a dogfood run. When empty, callers fall back to their
+// own scratch directory (tests use t.TempDir()).
+const ResultDirEnv = "DOGFOOD_RESULT_DIR"
+
+// ScenarioResultFileName returns the stable scenario-results/ file name for
+// one arm. IDs and arms are scenario identifiers, but they can contain
+// characters that are hostile to file systems, so anything outside the
+// portable set is folded to '-' and a collision-safe ordinal is appended.
+func ScenarioResultFileName(s ScenarioResult, ordinal int) string {
+	sanitize := func(in string) string {
+		var b strings.Builder
+		for _, r := range in {
+			switch {
+			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '.', r == '_':
+				b.WriteRune(r)
+			default:
+				b.WriteByte('-')
+			}
+		}
+		out := strings.Trim(b.String(), "-.")
+		if out == "" {
+			out = "scenario"
+		}
+		return out
+	}
+	name := sanitize(s.ID)
+	if s.Arm != "" {
+		name += "-" + sanitize(s.Arm)
+	}
+	if ordinal > 0 {
+		name += fmt.Sprintf("-%d", ordinal)
+	}
+	return name + ".json"
+}
+
+// WriteResultBundle writes the execution-dogfood result bundle under dir:
+// dogfood-result.json (the sealed MarshalResult document) and one
+// scenario-results/<id>[-<arm>].json per scenario arm. The directory and the
+// scenario-results/ subdirectory are created as needed. It returns the path
+// of dogfood-result.json.
+func (d DogfoodResult) WriteResultBundle(dir string) (string, error) {
+	if strings.TrimSpace(dir) == "" {
+		return "", fmt.Errorf("dogfood: result bundle directory is empty")
+	}
+	raw, err := d.MarshalResult()
+	if err != nil {
+		return "", err
+	}
+	sealed, _ := d.Seal()
+	if err := os.MkdirAll(filepath.Join(dir, "scenario-results"), 0o755); err != nil {
+		return "", err
+	}
+	top := filepath.Join(dir, "dogfood-result.json")
+	if err := os.WriteFile(top, raw, 0o644); err != nil {
+		return "", err
+	}
+	used := map[string]bool{}
+	for i, s := range sealed.Scenarios {
+		name := ScenarioResultFileName(s, 0)
+		if used[name] {
+			name = ScenarioResultFileName(s, i+1)
+		}
+		used[name] = true
+		body, err := json.MarshalIndent(s, "", "  ")
+		if err != nil {
+			return "", err
+		}
+		if err := os.WriteFile(filepath.Join(dir, "scenario-results", name), body, 0o644); err != nil {
+			return "", err
+		}
+	}
+	return top, nil
+}
+
+// EmitResult writes the result bundle to the directory named by
+// DOGFOOD_RESULT_DIR when that variable is set and non-empty; otherwise it
+// writes to fallback (tests pass t.TempDir() so the bundle is always
+// exercised even without the environment variable). It returns the directory
+// actually written.
+func (d DogfoodResult) EmitResult(fallback string) (string, error) {
+	dir := strings.TrimSpace(os.Getenv(ResultDirEnv))
+	if dir == "" {
+		dir = fallback
+	}
+	if strings.TrimSpace(dir) == "" {
+		return "", fmt.Errorf("dogfood: no result directory (%s unset and no fallback)", ResultDirEnv)
+	}
+	if _, err := d.WriteResultBundle(dir); err != nil {
+		return "", err
+	}
+	return dir, nil
 }

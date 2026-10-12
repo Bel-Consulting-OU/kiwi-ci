@@ -3,7 +3,7 @@
 Kiwi CI caches are content-addressed archive stores keyed by declared
 inputs, with optional remote mirroring through the control plane.
 
-## Declaration
+## Cache declaration
 
 ```yaml
 cache:
@@ -90,7 +90,7 @@ Payloads live in the content-addressed blob store
 or S3 backends. The CAS layer (`internal/cas`) verifies the digest on
 write and read.
 
-## Limits
+## Cache limits
 
 - Max cache bytes is configurable per store.
 

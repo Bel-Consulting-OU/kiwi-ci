@@ -52,7 +52,7 @@ Raising `MaxGen` or the constant sets is a deliberate tuning decision, not a cla
 
 The shipped instance (`Jobs = {"job-a"}`, `Runners = {"runner-1", "runner-2"}`, `MaxGen = 3`) was model-checked on 2026-10-11 with TLC2 2.19 on Java 17 (`java -jar tla2tools.jar -workers auto -config formal/kiwi_lease.cfg formal/kiwi_lease.tla`): **model checking completed, no error found**.
  5,426,161 states generated, 370,064 distinct states, complete state graph (depth 21) explored in 29s, all invariants and temporal properties checked.
-Running the check for the first time found three shipped defects, all fixed: 
+Running the check for the first time found three shipped defects, all fixed:
 
 1. the config used a `CONSTANT` / `<-` assignment form TLC rejects (now
    `CONSTANTS` with `=`; `MaxGen` became a real constant so instances are
@@ -60,7 +60,7 @@ Running the check for the first time found three shipped defects, all fixed:
 
 2. 2.
   `StaleAttempt` recorded a late duplicate of an ALREADY-COMMITTED attempt as a refusal, so the record-set encoding of `StaleOwnerCannotCommit` intersected `commits` through a representation artifact.
-   the action now models a refusal only for a record that was not already committed (a duplicate of a committed attempt is the I1 receipt replay); 
+   the action now models a refusal only for a record that was not already committed (a duplicate of a committed attempt is the I1 receipt replay);
 
 3. the advertised instance (2 jobs x MaxGen 3) was not exhaustible in
    practical time — the refusal ledger is a record set, so the state space is

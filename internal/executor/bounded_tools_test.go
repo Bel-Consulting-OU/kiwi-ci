@@ -51,7 +51,7 @@ func TestBoundedToolCommandSuccessKeepsOutput(t *testing.T) {
 // binary cannot flood the diagnostic.
 func TestBoundedToolCommandHangingTimesOutTypedBoundedOutput(t *testing.T) {
 	testutil.UnixShell(t)
-	noisyHang := "#!/bin/sh\nif [ -n \"$KIWI_TEST_WARM\" ]; then exit 0; fi\ni=0\nwhile [ \"$i\" -lt 100 ]; do printf 'abcdefghij'; i=$((i+1)); done\nexec sleep 300\n"
+	noisyHang := "#!/bin/sh\nif [ -n \"$KIWI_TEST_WARM\" ]; then exit 0; fi\ni=0\nwhile [ \"$i\" -lt 100 ]; do printf 'abcdefghij'; i=$(expr $i + 1); done\nexec sleep 300\n"
 	fake := writePrewarmedScript(t, "tool", noisyHang)
 
 	start := time.Now()
@@ -213,7 +213,7 @@ func TestRunXFSQuotaCommandHangingTimesOutBounded(t *testing.T) {
 	xfsQuotaTimeout = 500 * time.Millisecond
 	t.Cleanup(func() { xfsQuotaTimeout = orig })
 
-	noisyHang := "#!/bin/sh\nif [ -n \"$KIWI_TEST_WARM\" ]; then exit 0; fi\ni=0\nwhile [ \"$i\" -lt 100 ]; do printf 'abcdefghij'; i=$((i+1)); done\nexec sleep 300\n"
+	noisyHang := "#!/bin/sh\nif [ -n \"$KIWI_TEST_WARM\" ]; then exit 0; fi\ni=0\nwhile [ \"$i\" -lt 100 ]; do printf 'abcdefghij'; i=$(expr $i + 1); done\nexec sleep 300\n"
 	fake := writePrewarmedScript(t, "xfs_quota", noisyHang)
 	start := time.Now()
 	err := runXFSQuotaCommand(fake, "/mnt/xfs", "limit -p bhard=1 42")

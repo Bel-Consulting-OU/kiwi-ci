@@ -54,7 +54,7 @@ The executor decides this purely from the daemon kind
 | rootless | `0:0` in the user namespace | unchanged `0700` | stays runner-owned | none: container root already maps to the runner uid; the user namespace is the isolation boundary |
 | rootful  | `65534:65534` (`nobody`) | `0711` traverse-only | chowned to `65534:65534` for the container lifetime | `provisionContainerWorkspace` before `docker run` |
 
-Rules that keep this safe:
+Container-isolation rules that keep this safe:
 
 - The rootful provisioning refuses to touch a tree the runner does not
   own (validated entry by entry before any `chown`; symlinks are
@@ -78,7 +78,7 @@ Rules that keep this safe:
   created in the bind mount stay runner-owned on the host.
 
 `internal/runner/rootless_integration_test.go` (gated by `KIWI_TEST_DOCKER=1`) proves the contract end to end.
- The job writes a file through the mount, an artifact uploads from the host-side tree, the host sees runner ownership and the restored `0700` mode afterwards, and a rootless daemon reports container root while the host file stays runner-owned.
+The job writes a file through the mount, an artifact uploads from the host-side tree, the host sees runner ownership and the restored `0700` mode afterwards, and a rootless daemon reports container root while the host file stays runner-owned.
 
 
 ## Backend hardening
@@ -131,9 +131,9 @@ Untrusted work is bounded before it is ever queued. Admission applies
 server-side ceilings to every untrusted job: 2 CPU, 4 GiB memory, 10 GiB
 disk and 256 PIDs by default, plus at most 8 sidecar services per job.
 
-- - A declared request above a ceiling is rejected with `400` (`untrusted_resource_ceiling_exceeded`; services: `untrusted_service_ceiling_exceeded`) before the run is signed, persisted or scheduled.
+- A declared request above a ceiling is rejected with `400` (`untrusted_resource_ceiling_exceeded`; services: `untrusted_service_ceiling_exceeded`) before the run is signed, persisted or scheduled.
    it is never clamped to a smaller value, so admission and execution always agree on what was requested.
-  
+
 
 - A dimension the job leaves unset is filled with the ceiling, so the
   executor always has a limit to apply.
@@ -188,7 +188,7 @@ value the runner asserts:
 | per-runner bearer token (`runner_bearer_tokens`) | the authenticated runner ID | `runner_profile_links` |
 | shared dev token, no runner CA, no per-runner credentials (dev only) | the payload `cert_serial` (dev compatibility) | `cert_profile_links` |
 
-Rules that keep this safe:
+Docker-socket rules that keep this safe:
 
 - A client-asserted `cert_serial` in the registration payload is **never**
   a privilege key while runner mTLS or per-runner bearer credentials are
@@ -196,9 +196,9 @@ Rules that keep this safe:
   against the runner CA. A bearer token therefore cannot claim another
   runner's serial and inherit its profile.
 
-- - The runner-ID binding is an explicit admin fact with a primary KEY, so exactly one profile applies per runner.
+- The runner-ID binding is an explicit admin fact with a primary KEY, so exactly one profile applies per runner.
    At most one binding per runner ID, enforced by the database instead of a payload scan (a payload scan is client-asserted and racy — two concurrent registrations could both see a serial "unclaimed").
-  
+
 
 - Bind and unbind runner-ID bindings through the admin-tier API:
   `PUT /api/v1/runner-profiles/{profile}/runner/{runnerID}` and
@@ -227,6 +227,6 @@ Rules that keep this safe:
   production.
 
 - Keep deployment-capable runners separate from ordinary build runners
-  (see [environments.md](environments.md)).
+  See [environments.md](environments.md).
 
 - Drain runners before maintenance: `kiwi runner drain <id>`.

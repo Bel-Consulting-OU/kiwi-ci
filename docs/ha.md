@@ -40,8 +40,7 @@ dashboard, health, and metrics.
 - Default lease duration: 45 seconds.
 
 - Each lease carries a generation counter; acquisition is a single
-  conditional update (`WHERE status='queued' AND (lease_expires_at IS
-  NULL OR lease_expires_at < now())`), so two leaders can never both
+  conditional update (`WHERE status='queued' AND (lease_expires_at IS NULL OR lease_expires_at < now())`), so two leaders can never both
   lease the same job.
 
 - Heartbeats extend the lease; a heartbeat conflict that surfaces a

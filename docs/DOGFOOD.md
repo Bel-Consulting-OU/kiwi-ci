@@ -1,7 +1,7 @@
 # Kiwi dogfood — 360° self-validation
 
 This document is the operating contract for Kiwi's dogfood program. After the
-execution-assurance fixes (quota truthfulness, effective/observed consistency),
+execution-assurance corrections (quota truthfulness, effective/observed consistency),
 the architecture is frozen: the principal correctness engine becomes continuous
 self-validation under hostile conditions.
 
@@ -57,7 +57,7 @@ CONTROLLED DEPENDENCIES
   hostile/slow/failing endpoints
 ```
 
-Rules:
+Dogfood rules:
 
 - The harness **never mutates Kiwi's database** to make a scenario pass.
   Direct DB access is a **read-only secondary oracle** only.
@@ -145,11 +145,12 @@ modes live in `internal/dogfood/hostile`:
 ```text
 stale-generation · duplicate completion · wrong-runtime receipt
 contradictory assurance · artifact hash liar · late logger
-never-heartbeat · completion-before-artifact · wrong job · protocol downgrade
+never-heartbeat · completion-before-artifact · artifact-after-completion
+wrong job · protocol downgrade
 ```
 
-(`artifact-after-completion` is a planned mode; the implemented closed set is
-the ten names above, exercised by `TestNewModeMatrix`.)
+The implemented closed set is the eleven names above, exercised by
+`TestNewModeMatrix` and the DF-LEASE-001 hostile-mode table.
 
 The server signature means: *Kiwi validated and accepted this evidence
 according to its trust model.* Malformed or self-contradictory runner
@@ -227,7 +228,7 @@ unit/property test
 ```
 
 Examples: single authoritative terminal result.
- transition/ledger atomicity; stale lease cannot mutate authority; authorized event recovery; replay cannot silently introduce effects; dynamic mutation cannot rewrite committed history; speculation has one committer; terminal states are monotonic; credentials never exceed execution authority; untrusted execution cannot poison trusted cache.
+ transition/ledger atomicity; stale lease cannot mutate authority; authorized event recovery; replay cannot silently introduce effects. Dynamic mutation cannot rewrite committed history; speculation has one committer; terminal states are monotonic. Credentials never exceed execution authority; untrusted execution cannot poison trusted cache.
 
 
 ## Public-surface coverage is measurable
@@ -309,10 +310,12 @@ missing.
 |---|---|
 | DF-BOOT-001, DF-EVID-001..005, DF-LEASE-001/002, DF-QUOTA-001, DF-EFFECT-001/002, DF-SELF-001 (G0/G1/G2 limit), DF-UPGRADE-001 (evidence compat), DF-SCALE-001 (harness workload) — **model species** | — |
 | DF-ART-001 (artifact finalization crash windows via `internal/artifact`), DF-CACHE-001 (untrusted→trusted cache poison via `internal/cache`) — **component species** | — |
-| DF-BOOT-001 / DF-EVID-001 / DF-LEASE-001 / DF-QUOTA-001 — **system species** via `TestSys*` in `internal/dogfood/system/` (real `NewPersistent` + HTTP + runner). Fail-closed arms (stale lease generation → 409, untrusted hard-quota gate, untrusted rootless floor) always run. Boot/restart and evidence success arms run an untrusted container job when rootless Docker satisfies the untrusted policy floor, and otherwise run a TRUSTED native job through the product trusted ingress (`TestSysTrustedIngress` signed GitHub webhook, `TestSysTrustedScheduleIngress` trusted schedule) — so they execute on hosts without rootless Docker instead of skipping. Direct API submissions stay untrusted (the product force-clears `Trusted`); the store is never mutated to fake trust. | DF5 real-forge canary (live forge webhooks / PR events — needs external forge credentials) |
+| DF-BOOT-001 / DF-EVID-001 / DF-LEASE-001 / DF-QUOTA-001 — **system species** via `TestSys*` in `internal/dogfood/system/` (real `NewPersistent` + HTTP + runner). Fail-closed arms (stale lease generation → 409, untrusted hard-quota gate, untrusted rootless floor) always run. Boot/restart and evidence success arms run an untrusted container job when rootless Docker satisfies the untrusted policy floor, and otherwise run a TRUSTED native job through the product trusted ingress (`TestSysTrustedIngress` signed GitHub webhook, `TestSysTrustedScheduleIngress` trusted schedule) — so they execute on hosts without rootless Docker instead of skipping. Direct API submissions stay untrusted (the product force-clears `Trusted`); the store is never mutated to fake trust. | — |
+| **Forge protocol canary** (`TestSysDFForgeCanary001`) — a realistic signed GitHub `push` envelope (full repository object, commits array, head_commit, pusher/sender/organization/installation) through the product `POST /hooks/github`, HMAC gate included (wrong secret → 401), trusted job → success → evidence verifies. This is a **protocol-level** canary against the product webhook contract with a local forge stand-in — it is **not** a live github.com delivery. | DF5 **live-provider** canary (real forge webhooks / PR events against github.com — needs external forge credentials) |
 | DF-DIST-001 / DF-DR-001 (postgres + object store) — **system species** via `TestSysDFDist001Integration` / `TestSysDFDr001PostgresObjectStoreIntegration` in `internal/dogfood/dist` (real PostgreSQL, real server + runners processes, pg_dump backup/restore) | — |
+| **DF3 process-kill chaos** (`TestSysDFChaos001`, `internal/dogfood/dist`) — real `kiwi server` SIGKILLed mid-flight (one job completed, one lease held) and restarted on the same PostgreSQL + data dir: no double completion (idempotent replay + conflicting completion refused), work continues (surviving lease completes, fresh work completes), stale lease generation refused | DF3 chaos **at scale** (many concurrent kills/partitions across a large fleet) |
 | G0/G1/G2 recursion refusal (`Harness.BeginGeneration`) **and** full G0→G1→G2 self-build of a release binary (`TestSysDFSelf002G1ToG2`) | — |
-| `dogfood-result.json` shape (`MarshalResult`, `TestDogfoodResultJSONShape`) | — |
+| `dogfood-result.json` shape (`MarshalResult`, `TestDogfoodResultJSONShape`) **and** suite-level bundle emission (`WriteResultBundle` / `EmitResult` → `dogfood-result.json` + `scenario-results/`, `TestDogfoodResultBundleEmission`; `DOGFOOD_RESULT_DIR` selects the output directory) | — |
 | DF0 `.kiwi/pipeline.yaml` + dogfood YAML schema validation; DOGFOOD_MATRIX.md ↔ scenario-registry match gate (`TestDogfoodMatrixMatchesRegistry`, `TestDogfoodMatrixGateMatchesRegistry` in `surfacecheck`) | — |
 
 ## Not yet implemented
@@ -332,7 +335,6 @@ DF-DAG-002      graph mutation + cancellation + restart
 
 DF3 process/network chaos at scale
 long multi-hour / 10k-job soak scale
-suite-level artifact emission of the dogfood-result bundle on disk
 ```
 
 ## Highest-value initial set
@@ -408,7 +410,7 @@ GitHub Actions, Woodpecker and Kiwi itself exercise the same implementation.
 
 Each target runs through `scripts/dogfood-run.sh`, which takes an explicit
 `--require` list of the tests that suite **owns**. The suite is green only
-if every required name actually executed — not merely if the `-run` regexp
+if every required name actually executed, not only if the `-run` regexp
 matched something. Losing `TestDFUPGRADE001` reddens `dogfood-upgrade` even
 when another alternative in the same filter still runs.
 
@@ -523,4 +525,4 @@ The harness is **internal**. It is not a supported user command.
 
 - Redesign the execution model, event recovery, lease fencing, replay,
   speculation, or evidence architecture while dogfood is the correctness
-  engine — fix only what dogfood proves broken
+  engine — repair only what dogfood proves broken

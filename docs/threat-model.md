@@ -4,8 +4,8 @@ This document enumerates threats against Kiwi CI, the mitigations in
 the current codebase, and the residual risk. It is organized by
 component using a STRIDE-style classification (spoofing, tampering,
 repudiation, information disclosure, denial of service, elevation of
-privilege). Status: **Mitigated** (implemented and tested), **Partial**
-(implemented with known gaps), **Deferred** (planned, not implemented).
+privilege). Status: Mitigated (implemented and tested), Partial
+(implemented with known gaps), Deferred (planned, not implemented).
 
 ## Runner execution
 
@@ -58,7 +58,7 @@ privilege). Status: **Mitigated** (implemented and tested), **Partial**
 | State snapshot corruption (fs mode) | T | Atomic temp+rename snapshot; append-only logs | Mitigated (dev scope) |
 | Schedules fired twice | T | Nominal occurrence claims idempotent by (schedule ID, nominal) across restarts and leaders | Mitigated |
 
-## Secrets
+## Threat-model secrets
 
 | Threat | Class | Mitigation | Status |
 |---|---|---|---|
@@ -78,7 +78,7 @@ privilege). Status: **Mitigated** (implemented and tested), **Partial**
 | Status publication lost on restart | R | Durable outbox with idempotent external IDs | Mitigated |
 | Arbitrary pipeline text from fork | E | Base-commit fetch for untrusted PRs | Mitigated |
 
-## OIDC
+## Threat-model OIDC
 
 | Threat | Class | Mitigation | Status |
 |---|---|---|---|
@@ -91,7 +91,7 @@ privilege). Status: **Mitigated** (implemented and tested), **Partial**
 1. 1.
   **OIDC key rotation** — the key ring keeps a rotated-out signing key in the JWKS for a 72-hour previous-verification window, so tokens it signed stay verifiable across a rotation.
    a compromise is still a live-key event, but verifiers are not cut off immediately and no provider reconfiguration is forced within the window (`internal/server/oidc.go`: `oidcPreviousKeyRetireAfter`).
-  
+
 
 2. **Bearer-token runner mode** — shared runner tokens remain a
    supported configuration; prefer enrollment-based mTLS in multi-tenant

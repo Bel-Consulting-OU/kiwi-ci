@@ -19,7 +19,7 @@
 # Environment:
 #   KC_RELEASE_SH  scripts/release.sh to test (default: the working-tree copy).
 #                  Point it at `git show HEAD:scripts/release.sh` in a temp
-#                  file to prove this test fails against the pre-fix script.
+#                  file to prove this test fails against the pre-change script.
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -108,7 +108,7 @@ MC4CAQAwBQYDK2VwBCIEIEKJOYLJMpBQTgVAg45+KKKT+6OADJUnzgmMrGE15OSF
 HEAD_SHA="$(git -C "$ROOT" rev-parse HEAD)"
 
 # clone_repo checks out HEAD into $1, pins the script under test (so the
-# uncommitted working-tree fix is exercised, not the committed revision),
+# uncommitted working-tree change is exercised, not the committed revision),
 # commits it to keep the tree clean, and tags v1.2.3 for the release control.
 clone_repo() {
 	dest="$1"

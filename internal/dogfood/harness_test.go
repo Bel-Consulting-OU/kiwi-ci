@@ -2,6 +2,8 @@ package dogfood
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -85,6 +87,112 @@ func TestDogfoodResultJSONShape(t *testing.T) {
 	for _, key := range []string{"attempt_count", "first_attempt_result", "final_result"} {
 		if _, ok := attempts[key]; !ok {
 			t.Fatalf("attempts row missing %q", key)
+		}
+	}
+}
+
+// TestDogfoodResultBundleEmission pins the suite-level result bundle: with
+// DOGFOOD_RESULT_DIR set (or a fallback scratch dir), EmitResult writes
+// dogfood-result.json plus one scenario-results/<id>.json per arm, and every
+// emitted file re-parses into its documented shape.
+func TestDogfoodResultBundleEmission(t *testing.T) {
+	d := DogfoodResult{
+		Seed:       NewSeed(2, time.Date(2026, 2, 2, 0, 0, 0, 0, time.UTC), RunMetadata{Commit: "c", Versions: VersionInfo{Protocol: "kiwi.execution.v2"}}),
+		Namespace:  Namespace{Prefix: "df-2"},
+		Topology:   "distributed",
+		StartedAt:  time.Date(2026, 2, 2, 0, 0, 0, 0, time.UTC),
+		FinishedAt: time.Date(2026, 2, 2, 0, 2, 0, 0, time.UTC),
+		Scenarios: []ScenarioResult{{
+			ID: "DF-BOOT-001", Name: "boot", Arm: "positive", Topology: "local",
+			Attempts: AttemptAccounting{AttemptCount: 1, FirstAttemptResult: "success", FinalResult: "success"},
+			Green:    true,
+		}, {
+			ID: "DF-LEASE-001", Name: "stale-runner", Arm: "negative", Topology: "distributed",
+			Attempts: AttemptAccounting{AttemptCount: 1, FirstAttemptResult: "rejected", FinalResult: "rejected"},
+			Green:    true,
+		}},
+	}
+
+	t.Run("env dir", func(t *testing.T) {
+		dir := t.TempDir()
+		t.Setenv(ResultDirEnv, dir)
+		got, err := d.EmitResult(t.TempDir()) // fallback must be ignored
+		if err != nil {
+			t.Fatalf("EmitResult: %v", err)
+		}
+		if got != dir {
+			t.Fatalf("EmitResult dir = %q, want DOGFOOD_RESULT_DIR %q", got, dir)
+		}
+		assertResultBundle(t, dir, d)
+	})
+
+	t.Run("fallback dir", func(t *testing.T) {
+		t.Setenv(ResultDirEnv, "")
+		dir := t.TempDir()
+		got, err := d.EmitResult(dir)
+		if err != nil {
+			t.Fatalf("EmitResult: %v", err)
+		}
+		if got != dir {
+			t.Fatalf("EmitResult dir = %q, want fallback %q", got, dir)
+		}
+		assertResultBundle(t, dir, d)
+	})
+
+	t.Run("no dir refused", func(t *testing.T) {
+		t.Setenv(ResultDirEnv, "  ")
+		if _, err := d.EmitResult(""); err == nil {
+			t.Fatal("EmitResult with no directory succeeded")
+		}
+	})
+}
+
+// assertResultBundle verifies dogfood-result.json and scenario-results/
+// exist and parse back into the sealed document shapes.
+func assertResultBundle(t *testing.T, dir string, want DogfoodResult) {
+	t.Helper()
+	top := filepath.Join(dir, "dogfood-result.json")
+	raw, err := os.ReadFile(top)
+	if err != nil {
+		t.Fatalf("read %s: %v", top, err)
+	}
+	var parsed DogfoodResult
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		t.Fatalf("parse dogfood-result.json: %v\n%s", err, raw)
+	}
+	if parsed.SchemaVersion != DogfoodSchemaVersion {
+		t.Fatalf("schema_version = %d, want %d", parsed.SchemaVersion, DogfoodSchemaVersion)
+	}
+	if !parsed.Green {
+		t.Fatalf("emitted bundle is not green: %s", raw)
+	}
+	if len(parsed.Scenarios) != len(want.Scenarios) {
+		t.Fatalf("emitted scenarios = %d, want %d", len(parsed.Scenarios), len(want.Scenarios))
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, "scenario-results"))
+	if err != nil {
+		t.Fatalf("read scenario-results: %v", err)
+	}
+	if len(entries) != len(want.Scenarios) {
+		t.Fatalf("scenario-results files = %d, want %d", len(entries), len(want.Scenarios))
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			t.Fatalf("scenario-results contains directory %s", e.Name())
+		}
+		body, err := os.ReadFile(filepath.Join(dir, "scenario-results", e.Name()))
+		if err != nil {
+			t.Fatalf("read scenario file: %v", err)
+		}
+		var s ScenarioResult
+		if err := json.Unmarshal(body, &s); err != nil {
+			t.Fatalf("parse %s: %v\n%s", e.Name(), err, body)
+		}
+		if s.ID == "" {
+			t.Fatalf("scenario file %s has empty id", e.Name())
+		}
+		if err := s.Validate(); err != nil {
+			t.Fatalf("scenario file %s failed Validate: %v", e.Name(), err)
 		}
 	}
 }

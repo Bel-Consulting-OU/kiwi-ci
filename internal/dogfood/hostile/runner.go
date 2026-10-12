@@ -33,6 +33,11 @@ const (
 	// ModeCompletionBeforeArtifact completes before its artifact is
 	// uploaded — the finalize window the crash-recovery ledger owns.
 	ModeCompletionBeforeArtifact Mode = "completion-before-artifact"
+	// ModeArtifactAfterCompletion uploads its artifact only AFTER the
+	// terminal completion has landed — a late artifact write against an
+	// already-closed attempt. The completion itself is honest; the late
+	// write must not reopen or mutate the terminal job.
+	ModeArtifactAfterCompletion Mode = "artifact-after-completion"
 	// ModeWrongJob completes a different job's attempt id than the lease
 	// names.
 	ModeWrongJob Mode = "wrong-job"
@@ -51,6 +56,7 @@ var AllModes = []Mode{
 	ModeLateLogger,
 	ModeNeverHeartbeat,
 	ModeCompletionBeforeArtifact,
+	ModeArtifactAfterCompletion,
 	ModeWrongJob,
 	ModeProtocolDowngrade,
 }
@@ -77,13 +83,15 @@ type Attempt struct {
 // Traffic is the protocol traffic a hostile runner emits for one attempt.
 // Completions are the terminal claims (possibly several, for duplicates);
 // LogsAfterCompletion counts log lines posted after the terminal completion;
-// Heartbeats is how many heartbeats the runner sent.
+// ArtifactsAfterCompletion counts artifact uploads posted after the terminal
+// completion; Heartbeats is how many heartbeats the runner sent.
 type Traffic struct {
-	Mode                Mode
-	Completions         []Completion
-	LogsAfterCompletion int
-	Heartbeats          int
-	ArtifactUploaded    bool
+	Mode                     Mode
+	Completions              []Completion
+	LogsAfterCompletion      int
+	ArtifactsAfterCompletion int
+	Heartbeats               int
+	ArtifactUploaded         bool
 }
 
 // Completion is one terminal claim. It mirrors the fields the control-plane
@@ -169,6 +177,14 @@ func New(mode Mode, base Attempt) (Traffic, error) {
 	case ModeCompletionBeforeArtifact:
 		t.ArtifactUploaded = false
 		t.Completions = []Completion{honest}
+	case ModeArtifactAfterCompletion:
+		// The artifact is uploaded, but strictly after the terminal
+		// completion: a late write against a closed attempt. The
+		// completion itself carries the true hash (the lie is the
+		// ordering, not the bytes).
+		t.ArtifactUploaded = true
+		t.ArtifactsAfterCompletion = 1
+		t.Completions = []Completion{honest}
 	case ModeWrongJob:
 		c := honest
 		c.AttemptID = base.JobID + "-other"
@@ -211,10 +227,15 @@ func (m Mode) Expectation() Expectation {
 		return Expectation{AcceptsAtMostOne: true, RequiresLiveHolder: true}
 	case ModeWrongRuntimeReceipt, ModeContradictoryAssurance, ModeArtifactHashLiar:
 		return Expectation{EvidenceMustFail: true, RequiresLiveHolder: true}
+	case ModeLateLogger, ModeNeverHeartbeat, ModeCompletionBeforeArtifact, ModeArtifactAfterCompletion:
+		// The completion itself is legitimate; the surrounding discipline
+		// is what the scenario flags. Artifact-after-completion's late
+		// artifact write must not reopen the terminal job.
+		return Expectation{RequiresLiveHolder: true}
 	default:
-		// ModeLateLogger, ModeNeverHeartbeat, ModeCompletionBeforeArtifact:
-		// the completion itself is legitimate; the surrounding discipline
-		// is what the scenario flags.
+		// Unknown modes never reach here — New refuses them — but a mode
+		// added without an explicit arm must still demand liveness rather
+		// than silently drop it.
 		return Expectation{RequiresLiveHolder: true}
 	}
 }

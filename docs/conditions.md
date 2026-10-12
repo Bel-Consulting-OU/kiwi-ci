@@ -42,7 +42,7 @@ explicit `if` runs only while the job status still admits `success()`.
 - left-hand values: `status`, `event`, `branch`, `env.NAME`, or a
   quoted literal; right-hand values are literals
 
-Example:
+Condition example:
 
 ```yaml
 if: always() && branch == 'main'

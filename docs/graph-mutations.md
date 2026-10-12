@@ -7,7 +7,7 @@ an edge, replace a node, rewire a committed job) is deliberately absent. This
 document defines the operation algebra and the legality rules that bound it,
 each mapped to the code that enforces it and the tests that prove it. It is
 the companion to [INVARIANTS.md](INVARIANTS.md) invariant **I6 (graph mutation
-cannot invalidate committed history)**; a change that adds an operation or
+cannot invalidate committed history)**. A change that adds an operation or
 loosens a rule MUST first extend the invariant analysis (I1/I2/I6) and update
 this mapping in the same change.
 
@@ -37,7 +37,7 @@ field inside a fragment job body is **cleared, never honored**
 ## Operations
 
 The complete named operation set. An operation not in this table does not
-exist on the surface (see [Non-goals](#non-goals)).
+exist on the surface. See [Non-goals](#non-goals).
 
 | Operation | Semantics | Enforcement (symbol) | Tests |
 |---|---|---|---|
@@ -68,7 +68,7 @@ admitted compiled jobs and does not itself re-force the status. The server is
 the sole production caller of `InsertGeneratedFragmentTx`, and the queue-only
 property is pinned by test rather than by a storage-side assertion.
 
-Tests: `TestGraphMutationAddNodeQueuesChildWithParentEdge` (every child queued,
+Tests (L1): `TestGraphMutationAddNodeQueuesChildWithParentEdge` (every child queued,
 depth incremented), `TestDynamicGenerateHappyPath`.
 
 ### L2 — No mutation may alter the prerequisite set of a Running/Succeeded/Failed/Cancelled node
@@ -79,7 +79,7 @@ existing job's `Needs`, `Status` or any other column. The server builds edge
 sets exclusively for the newly created children. A fragment therefore cannot
 rewire a node that already has history.
 
-Tests: `TestGraphMutationNeverMutatesCommittedNodes` (all pre-existing run jobs
+Tests (L2): `TestGraphMutationNeverMutatesCommittedNodes` (all pre-existing run jobs
 are byte-identical after an admission, including the generating parent);
 `TestGraphMutationFragmentJobNeedsFieldCannotSmuggleEdges`.
 
@@ -88,10 +88,10 @@ are byte-identical after an admission, including the generating parent);
 Every edge introduced by a fragment ends at a node created by that same fragment, which is queued by L1.
 The generating parent gains no new prerequisites; fragment-internal edges point only at fragment keys.
 Targeting a running or terminal node is not expressible.
- Every `deps` key and every dependency value must be a declared fragment key, and a name outside the fragment (including the parent's own key or any existing run job) is refused whole.
+Every `deps` key and every dependency value must be a declared fragment key, and a name outside the fragment (including the parent's own key or any existing run job) is refused whole.
 
 
-Tests: `TestGraphMutationNeverMutatesCommittedNodes`,
+Tests (L3): `TestGraphMutationNeverMutatesCommittedNodes`,
 `TestGraphMutationAddDependencyStaysInsideFragment`,
 `TestFlowDynamicFragmentShapeErrors`.
 
@@ -105,7 +105,7 @@ A fragment job body's `needs` field is cleared before validation
 (`internal/server/dynamic.go:378`), so it cannot smuggle an edge to an existing
 job either.
 
-Tests: `TestGraphMutationAddDependencyStaysInsideFragment` (dep on the parent
+Tests (L4): `TestGraphMutationAddDependencyStaysInsideFragment` (dep on the parent
 key and on an injected existing run job both rejected),
 `TestGraphMutationFragmentJobNeedsFieldCannotSmuggleEdges`,
 `TestFlowDynamicFragmentShapeErrors`.
@@ -120,7 +120,7 @@ dedicated error (`internal/server/dynamic.go:390`). A cycle through the
 implicit parent edge is impossible: the parent is not a fragment node and no
 fragment node is ever added to the parent's prerequisite set (L2).
 
-Tests: `TestGraphMutationRejectsCycle`, `TestFlowDynamicFragmentShapeErrors`
+Tests (L5): `TestGraphMutationRejectsCycle`, `TestFlowDynamicFragmentShapeErrors`
 (self dependency).
 
 ### L6 — Depth and size caps are enforced per fragment, per parent envelope and per run
@@ -135,7 +135,7 @@ Tests: `TestGraphMutationRejectsCycle`, `TestFlowDynamicFragmentShapeErrors`
 An unreadable current-format parent policy payload fails closed instead of
 widening the cap (`parentGenerateEnvelope` `internal/server/dynamic.go:218-259`).
 
-Tests: `TestDynamicGenerateDepthLimit`, `TestDynamicGenerateRejectsFragmentTooLarge`,
+Tests (L6): `TestDynamicGenerateDepthLimit`, `TestDynamicGenerateRejectsFragmentTooLarge`,
 `TestFlowDynamicFragmentShapeErrors`, `TestFlowDynamicFragmentHonorsParentGenerateEnvelope`,
 `TestGeneratedFragmentInsertionPredicateParity` (cap exceeded),
 `TestGeneratedFragmentConcurrentCapRaceParity`.
@@ -173,7 +173,7 @@ fragment with `409 GENERATED_JOB_KEY_CONFLICT` and inserts nothing
 duplicate `(run_id, key)` rows the unique index is deliberately not created
 (migration `0048`), and the admission check remains authoritative.
 
-Tests: `TestGeneratedFragmentChildKeyCollidesWithExistingRunJob`,
+Tests (L8): `TestGeneratedFragmentChildKeyCollidesWithExistingRunJob`,
 `TestGeneratedFragmentChildKeyCollidesAcrossFragments`,
 `TestGeneratedFragmentMatrixKeysStayDistinct`,
 `TestCheckGeneratedJobKeyConflicts`, `TestMemStoreGeneratedFragmentChildKeyConflict`,
@@ -182,19 +182,18 @@ plus the PostgreSQL integration twins in `internal/storage/postgres_run_key_conf
 ### L9 — Generation is lease-authorized and commit-time fenced
 
 A mutation requires the parent's live lease.
- Authorization runs before the receipt lookup so a stale generation or token can never observe committed children (`authorizeRunnerLease` `internal/server/runner_lease.go:42`),.
+Authorization runs before the receipt lookup so a stale generation or token can never observe committed children (`authorizeRunnerLease` `internal/server/runner_lease.go:42`).
 The store re-evaluates the complete predicate `{running, runner, generation, token, storage-clock expiry}` on the locked parent inside the insertion transaction (`ValidateGeneratedParentLease` `internal/storage/store.go:1008`; `internal/storage/postgres.go:5173`; memory `internal/server/dynamic.go:628`).
 Every refusal wraps `ErrLeaseLost` and maps to `409`, never a misleading `400` (`internal/server/dynamic.go:149`).
 
 
-Tests: `TestGeneratedFragmentStaleGenerationCannotReplay`,
+Tests (L9): `TestGeneratedFragmentStaleGenerationCannotReplay`,
 `TestGeneratedFragmentRacedLeaseLossMaps409Not400`,
 `TestGeneratedFragmentInsertionPredicateParity`.
 
 ## Determinism note
 
-Mutation is **content-addressed**, **slot-idempotent** and
-**generation-authorized**:
+Mutation is content-addressed, slot-idempotent and generation-authorized:
 
 - Content address: `fragment_id` is the sha256 of the canonical `{jobs, deps}`
   (`internal/api/v1/generated.go:34`), recomputed by the server. Identical
@@ -206,9 +205,9 @@ Mutation is **content-addressed**, **slot-idempotent** and
   original children, while a nondeterministic re-emission (different digest)
   fails closed `409`.
 
-- - Generation authorization: the presented lease generation must still be live at both the request gate and the commit-time predicate, but it never becomes part of the mutation identity.
+- Generation authorization: the presented lease generation must still be live at both the request gate and the commit-time predicate, but it never becomes part of the mutation identity.
    an infrastructure retry of the same logical parent under a new generation replays rather than duplicates.
-  
+
 
 ## Non-goals
 

@@ -22,7 +22,7 @@ cursor can walk the whole history.
 
 The collection is gated by the coarse read gate (admin/global read, or any repository read grant); a reader without any read capability is answered `403`, not an empty `200`.
 The gate is not the per-run decision.
- The principal's normalized repository-read predicate is resolved once per request (`runAuthzPolicy`) and applied **inside** the paged query, before the page boundary exists, so no returned row, count, timestamp or cursor is ever derived from a run the caller cannot read.
+The principal's normalized repository-read predicate is resolved once per request (`runAuthzPolicy`) and applied **inside** the paged query, before the page boundary exists. No returned row, count, timestamp or cursor is ever derived from a run the caller cannot read.
 
 
 ## Response
@@ -58,10 +58,10 @@ opaque `400`.
 - **Ordering.** Pages are consecutive windows of one total order,
   `(created_at DESC, id DESC)`. The first page is the newest `limit` runs.
 
-- - **Keyset, not offsets.** A page contains only runs strictly older than the cursor position `(created_at, id)`.
+- **Keyset, not offsets.** A page contains only runs strictly older than the cursor position `(created_at, id)`.
   A run created between two page reads is newer than the cursor and is simply not part of the remaining walk of that traversal (a fresh first-page request sees it).
    it can never shift a page boundary, so a walk never returns a run twice and never skips one.
-  
+
 
 - **Authorization happens before paging.** The principal's normalized
   repository-read predicate is a clause of the same query that computes the
@@ -100,7 +100,7 @@ control: each click appends exactly one page using the previous
 `X-Kiwi-Next-Cursor` value, and the control disappears when the last page
 carries no cursor. It never walks the remaining pages on its own.
 
-## Example
+## Runs API example
 
 ```sh
 # First page: the newest 100 runs.

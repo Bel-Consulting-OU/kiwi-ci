@@ -3,18 +3,18 @@
 Kiwi CI accepts GitHub webhooks, fetches pipeline files through the
 GitHub API, and publishes check runs back to the repository.
 
-## Webhook setup
+## GitHub App webhook setup
 
 1. In the repository (or organization) settings, add a webhook to
    `https://<your-kiwi-host>/hooks/github`.
 
 2. Content type: `application/json`.
 
-3. Secret: the value of `--github-webhook-secret` (or
+3. GitHub App secret: the value of `--github-webhook-secret` (or
    `KIWI_GITHUB_WEBHOOK_SECRET`). Kiwi verifies `X-Hub-Signature-256`
    before processing anything.
 
-4. Events: `Pushes` and `Pull requests` at minimum.
+4. GitHub App events: `Pushes` and `Pull requests` at minimum.
 
 ## Trust handling
 
@@ -42,7 +42,7 @@ Two modes:
   until shortly before expiry. This is required for Checks API use on
   many installations.
 
-## Trigger matching
+## GitHub App trigger matching
 
 The pipeline's `on` section is evaluated before enqueue
 (`internal/forge` `MatchesTrigger`): event keys (`push`,
@@ -60,7 +60,7 @@ queued/in_progress/completed states, annotations for failures, and the
 details URL back to the Kiwi dashboard. Publication is idempotent by
 external ID and survives server restarts (outbox replay).
 
-## Config reference
+## GitHub App config reference
 
 ```toml
 [github]

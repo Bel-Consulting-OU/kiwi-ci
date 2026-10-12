@@ -3,19 +3,19 @@
 Kiwi CI accepts Forgejo (and Gitea) webhooks, fetches pipeline files
 through the Forgejo API, and publishes commit statuses.
 
-## Webhook setup
+## Forgejo webhook setup
 
 1. In the repository settings, add a webhook to
    `https://<your-kiwi-host>/hooks/forgejo`.
 
-2. Secret: the value of `forgejo.webhook_secret` (or
+2. Forgejo secret: the value of `forgejo.webhook_secret` (or
    `KIWI_FORGEJO_WEBHOOK_SECRET`). Kiwi verifies the HMAC-SHA256
    signature (the same `X-Hub-Signature-256` scheme GitHub uses) before
    processing anything.
 
-3. Events: `Push` and `Pull Request` at minimum.
+3. Forgejo events: `Push` and `Pull Request` at minimum.
 
-## Events handled
+## Forgejo events handled
 
 - `push` — enqueues a run.
 
@@ -26,7 +26,7 @@ through the Forgejo API, and publishes commit statuses.
   (no secrets, no OIDC, no native execution, no egress, digest-pinned
   images).
 
-## Trigger matching
+## Forgejo trigger matching
 
 The pipeline `on` section is evaluated per event with the standard
 semantics: `pull_request` keys and `<event>.<action>` precedence,
@@ -34,13 +34,13 @@ branch and tag globs, path filters over the server-fetched changed-file
 list, and draft status. Deliveries are deduplicated by the delivery
 header when present.
 
-## Status publishing
+## Forgejo status publishing
 
 Forgejo exposes commit statuses; Kiwi publishes
 pending/running/success/failure/cancelled statuses through the durable
 outbox.
 
-## Config reference
+## Forgejo config reference
 
 ```toml
 [forgejo]
@@ -52,9 +52,9 @@ webhook_secret = "high-entropy-secret"
 token = ""        # API token for private pipeline fetches and statuses
 ```
 
-`base_url` may also be set with `--forgejo-base-url` or
-`KIWI_FORGEJO_BASE_URL`. It must not carry userinfo, a query or a fragment;
+In Forgejo, `base_url` may also be set with `--forgejo-base-url` or
+`KIWI_FORGEJO_BASE_URL`. A Forgejo `base_url` must not carry userinfo, a query or a fragment;
 credentials go in `token`.
 
-See [production-deployment.md](production-deployment.md) for server
+See [production-deployment.md](production-deployment.md) for Forgejo server
 setup.

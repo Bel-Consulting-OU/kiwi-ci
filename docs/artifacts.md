@@ -4,7 +4,7 @@ Artifacts are first-class pipeline outputs: deterministic tar.gz
 archives captured from the workspace, with sidecar manifests,
 retention, provenance, and download contracts between jobs.
 
-## Declaration
+## Artifact declaration
 
 ```yaml
 artifacts:
@@ -67,7 +67,7 @@ with integrity hashes checked by the server, staged to a temporary
 blob, and committed atomically only after the metadata transaction
 succeeds — clients never observe half-created artifacts.
 
-## Limits
+## Artifact limits
 
 - Artifact paths must be relative (no absolute paths, no `..`).
 

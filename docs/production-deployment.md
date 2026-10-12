@@ -16,10 +16,10 @@ local testing and is not covered here beyond the basics.
 
   -   - distinct `--admin-token` and `--runner-token` are required unless `--allow-shared-token` acknowledges a shared credential; `--allow-shared-token` only acknowledges reusing one value for both tokens — it does not re-enable the shared token on the runner tier.
      - runner traffic must have an actual per-runner mechanism: enforced runner mTLS (`--runner-ca-cert`/`--runner-ca-key` with `--runner-require-client-certs`) or provisioned per-runner bearer credentials (`--runner-tokens-file`, or rows already present in `runner_bearer_tokens`).
-    The runner PKI is initialized BEFORE this check (an explicit CA is installed into the shared cluster key store, an enrollment token materializes the shared CA),.
+    The runner PKI is initialized BEFORE this check (an explicit CA is installed into the shared cluster key store, an enrollment token materializes the shared CA).
     The decision uses the actual initialized state, because the credentials may already be provisioned in the database and the CA only exists once the cluster key store is reachable.
     The shared `--runner-token` is dev/bootstrap compatibility only: the server clears it at startup and production refuses runner traffic authenticated with it; - `--external-url` starting with `https://` is required (the OIDC issuer always serves in production); - `--tls-cert`/`--tls-key` are required.
-    
+
 
 ```bash
 kiwi server \
@@ -67,7 +67,7 @@ full leader-duty list.
 Run at least two instances behind a load balancer.
 Each instance needs the same database URL, tokens, and external URL.
 Signing material must be shared, not node-local.
- In DB mode the server uses the database-backed cluster key store (`cluster_keys`, created on first start), so replicas share the lease HMAC key, OIDC ring, provenance key, cache signing key, web session secret and runner CA through PostgreSQL.
+In DB mode the server uses the database-backed cluster key store (`cluster_keys`, created on first start), so replicas share the lease HMAC key, OIDC ring, provenance key, cache signing key, web session secret and runner CA through PostgreSQL.
 An explicit `--cluster-key-dir` on shared storage is the alternative; a store rooted at the per-node `--data-dir` is refused in production/DB mode, because two replicas with separate data dirs would each pass a naive readiness check while holding different keys.
 When a data dir exists, its existing key files are migrated into the shared store on first use, so upgrading a single-node deployment keeps its OIDC/provenance/runner-CA trust roots.
 
@@ -118,7 +118,7 @@ Dev mode falls back to a bounded default under the server data dir when the sect
 
 
 The `quota` section also carries the untrusted resource ceilings (`untrusted_cpu_ceiling`, `untrusted_memory_ceiling`, `untrusted_disk_ceiling`, `untrusted_pids_ceiling`; memory/disk in bytes), which admission enforces before a run is signed or persisted.
-The defaults (2 CPU, 4 GiB, 10 GiB, 256 PIDs) are deliberately conservative production values: raise them per deployment only when untrusted jobs legitimately need more, because each raise widens the resources a fork pipeline can consume on a runner host.
+The defaults (2 CPU, 4 GiB, 10 GiB, 256 PIDs) are deliberately conservative production values. Raise them per deployment only when untrusted jobs legitimately need more. Each raise widens the resources a fork pipeline can consume on a runner host.
  see [pipeline-reference.md](pipeline-reference.md#untrusted-ceilings).
 Raising them at runtime via the flags/environment variables does not require a config-file change.
 
@@ -152,8 +152,8 @@ per-runner identity and cannot distinguish runners. It is dev/bootstrap
 compatibility only. Production disables it and refuses to start unless at
 least one actual per-runner mechanism exists:
 
-- - **per-runner bearer credentials** — `--runner-tokens-file` maps each runner ID to the SHA-256 digest of its own token (provisioned into `runner_bearer_tokens`), or the rows are provisioned out of band.
-   the server rejects the shared token as soon as per-runner credentials exist; 
+- **per-runner bearer credentials** — `--runner-tokens-file` maps each runner ID to the SHA-256 digest of its own token (provisioned into `runner_bearer_tokens`), or the rows are provisioned out of band.
+   the server rejects the shared token as soon as per-runner credentials exist;
 
 - **enforced runner mTLS** — `--runner-ca-cert`/`--runner-ca-key` plus
   runner certificates (see below), with `--runner-require-client-certs`
@@ -210,7 +210,7 @@ Two-phase procedure:
   **Upgrade the control plane first, keeping the default floor.** New runners register and execute normally.
    a legacy runner that tries to register is refused 400 (body names the required minimum and its version), and a legacy runner row that predates the upgrade is answered 409 for every new lease.
   Heartbeat, logs and completion for work it already claimed keep working under the existing generation-based fencing, so in-flight jobs drain safely.
-  
+
 
 2. **Controlled legacy window (only if needed).** If a legacy runner that
    was mid-job before the upgrade must re-register (for example after a
@@ -230,16 +230,16 @@ implements.
 
 ## Health and metrics
 
-- - `GET /readiness` — ready to serve traffic.
+- `GET /readiness` — ready to serve traffic.
   DB mode checks the store.
   In fs mode (data-dir snapshot store) a failed snapshot write degrades the control plane.
-   `/readiness` answers 503 with `X-Kiwi-State: degraded` and a fixed body (the raw error stays in the server logs), new runner leases are refused with 503 so no capability is issued for state the snapshot does not contain,.
+   `/readiness` answers 503 with `X-Kiwi-State: degraded` and a fixed body (the raw error stays in the server logs), new runner leases are refused with 503 so no capability is issued for state the snapshot does not contain.
   Heartbeats answer 503 without extending the stored lease expiry, so a runner self-cancels at its last acknowledged deadline instead of running on an unrecorded extension.
   The state self-heals on the next successful persist and is cleared when the server switches to DB mode (the abandoned snapshot is no longer authoritative).
   Configure probes and load balancers to stop routing traffic to an instance while `/readiness` answers 503, and alert on the degraded state so a persistent snapshot-write failure is not masked.
   Probe over HTTPS when the server runs with `--tls-cert`/`--tls-key`, e.g.
   `curl -fsS https://ci.example.com/readiness` (a plaintext probe against a TLS listener fails).
-  
+
 
 - `GET /liveness` — process is up.
 
@@ -294,14 +294,14 @@ The Woodpecker instance hosting it must be configured so CI reflects reality:
   `capability=docker`, `platform=windows/amd64` and `platform=darwin/arm64`
   matching the workflow label sets.
 
-- - `docker-workspace-diagnostic` is a trusted, push/manual/tag-only job: it mounts the agent host's Docker daemon socket in its steps.
+- `docker-workspace-diagnostic` is a trusted, push/manual/tag-only job: it mounts the agent host's Docker daemon socket in its steps.
   Woodpecker gates host volumes on the repository-level Trusted flag alone -- there is no per-event or fork gating -- so a `pull_request` run would execute PR-authored code with host-daemon control (host-root equivalent).
   It is deliberately non-blocking (`failure: ignore` on every step) and is not a required PR or push context; re-gating pull requests needs a socket-less variant of the lane.
   It also cannot run its invariant on the current Woodpecker topology at all.
    The docker backend exposes the pipeline workspace as a named volume, so the test's own-workspace bind mounts resolve on the daemon host where that path does not exist.
   The job reports a missing daemon or that topology mismatch and skips; a compatible backend (or a rewritten, bind-mount-free invariant) must be promoted to a required push context in `scripts/gh-branch-protection.sh` when it exists.
   The script lists the `push/*` variants of the runnable lanes only so an operator can require them instead for direct pushes (`KIWI_PUSH_CONTEXTS`), and does not install them as required checks.
-  
+
 
 - The clone plugin and every workflow image are pinned by OCI digest.
 
@@ -338,7 +338,7 @@ intended required-check set and where each lane is enforced:
 Only the three `pr/*` contexts are installed as required checks.
 The native and Docker-socket jobs are deliberately unrequirable: a fork PR never schedules them, so requiring them would leave every fork PR waiting forever, and the docker workspace lane additionally cannot satisfy its environment invariant on the current topology.
 When no compatible Windows agent is attached, the `native-windows` push context may remain pending indefinitely.
- That is a platform-availability signal, not a required gate, and it must not be added to `CONTEXTS`/`PUSH_CONTEXTS` unless a Windows agent is guaranteed to pick it up.
+That is a platform-availability signal, not a required gate, and it must not be added to `CONTEXTS`/`PUSH_CONTEXTS` unless a Windows agent is guaranteed to pick it up.
 The context list in `scripts/gh-branch-protection.sh` is validated against each workflow's `when` events by `go test ./internal/workflowguard/`.
 
 
@@ -415,9 +415,9 @@ In **DB mode the database clock is the authority for a lease's lifetime**:
   while the stored lease has not already expired at that clock, so a delayed
   heartbeat can never resurrect a recoverable lease.
 
-- - **Recovery discovery and application** compare against `clock_timestamp()` sampled after the row lock, so a recovery replica whose application clock is hours ahead cannot prematurely reclaim a live lease,.
+- **Recovery discovery and application** compare against `clock_timestamp()` sampled after the row lock, so a recovery replica whose application clock is hours ahead cannot prematurely reclaim a live lease.
   One that is hours behind can still recover an expired lease.
-  
+
 
 - **Completion** re-checks the locked lease against a post-lock
   `clock_timestamp()` before applying any lifecycle transition: an expired
@@ -433,7 +433,7 @@ In **DB mode the database clock is the authority for a lease's lifetime**:
   `LiveLeaseStore` is refused with 503 rather than silently downgrading to
   replica-clock liveness.
 
-- - **Test-report ingestion is lease-fenced.
+- **Test-report ingestion is lease-fenced.
    only log ingestion is deliberate late-log grace.** Test reports commit through `LeaseTestReportStore`, which locks the job row, re-validates runner/generation and `lease_expires_at > clock_timestamp()` after the lock, and stamps the canonical `(created_at,id)` ordering instant from that same database clock.
    because test history drives future shard assignment, duration balancing, the test manifest and flaky classification.
   A report whose lease expired while the request (or a row-lock wait) was in flight is refused with 409 and commits nothing.
@@ -442,31 +442,31 @@ In **DB mode the database clock is the authority for a lease's lifetime**:
   Log lines/batches pass the same database-clock gate at request start but are deliberately NOT transactionally lease-fenced.
    Log lines carry no lifecycle, authority or accounting meaning, and batch receipts are generation-scoped, so a late batch can never collide with a re-leased generation.
   Every behavior-affecting runner mutation (completion, heartbeat, test reports, cache/artifact/snapshot publication, generated jobs, OIDC, secrets) is commit-time fenced.
-  
 
-- - **Durable cache retention is database-clock authoritative.** The `cache_manifests.created_at` used for age pruning and entry/byte ranking is stamped with `clock_timestamp()` by both writers,.
+
+- **Durable cache retention is database-clock authoritative.** The `cache_manifests.created_at` used for age pruning and entry/byte ranking is stamped with `clock_timestamp()` by both writers.
   The prune cutoff is computed in SQL, so a skewed publishing or pruning replica cannot evict a fresh entry, pin an old one, or reorder quota eviction.
   The signed payload keeps the producer instant as provenance only.
-  
 
-- - **Deployment creation is idempotent across replicas and restarts.** `StartDeployment` inserts with `ON CONFLICT (id) DO NOTHING`, returns the canonical stored record on replay (a conflicting run/job/environment fails closed), and commits `deployment.started` in the same transaction.
+
+- **Deployment creation is idempotent across replicas and restarts.** `StartDeployment` inserts with `ON CONFLICT (id) DO NOTHING`, returns the canonical stored record on replay (a conflicting run/job/environment fails closed), and commits `deployment.started` in the same transaction.
    an audit failure rolls the record back.
   `FinishDeploymentOnce` likewise commits the finish marker and `deployment.completed` together, exactly once.
   The server caches only the stored record.
   The explicit record endpoint requires an actually running job and derives `StartedAt` from the job, and `SwitchToDB` refuses a store without the deployment contract at startup.
-  
 
-- - **Enrollment grants, outbox claims, OIDC lifetimes and DB schedules share the database clock.** Grant creation takes a TTL and stores `clock_timestamp() + TTL`, the DB gate asks the store for liveness, and consumption locks the row before sampling the clock.
+
+- **Enrollment grants, outbox claims, OIDC lifetimes and DB schedules share the database clock.** Grant creation takes a TTL and stores `clock_timestamp() + TTL`, the DB gate asks the store for liveness, and consumption locks the row before sampling the clock.
    outbox claim due/cutoff predicates and the `claimed_at` stamp are all `clock_timestamp()` (TTL in SQL).
    the OIDC commit derives the JWT `iat`/`exp` and the audit instant from its commit clock; and DB-mode schedule due evaluation reads `ClockStore.Now`, skipping the tick rather than using the leader's wall clock.
   A skewed replica can neither extend a credential or claim, steal a live claim, nor fire or postpone a due schedule.
-  
 
-- - **Pipeline-controlled child output is captured under a hard bound.** Service healthchecks retain a 64 KiB diagnostic prefix and drain (discarding) the rest,.
+
+- **Pipeline-controlled child output is captured under a hard bound.** Service healthchecks retain a 64 KiB diagnostic prefix and drain (discarding) the rest.
   Every executor/git/prewarm capture is bounded, so a hostile healthcheck cannot grow the runner heap or block on a full pipe.
-  
 
-- - **Runner crash recovery is closed and fail-closed.** Reconciliation errors (discovery or removal) block leasing.
+
+- **Runner crash recovery is closed and fail-closed.** Reconciliation errors (discovery or removal) block leasing.
    Tart clones carry runner/instance ownership tags and are reaped like Docker resources.
    each `Run()` gets a fresh incarnation ID.
    a durable runtime ledger reclaims crashed workspaces and artifact scratch.
@@ -474,33 +474,33 @@ In **DB mode the database clock is the authority for a lease's lifetime**:
    XFS allocation is serialized across processes with a host-global lock and re-reads the filesystem on every allocation, with crashed assignments AND job cgroups reclaimed from the durable ledger on the next run.
    runner identity persistence is atomic and pair-verified (Windows: protected owner-only DACL); and each registration issues a session incarnation that supersedes older polling, heartbeat and completion sessions (409).
   Scheduler aging is uncapped and capacity metrics count effective schedulable slots.
-  
 
-- - **Runner crashes are reconciled immediately.** Every runner process has an instance ID; containers/services/networks are labelled with `kiwi.runner`/`kiwi.instance`, and a restarted runner reaps its own predecessor's runtimes BEFORE leasing.
+
+- **Runner crashes are reconciled immediately.** Every runner process has an instance ID; containers/services/networks are labelled with `kiwi.runner`/`kiwi.instance`, and a restarted runner reaps its own predecessor's runtimes BEFORE leasing.
   XFS project IDs already present on the filesystem are discovered and reserved before allocation, so a restart cannot reuse a live assignment.
   Production also requires a shared dashboard session key — either `KIWI_WEB_SESSION_SECRET` (a malformed value is a startup error, never a silent random fallback) or the shared cluster key store above.
    set `sandbox.non_root` is enforced (or the runtime is refused), corrupt current-format parent policy metadata fails generated children closed, and lease scheduling ages waiting jobs so low-priority work cannot be starved.
-  
 
-- - **Runtime teardown is proven-gone before workspace protections are removed.** `CloseJob` keeps the container/clone identity until removal succeeds or the runtime is positively absent, never restores workspace ownership or drops the XFS project quota while the runtime object may still exist,.
+
+- **Runtime teardown is proven-gone before workspace protections are removed.** `CloseJob` keeps the container/clone identity until removal succeeds or the runtime is positively absent, never restores workspace ownership or drops the XFS project quota while the runtime object may still exist.
   Keeps quota/ownership cleanup callbacks retryable until they succeed.
   Failed webhook deliveries from an ignored terminal outcome (no trigger match) persist an ignored receipt, so replays perform no forge work.
   A corrupt current-format generation envelope fails child admission closed.
-  
 
-- - **Retry budgets are capped and zero is explicit.** Step retries cap at 20, service healthcheck retries at 100 and infrastructure retries at 20, enforced at admission and clamped in the executor/recovery.
+
+- **Retry budgets are capped and zero is explicit.** Step retries cap at 20, service healthcheck retries at 100 and infrastructure retries at 20, enforced at admission and clamped in the executor/recovery.
    explicit `0` values mean zero retries / one healthcheck attempt / never requeue rather than inheriting the defaults.
-  
 
-- - **Webhook replays are suppressed before any forge work.
-  Bound to the signed body.** The delivery + authenticated-body-digest fast path runs before pipeline/diff fetches, the body receipt suppresses the same signed payload under a fresh delivery header, a reused delivery ID with different content is a 409,.
+
+- **Webhook replays are suppressed before any forge work.
+  Bound to the signed body.** The delivery + authenticated-body-digest fast path runs before pipeline/diff fetches, the body receipt suppresses the same signed payload under a fresh delivery header, a reused delivery ID with different content is a 409.
   The delivery header is required.
-  
 
-- - **Heartbeats touch only `last_seen`.** The runner liveness refresh is a narrow `RunnerHeartbeatStore.TouchRunnerLastSeen` (`UPDATE runners SET last_seen=clock_timestamp()`), never a whole-row read-modify-write.
+
+- **Heartbeats touch only `last_seen`.** The runner liveness refresh is a narrow `RunnerHeartbeatStore.TouchRunnerLastSeen` (`UPDATE runners SET last_seen=clock_timestamp()`), never a whole-row read-modify-write.
    A heartbeat that read the runner before a concurrent admin disable/drain/profile edit can no longer write the stale snapshot back and undo the admin action.
   Profile/admin writes likewise never own `last_seen` (the guarded merge preserves the committed instant, and registration touches it explicitly afterwards), so a re-registration, drain or enable from a stale snapshot cannot move it backward.
-  
+
 
 The in-memory/dev store is single-process and keeps a monotonic application clock, where skew is not a concept.
 Queue deadlines are one-shot instants recorded at admission.

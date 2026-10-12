@@ -7,7 +7,7 @@ This document describes the Kiwi CI pipeline language, version 1
 (Draft 2020-12) lives at `.kiwi/schema.json` and is embedded in the
 binary; a test pins the two together.
 
-Example:
+Pipeline example:
 
 ```yaml
 version: 1
@@ -362,7 +362,7 @@ Enforced on every admission path (`internal/pipeline/validate.go`):
 | Output keys | 256 |
 
 Also rejected.
- Absolute paths and `..` components in path fields, negative or zero explicit durations, unknown shells/network modes/runtime combinations, non-scalar matrix values, empty matrix dimensions, invalid IDs, duplicate step IDs, duplicate dependencies, duplicate artifact names, unknown interpolation contexts, and unterminated `${{ ...
+Absolute paths and `..` components in path fields, negative or zero explicit durations, unknown shells/network modes/runtime combinations, non-scalar matrix values, empty matrix dimensions, invalid IDs, duplicate step IDs, duplicate dependencies, duplicate artifact names, unknown interpolation contexts, and unterminated `${{ ...
 }}`.
 
 

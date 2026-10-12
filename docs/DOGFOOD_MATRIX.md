@@ -202,7 +202,7 @@ endpoint.
 ## Hostile data set
 
 Dogfood intentionally uses.
- Very long branch names, Unicode, spaces, quotes, shell metacharacters, unusual file names, deep trees, symlinks, large logs, zero-byte artifacts, scaled multi-GB streams, malformed UTF-8 where the interface permits bytes, duplicate keys, invalid YAML, unknown schema fields, stale schema versions.
+Very long branch names, Unicode, spaces, quotes, shell metacharacters, unusual file names, deep trees, symlinks, large logs, zero-byte artifacts, scaled multi-GB streams, malformed UTF-8 where the interface permits bytes, duplicate keys, invalid YAML, unknown schema fields, stale schema versions.
 
 
 ## Execution-dogfood result bundle
@@ -219,6 +219,15 @@ environment.json
 failure-seeds.json
 metrics-summary.json
 ```
+
+The core of the bundle is written by `dogfood.WriteResultBundle` /
+`DogfoodResult.EmitResult` (`internal/dogfood`): `dogfood-result.json` is the
+sealed `MarshalResult` document and `scenario-results/` holds one
+`<id>[-<arm>].json` per scenario arm. `EmitResult` targets
+`$DOGFOOD_RESULT_DIR` when set — `scripts/dogfood-run.sh` defaults that to
+`.kiwi/dogfood-results/` so suite runs always have a stable destination
+(`TestDogfoodResultBundleEmission` pins both paths). The companion files
+above are emitted by the surrounding suite tooling.
 
 Example top-level:
 
@@ -269,4 +278,4 @@ While dogfood is the principal correctness engine, do **not**:
 - make evidence more product-specific
 - add a grander assurance taxonomy
 
-Fix only what dogfood proves broken.
+Repair only what dogfood proves broken.

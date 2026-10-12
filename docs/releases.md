@@ -35,7 +35,7 @@ release: HEAD is not an exact tag; releases must be cut from a tagged commit
 (use --snapshot for branch/dirty development builds)
 ```
 
-Other release-mode refusals include a tag argument that is not the exact tag at `HEAD`, a non-semver tag, a dirty tree, a `COMMIT` override that is not the full 40-char SHA of the tagged commit,.
+Other release-mode refusals include a tag argument that is not the exact tag at `HEAD`, a non-semver tag, a dirty tree, a `COMMIT` override that is not the full 40-char SHA of the tagged commit.
 A `VERSION` that does not match the tag.
 Formula rendering has no flag: release mode always re-renders `Formula/kiwi.rb`, and snapshot mode always skips it.
 
@@ -45,7 +45,7 @@ When both flags are given, the last one wins.
 `--require-signing` applies to release builds only: snapshots are never signed, so `--snapshot --require-signing` is rejected during argument validation with a usage error before any git or build work, and the caller must drop the flag.
 `--allow-unsigned` is accepted and ignored for snapshots (it changes nothing, since snapshots are never signed).
 Snapshot signing does not depend on the environment.
- In snapshot mode `KIWI_RELEASE_SIGNING_KEY` is never read or materialized and `release-tool` is never invoked with `-key`, so a signing key that happens to be exported in the environment cannot silently sign a snapshot.
+In snapshot mode `KIWI_RELEASE_SIGNING_KEY` is never read or materialized and `release-tool` is never invoked with `-key`, so a signing key that happens to be exported in the environment cannot silently sign a snapshot.
 
 
 Invocation:
@@ -69,7 +69,7 @@ scripts/release.sh v1.2.3 --allow-unsigned
 Snapshot versions look like `0.1.0-dev-snapshot+1a2b3c4` (or `...+1a2b3c4.dirty`) and the bundle contains a `SNAPSHOT` marker file that states the build is not a release.
 Snapshots are for testing; they are never published as releases, never update the Homebrew formula, and are never signed: `--snapshot --require-signing` is rejected as a usage error, while `--snapshot --allow-unsigned` is accepted and ignored.
 The signing key is ignored in snapshot mode even when `KIWI_RELEASE_SIGNING_KEY` is set in the environment (PEM or path).
- The variable is neither read nor materialized, no key temp file is created, and `release-tool` receives no `-key` argument, so snapshot behavior does not depend on the caller's environment.
+The variable is neither read nor materialized, no key temp file is created, and `release-tool` receives no `-key` argument, so snapshot behavior does not depend on the caller's environment.
 
 
 ## 2. Homebrew formula rendering
@@ -89,7 +89,7 @@ scripts/release.sh --render-formula 1.2.3 <sha-arm64> <sha-amd64> [OUT]
 scripts/release-formula-test.sh   # make release-formula-test
 ```
 
-The test script renders `v1.2.3` and then `v2.0.0` over the same output file and asserts that both times the version, both `/releases/download/v<version>/` URLs,.
+The test script renders `v1.2.3` and then `v2.0.0` over the same output file and asserts that both times the version, both `/releases/download/v<version>/` URLs.
 Both digests are exactly the new values, with no tokens and no leftovers from the earlier rendering.
 
 
@@ -154,7 +154,7 @@ Flow in `scripts/release.sh` release mode:
    Any other value, including one carrying whitespace or extra `-X` linker flags, and including a shape-valid impossible date such as `2006-13-45T99:99:99Z`, is rejected with a fatal error before the build, in both release.
   Snapshot mode, so a caller cannot override the validated version through `-ldflags`.
   The calendar check is performed by `scripts/rfc3339check` (see 5.1).
-  
+
 
 2. Else if `SOURCE_DATE_EPOCH` is set, it is converted to RFC3339 UTC.
 
@@ -201,7 +201,7 @@ build:
 | `BUILD_DATE` | exactly the canonical RFC3339 UTC form `YYYY-MM-DDTHH:MM:SSZ`, naming a real UTC calendar instant |
 
 `BUILD_DATE` is validated in two layers. The character set (`0-9 T Z : . -`)
-and the canonical shape are checked first; then, for every caller-supplied
+and the canonical shape are checked first. Then for every caller-supplied
 `BUILD_DATE` in both release and snapshot mode, `scripts/release.sh` runs
 `scripts/rfc3339check`, which parses the value with
 `time.Parse(time.RFC3339, ...)` and requires the parsed time to re-format to
@@ -337,19 +337,19 @@ If a release key is compromised, is lost, or is suspected to be:
 
 The current root of trust is the static Ed25519 release key above.
 The DSSE envelope, the in-toto statement, and the recorded builder identity are designed so that Sigstore keyless signing (Fulcio certificates plus Rekor transparency entries) can be layered on later without changing the statement format.
- The predicate already carries the repository, ref, commit, and builder identity, so a keyless signature can be added alongside or replace the Ed25519 signature.
+The predicate already carries the repository, ref, commit, and builder identity, so a keyless signature can be added alongside or replace the Ed25519 signature.
 Until that lands, `--trusted-key` verification against the published release key is the supported path.
 
 
 ## 7. Release governance on `main`
 
 Canonical release gates (the fail-closed `make release-gate`, the formal model checks, the supply-chain verification in `scripts/release.sh`) must not be admin-bypassable on `main`.
- No force-merge past a red required check, and no "required" gate that a repository admin can silently skip to publish.
+No force-merge past a red required check, and no "required" gate that a repository admin can silently skip to publish.
 GitHub branch-protection settings live outside this repository and cannot be enforced from here — this section is the policy those settings must match.
 
 
 If a break-glass bypass is ever used (outage, stuck release, compromised runner), treat it as an incident.
- Record who bypassed, which gate, the full commit SHA, the justification, and the follow-up, in the release notes of the affected version and in the audit log.
+Record who bypassed, which gate, the full commit SHA, the justification, and the follow-up, in the release notes of the affected version and in the audit log.
 Re-establish every canonical gate before the next release is cut.
 An unaudited bypass voids the release's supply-chain claims.
 

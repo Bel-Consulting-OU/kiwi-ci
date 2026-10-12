@@ -152,7 +152,7 @@ entry point exists (`KIWI_GEN_CONTRACT_FIXTURES=1` with
 `go test ./internal/provenance -run TestGenerateContractFixtures`) for an
 audit refresh; regenerating
 without updating the golden test constants is expected to fail, by design.
-Never "fix" a frozen fixture to make a consumer pass — introduce a new
+Never alter a frozen fixture to make a consumer pass — introduce a new
 version instead (see `version.ContractVersions`).
 
 ## 4. Execution assurance: facts first, profiles derived
@@ -207,7 +207,7 @@ guarantee of a lower one. Never authorize with `profile >= N`.
 | 5 | `sealed_pinned_no_network` | profile 4 **plus** **proven** `network_access_denied` **plus** every declared image digest-pinned. This is NOT a hermeticity or bit-reproducibility claim: clocks, randomness, locale, kernel/runtime state and undeclared inputs remain outside what these controls prove |
 
 The derivation is deterministic and total, runs only over the persisted job + compiled payload + trust/policy records, and never upgrades an unprovable record.
- An unmaterializable execution gets the conservative fact vector (unknown runtime, credentials not excluded) and derives profile 0 even when a runtime receipt exists.
+An unmaterializable execution gets the conservative fact vector (unknown runtime, credentials not excluded) and derives profile 0 even when a runtime receipt exists.
 
 
 `model.ExternalEffectsClass` classifies where a job's external effects come
@@ -305,8 +305,8 @@ a weaker trust story.
 The projected fields are canonicalized, hashed into the subject digest and signed; what the signature covers is exactly what the profile declares.
 There is no post-signature redaction: a statement with fields removed or altered is a different statement and no longer verifies against the original subject digest.
 A consumer that requires an unprojected field must fetch a richer profile, not strip one.
-The forensic bundle is a retrieval materialization, not a signed projection: the signed artifact remains the embedded envelope (whose digest the bundle carries), and every other bundle field is a digest or reference a consumer can recompute or re-fetch through its own authorized reads.
- Kiwi never mints a second statement at retrieval time.
+The forensic bundle is a retrieval materialization, not a signed projection. The signed artifact remains the embedded envelope (whose digest the bundle carries). Every other bundle field is a digest or reference a consumer can recompute or re-fetch through its own authorized reads.
+Kiwi never mints a second statement at retrieval time.
 
 
 **Integrity scope of the forensic bundle (stated sharply).** The signed
@@ -321,7 +321,7 @@ wrapper as a convenience view and recompute/re-fetch every referenced value
 through its own authorized reads.
 
 **Non-goal: secret values are never recorded.** Evidence records references, versions and digests — `secret.issued` carries the secret name and lease generation only.
- OIDC issuance carries audience/kid/claim key names; sealed envelopes, tokens, plaintext claims and host credentials never appear in any event, attestation or provenance document.
+OIDC issuance carries audience/kid/claim key names; sealed envelopes, tokens, plaintext claims and host credentials never appear in any event, attestation or provenance document.
 Step outputs are bound by the completion result digest, never embedded; artifact contents are bound by digest, never copied into evidence.
 
 
@@ -363,9 +363,9 @@ boundary of that execution:
   environment, or native host authority) Kiwi says so; it does not claim that
   such effects are attributable to declared Kiwi capabilities.
 
-- - **Replay and speculation guarantees apply to Kiwi-mediated effects and declared surfaces only.** Exact replay cannot add child jobs, runs, outbox work or fragment uploads, and it refuses declared external effects unless explicitly authorized.
+- **Replay and speculation guarantees apply to Kiwi-mediated effects and declared surfaces only.** Exact replay cannot add child jobs, runs, outbox work or fragment uploads, and it refuses declared external effects unless explicitly authorized.
    it cannot promise that a step which declares nothing performs nothing outside the recorded policy.
-  
+
 
 - **Assurance facts are enforcement statements, not safety verdicts.** The
   `observed` receipt inside the facts is the executor's report of what the
@@ -376,10 +376,10 @@ boundary of that execution:
   correct. `uncontrolled`/`opaque_external` are honest classifications of
   weaker enforcement, not failures to hide.
 
-- - **The observed receipt is runner-reported evidence.** It is captured by the executor that ran the job, bound into the signature.
+- **The observed receipt is runner-reported evidence.** It is captured by the executor that ran the job, bound into the signature.
   Cross-checked against the effective runtime, but a malicious or compromised runner can report a receipt that misdescribes what it entered.
   The effective facts (derived from durable control-plane records) are the policy floor; treat the receipt as corroboration, not proof of honesty.
-  
+
 
 - **Evidence is not a proof of correctness.** Digests and signatures bind
   identity and integrity of the recorded surfaces; they say nothing about the
@@ -400,7 +400,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 ```
 
 `kiwi verify` prints the verified identity, the execution semantics and the assurance evidence (`execution assurance: profile N (name)` followed by the proven facts and, when present, the observed receipt; `external effects: class`).
-Verification recomputes the canonical digest, refuses a block whose fields disagree with its own subject digest, refuses a facts vector outside the closed domains, a profile label that disagrees with the facts it was derived from, or an unknown effects class,.
+Verification recomputes the canonical digest. It refuses a block whose fields disagree with its own subject digest. It also refuses a facts vector outside the closed domains, a profile label that disagrees with the facts it was derived from, or an unknown effects class.
 Never prints raw command output.
 A schema-v4 statement is still verified against its frozen name vocabulary.
 

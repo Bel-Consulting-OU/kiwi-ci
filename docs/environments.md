@@ -3,7 +3,7 @@
 Environments gate sensitive work (production, staging) behind approvals
 and concurrency limits, and record deployment lifecycles.
 
-## Declaration
+## Environment declaration
 
 ```yaml
 jobs:

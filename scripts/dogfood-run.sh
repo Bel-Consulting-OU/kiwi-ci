@@ -67,6 +67,14 @@ fi
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
+# Result-bundle emission hook: dogfood.EmitResult writes dogfood-result.json
+# + scenario-results/ into DOGFOOD_RESULT_DIR. Suite runs default it to a
+# workspace-local directory (matching the .kiwi/dogfood/*.yaml artifact
+# paths) so a suite that emits always has a stable destination; an explicit
+# DOGFOOD_RESULT_DIR from the caller wins.
+export DOGFOOD_RESULT_DIR="${DOGFOOD_RESULT_DIR:-$root/.kiwi/dogfood-results}"
+mkdir -p "$DOGFOOD_RESULT_DIR"
+
 out="$(mktemp)"
 trap 'rm -f "$out"' EXIT
 

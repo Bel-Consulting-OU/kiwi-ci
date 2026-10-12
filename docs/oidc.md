@@ -51,7 +51,7 @@ Ed25519-signed ID token with:
 - `permissions.id_token` with no allowed audiences is a policy
   violation at admission.
 
-## Key material
+## OIDC key material
 
 The signing key material is a persisted Ed25519 key ring
 (`oidc-keyring.json` in the data directory) so tokens survive restarts.

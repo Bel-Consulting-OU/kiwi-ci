@@ -30,7 +30,7 @@ Standard Postgres tooling applies:
 Hot-path job state (status, leases, counters) is relational; the full
 model payload is a jsonb column, so a logical dump restores everything.
 
-## Key material
+## Disaster-recovery key material
 
 The lease key, OIDC key, and runner CA are files, not rows. Back them
 up out-of-band with restricted access. Losing them:
@@ -39,8 +39,8 @@ up out-of-band with restricted access. Losing them:
   and restart clean. A new key is generated on next start.
 
 - **oidc-keyring.json** — issued tokens become unverifiable; providers
-  must be reconfigured for the new keys (see [oidc.md](oidc.md) for the
-  rotation model).
+  must be reconfigured for the new keys. See [oidc.md](oidc.md) for the
+  rotation model.
 
 - **runner CA** — enrolled runners fail mTLS; re-enroll or reload the
   CA from backup.

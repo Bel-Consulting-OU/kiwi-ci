@@ -157,6 +157,10 @@ func TestDFLEASE001StaleRunnerAfterReassignment(t *testing.T) {
 				if traffic.ArtifactUploaded {
 					t.Fatal("completion-before-artifact uploaded the artifact")
 				}
+			case hostile.ModeArtifactAfterCompletion:
+				if traffic.ArtifactsAfterCompletion == 0 {
+					t.Fatal("artifact-after-completion traffic has no post-terminal artifact write")
+				}
 			}
 			// Liveness: a fresh honest holder can still complete its own
 			// attempt afterwards (the mode never burns the runner).

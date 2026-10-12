@@ -143,10 +143,12 @@ dogfood-distributed:
 
 # DF3 nightly chaos: lease races, hostile-runner modes, deterministic fault
 # windows, evidence mismatch, artifact finalization crash windows, cache
-# trust poison. Safety AND liveness.
+# trust poison. Safety AND liveness. DF3 process-kill chaos (TestSysDFChaos001
+# in internal/dogfood/dist) is included: real server SIGKILL mid-flight and
+# restart on the same DB + data dir.
 dogfood-adversarial:
 	./scripts/dogfood-run.sh 180m \
-		--run 'TestDFLEASE|TestDFEVID|TestDFQUOTA|TestDFEFFECT|TestDFART|TestDFCACHE|TestEightOracle|TestNoHiddenRetries|TestFaultPoints|TestNewModeMatrix|TestExpectationsAreLayered' \
+		--run 'TestDFLEASE|TestDFEVID|TestDFQUOTA|TestDFEFFECT|TestDFART|TestDFCACHE|TestEightOracle|TestNoHiddenRetries|TestFaultPoints|TestNewModeMatrix|TestExpectationsAreLayered|TestSysDFChaos' \
 		--require TestDFLEASE001 \
 		--require TestDFLEASE002 \
 		--require TestDFEVID002 \
@@ -160,7 +162,8 @@ dogfood-adversarial:
 		--require TestExpectationsAreLayered \
 		--require TestEightOracleDisagreementFails \
 		--require TestNoHiddenRetries \
-		--require TestFaultPointsAreDeterministic
+		--require TestFaultPointsAreDeterministic \
+		--require TestSysDFChaos001
 
 # DF4 cross-version: evidence schema compatibility the verifier already
 # pins. Live N-1 binary matrix is the next wave.
@@ -180,6 +183,7 @@ dogfood-scale:
 		--run 'TestDFSCALE|TestDogfoodResult|TestScenarioResult|TestNamespace' \
 		--require TestDFSCALE001 \
 		--require TestDogfoodResultJSONShape \
+		--require TestDogfoodResultBundleEmission \
 		--require TestScenarioResultRejectsHiddenRetries \
 		--require TestNamespaceIsolationSurfaces
 
@@ -242,7 +246,7 @@ dogfood-release-artifacts:
 # the suite cannot silently lose them.
 dogfood-system:
 	./scripts/dogfood-run.sh 180s \
-		--run 'TestSysDFBoot|TestSysDFEvid|TestSysDFLease|TestSysQuota|TestSysRootless|TestSysTrusted' \
+		--run 'TestSysDFBoot|TestSysDFEvid|TestSysDFLease|TestSysQuota|TestSysRootless|TestSysTrusted|TestSysDFForgeCanary' \
 		--require TestSysDFBoot001 \
 		--require TestSysDFEvid001 \
 		--require TestSysDFLease001 \
@@ -250,6 +254,7 @@ dogfood-system:
 		--require TestSysRootlessEnforced \
 		--require TestSysTrustedIngress \
 		--require TestSysTrustedScheduleIngress \
+		--require TestSysDFForgeCanary001 \
 		-- ./internal/dogfood/system/
 
 # Production-closure SYSTEM species: live resource-leak/soak (DF-SCALE-002),

@@ -3,7 +3,7 @@
 Kiwi CI accepts GitLab webhooks, fetches pipeline files through the
 GitLab API, and publishes commit statuses.
 
-## Webhook setup
+## GitLab webhook setup
 
 1. In the project settings, add a webhook to
    `https://<your-kiwi-host>/hooks/gitlab`.
@@ -16,7 +16,7 @@ GitLab API, and publishes commit statuses.
 
 Ping events are acknowledged without action.
 
-## Events handled
+## GitLab events handled
 
 - `push` — enqueues a run when the head SHA is known.
 
@@ -27,7 +27,7 @@ Ping events are acknowledged without action.
   secrets, no OIDC, no native execution, no egress, digest-pinned
   images).
 
-## Trigger matching
+## GitLab trigger matching
 
 The pipeline `on` section is evaluated per event with the same
 semantics as GitHub: `merge_request` keys (with `pull_request` as
@@ -35,13 +35,13 @@ fallback), `<event>.<action>` precedence, branch and tag globs, path
 filters over the server-fetched changed files, and draft status.
 Deliveries are deduplicated by `X-GitLab-Event-UUID`.
 
-## Status publishing
+## GitLab status publishing
 
 GitLab does not expose GitHub-style checks; Kiwi falls back to commit
 statuses (`pending`/`running`, `success`, `failure`, `cancelled`)
 published through the durable outbox.
 
-## Config reference
+## GitLab config reference
 
 ```toml
 [gitlab]
@@ -53,9 +53,9 @@ webhook_secret = "high-entropy-secret"
 token = ""        # API token for private pipeline fetches and statuses
 ```
 
-`base_url` may also be set with `--gitlab-base-url` or
-`KIWI_GITLAB_BASE_URL`. It must not carry userinfo, a query or a fragment;
+In GitLab, `base_url` may also be set with `--gitlab-base-url` or
+`KIWI_GITLAB_BASE_URL`. A GitLab `base_url` must not carry userinfo, a query or a fragment;
 credentials go in `token`.
 
-See [production-deployment.md](production-deployment.md) for server
+See [production-deployment.md](production-deployment.md) for GitLab server
 setup.
