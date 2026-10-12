@@ -85,6 +85,13 @@ type VerificationObligation struct {
 	// VerificationContractDigest pins the contract defining the checks and
 	// assurance. Any different digest is a different obligation.
 	VerificationContractDigest Digest `json:"verification_contract_digest"`
+	// RecipeDigest pins the immutable Verification Recipe (see recipe.go)
+	// this obligation was issued under. When set it participates in the
+	// canonical obligation digest: the same content under a different
+	// recipe is a different obligation. Zero means the obligation predates
+	// recipes (or its issuer pinned the rules inline via RequiredChecks /
+	// RequiredAssurance / Freshness alone).
+	RecipeDigest Digest `json:"recipe_digest,omitempty"`
 	// RequiredChecks is the non-empty set of check identities the outcome
 	// must have covered to claim pass.
 	RequiredChecks []string `json:"required_checks"`

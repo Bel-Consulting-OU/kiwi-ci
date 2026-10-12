@@ -34,6 +34,12 @@ type ProvenanceEvidenceVerifier struct {
 	// VerifyOpts are optional non-empty pins every statement must match
 	// (repository, commit, capsule digests, …).
 	VerifyOpts provenance.VerifyOptions
+	// LookupTestReport resolves a signed suite digest to the stored test
+	// report it commits. Required for named test-report checks: the check
+	// outcome is derived from the report's cases (see
+	// DeriveCheckOutcomeFromCases), never from a caller string. When nil,
+	// every test-report check is derived as incomplete (fail closed).
+	LookupTestReport TestReportLookup
 	// Clock stamps VerifiedAt. Nil selects time.Now.
 	Clock func() time.Time
 }
@@ -117,12 +123,31 @@ func resolveProvenanceAttestation(ctx context.Context, ref string, p *Provenance
 	}
 	// Named checks are bound by structured signed result evidence: each
 	// test-report suite the attestation commits (its suite digest covers the
-	// ordered cases) binds its report name as a completed check. Caller
-	// strings never enter here.
+	// ordered cases) binds a VerifiedCheck whose Outcome is derived from the
+	// stored report's cases — never from a caller string and never assumed
+	// to be pass. A suite whose report cannot be resolved, or whose stored
+	// digest does not match the signed one, is derived as incomplete.
 	for _, rep := range att.TestReports {
-		if rep.Name != "" {
-			res.Checks = append(res.Checks, rep.Name)
+		if rep.Name == "" {
+			continue
 		}
+		vc := VerifiedCheck{
+			Name:           rep.Name,
+			Outcome:        CheckOutcomeIncomplete,
+			EvidenceDigest: Digest(rep.SuiteDigest),
+			ExecutionID:    execID,
+		}
+		if p.LookupTestReport != nil {
+			if report, ok := p.LookupTestReport(ctx, rep.SuiteDigest); ok && report != nil {
+				// The stored report must hash to the signed suite digest;
+				// a report whose content disagrees with the signed digest is
+				// not the evidence the attestation committed.
+				if got := provenance.TestReportSuiteDigest(*report); got == rep.SuiteDigest {
+					vc.Outcome = DeriveCheckOutcomeFromCases(*report)
+				}
+			}
+		}
+		res.Checks = append(res.Checks, vc)
 	}
 	return res, nil
 }

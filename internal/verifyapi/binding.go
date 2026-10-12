@@ -65,7 +65,10 @@ func (o VerificationObligation) Validate() error {
 		return fmt.Errorf("%w: subject is required", ErrInvalid)
 	}
 	if o.SubjectRef != nil {
-		if err := o.SubjectRef.Validate(); err != nil {
+		// An obligation's authority subject must be a strict prefix
+		// hierarchy (namespace[/tenant[/project[/repository]]]); a
+		// malformed partial shape can never enter the store as authority.
+		if err := o.SubjectRef.ValidateHierarchy(); err != nil {
 			return err
 		}
 	}
@@ -77,6 +80,11 @@ func (o VerificationObligation) Validate() error {
 	}
 	if err := validateDigest("verification_contract_digest", o.VerificationContractDigest); err != nil {
 		return err
+	}
+	if o.RecipeDigest != "" {
+		if err := validateDigest("recipe_digest", o.RecipeDigest); err != nil {
+			return err
+		}
 	}
 	if len(o.RequiredChecks) == 0 {
 		return fmt.Errorf("%w: required_checks must be non-empty", ErrInvalid)

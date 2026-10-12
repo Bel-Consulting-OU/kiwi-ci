@@ -42,6 +42,58 @@ const (
 	CheckEvidenceRoot = "evidence-root"
 )
 
+// CheckOutcome is the evidence-derived verdict of one verified check. It is
+// computed from signed result material (report cases, attestation facts) —
+// never copied from a caller's claim.
+type CheckOutcome string
+
+const (
+	// CheckOutcomePass: the check's evidence proves every case passed.
+	CheckOutcomePass CheckOutcome = "pass"
+	// CheckOutcomeFail: the check's evidence proves at least one failure.
+	CheckOutcomeFail CheckOutcome = "fail"
+	// CheckOutcomeError: the check's evidence proves an execution error.
+	CheckOutcomeError CheckOutcome = "error"
+	// CheckOutcomeIncomplete: the evidence does not prove a terminal
+	// pass/fail/error (empty suite, all skipped, or no resolvable report).
+	// Incomplete never satisfies an obligation requirement.
+	CheckOutcomeIncomplete CheckOutcome = "incomplete"
+)
+
+// Valid reports whether o is one of the closed check-outcome vocabulary values.
+func (o CheckOutcome) Valid() bool {
+	switch o {
+	case CheckOutcomePass, CheckOutcomeFail, CheckOutcomeError, CheckOutcomeIncomplete:
+		return true
+	}
+	return false
+}
+
+// VerifiedCheck is one evidence-derived required-check result. Name is the
+// check identity the obligation demands; Outcome is derived from the signed
+// report cases (or structural attestation facts); EvidenceDigest commits the
+// material the outcome was derived from (the signed suite digest for a
+// test-report check, the evidence root for a structural check); ExecutionID
+// names the execution the evidence binds.
+//
+// Obligation satisfaction requires Outcome == CheckOutcomePass — a check
+// that merely ran (or merely appears by name in a caller's list) never
+// discharges a requirement.
+type VerifiedCheck struct {
+	// Name is the check identity (matches VerificationObligation.RequiredChecks).
+	Name string `json:"name"`
+	// Outcome is the evidence-derived verdict (pass/fail/error/incomplete).
+	Outcome CheckOutcome `json:"outcome"`
+	// EvidenceDigest commits the signed material the verdict was derived
+	// from (the test-report suite digest, or the evidence root).
+	EvidenceDigest Digest `json:"evidence_digest"`
+	// ExecutionID is the execution whose evidence produced this check.
+	ExecutionID string `json:"execution_id"`
+}
+
+// Passed reports whether this check satisfies an obligation requirement.
+func (c VerifiedCheck) Passed() bool { return c.Outcome == CheckOutcomePass }
+
 // VerifiedEvidence is the cryptographically resolved evidence of one outcome.
 // Every field is produced by the verifier from signature-checked attestation
 // material — never copied from the caller's claim — so a forged evidence_root
@@ -66,10 +118,15 @@ type VerifiedEvidence struct {
 	// attestations: "success" only when every attestation reports success,
 	// "failure" when any reports failure, otherwise "incomplete".
 	JobStatus string `json:"job_status"`
-	// CompletedChecks are the check identities bound by structured signed
-	// result evidence (attestation facts, test-report suites, explicit
-	// signed check results). Never caller strings.
+	// CompletedChecks lists the names of the verified checks whose
+	// evidence-derived Outcome is pass. It is derived from VerifiedChecks
+	// and is the wire-facing subset an obligation requirement is matched
+	// against. Never caller strings.
 	CompletedChecks []string `json:"completed_checks"`
+	// VerifiedChecks is the full evidence-derived check set with outcomes.
+	// This is the authority: a name appears in CompletedChecks only when its
+	// VerifiedCheck.Outcome is pass.
+	VerifiedChecks []VerifiedCheck `json:"verified_checks,omitempty"`
 	// Assurance is the profile derived from the signed assurance facts with
 	// model.DeriveAssuranceProfileSchema (weakest profile across
 	// attestations). Never the caller's string.
@@ -166,12 +223,22 @@ type ResolvedAttestation struct {
 	// window; the verifier then records no attested wall time instead of
 	// inventing one.
 	Attested *AttestedResourceFacts
-	// Checks are the named checks this attestation binds through structured
-	// signed result evidence: test-report suite names and explicit signed
-	// check results. Only these names become CompletedChecks authority —
-	// caller strings never enter.
-	Checks []string
+	// Checks are the evidence-derived check results this attestation binds.
+	// Each entry carries a Name plus an Outcome derived from signed result
+	// material (test-report cases, explicit signed check results) — never a
+	// caller string and never a bare name that implies pass. Only a
+	// VerifiedCheck whose Outcome is CheckOutcomePass becomes CompletedChecks
+	// authority.
+	Checks []VerifiedCheck
 }
+
+// TestReportLookup resolves a signed suite digest to the stored test report
+// it commits. Implementations must fail closed: a digest with no matching
+// stored report yields (nil, false), and the check is then derived as
+// incomplete — never as pass. The lookup is the seam that turns a signed
+// SuiteDigest into report cases whose pass/fail/error/incomplete verdict the
+// verifier derives itself (rather than trusting a caller-named check list).
+type TestReportLookup func(ctx context.Context, suiteDigest string) (*model.TestReport, bool)
 
 // AttestationResolver cryptographically resolves one opaque evidence
 // reference into a verified attestation. Implementations must fail closed:
@@ -259,7 +326,8 @@ func (f *FuncEvidenceVerifier) Verify(ctx context.Context, obligation Verificati
 
 	// ---- derivation: authority comes only from what the signatures prove ----
 	jobStatus := deriveJobStatus(resolved)
-	completed := deriveCompletedChecks(resolved, root)
+	verifiedChecks := deriveVerifiedChecks(resolved, root)
+	completed := completedCheckNames(verifiedChecks)
 	assurance := deriveAssurance(resolved)
 	observed := mergeObserved(resolved)
 	attested := mergeAttested(resolved)
@@ -271,7 +339,7 @@ func (f *FuncEvidenceVerifier) Verify(ctx context.Context, obligation Verificati
 		CandidateDigest:  obligation.ImmutableCandidateDigest,
 		SnapshotDigest:   obligation.SourceSnapshotDigest,
 		ContractDigest:   obligation.VerificationContractDigest,
-		Outcome:          deriveResult(obligation, jobStatus, completed, assurance),
+		Outcome:          deriveResult(obligation, jobStatus, verifiedChecks, assurance),
 		AssuranceProfile: assurance.Name(),
 		CompletedChecks:  completed,
 		ExecutionIDs:     append([]string(nil), execIDs...),
@@ -313,6 +381,7 @@ func (f *FuncEvidenceVerifier) Verify(ctx context.Context, obligation Verificati
 		Attested:           attested,
 		JobStatus:          jobStatus,
 		CompletedChecks:    completed,
+		VerifiedChecks:     verifiedChecks,
 		Assurance:          assurance,
 		ObservedControls:   observed,
 		VerifierIdentity:   f.Identity,
@@ -369,43 +438,127 @@ func deriveJobStatus(resolved []ResolvedAttestation) string {
 	return "incomplete"
 }
 
-// deriveCompletedChecks builds the authoritative completed-check set from
-// structured signed result evidence only:
+// deriveVerifiedChecks builds the authoritative evidence-derived check set.
+// Every entry's Outcome is computed from signed result material — never from
+// a caller's string list:
 //
 //   - attestation facts: CheckJobStatusSuccess (unanimous signed success) and
 //     CheckEvidenceRoot (a committed, well-formed root);
-//   - test-report suites / explicit signed check results: the names the
-//     resolver surfaced on ResolvedAttestation.Checks.
+//   - test-report suites / explicit signed check results: the VerifiedCheck
+//     values the resolver surfaced on ResolvedAttestation.Checks, whose
+//     outcomes were derived from the signed report cases (pass / fail /
+//     error / incomplete) or from the explicit signed check result.
 //
 // A caller's CompletedChecks string list is never consulted. The result is
-// deterministic: structural names first, then named checks sorted.
-func deriveCompletedChecks(resolved []ResolvedAttestation, root Digest) []string {
-	out := make([]string, 0, 4)
-	if deriveJobStatus(resolved) == string(model.StatusSuccess) {
-		out = append(out, CheckJobStatusSuccess)
+// deterministic: structural names first, then named checks sorted by name.
+func deriveVerifiedChecks(resolved []ResolvedAttestation, root Digest) []VerifiedCheck {
+	out := make([]VerifiedCheck, 0, 4)
+	status := deriveJobStatus(resolved)
+	if status == string(model.StatusSuccess) {
+		out = append(out, VerifiedCheck{
+			Name:           CheckJobStatusSuccess,
+			Outcome:        CheckOutcomePass,
+			EvidenceDigest: root,
+		})
+	} else if status == string(model.StatusFailure) {
+		out = append(out, VerifiedCheck{
+			Name:           CheckJobStatusSuccess,
+			Outcome:        CheckOutcomeFail,
+			EvidenceDigest: root,
+		})
+	} else {
+		out = append(out, VerifiedCheck{
+			Name:           CheckJobStatusSuccess,
+			Outcome:        CheckOutcomeIncomplete,
+			EvidenceDigest: root,
+		})
 	}
-	if root != "" {
-		if err := validateDigest("resolved evidence_root", root); err == nil {
-			out = append(out, CheckEvidenceRoot)
-		}
+	if root != "" && validateDigest("resolved evidence_root", root) == nil {
+		out = append(out, VerifiedCheck{
+			Name:           CheckEvidenceRoot,
+			Outcome:        CheckOutcomePass,
+			EvidenceDigest: root,
+		})
+	} else {
+		out = append(out, VerifiedCheck{
+			Name:           CheckEvidenceRoot,
+			Outcome:        CheckOutcomeIncomplete,
+			EvidenceDigest: root,
+		})
 	}
-	seen := make(map[string]bool, len(out))
-	for _, c := range out {
-		seen[c] = true
-	}
-	named := make([]string, 0, len(resolved))
-	seenNamed := make(map[string]bool)
+	seen := map[string]bool{CheckJobStatusSuccess: true, CheckEvidenceRoot: true}
+	named := make([]VerifiedCheck, 0, len(resolved))
 	for _, att := range resolved {
 		for _, c := range att.Checks {
-			if c == "" || seen[c] || seenNamed[c] {
+			if c.Name == "" || seen[c.Name] {
 				continue
 			}
-			seenNamed[c] = true
-			named = append(named, c)
+			seen[c.Name] = true
+			// The resolver already derived the outcome from signed material;
+			// stamp the execution identity and (when absent) the attestation's
+			// evidence root as the evidence digest.
+			vc := c
+			if vc.ExecutionID == "" {
+				vc.ExecutionID = att.ExecutionID
+			}
+			if vc.EvidenceDigest == "" {
+				vc.EvidenceDigest = att.EvidenceRoot
+			}
+			named = append(named, vc)
 		}
 	}
-	sort.Strings(named)
+	sort.SliceStable(named, func(i, j int) bool { return named[i].Name < named[j].Name })
 	return append(out, named...)
+}
+
+// completedCheckNames returns the names of the verified checks whose
+// evidence-derived outcome is pass. Only these names enter CompletedChecks,
+// so obligation satisfaction transitively requires VerifiedCheck.Outcome ==
+// pass.
+func completedCheckNames(checks []VerifiedCheck) []string {
+	out := make([]string, 0, len(checks))
+	for _, c := range checks {
+		if c.Passed() {
+			out = append(out, c.Name)
+		}
+	}
+	return out
+}
+
+// DeriveCheckOutcomeFromCases computes the evidence-derived verdict of one
+// test-report suite from its cases (and its report-level error/failure
+// counts). The caller never supplies a verdict — it is derived here:
+//
+//   - error  when the report carries errors, or any case reports an error
+//     message without having passed;
+//   - fail   when any non-skipped case did not pass;
+//   - incomplete when the suite is empty or every case is skipped (nothing
+//     was proven either way);
+//   - pass   only when at least one case ran and every non-skipped case passed.
+func DeriveCheckOutcomeFromCases(rep model.TestReport) CheckOutcome {
+	if rep.Errors > 0 {
+		return CheckOutcomeError
+	}
+	ran := false
+	for _, c := range rep.Cases {
+		if c.Skipped {
+			continue
+		}
+		ran = true
+		if !c.Passed {
+			// A failed case with a message is still a fail (the report's
+			// Errors counter is the error signal); without one it is a fail
+			// too. Either way it is not a pass.
+			return CheckOutcomeFail
+		}
+	}
+	if !ran {
+		return CheckOutcomeIncomplete
+	}
+	if rep.Failures > 0 {
+		return CheckOutcomeFail
+	}
+	return CheckOutcomePass
 }
 
 // deriveAssurance derives the profile label from the signed assurance facts
@@ -438,24 +591,27 @@ func deriveAssurance(resolved []ResolvedAttestation) model.ExecutionAssurance {
 const provenanceCurrentAssuranceSchema = 6
 
 // deriveResult computes the authoritative verdict. Pass requires BOTH the
-// signed job status success AND full obligation check coverage by derived
-// completed checks (and the derived assurance meeting the required profile);
-// a failure status yields fail; anything else (including a missing or
-// partial check set, or an assurance shortfall) yields partial and therefore
-// can never satisfy ProvenPass.
-func deriveResult(obligation VerificationObligation, jobStatus string, completed []string, assurance model.ExecutionAssurance) Outcome {
+// signed job status success AND full obligation check coverage by
+// evidence-derived VerifiedChecks whose Outcome is pass (and the derived
+// assurance meeting the required profile); a failure status yields fail;
+// anything else (including a missing or partial check set, a check whose
+// evidence-derived outcome is not pass, or an assurance shortfall) yields
+// partial and therefore can never satisfy ProvenPass.
+func deriveResult(obligation VerificationObligation, jobStatus string, checks []VerifiedCheck, assurance model.ExecutionAssurance) Outcome {
 	if jobStatus == string(model.StatusFailure) {
 		return OutcomeFail
 	}
 	if jobStatus != string(model.StatusSuccess) {
 		return OutcomePartial
 	}
-	covered := make(map[string]bool, len(completed))
-	for _, c := range completed {
-		covered[c] = true
+	passed := make(map[string]bool, len(checks))
+	for _, c := range checks {
+		if c.Passed() {
+			passed[c.Name] = true
+		}
 	}
 	for _, need := range obligation.RequiredChecks {
-		if !covered[need] {
+		if !passed[need] {
 			return OutcomePartial
 		}
 	}
@@ -554,6 +710,11 @@ func (a ResolvedAttestation) Observed() *model.ExecutionControlReceipt {
 // identity present, otherwise nothing is sealed. The derived outcome is
 // checked for structural soundness here; obligation binding (including
 // freshness) is applied at record time by the registry/store.
+//
+// The submitted claim is independently checked against the accepted identity
+// (VerificationID, ObligationID, CandidateDigest, SnapshotDigest,
+// ContractDigest) so a claim swapped into a persisted row can never restore
+// under an identity the acceptance record did not bind.
 func sealDerivedOutcome(submitted, derived VerificationOutcome, evidence VerifiedEvidence) (DerivedVerifiedOutcome, error) {
 	if err := derived.Validate(); err != nil {
 		return DerivedVerifiedOutcome{}, err
@@ -572,6 +733,25 @@ func sealDerivedOutcome(submitted, derived VerificationOutcome, evidence Verifie
 	}
 	if evidence.VerifiedAt.IsZero() {
 		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: verified_at is required", ErrUnverified)
+	}
+	// Claim-identity rule: the submitted claim must agree with the accepted
+	// identity on every binding field. A claim that names a different
+	// verification, obligation, candidate, snapshot or contract is a
+	// different submission and must not ride along under this seal.
+	if submitted.VerificationID != derived.VerificationID {
+		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: submitted claim verification id %q disagrees with accepted %q", ErrUnverified, submitted.VerificationID, derived.VerificationID)
+	}
+	if submitted.ObligationID != derived.ObligationID {
+		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: submitted claim obligation id %q disagrees with accepted %q", ErrUnverified, submitted.ObligationID, derived.ObligationID)
+	}
+	if submitted.CandidateDigest != derived.CandidateDigest {
+		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: submitted claim candidate digest %s disagrees with accepted %s", ErrUnverified, submitted.CandidateDigest, derived.CandidateDigest)
+	}
+	if submitted.SnapshotDigest != derived.SnapshotDigest {
+		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: submitted claim snapshot digest %s disagrees with accepted %s", ErrUnverified, submitted.SnapshotDigest, derived.SnapshotDigest)
+	}
+	if submitted.ContractDigest != derived.ContractDigest {
+		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: submitted claim contract digest %s disagrees with accepted %s", ErrUnverified, submitted.ContractDigest, derived.ContractDigest)
 	}
 	// The derived record must agree with the evidence side: these are the
 	// same derivation, restated as a seal invariant so a future edit cannot

@@ -203,15 +203,11 @@ func (r *Registry) RecordVerifiedOutcome(v DerivedVerifiedOutcome) error {
 // substrate-derived Measured subset is excluded — it is filled at record
 // time) so two different runs cannot share one verification id.
 //
-// ExecutionIDs use Model A canonicalization instead of strict list equality:
-// the submitted claim and the verified evidence keep their id sets DISTINCT
-// forever, so evidence-derived id upgrades (empty→one, subset→full,
-// duplicates, reordering) must never be treated as claim conflicts. The two
-// sets are therefore compared set-wise and a subset relation in either
-// direction is accepted; disjoint or partially-overlapping sets remain a
-// conflict (a claim naming an id the other side does not is a different
-// submission — Verify already refuses any claimed id the attestations do
-// not bind).
+// ExecutionIDs use exact sorted-set equality: for idempotency the two lists
+// must name the same execution set (order and duplicates are canonicalized
+// away, but membership is not). A subset or superset is a different
+// submission — supersession of a claim's id set is modeled separately (see
+// claimCompatible) and never launders an idempotent replay.
 func claimEquivalent(a, b VerificationOutcome) bool {
 	if !(a.VerificationID == b.VerificationID &&
 		a.ObligationID == b.ObligationID &&
@@ -227,7 +223,7 @@ func claimEquivalent(a, b VerificationOutcome) bool {
 		a.CompletedAt.Equal(b.CompletedAt)) {
 		return false
 	}
-	if !executionIDsCompatible(a.ExecutionIDs, b.ExecutionIDs) {
+	if !executionIDsEqual(a.ExecutionIDs, b.ExecutionIDs) {
 		return false
 	}
 	ra, rb := a.Resources, b.Resources
@@ -250,24 +246,35 @@ func equalStringSlices(a, b []string) bool {
 // claimCompatible reports whether a stored claim and a sealed record's
 // SubmittedClaim are the same submission. It is claimEquivalent on every
 // dimension except ExecutionIDs, where a subset/superset relationship is
-// tolerated: a pre-Model-A sealed record carries the evidence-derived id set
-// on its claim side, which is an upgrade of the raw claim (not a different
-// claim). Partially-overlapping or disjoint id sets remain a conflict.
+// tolerated as SUPERSESSION: a pre-Model-A sealed record carries the
+// evidence-derived id set on its claim side, which is an upgrade of the raw
+// claim (not a different claim). Partially-overlapping or disjoint id sets
+// remain a conflict. Supersession is deliberately its own rule — it is never
+// mixed into idempotency (claimEquivalent).
 func claimCompatible(a, b VerificationOutcome) bool {
 	aa, bb := a, b
 	aa.ExecutionIDs, bb.ExecutionIDs = nil, nil
 	if !claimEquivalent(aa, bb) {
 		return false
 	}
-	return executionIDsCompatible(a.ExecutionIDs, b.ExecutionIDs)
+	return executionIDsSupersede(a.ExecutionIDs, b.ExecutionIDs)
 }
 
-// executionIDsCompatible reports whether two execution-id lists may belong to
-// the same claim under Model A. Duplicates and ordering are canonicalized
-// away; one side being a subset of the other is an evidence-derived id
-// upgrade (or a raw claim naming fewer ids than the evidence resolved) and
-// is compatible. Disjoint or partially-overlapping sets are not.
-func executionIDsCompatible(a, b []string) bool {
+// executionIDsEqual reports exact sorted-set equality: the idempotency rule.
+// Duplicates and ordering are canonicalized away; membership must match
+// exactly. A proof that names a different execution set is a different
+// submission.
+func executionIDsEqual(a, b []string) bool {
+	sa, sb := stringSet(a), stringSet(b)
+	return len(sa) == len(sb) && isSubset(sa, sb)
+}
+
+// executionIDsSupersede reports whether one execution-id list may SUPERSEDE
+// the other (subset in either direction). This is the claim-upgrade rule
+// only: evidence-derived id upgrades (empty→one, subset→full) are not claim
+// conflicts. Disjoint or partially-overlapping sets are not supersession and
+// remain a conflict.
+func executionIDsSupersede(a, b []string) bool {
 	sa, sb := stringSet(a), stringSet(b)
 	return isSubset(sa, sb) || isSubset(sb, sa)
 }
@@ -535,6 +542,7 @@ func cloneDerived(v DerivedVerifiedOutcome) DerivedVerifiedOutcome {
 	out.Evidence.ExecutionIDs = append([]string(nil), v.Evidence.ExecutionIDs...)
 	out.Evidence.AttestationDigests = append([]Digest(nil), v.Evidence.AttestationDigests...)
 	out.Evidence.CompletedChecks = append([]string(nil), v.Evidence.CompletedChecks...)
+	out.Evidence.VerifiedChecks = append([]VerifiedCheck(nil), v.Evidence.VerifiedChecks...)
 	if v.Evidence.Attested != nil {
 		a := *v.Evidence.Attested
 		out.Evidence.Attested = &a

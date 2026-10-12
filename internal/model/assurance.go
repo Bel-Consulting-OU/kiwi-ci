@@ -489,6 +489,62 @@ func (a ExecutionAssurance) Valid() bool {
 	return ok
 }
 
+// assuranceProperties is the fact-set each profile proves. This is the
+// lattice order: profile a satisfies need exactly when a's property set is
+// a superset of need's. Numeric profile order is NOT the lattice —
+// network_denied (3) and kiwi_mediated_authority (4) are incomparable.
+type assuranceProperties uint
+
+const (
+	propFilesystemIsolated assuranceProperties = 1 << iota
+	propNoSecretsCleanEnv
+	propNetworkDenied
+	propMediatedAuthority
+	propImagesPinned
+)
+
+// properties returns the fact-set a proves. An invalid profile proves
+// nothing (the zero set is only meaningful for the valid uncontrolled
+// profile; callers must check Valid first for that case).
+func (a ExecutionAssurance) properties() assuranceProperties {
+	switch a {
+	case AssuranceUncontrolled:
+		return 0
+	case AssuranceIsolatedFilesystem:
+		return propFilesystemIsolated
+	case AssuranceNoInjectedCredentials:
+		return propFilesystemIsolated | propNoSecretsCleanEnv
+	case AssuranceNetworkDenied:
+		return propFilesystemIsolated | propNoSecretsCleanEnv | propNetworkDenied
+	case AssuranceKiwiMediatedAuthority:
+		return propFilesystemIsolated | propNoSecretsCleanEnv | propMediatedAuthority
+	case AssuranceSealedPinnedNoNetwork:
+		return propFilesystemIsolated | propNoSecretsCleanEnv | propNetworkDenied | propMediatedAuthority | propImagesPinned
+	default:
+		return 0
+	}
+}
+
+// Satisfies reports whether a provides at least the assurance properties
+// need requires. The order is a property lattice, NOT the numeric profile
+// order: a satisfies need when every fact need proves, a also proves.
+//
+// Consequences the lattice pins (and a naive "a >= need" would get wrong):
+//
+//   - network_denied (3) and kiwi_mediated_authority (4) are INCOMPARABLE:
+//     neither satisfies the other. 3 proves network none but not mediated
+//     authority; 4 proves mediated authority but may allow the network.
+//   - sealed_pinned_no_network (5) satisfies every defined profile.
+//   - every defined profile satisfies uncontrolled (which proves nothing).
+//   - an unknown profile neither satisfies nor is satisfied (fail closed).
+func (a ExecutionAssurance) Satisfies(need ExecutionAssurance) bool {
+	if !a.Valid() || !need.Valid() {
+		return false
+	}
+	needProps := need.properties()
+	return a.properties()&needProps == needProps
+}
+
 // DeriveAssuranceProfile derives the profile label from the authoritative
 // fact vector under SCHEMA v6 semantics. Network-denied and sealed profiles
 // require the PROVEN NetworkAccessDenied fact — never the policy field alone.

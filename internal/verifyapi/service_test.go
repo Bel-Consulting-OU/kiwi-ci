@@ -54,9 +54,9 @@ func newServiceFixture(t *testing.T) *serviceFixture {
 		svc:      svc,
 		store:    st,
 		clock:    clock,
-		tenantA:  Principal{Subject: "svc-a", Scope: tenantRef("tenant-a")},
-		tenantB:  Principal{Subject: "svc-b", Scope: tenantRef("tenant-b")},
-		admin:    Principal{Subject: "root", Admin: true},
+		tenantA:  Principal{Subject: "svc-a", Capabilities: CapabilitiesIn(tenantRef("tenant-a"))},
+		tenantB:  Principal{Subject: "svc-b", Capabilities: CapabilitiesIn(tenantRef("tenant-b"))},
+		admin:    Principal{Subject: "root", Capabilities: []Capability{GlobalVerificationAdmin}},
 		verifier: v,
 	}
 }
@@ -419,19 +419,151 @@ func TestServiceCompareGroupAuthorizesSubjects(t *testing.T) {
 	}
 }
 
-// TestScopeAuthorizerZeroScope: a principal with no authority subject is
-// refused on any named subject and on the zero subject (unless admin).
+// TestScopeAuthorizerZeroScope: a principal with no capabilities is refused
+// on any subject, including the zero subject. Admin authority is only the
+// explicit GlobalVerificationAdmin capability — never a zero SubjectRef.
 func TestScopeAuthorizerZeroScope(t *testing.T) {
 	var a ScopeAuthorizer
 	ctx := context.Background()
 	p := Principal{Subject: "anon"}
-	if err := a.Authorize(ctx, p, ActionQueryOutcome, tenantRef("tenant-a")); !errors.Is(err, ErrUnauthorized) {
-		t.Fatalf("zero scope over named subject = %v, want ErrUnauthorized", err)
+	if err := a.Authorize(ctx, p, ActionProofRead, tenantRef("tenant-a")); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("capability-less principal over named subject = %v, want ErrUnauthorized", err)
 	}
-	if err := a.Authorize(ctx, p, ActionQueryOutcome, SubjectRef{}); !errors.Is(err, ErrUnauthorized) {
-		t.Fatalf("zero scope over zero subject = %v, want ErrUnauthorized", err)
+	if err := a.Authorize(ctx, p, ActionProofRead, SubjectRef{}); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("capability-less principal over zero subject = %v, want ErrUnauthorized", err)
 	}
-	if err := a.Authorize(ctx, Principal{Subject: "root", Admin: true}, ActionQueryOutcome, tenantRef("tenant-a")); err != nil {
-		t.Fatalf("admin over named subject = %v, want nil", err)
+	// The zero SubjectRef is not a wildcard: a capability scoped to it
+	// grants nothing.
+	zeroScoped := Principal{Subject: "zero-scoped", Capabilities: []Capability{
+		{Action: ActionProofRead, Scope: SubjectRef{}},
+	}}
+	if err := a.Authorize(ctx, zeroScoped, ActionProofRead, tenantRef("tenant-a")); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("zero-scope capability over named subject = %v, want ErrUnauthorized", err)
+	}
+	if err := a.Authorize(ctx, zeroScoped, ActionProofRead, SubjectRef{}); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("zero-scope capability over zero subject = %v, want ErrUnauthorized", err)
+	}
+	// Admin is explicit, not a zero ref.
+	if err := a.Authorize(ctx, Principal{Subject: "root", Capabilities: []Capability{GlobalVerificationAdmin}}, ActionProofRead, tenantRef("tenant-a")); err != nil {
+		t.Fatalf("explicit GlobalVerificationAdmin over named subject = %v, want nil", err)
+	}
+}
+
+// TestSubjectHierarchyEnforcement is the P1 authorization rule: scopes are
+// strict prefix hierarchies. A tenant-only or project-only ref is a
+// malformed scope and authorizes nothing; it can never cross namespaces or
+// tenants even when the trailing dimensions collide.
+func TestSubjectHierarchyEnforcement(t *testing.T) {
+	var a ScopeAuthorizer
+	ctx := context.Background()
+
+	// Malformed partial hierarchies are refused as scopes (and as
+	// principal capabilities).
+	for name, bad := range map[string]SubjectRef{
+		"tenant-only":       {TenantID: "acme"},
+		"project-only":      {ProjectID: "payments"},
+		"repository-only":   {RepositoryID: "github.com/acme/service"},
+		"namespace/project": {AuthorityNamespace: "github.com", ProjectID: "payments"},
+		"namespace/repo":    {AuthorityNamespace: "github.com", RepositoryID: "github.com/acme/service"},
+		"tenant/repo":       {TenantID: "acme", RepositoryID: "github.com/acme/service"},
+		"namespace/tenant/repo": {
+			AuthorityNamespace: "github.com", TenantID: "acme", RepositoryID: "github.com/acme/service",
+		},
+	} {
+		if err := bad.ValidateHierarchy(); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("%s ValidateHierarchy = %v, want ErrInvalid", name, err)
+		}
+		p := Principal{Subject: name, Capabilities: CapabilitiesIn(bad)}
+		if len(p.Capabilities) != 0 {
+			t.Fatalf("%s: CapabilitiesIn must refuse a malformed scope, got %v", name, p.Capabilities)
+		}
+		// A hand-built capability with a malformed scope authorizes nothing.
+		p = Principal{Subject: name, Capabilities: []Capability{
+			{Action: ActionProofRead, Scope: bad},
+		}}
+		if err := a.Authorize(ctx, p, ActionProofRead, tenantRef("acme")); !errors.Is(err, ErrUnauthorized) {
+			t.Fatalf("%s scope authorized a subject: %v", name, err)
+		}
+		if err := p.Validate(); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("%s principal Validate = %v, want ErrInvalid", name, err)
+		}
+	}
+
+	// {tenant:acme} cannot authorize other namespaces (it is not a scope).
+	acme := SubjectRef{TenantID: "acme"}
+	otherNS := SubjectRef{AuthorityNamespace: "evil.example", TenantID: "acme"}
+	if acme.Includes(otherNS) || acme.Includes(tenantRef("acme")) {
+		t.Fatal("tenant-only ref must not authorize any namespace")
+	}
+
+	// {project:payments} cannot cross tenants.
+	payments := SubjectRef{ProjectID: "payments"}
+	ta := SubjectRef{AuthorityNamespace: "github.com", TenantID: "tenant-a", ProjectID: "payments"}
+	tb := SubjectRef{AuthorityNamespace: "github.com", TenantID: "tenant-b", ProjectID: "payments"}
+	if payments.Includes(ta) || payments.Includes(tb) {
+		t.Fatal("project-only ref must not cross tenants")
+	}
+
+	// Valid hierarchy: namespace scope is trailing-wildcard over its
+	// tenants, but never another namespace.
+	ns := SubjectRef{AuthorityNamespace: "github.com"}
+	if !ns.Includes(ta) || !ns.Includes(tb) {
+		t.Fatal("namespace scope must cover its own tenants")
+	}
+	if ns.Includes(otherNS) {
+		t.Fatal("namespace scope must not cover another namespace")
+	}
+
+	// A tenant scope covers its own projects/repositories but not a
+	// namespace-level obligation (the scope must not extend upward).
+	tScope := SubjectRef{AuthorityNamespace: "github.com", TenantID: "tenant-a"}
+	if !tScope.Includes(ta) {
+		t.Fatal("tenant scope must cover its project")
+	}
+	if tScope.Includes(ns) {
+		t.Fatal("tenant scope must not cover a namespace-level subject")
+	}
+
+	// Admin is explicit, not a zero ref: a zero SubjectRef covers nothing,
+	// and only GlobalVerificationAdmin spans subjects.
+	if (SubjectRef{}).Includes(ta) || (SubjectRef{}).Includes(SubjectRef{}) {
+		t.Fatal("zero SubjectRef must not cover anything")
+	}
+	if err := a.Authorize(ctx, Principal{Subject: "root", Capabilities: []Capability{GlobalVerificationAdmin}}, ActionProofRead, ta); err != nil {
+		t.Fatalf("explicit admin = %v, want nil", err)
+	}
+	// A zero-SubjectRef-shaped "admin" principal is NOT admin.
+	if err := a.Authorize(ctx, Principal{Subject: "root"}, ActionProofRead, ta); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("zero-ref principal must not be admin: %v", err)
+	}
+}
+
+// TestCapabilityAuthorizerIsActionScoped: a capability for one action does
+// not grant another; the admin capability grants every action.
+func TestCapabilityAuthorizerIsActionScoped(t *testing.T) {
+	var a ScopeAuthorizer
+	ctx := context.Background()
+	scope := tenantRef("tenant-a")
+	readOnly := Principal{Subject: "reader", Capabilities: []Capability{
+		{Action: ActionProofRead, Scope: scope},
+	}}
+	if err := a.Authorize(ctx, readOnly, ActionProofRead, scope); err != nil {
+		t.Fatalf("scoped read = %v", err)
+	}
+	if err := a.Authorize(ctx, readOnly, ActionObligationCreate, scope); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("read capability must not create obligations: %v", err)
+	}
+	if err := a.Authorize(ctx, readOnly, ActionClaimSubmit, scope); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("read capability must not submit claims: %v", err)
+	}
+	// GlobalVerificationAdmin is every action on every subject.
+	admin := Principal{Subject: "root", Capabilities: []Capability{GlobalVerificationAdmin}}
+	for _, act := range []Action{ActionObligationCreate, ActionClaimSubmit, ActionProofVerify, ActionProofRead, ActionGroupCompare} {
+		if err := a.Authorize(ctx, admin, act, scope); err != nil {
+			t.Fatalf("admin %s = %v, want nil", act, err)
+		}
+		if err := a.Authorize(ctx, admin, act, SubjectRef{}); err != nil {
+			t.Fatalf("admin %s on zero subject = %v, want nil", act, err)
+		}
 	}
 }

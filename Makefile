@@ -406,6 +406,17 @@ surface-check:
 docs-lint:
 	./scripts/docs-lint.sh --source --baseline scripts/docs-lint-baseline.txt
 
+# generate refreshes every derived artifact (FILE_MAP.md, contract docs).
+# Run it before committing; precommit is the documented developer gate.
+.PHONY: generate precommit
+generate:
+	go run ./cmd/filemap
+	KIWI_GEN=1 go test ./internal/version -run TestGenerateContractVersionsDoc -count=1
+
+precommit: generate docs-lint
+	go run ./cmd/filemap --check
+	./scripts/docs-links-check.sh
+
 docs-check: docs-lint
 	test -f docs/threat-model.md
 	test -f ADVERSARIAL_TEST_MATRIX.md

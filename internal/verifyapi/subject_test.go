@@ -16,8 +16,8 @@ func tenantRef(id string) SubjectRef {
 	}
 }
 
-// TestSubjectRefValidate: zero is valid; set dimensions must be clean
-// identifiers; whitespace and control characters are refused.
+// TestSubjectRefValidate: zero is structurally valid; set dimensions must
+// be clean identifiers; whitespace and control characters are refused.
 func TestSubjectRefValidate(t *testing.T) {
 	if err := (SubjectRef{}).Validate(); err != nil {
 		t.Fatalf("zero SubjectRef refused: %v", err)
@@ -37,8 +37,47 @@ func TestSubjectRefValidate(t *testing.T) {
 	}
 }
 
+// TestSubjectRefValidateHierarchy: only the strict prefix shapes are valid
+// scopes — namespace, namespace/tenant, namespace/tenant/project,
+// namespace/tenant/project/repository. Every hole in the chain and the zero
+// ref are refused (the zero ref is not a scope; admin is explicit).
+func TestSubjectRefValidateHierarchy(t *testing.T) {
+	valid := map[string]SubjectRef{
+		"namespace":  {AuthorityNamespace: "github.com"},
+		"tenant":     {AuthorityNamespace: "github.com", TenantID: "acme"},
+		"project":    {AuthorityNamespace: "github.com", TenantID: "acme", ProjectID: "payments"},
+		"repository": tenantRef("acme"),
+	}
+	for name, s := range valid {
+		if err := s.ValidateHierarchy(); err != nil {
+			t.Fatalf("valid shape %q refused: %v", name, err)
+		}
+	}
+	invalid := map[string]SubjectRef{
+		"zero":               {},
+		"tenant-only":        {TenantID: "acme"},
+		"project-only":       {ProjectID: "payments"},
+		"repository-only":    {RepositoryID: "github.com/acme/service"},
+		"tenant/project":     {TenantID: "acme", ProjectID: "payments"},
+		"tenant/repository":  {TenantID: "acme", RepositoryID: "github.com/acme/service"},
+		"namespace/project":  {AuthorityNamespace: "github.com", ProjectID: "payments"},
+		"namespace/repository": {
+			AuthorityNamespace: "github.com", RepositoryID: "github.com/acme/service",
+		},
+		"namespace/tenant/repository": {
+			AuthorityNamespace: "github.com", TenantID: "acme", RepositoryID: "github.com/acme/service",
+		},
+		"project/repository": {ProjectID: "payments", RepositoryID: "github.com/acme/service"},
+	}
+	for name, s := range invalid {
+		if err := s.ValidateHierarchy(); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("invalid shape %q accepted: %v", name, err)
+		}
+	}
+}
+
 // TestSubjectRefIncludesIsFailClosed: a scope covers only its own
-// dimensions; a zero scope never covers a named subject.
+// hierarchy; malformed partial scopes and the zero ref cover nothing.
 func TestSubjectRefIncludesIsFailClosed(t *testing.T) {
 	a := tenantRef("tenant-a")
 	if !a.Includes(a) {
@@ -55,14 +94,95 @@ func TestSubjectRefIncludesIsFailClosed(t *testing.T) {
 	if (SubjectRef{}).Includes(a) {
 		t.Fatal("zero scope must not cover a named subject")
 	}
-	if !(SubjectRef{}).Includes(SubjectRef{}) {
-		t.Fatal("zero scope must include the zero subject")
+	if (SubjectRef{}).Includes(SubjectRef{}) {
+		t.Fatal("zero scope is not a wildcard — it covers nothing")
 	}
 	// Same repository id under different tenants is NOT the same authority.
 	clone := tenantRef("tenant-b")
 	clone.RepositoryID = a.RepositoryID
 	if a.Includes(clone) {
 		t.Fatal("byte-identical repository under another tenant must not be covered")
+	}
+	// Trailing wildcards only: a namespace scope spans its tenants, a
+	// holey scope spans nothing.
+	ns := SubjectRef{AuthorityNamespace: "github.com"}
+	if !ns.Includes(a) || !ns.Includes(b) {
+		t.Fatal("namespace scope must cover its tenants")
+	}
+	otherNS := tenantRef("tenant-a")
+	otherNS.AuthorityNamespace = "evil.example"
+	if ns.Includes(otherNS) {
+		t.Fatal("namespace scope must not cover another namespace")
+	}
+	// {tenant:acme} is a holey shape: it authorizes nothing, including
+	// subjects that share the tenant id.
+	acme := SubjectRef{TenantID: "acme"}
+	sameTenant := SubjectRef{AuthorityNamespace: "github.com", TenantID: "acme", ProjectID: "p"}
+	if acme.Includes(sameTenant) {
+		t.Fatal("tenant-only ref must not authorize any subject")
+	}
+	// {project:payments} cannot cross tenants.
+	payments := SubjectRef{ProjectID: "payments"}
+	pa := SubjectRef{AuthorityNamespace: "github.com", TenantID: "a", ProjectID: "payments"}
+	pb := SubjectRef{AuthorityNamespace: "github.com", TenantID: "b", ProjectID: "payments"}
+	if payments.Includes(pa) || payments.Includes(pb) {
+		t.Fatal("project-only ref must not cross tenants")
+	}
+}
+
+// TestValidateScopes: loading a scope map refuses any malformed entry and
+// accepts the four valid hierarchy shapes.
+func TestValidateScopes(t *testing.T) {
+	good := map[string]SubjectRef{
+		"ns":   {AuthorityNamespace: "github.com"},
+		"ten":  {AuthorityNamespace: "github.com", TenantID: "acme"},
+		"proj": {AuthorityNamespace: "github.com", TenantID: "acme", ProjectID: "payments"},
+		"repo": tenantRef("acme"),
+	}
+	if err := ValidateScopes(good); err != nil {
+		t.Fatalf("valid scopes refused: %v", err)
+	}
+	if err := ValidateScopes(nil); err != nil {
+		t.Fatalf("empty scopes refused: %v", err)
+	}
+	bad := map[string]SubjectRef{
+		"tenant-only": {TenantID: "acme"},
+	}
+	if err := ValidateScopes(bad); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("malformed scope loaded = %v, want ErrInvalid", err)
+	}
+}
+
+// TestObligationValidateRequiresHierarchy: an obligation's SubjectRef must
+// be a strict prefix hierarchy. Malformed partial shapes are refused at
+// obligation validation (and therefore at decode, submit and digest).
+func TestObligationValidateRequiresHierarchy(t *testing.T) {
+	ob := baseObligation(t)
+	nsOnly := SubjectRef{AuthorityNamespace: "github.com"}
+	ob.SubjectRef = &nsOnly
+	if err := ob.Validate(); err != nil {
+		t.Fatalf("namespace-only subject refused: %v", err)
+	}
+	if _, err := CanonicalObligationDigest(ob); err != nil {
+		t.Fatalf("namespace-only digest = %v", err)
+	}
+	for name, bad := range map[string]SubjectRef{
+		"zero":               {},
+		"tenant-only":        {TenantID: "acme"},
+		"namespace/project":  {AuthorityNamespace: "github.com", ProjectID: "payments"},
+		"namespace/repo":     {AuthorityNamespace: "github.com", RepositoryID: "github.com/acme/service"},
+		"namespace/tenant/repo": {
+			AuthorityNamespace: "github.com", TenantID: "acme", RepositoryID: "github.com/acme/service",
+		},
+	} {
+		bad := bad
+		ob.SubjectRef = &bad
+		if err := ob.Validate(); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("obligation with %s subject accepted: %v", name, err)
+		}
+		if _, err := CanonicalObligationDigest(ob); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("digest of %s subject = %v, want ErrInvalid", name, err)
+		}
 	}
 }
 

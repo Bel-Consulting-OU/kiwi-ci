@@ -333,7 +333,10 @@ func verificationITSeal(t *testing.T, ob verifyapi.VerificationObligation, v ver
 				EvidenceRoot:      root,
 				AttestationDigest: verificationITDigest(t, "att-"+string(root[:8])),
 				Status:            "success",
-				Checks:            []string{"digest-match", "signature"},
+				Checks: []verifyapi.VerifiedCheck{
+					{Name: "digest-match", Outcome: verifyapi.CheckOutcomePass, EvidenceDigest: root, ExecutionID: v.ExecutionIDs[0]},
+					{Name: "signature", Outcome: verifyapi.CheckOutcomePass, EvidenceDigest: root, ExecutionID: v.ExecutionIDs[0]},
+				},
 			}, nil
 		},
 	}

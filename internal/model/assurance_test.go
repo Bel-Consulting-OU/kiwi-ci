@@ -406,3 +406,84 @@ func TestValidateExternalEffectsMediatedRequiresCleanCredentials(t *testing.T) {
 		t.Fatalf("clean isolated mediated: %v", err)
 	}
 }
+
+// TestExecutionAssuranceSatisfiesIsPropertyLattice: Satisfies is the
+// property lattice over what each profile proves — NOT the numeric profile
+// order. network_denied (3) and kiwi_mediated_authority (4) are
+// incomparable despite 3 < 4; sealed (5) satisfies every profile;
+// uncontrolled is the bottom; invalid profiles satisfy nothing.
+func TestExecutionAssuranceSatisfiesIsPropertyLattice(t *testing.T) {
+	all := []ExecutionAssurance{
+		AssuranceUncontrolled,
+		AssuranceIsolatedFilesystem,
+		AssuranceNoInjectedCredentials,
+		AssuranceNetworkDenied,
+		AssuranceKiwiMediatedAuthority,
+		AssuranceSealedPinnedNoNetwork,
+	}
+	// want[a][need] = a.Satisfies(need).
+	want := map[ExecutionAssurance]map[ExecutionAssurance]bool{
+		AssuranceUncontrolled: {
+			AssuranceUncontrolled: true,
+		},
+		AssuranceIsolatedFilesystem: {
+			AssuranceUncontrolled:       true,
+			AssuranceIsolatedFilesystem: true,
+		},
+		AssuranceNoInjectedCredentials: {
+			AssuranceUncontrolled:          true,
+			AssuranceIsolatedFilesystem:    true,
+			AssuranceNoInjectedCredentials: true,
+		},
+		AssuranceNetworkDenied: {
+			AssuranceUncontrolled:          true,
+			AssuranceIsolatedFilesystem:    true,
+			AssuranceNoInjectedCredentials: true,
+			AssuranceNetworkDenied:         true,
+			// Lacks mediated authority.
+			AssuranceKiwiMediatedAuthority: false,
+			AssuranceSealedPinnedNoNetwork: false,
+		},
+		AssuranceKiwiMediatedAuthority: {
+			AssuranceUncontrolled:          true,
+			AssuranceIsolatedFilesystem:    true,
+			AssuranceNoInjectedCredentials: true,
+			// May allow the network: does not satisfy network_denied.
+			AssuranceNetworkDenied:         false,
+			AssuranceKiwiMediatedAuthority: true,
+			AssuranceSealedPinnedNoNetwork: false,
+		},
+		AssuranceSealedPinnedNoNetwork: {
+			AssuranceUncontrolled:          true,
+			AssuranceIsolatedFilesystem:    true,
+			AssuranceNoInjectedCredentials: true,
+			AssuranceNetworkDenied:         true,
+			AssuranceKiwiMediatedAuthority: true,
+			AssuranceSealedPinnedNoNetwork: true,
+		},
+	}
+	for _, a := range all {
+		for _, need := range all {
+			got := a.Satisfies(need)
+			if got != want[a][need] {
+				t.Fatalf("%s.Satisfies(%s) = %v, want %v", a.Name(), need.Name(), got, want[a][need])
+			}
+		}
+	}
+	// The lattice is NOT numeric order: 4 does not satisfy 3 even though 4 > 3.
+	if AssuranceKiwiMediatedAuthority.Satisfies(AssuranceNetworkDenied) {
+		t.Fatal("kiwi_mediated_authority must not satisfy network_denied (numeric order is not the lattice)")
+	}
+	if AssuranceNetworkDenied.Satisfies(AssuranceKiwiMediatedAuthority) {
+		t.Fatal("network_denied must not satisfy kiwi_mediated_authority")
+	}
+	// Invalid profiles fail closed on both sides.
+	for _, bad := range []ExecutionAssurance{-1, 6, 99} {
+		if bad.Satisfies(AssuranceUncontrolled) || bad.Satisfies(bad) {
+			t.Fatalf("invalid profile %d must satisfy nothing", bad)
+		}
+		if AssuranceSealedPinnedNoNetwork.Satisfies(bad) {
+			t.Fatalf("sealed must not satisfy invalid requirement %d", bad)
+		}
+	}
+}

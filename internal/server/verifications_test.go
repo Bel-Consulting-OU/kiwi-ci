@@ -260,3 +260,82 @@ func TestVerificationsCrossTenantSubmitDenied(t *testing.T) {
 		t.Fatalf("cross-tenant submit = %d %s, want 403", rec.Code, rec.Body.String())
 	}
 }
+
+// TestSetVerificationScopesRejectsMalformedHierarchy: loading verification
+// scopes from config refuses every malformed partial shape (tenant-only,
+// namespace/project, ...) and installs nothing on failure. A tenant-only
+// scope must never be able to authorize across namespaces.
+func TestSetVerificationScopesRejectsMalformedHierarchy(t *testing.T) {
+	s := newVerificationServer(t)
+	keep := s.VerificationScopes
+	for name, bad := range map[string]verifyapi.SubjectRef{
+		"tenant-only":       {TenantID: "acme"},
+		"project-only":      {ProjectID: "payments"},
+		"namespace/project": {AuthorityNamespace: "github.com", ProjectID: "payments"},
+		"namespace/repo":    {AuthorityNamespace: "github.com", RepositoryID: "github.com/acme/service"},
+		"zero":              {},
+	} {
+		err := s.SetVerificationScopes(map[string]verifyapi.SubjectRef{"svc-a": bad})
+		if err == nil {
+			t.Fatalf("%s scope accepted at load", name)
+		}
+		// Previous map must remain installed (never partially replaced).
+		if len(s.VerificationScopes) != len(keep) {
+			t.Fatalf("%s load replaced the scope map", name)
+		}
+		for k, v := range keep {
+			if !s.VerificationScopes[k].Equal(v) {
+				t.Fatalf("%s load mutated existing scopes", name)
+			}
+		}
+	}
+	// A malformed scope on a principal grants nothing: tenant-only cannot
+	// authorize another namespace even if it were hand-built.
+	principal := verifyapi.Principal{Subject: "x", Capabilities: []verifyapi.Capability{
+		{Action: verifyapi.ActionProofRead, Scope: verifyapi.SubjectRef{TenantID: "acme"}},
+	}}
+	if principal.Allows(verifyapi.ActionProofRead, verifyapi.SubjectRef{AuthorityNamespace: "evil", TenantID: "acme"}) {
+		t.Fatal("tenant-only capability must not authorize another namespace")
+	}
+	// Valid load replaces the map.
+	ns := verifyapi.SubjectRef{AuthorityNamespace: "github.com"}
+	if err := s.SetVerificationScopes(map[string]verifyapi.SubjectRef{"svc-a": ns}); err != nil {
+		t.Fatalf("valid scope load = %v", err)
+	}
+	if !s.VerificationScopes["svc-a"].Equal(ns) {
+		t.Fatalf("loaded scope = %v, want %v", s.VerificationScopes["svc-a"], ns)
+	}
+}
+
+// TestVerificationAdminIsExplicitNotZeroRef: admin break-glass is only the
+// explicit GlobalVerificationAdmin capability. A principal with no
+// capabilities (including one whose scope is the zero ref) is never admin.
+func TestVerificationAdminIsExplicitNotZeroRef(t *testing.T) {
+	s := newVerificationServer(t)
+	// Admin token maps to the explicit capability, not a zero-ref wildcard.
+	req := httptest.NewRequest("GET", "/api/v1/verifications/obligations/ob-a", nil)
+	req.Header.Set("Authorization", "Bearer admin-tok")
+	p, ok := s.verificationPrincipal(req)
+	if !ok {
+		t.Fatal("admin token must authenticate")
+	}
+	if err := p.Validate(); err != nil {
+		t.Fatalf("admin principal malformed: %v", err)
+	}
+	if !p.Allows(verifyapi.ActionProofRead, verifyapi.SubjectRef{AuthorityNamespace: "any", TenantID: "any"}) {
+		t.Fatal("explicit GlobalVerificationAdmin must span subjects")
+	}
+	// An unlisted store subject gets no capabilities and is not admin.
+	req = httptest.NewRequest("GET", "/api/v1/verifications/obligations/ob-a", nil)
+	req = req.WithContext(auth.WithPrincipal(req.Context(), auth.Principal{Subject: "svc-c"}))
+	p, ok = s.verificationPrincipal(req)
+	if !ok {
+		t.Fatal("svc-c must authenticate")
+	}
+	if p.Allows(verifyapi.ActionProofRead, verifyapi.SubjectRef{}) {
+		t.Fatal("unlisted subject must not hold authority, even on the zero subject")
+	}
+	if err := p.Validate(); err != nil {
+		t.Fatalf("svc-c principal malformed: %v", err)
+	}
+}

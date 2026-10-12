@@ -240,7 +240,10 @@ func TestAcceptanceIntegrityRejectsTamperedPayload(t *testing.T) {
 				EvidenceRoot:      testDigest(t, "evidence"),
 				AttestationDigest: testDigest(t, "att"),
 				Status:            "success",
-				Checks:            []string{"digest-match", "signature"},
+				Checks: []verifyapi.VerifiedCheck{
+					{Name: "digest-match", Outcome: verifyapi.CheckOutcomePass, EvidenceDigest: testDigest(t, "att"), ExecutionID: "exec-1"},
+					{Name: "signature", Outcome: verifyapi.CheckOutcomePass, EvidenceDigest: testDigest(t, "att"), ExecutionID: "exec-1"},
+				},
 			}, nil
 		},
 	}

@@ -57,7 +57,7 @@ func ServiceHandler(svc *Service, principal PrincipalFromRequest) http.Handler {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		authed(w, req, ActionSubmitObligation, func(p Principal) error {
+		authed(w, req, ActionObligationCreate, func(p Principal) error {
 			if err := svc.SubmitObligation(req.Context(), p, o); err != nil {
 				return err
 			}
@@ -66,14 +66,14 @@ func ServiceHandler(svc *Service, principal PrincipalFromRequest) http.Handler {
 		})
 	})
 	mux.HandleFunc("GET /api/v1/verifications/obligations/{id}", func(w http.ResponseWriter, req *http.Request) {
-		authed(w, req, ActionQueryOutcome, func(p Principal) error {
+		authed(w, req, ActionProofRead, func(p Principal) error {
 			ob, err := svc.Store.GetObligation(req.Context(), req.PathValue("id"))
 			if err != nil {
 				return err
 			}
 			// Disclosure of an obligation is authorized against its own
 			// subject, exactly like an outcome read.
-			if err := svc.authorize(req.Context(), p, ActionQueryOutcome, ob.SubjectReference()); err != nil {
+			if err := svc.authorize(req.Context(), p, ActionProofRead, ob.SubjectReference()); err != nil {
 				return err
 			}
 			writeJSON(w, http.StatusOK, func() ([]byte, error) { return MarshalObligation(ob) })
@@ -81,12 +81,12 @@ func ServiceHandler(svc *Service, principal PrincipalFromRequest) http.Handler {
 		})
 	})
 	mux.HandleFunc("GET /api/v1/verifications/obligations/{id}/outcomes", func(w http.ResponseWriter, req *http.Request) {
-		authed(w, req, ActionQueryOutcome, func(p Principal) error {
+		authed(w, req, ActionProofRead, func(p Principal) error {
 			ob, err := svc.Store.GetObligation(req.Context(), req.PathValue("id"))
 			if err != nil {
 				return err
 			}
-			if err := svc.authorize(req.Context(), p, ActionQueryOutcome, ob.SubjectReference()); err != nil {
+			if err := svc.authorize(req.Context(), p, ActionProofRead, ob.SubjectReference()); err != nil {
 				return err
 			}
 			list, err := svc.Store.OutcomesForObligation(req.Context(), ob.ObligationID)
@@ -108,7 +108,7 @@ func ServiceHandler(svc *Service, principal PrincipalFromRequest) http.Handler {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		authed(w, req, ActionRecordClaim, func(p Principal) error {
+		authed(w, req, ActionClaimSubmit, func(p Principal) error {
 			if err := svc.RecordClaim(req.Context(), p, v); err != nil {
 				return err
 			}
@@ -127,7 +127,7 @@ func ServiceHandler(svc *Service, principal PrincipalFromRequest) http.Handler {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		authed(w, req, ActionVerifyAndRecord, func(p Principal) error {
+		authed(w, req, ActionProofVerify, func(p Principal) error {
 			seal, err := svc.VerifyAndRecord(req.Context(), p, v)
 			if err != nil {
 				return err
@@ -137,7 +137,7 @@ func ServiceHandler(svc *Service, principal PrincipalFromRequest) http.Handler {
 		})
 	})
 	mux.HandleFunc("GET /api/v1/verifications/outcomes/{id}", func(w http.ResponseWriter, req *http.Request) {
-		authed(w, req, ActionQueryOutcome, func(p Principal) error {
+		authed(w, req, ActionProofRead, func(p Principal) error {
 			v, err := svc.Store.GetOutcome(req.Context(), req.PathValue("id"))
 			if err != nil {
 				return err
@@ -146,7 +146,7 @@ func ServiceHandler(svc *Service, principal PrincipalFromRequest) http.Handler {
 			if err != nil {
 				return err
 			}
-			if err := svc.authorize(req.Context(), p, ActionQueryOutcome, ob.SubjectReference()); err != nil {
+			if err := svc.authorize(req.Context(), p, ActionProofRead, ob.SubjectReference()); err != nil {
 				return err
 			}
 			writeJSON(w, http.StatusOK, func() ([]byte, error) { return MarshalOutcome(v) })
@@ -154,7 +154,7 @@ func ServiceHandler(svc *Service, principal PrincipalFromRequest) http.Handler {
 		})
 	})
 	mux.HandleFunc("GET /api/v1/verifications/outcomes/{id}/verified", func(w http.ResponseWriter, req *http.Request) {
-		authed(w, req, ActionQueryOutcome, func(p Principal) error {
+		authed(w, req, ActionProofRead, func(p Principal) error {
 			// QueryOutcome is the sealed read: a claim-only id answers
 			// ErrUnverified here and never becomes proof on the wire.
 			vo, err := svc.QueryOutcome(req.Context(), p, req.PathValue("id"))
@@ -176,11 +176,11 @@ func ServiceHandler(svc *Service, principal PrincipalFromRequest) http.Handler {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		authed(w, req, ActionSubmitObligation, func(p Principal) error {
+		authed(w, req, ActionObligationCreate, func(p Principal) error {
 			// Group registration is authorized on the zero subject unless
 			// the caller is admin (groups themselves carry no SubjectRef);
 			// member outcomes are authorized individually when recorded.
-			if err := svc.authorize(req.Context(), p, ActionSubmitObligation, SubjectRef{}); err != nil {
+			if err := svc.authorize(req.Context(), p, ActionObligationCreate, SubjectRef{}); err != nil {
 				return err
 			}
 			if err := svc.Store.RegisterGroup(req.Context(), g); err != nil {
@@ -191,12 +191,12 @@ func ServiceHandler(svc *Service, principal PrincipalFromRequest) http.Handler {
 		})
 	})
 	mux.HandleFunc("GET /api/v1/verifications/groups/{id}", func(w http.ResponseWriter, req *http.Request) {
-		authed(w, req, ActionCompareGroup, func(p Principal) error {
+		authed(w, req, ActionGroupCompare, func(p Principal) error {
 			g, err := svc.Store.GetGroup(req.Context(), req.PathValue("id"))
 			if err != nil {
 				return err
 			}
-			if err := svc.authorize(req.Context(), p, ActionCompareGroup, SubjectRef{}); err != nil {
+			if err := svc.authorize(req.Context(), p, ActionGroupCompare, SubjectRef{}); err != nil {
 				return err
 			}
 			writeJSON(w, http.StatusOK, func() ([]byte, error) { return MarshalGroup(g) })
@@ -204,7 +204,7 @@ func ServiceHandler(svc *Service, principal PrincipalFromRequest) http.Handler {
 		})
 	})
 	mux.HandleFunc("GET /api/v1/verifications/groups/{id}/comparison", func(w http.ResponseWriter, req *http.Request) {
-		authed(w, req, ActionCompareGroup, func(p Principal) error {
+		authed(w, req, ActionGroupCompare, func(p Principal) error {
 			cmp, err := svc.CompareGroup(req.Context(), p, req.PathValue("id"))
 			if err != nil {
 				return err

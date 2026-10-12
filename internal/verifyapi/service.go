@@ -21,43 +21,132 @@ var (
 	ErrUnauthorized = errors.New("verifyapi: unauthorized")
 )
 
-// Action names the Service operations an Authorizer mediates.
+// Action names the Service operations an Authorizer mediates. The spelling
+// is the capability vocabulary: each action is a grant a principal may hold
+// on an authority scope (see Capability).
 type Action string
 
 const (
-	// ActionSubmitObligation: create an obligation under a subject.
-	ActionSubmitObligation Action = "submit_obligation"
-	// ActionRecordClaim: record a CLAIM outcome. Claims are never
+	// ActionObligationCreate: create an obligation under a subject.
+	ActionObligationCreate Action = "verification.obligation.create"
+	// ActionClaimSubmit: record a CLAIM outcome. Claims are never
 	// authoritative and never authorize merge/deploy.
-	ActionRecordClaim Action = "record_claim"
-	// ActionVerifyAndRecord: run the evidence verifier and record the
+	ActionClaimSubmit Action = "verification.claim.submit"
+	// ActionProofVerify: run the evidence verifier and record the
 	// sealed authoritative outcome.
-	ActionVerifyAndRecord Action = "verify_and_record"
-	// ActionQueryOutcome: read the sealed authoritative record.
-	ActionQueryOutcome Action = "query_outcome"
-	// ActionCompareGroup: read a speculative-group resource comparison.
-	ActionCompareGroup Action = "compare_group"
+	ActionProofVerify Action = "verification.proof.verify"
+	// ActionProofRead: read the sealed authoritative record.
+	ActionProofRead Action = "verification.proof.read"
+	// ActionGroupCompare: read a speculative-group resource comparison.
+	ActionGroupCompare Action = "verification.group.compare"
+	// ActionVerificationAdmin is the action carried by the
+	// GlobalVerificationAdmin capability. It is never granted on a scope —
+	// only as the explicit global break-glass.
+	ActionVerificationAdmin Action = "verification.admin"
 )
 
+// Capability is one explicit authorization grant: an Action within an
+// authority Scope (a strict SubjectRef hierarchy, trailing wildcards only),
+// or the global break-glass. Scopes are never inferred: a zero SubjectRef
+// grants nothing, and global authority is only GlobalVerificationAdmin.
+type Capability struct {
+	// Action is the granted operation (capability vocabulary).
+	Action Action
+	// Scope is the authority hierarchy the grant applies in. Must pass
+	// SubjectRef.ValidateHierarchy. Ignored when Global is set.
+	Scope SubjectRef
+	// Global marks the GlobalVerificationAdmin grant: every action on
+	// every subject. The empty SubjectRef is NOT a global wildcard — this
+	// explicit flag on the named admin capability is the only break-glass.
+	Global bool
+}
+
+// GlobalVerificationAdmin is the explicit break-glass capability: every
+// verification action on every subject in every namespace. It is a named,
+// security-significant grant — never a zero SubjectRef (the empty struct
+// covers nothing). Authorizers must still audit its use. Sentinel value:
+// copy it into a principal's capability list; do not mutate it.
+var GlobalVerificationAdmin = Capability{Action: ActionVerificationAdmin, Global: true}
+
+// CapabilitiesIn returns the standard per-action capability set covering
+// the given scope hierarchy: every non-admin verification action, each
+// scoped to the same authority subject. The scope must be a valid strict
+// prefix hierarchy (SubjectRef.ValidateHierarchy); a malformed or zero
+// scope yields no capabilities (fail closed).
+func CapabilitiesIn(scope SubjectRef) []Capability {
+	if err := scope.ValidateHierarchy(); err != nil {
+		return nil
+	}
+	return []Capability{
+		{Action: ActionObligationCreate, Scope: scope},
+		{Action: ActionClaimSubmit, Scope: scope},
+		{Action: ActionProofVerify, Scope: scope},
+		{Action: ActionProofRead, Scope: scope},
+		{Action: ActionGroupCompare, Scope: scope},
+	}
+}
+
 // Principal is the authenticated caller identity the Service authorizes.
-// Scope is the authority SubjectRef the caller may act in; Admin is the
-// break-glass override (still audited by the Authorizer implementation).
-// The type is deliberately local so verifyapi stays free of the HTTP auth
-// package: the mounting server adapts its own principal onto this shape.
+// Authority is ONLY the explicit capability list: there is no Admin bool
+// and a zero SubjectRef never grants anything (global authority is the
+// named GlobalVerificationAdmin capability). The type is deliberately local
+// so verifyapi stays free of the HTTP auth package: the mounting server
+// adapts its own principal onto this shape.
 type Principal struct {
 	// Subject names the caller (token subject / service identity).
 	Subject string
-	// Scope is the authority subject the caller holds. A zero scope is
-	// never authority over a named subject (fail closed).
-	Scope SubjectRef
-	// Admin grants cross-subject access. Authorizers must still log it.
-	Admin bool
+	// Capabilities are the explicit grants the caller holds. Every act of
+	// authority flows through these; an empty list holds no authority.
+	Capabilities []Capability
+}
+
+// Validate reports whether every capability is well formed. A global grant
+// must be the admin action (GlobalVerificationAdmin's shape); a scoped
+// grant must name an action and carry a valid strict-prefix hierarchy.
+// Principal construction MUST call this so a malformed partial scope can
+// never ride along on a principal.
+func (p Principal) Validate() error {
+	for i, c := range p.Capabilities {
+		if c.Global {
+			if c.Action != ActionVerificationAdmin {
+				return fmt.Errorf("%w: capability[%d]: global grant must be %s, got %q", ErrInvalid, i, ActionVerificationAdmin, c.Action)
+			}
+			continue
+		}
+		if c.Action == "" {
+			return fmt.Errorf("%w: capability[%d]: action is required", ErrInvalid, i)
+		}
+		if err := c.Scope.ValidateHierarchy(); err != nil {
+			return fmt.Errorf("%w: capability[%d] (%s): %v", ErrInvalid, i, c.Action, err)
+		}
+	}
+	return nil
+}
+
+// Allows reports whether p holds a capability granting action on subject.
+// GlobalVerificationAdmin grants every action on every subject; otherwise
+// the capability's action must match and its scope must cover the subject
+// (SubjectRef.Includes, which itself refuses malformed hierarchies and the
+// zero ref).
+func (p Principal) Allows(action Action, subject SubjectRef) bool {
+	for _, c := range p.Capabilities {
+		if c.Global {
+			return true
+		}
+		if c.Action != action {
+			continue
+		}
+		if c.Scope.Includes(subject) {
+			return true
+		}
+	}
+	return false
 }
 
 // Authorizer decides whether a principal may perform an action on a subject.
-// Implementations must fail closed: an unknown principal, a zero subject
-// where a named subject is required, or any error is a refusal. A nil
-// Authorizer on the Service denies every call.
+// Implementations must fail closed: an unknown principal, a malformed
+// principal, a zero subject where a named subject is required, or any error
+// is a refusal. A nil Authorizer on the Service denies every call.
 type Authorizer interface {
 	Authorize(ctx context.Context, p Principal, action Action, subject SubjectRef) error
 }
@@ -71,21 +160,20 @@ func (f AuthorizerFunc) Authorize(ctx context.Context, p Principal, action Actio
 }
 
 // ScopeAuthorizer is the reference Authorizer: a principal may act on a
-// subject when it is admin, or when its Scope covers the subject (see
-// SubjectRef.Includes). A zero principal scope covers only the zero subject
-// and only for admin. Anything else is ErrUnauthorized.
+// subject when its capabilities grant the action on a scope that covers the
+// subject (Principal.Allows), or when it holds the explicit
+// GlobalVerificationAdmin break-glass. A malformed principal, a zero
+// subject and an empty capability list are all refusals — the zero
+// SubjectRef is never a wildcard.
 type ScopeAuthorizer struct{}
 
 // Authorize implements Authorizer.
 func (ScopeAuthorizer) Authorize(_ context.Context, p Principal, action Action, subject SubjectRef) error {
-	if p.Admin {
-		return nil
+	if err := p.Validate(); err != nil {
+		return fmt.Errorf("%w: principal %q is malformed: %v", ErrUnauthorized, p.Subject, err)
 	}
-	if p.Scope.IsZero() {
-		return fmt.Errorf("%w: principal %q holds no authority subject for %s on %s", ErrUnauthorized, p.Subject, action, subject)
-	}
-	if !p.Scope.Includes(subject) {
-		return fmt.Errorf("%w: principal %q scope %s does not cover %s for %s", ErrUnauthorized, p.Subject, p.Scope, subject, action)
+	if !p.Allows(action, subject) {
+		return fmt.Errorf("%w: principal %q holds no capability for %s on %s", ErrUnauthorized, p.Subject, action, subject)
 	}
 	return nil
 }
@@ -156,12 +244,21 @@ func (s *Service) now() time.Time {
 
 // authorize is the single fail-closed gate. A nil service or nil Authz
 // denies; the Authorizer's error is returned as-is (usually ErrUnauthorized).
+// The subject must be structurally sound, and a named subject must also be a
+// valid strict-prefix hierarchy (defense in depth before Includes). The zero
+// subject is allowed through as "no subject" (group registration / empty
+// comparisons): only GlobalVerificationAdmin ever covers it.
 func (s *Service) authorize(ctx context.Context, p Principal, action Action, subject SubjectRef) error {
 	if s == nil || s.Authz == nil {
 		return fmt.Errorf("%w: %s denied (no authorizer)", ErrUnauthorized, action)
 	}
 	if err := subject.Validate(); err != nil {
 		return err
+	}
+	if !subject.IsZero() {
+		if err := subject.ValidateHierarchy(); err != nil {
+			return err
+		}
 	}
 	return s.Authz.Authorize(ctx, p, action, subject)
 }
@@ -185,7 +282,7 @@ func (s *Service) SubmitObligation(ctx context.Context, p Principal, o Verificat
 	if err := o.Validate(); err != nil {
 		return err
 	}
-	if err := s.authorize(ctx, p, ActionSubmitObligation, o.SubjectReference()); err != nil {
+	if err := s.authorize(ctx, p, ActionObligationCreate, o.SubjectReference()); err != nil {
 		return err
 	}
 	return s.Store.SubmitObligation(ctx, o)
@@ -206,7 +303,7 @@ func (s *Service) RecordClaim(ctx context.Context, p Principal, v VerificationOu
 	if err != nil {
 		return err
 	}
-	if err := s.authorize(ctx, p, ActionRecordClaim, ob.SubjectReference()); err != nil {
+	if err := s.authorize(ctx, p, ActionClaimSubmit, ob.SubjectReference()); err != nil {
 		return err
 	}
 	return s.Store.RecordOutcome(ctx, v)
@@ -229,7 +326,7 @@ func (s *Service) VerifyAndRecord(ctx context.Context, p Principal, v Verificati
 	if err != nil {
 		return DerivedVerifiedOutcome{}, err
 	}
-	if err := s.authorize(ctx, p, ActionVerifyAndRecord, ob.SubjectReference()); err != nil {
+	if err := s.authorize(ctx, p, ActionProofVerify, ob.SubjectReference()); err != nil {
 		return DerivedVerifiedOutcome{}, err
 	}
 	// The verifier derives every authority-bearing value from signed
@@ -264,7 +361,7 @@ func (s *Service) QueryOutcome(ctx context.Context, p Principal, id string) (Der
 	if err != nil {
 		return DerivedVerifiedOutcome{}, err
 	}
-	if err := s.authorize(ctx, p, ActionQueryOutcome, ob.SubjectReference()); err != nil {
+	if err := s.authorize(ctx, p, ActionProofRead, ob.SubjectReference()); err != nil {
 		return DerivedVerifiedOutcome{}, err
 	}
 	return vo, nil
@@ -298,12 +395,12 @@ func (s *Service) CompareGroup(ctx context.Context, p Principal, groupID string)
 			continue
 		}
 		seen[subj] = true
-		if err := s.authorize(ctx, p, ActionCompareGroup, subj); err != nil {
+		if err := s.authorize(ctx, p, ActionGroupCompare, subj); err != nil {
 			return GroupComparison{}, err
 		}
 	}
 	if len(seen) == 0 {
-		if err := s.authorize(ctx, p, ActionCompareGroup, SubjectRef{}); err != nil {
+		if err := s.authorize(ctx, p, ActionGroupCompare, SubjectRef{}); err != nil {
 			return GroupComparison{}, err
 		}
 	}

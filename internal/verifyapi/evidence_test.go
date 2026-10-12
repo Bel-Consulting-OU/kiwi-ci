@@ -21,18 +21,52 @@ import (
 // provenance.ExecutionAttestationStatement, and the envelope is Ed25519-signed.
 // The returned evidence root, attempt id and envelope bytes are what the
 // verifier must cryptographically resolve.
+//
+// The test-report suites are backed by REAL stored reports whose
+// provenance.TestReportSuiteDigest matches the signed suite digests, so the
+// verifier can resolve each signed SuiteDigest to report cases and derive the
+// check outcome (pass) from them — never from a caller string.
 type signedAttestationFixture struct {
 	envelope     []byte
 	evidenceRoot Digest
 	attemptID    string
 	pub          ed25519.PublicKey
 	priv         ed25519.PrivateKey
+	// reports maps suite digest → the stored test report it commits.
+	reports map[string]model.TestReport
+}
+
+// passingReport builds a stored test report whose cases all pass, and returns
+// it together with its provenance.TestReportSuiteDigest (the value the signed
+// attestation must commit).
+func passingReport(name string) (model.TestReport, string) {
+	rep := model.TestReport{
+		ID:       "rep-" + name,
+		RunID:    "run-1",
+		JobID:    "job-1",
+		JobKey:   "build[os=linux]",
+		Path:     "testdata/" + name + ".xml",
+		Tests:    2,
+		Failures: 0,
+		Cases: []model.TestResult{
+			{Name: name + "-a", Passed: true, Duration: 0.5},
+			{Name: name + "-b", Passed: true, Duration: 0.25},
+		},
+	}
+	return rep, provenance.TestReportSuiteDigest(rep)
 }
 
 func newSignedAttestationFixture(t *testing.T) signedAttestationFixture {
 	t.Helper()
 	start := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	finish := start.Add(90 * time.Second)
+
+	// Real stored reports back the signed suite digests: the verifier
+	// resolves each signed SuiteDigest to its cases and derives the check
+	// outcome from them (never from a caller string).
+	repDM, digDM := passingReport("digest-match")
+	repSig, digSig := passingReport("signature")
+	reports := map[string]model.TestReport{digDM: repDM, digSig: repSig}
 
 	// The evidence root binds the FULL artifact-side evidence graph. The
 	// test-report suite names are the structured signed check results the
@@ -42,8 +76,8 @@ func newSignedAttestationFixture(t *testing.T) signedAttestationFixture {
 			{Name: "bin", SHA256: strings.Repeat("1", 64), Size: 42, Generation: 7, ProvenanceSHA256: strings.Repeat("2", 64)},
 		},
 		TestReports: []provenance.ExecutionAttestationReport{
-			{Name: "digest-match", SuiteDigest: strings.Repeat("3", 64), Generation: 7},
-			{Name: "signature", SuiteDigest: strings.Repeat("5", 64), Generation: 7},
+			{Name: "digest-match", SuiteDigest: digDM, Generation: 7},
+			{Name: "signature", SuiteDigest: digSig, Generation: 7},
 		},
 		Snapshots: []provenance.ExecutionAttestationSnapshot{
 			{ID: "snap-1", Phase: model.SnapshotPhasePreJob, SHA256: strings.Repeat("4", 64), Generation: 7},
@@ -76,8 +110,8 @@ func newSignedAttestationFixture(t *testing.T) signedAttestationFixture {
 			DeclaredAuthorityMediated: true,
 		},
 		TestReports: []provenance.ExecutionAttestationReport{
-			{Name: "digest-match", SuiteDigest: strings.Repeat("3", 64), Generation: 7},
-			{Name: "signature", SuiteDigest: strings.Repeat("5", 64), Generation: 7},
+			{Name: "digest-match", SuiteDigest: digDM, Generation: 7},
+			{Name: "signature", SuiteDigest: digSig, Generation: 7},
 		},
 		ExternalEffects: model.EffectsKiwiMediated,
 	})
@@ -102,6 +136,7 @@ func newSignedAttestationFixture(t *testing.T) signedAttestationFixture {
 		attemptID:    st.AttemptID,
 		pub:          pub,
 		priv:         priv,
+		reports:      reports,
 	}
 }
 
@@ -115,6 +150,13 @@ func fixtureVerifier(fx signedAttestationFixture, ref string) *ProvenanceEvidenc
 			return fx.envelope, nil
 		},
 		TrustedKey: fx.pub,
+		LookupTestReport: func(_ context.Context, suiteDigest string) (*model.TestReport, bool) {
+			if rep, ok := fx.reports[suiteDigest]; ok {
+				r := rep
+				return &r, true
+			}
+			return nil, false
+		},
 	}
 }
 
@@ -138,7 +180,7 @@ func bareResolvedAttestation(t *testing.T, execID string, root Digest) ResolvedA
 		EvidenceRoot:      root,
 		AttestationDigest: mustDigest(t, "bare-att-digest"),
 		Status:            "success",
-		Checks:            []string{"digest-match", "signature"},
+		Checks:            passChecks(execID, "digest-match", "signature"),
 	}
 }
 
@@ -315,7 +357,7 @@ func TestMeasuredWallTimeUnfilledWithoutAttestedWindow(t *testing.T) {
 				EvidenceRoot:      root,
 				AttestationDigest: mustDigest(t, "bare-att-digest"),
 				Status:            "success",
-				Checks:            []string{"digest-match", "signature"},
+				Checks:            passChecks(v.ExecutionIDs[0], "digest-match", "signature"),
 				// No Attested facts: older statements carry no job window.
 			}, nil
 		},
@@ -367,7 +409,11 @@ func TestMergeAttestedFailsClosedOnPartialFacts(t *testing.T) {
 
 // TestVerifiedOutcomeWithContractAttestationV6Fixture proves the committed
 // historical contract fixture (testdata/contracts/attestation_v6.json) can be
-// signed and resolved end-to-end through the acceptance boundary.
+// signed and resolved end-to-end through the acceptance boundary. The
+// fixture's synthetic suite digest is replaced with the digest of a real
+// stored report (and the subject recomputed) so the verifier can resolve the
+// signed SuiteDigest to report cases and derive the "test" check outcome
+// from them.
 func TestVerifiedOutcomeWithContractAttestationV6Fixture(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", "testdata", "contracts", "attestation_v6.json"))
 	if err != nil {
@@ -380,6 +426,18 @@ func TestVerifiedOutcomeWithContractAttestationV6Fixture(t *testing.T) {
 	if st.Attestation == nil {
 		t.Fatal("fixture has no attestation block")
 	}
+	// Back the fixture's named suite with a real stored report and recommit
+	// the attestation digest so the statement stays self-consistent.
+	testRep, testDig := passingReport("test")
+	st.Attestation.TestReports = []provenance.ExecutionAttestationReport{
+		{Name: "test", SuiteDigest: testDig, Generation: 1},
+	}
+	provenance.SortAttestationEvidence(st.Attestation)
+	attDig, err := provenance.ExecutionAttestationDigest(*st.Attestation)
+	if err != nil {
+		t.Fatalf("recompute attestation digest: %v", err)
+	}
+	st.Subject = []provenance.Subject{{Name: st.Attestation.AttemptID, Digest: map[string]string{"sha256": attDig}}}
 	pub, priv, err := provenance.NewProvenanceKey()
 	if err != nil {
 		t.Fatalf("new provenance key: %v", err)
@@ -419,6 +477,13 @@ func TestVerifiedOutcomeWithContractAttestationV6Fixture(t *testing.T) {
 			return envBytes, nil
 		},
 		TrustedKey: pub,
+		LookupTestReport: func(_ context.Context, suiteDigest string) (*model.TestReport, bool) {
+			if suiteDigest == testDig {
+				r := testRep
+				return &r, true
+			}
+			return nil, false
+		},
 	}
 	vo, err := verifier.Verify(context.Background(), ob, v)
 	if err != nil {
@@ -596,7 +661,7 @@ func TestFuncEvidenceVerifierSealRules(t *testing.T) {
 		EvidenceRoot:      mustDigest(t, "resolved-root"),
 		AttestationDigest: mustDigest(t, "att-digest"),
 		Status:            "success",
-		Checks:            []string{"digest-match", "signature"},
+		Checks:            passChecks("exec-1", "digest-match", "signature"),
 	}
 	f := &FuncEvidenceVerifier{
 		Identity: "func-verifier/v1",
@@ -715,12 +780,26 @@ func TestRestoreVerifiedOutcomeRoundTrip(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // adversarialSignedFixture builds a REAL signed execution attestation with
-// the given job status and test-report set (the only two knobs the adversary
-// does not control: the signature and evidence root are genuine).
-func adversarialSignedFixture(t *testing.T, status string, reports []provenance.ExecutionAttestationReport) signedAttestationFixture {
+// the given job status and named test-report suites (the only two knobs the
+// adversary does not control: the signature and evidence root are genuine).
+// Each suite name is backed by a real stored report whose suite digest the
+// attestation commits, so the verifier can resolve it and derive the check
+// outcome from its cases.
+func adversarialSignedFixture(t *testing.T, status string, suiteNames []string) signedAttestationFixture {
 	t.Helper()
 	start := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	finish := start.Add(90 * time.Second)
+	reports := make([]provenance.ExecutionAttestationReport, 0, len(suiteNames))
+	stored := make(map[string]model.TestReport, len(suiteNames))
+	for i, name := range suiteNames {
+		rep, dig := passingReport(name)
+		stored[dig] = rep
+		reports = append(reports, provenance.ExecutionAttestationReport{
+			Name:        name,
+			SuiteDigest: dig,
+			Generation:  int64(7 + i),
+		})
+	}
 	evidenceRoot := provenance.ExecutionEvidenceRoot(provenance.ExecutionEvidenceGraph{
 		Artifacts: []provenance.ExecutionEvidenceArtifact{
 			{Name: "bin", SHA256: strings.Repeat("1", 64), Size: 42, Generation: 7, ProvenanceSHA256: strings.Repeat("2", 64)},
@@ -770,6 +849,7 @@ func adversarialSignedFixture(t *testing.T, status string, reports []provenance.
 		evidenceRoot: Digest(evidenceRoot),
 		attemptID:    st.AttemptID,
 		pub:          pub,
+		reports:      stored,
 	}
 }
 
@@ -779,10 +859,7 @@ func adversarialSignedFixture(t *testing.T, status string, reports []provenance.
 // derived record must not be a proven pass — authority follows the signed
 // job status, not the proposal.
 func TestAdversarialCallerPassHighWithFailedJobIsNotProvenPass(t *testing.T) {
-	fx := adversarialSignedFixture(t, "failure", []provenance.ExecutionAttestationReport{
-		{Name: "digest-match", SuiteDigest: strings.Repeat("3", 64), Generation: 7},
-		{Name: "signature", SuiteDigest: strings.Repeat("5", 64), Generation: 7},
-	})
+	fx := adversarialSignedFixture(t, "failure", []string{"digest-match", "signature"})
 	ob := provenanceFixtureObligation(t)
 	v := baseOutcome(t, ob)
 	v.EvidenceRoot = fx.evidenceRoot
@@ -840,9 +917,7 @@ func TestAdversarialCallerPassHighWithFailedJobIsNotProvenPass(t *testing.T) {
 func TestAdversarialCallerPassWithUnboundChecksIsNotProvenPass(t *testing.T) {
 	// The signed evidence binds only the suite "other-suite" — none of the
 	// obligation's required check names.
-	fx := adversarialSignedFixture(t, "success", []provenance.ExecutionAttestationReport{
-		{Name: "other-suite", SuiteDigest: strings.Repeat("9", 64), Generation: 7},
-	})
+	fx := adversarialSignedFixture(t, "success", []string{"other-suite"})
 	ob := provenanceFixtureObligation(t)
 	v := baseOutcome(t, ob)
 	v.EvidenceRoot = fx.evidenceRoot

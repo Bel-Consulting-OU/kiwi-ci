@@ -25,6 +25,22 @@ func mustDigest(t *testing.T, seed string) Digest {
 	return Digest(d)
 }
 
+// passChecks builds evidence-derived verified checks that all PASS. It is
+// the test-fake shape for ResolvedAttestation.Checks: the resolver is the
+// authority and states the derived outcome explicitly (a bare name never
+// implies pass).
+func passChecks(execID string, names ...string) []VerifiedCheck {
+	out := make([]VerifiedCheck, 0, len(names))
+	for _, n := range names {
+		out = append(out, VerifiedCheck{
+			Name:        n,
+			Outcome:     CheckOutcomePass,
+			ExecutionID: execID,
+		})
+	}
+	return out
+}
+
 func baseObligation(t *testing.T) VerificationObligation {
 	t.Helper()
 	return VerificationObligation{

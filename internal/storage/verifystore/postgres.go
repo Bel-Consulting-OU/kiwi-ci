@@ -24,9 +24,15 @@ import (
 
 // PostgresStore is the durable SQL implementation of
 // verifyapi.VerificationStore. Hot-path identity columns (ids, content
-// digests, claim/verified flags, group/candidate dimensions, timestamps)
-// are real relational columns; the full wire structs live in JSONB payloads
-// so reads round-trip byte-faithful claim identities.
+// digests, claim/verified flags, group/candidate dimensions, subject/scope,
+// timestamps) are real relational columns; the full wire structs live in
+// JSONB payloads so reads round-trip byte-faithful claim identities.
+//
+// Source of truth (P7): the normalized subject/scope and index columns are
+// AUTHORITATIVE. The JSONB payload is the wire-faithful encoding. Every
+// write emits columns and payload together in one write-all statement,
+// derived from the same Go value (subject_scope.go), so a successful write
+// cannot leave them diverged; reads restore subject/scope from the columns.
 //
 // The schema is created by internal/storage/migrations (0057+) and applied
 // by storage.PostgresStore.Migrate; this package only owns the read/write
@@ -36,19 +42,41 @@ type PostgresStore struct {
 	// now reads the store clock for freshness binding at record time.
 	// Production leaves it nil (time.Now); tests may override it.
 	now func() time.Time
-	// acceptanceKey seals and verifies durable acceptance records. It is
+	// acceptanceKeyring seals and verifies durable acceptance records. It is
 	// REQUIRED for RecordVerifiedOutcome and for QueryOutcome of a verified
 	// row: a store without it refuses both (fail closed) instead of
-	// restoring authority from a bare database row. The key is deliberately
-	// separate from the runner evidence keys used to resolve attestations.
-	acceptanceKey verifyapi.AcceptanceKey
+	// restoring authority from a bare database row. The keyring is
+	// deliberately separate from the runner evidence keys used to resolve
+	// attestations. Old records verify under their own KeyID; new records
+	// are sealed under the keyring's current signing key (rotation).
+	acceptanceKeyring *verifyapi.AcceptanceKeyring
 }
 
-// WithAcceptanceKey sets the acceptance key this store uses to seal and
+// WithAcceptanceKey sets a single acceptance key this store uses to seal and
 // verify durable acceptance records. Required before any verified write or
 // read; without it both are refused with verifyapi.ErrAcceptance.
 func (s *PostgresStore) WithAcceptanceKey(key verifyapi.AcceptanceKey) *PostgresStore {
-	s.acceptanceKey = key
+	if key == nil {
+		s.acceptanceKeyring = nil
+		return s
+	}
+	ring, err := verifyapi.NewSingleKeyring(key)
+	if err != nil {
+		// A key that cannot form a keyring is unusable; leave the store
+		// unarmed so both write and read refuse (fail closed).
+		s.acceptanceKeyring = nil
+		return s
+	}
+	s.acceptanceKeyring = ring
+	return s
+}
+
+// WithAcceptanceKeyring arms the store with a rotation-aware keyring. New
+// records are sealed under the keyring's current signing key; persisted
+// records verify under the key id they were sealed with. Required before any
+// verified write or read.
+func (s *PostgresStore) WithAcceptanceKeyring(ring *verifyapi.AcceptanceKeyring) *PostgresStore {
+	s.acceptanceKeyring = ring
 	return s
 }
 
@@ -223,10 +251,16 @@ func (s *PostgresStore) SubmitObligation(ctx context.Context, o verifyapi.Verifi
 	if err != nil {
 		return err
 	}
+	// Write-all: subject/scope columns and the payload come from the same
+	// obligation value in the same statement (subject_scope.go).
+	sc := ScopeOfObligation(o)
 	_, err = s.pool.Exec(ctx, `
-		INSERT INTO verification_obligations (obligation_id, content_digest, payload)
-		VALUES ($1, $2, $3)`,
-		o.ObligationID, digest, payload)
+		INSERT INTO verification_obligations (
+			obligation_id, content_digest, payload,
+			subject, authority_namespace, tenant_id, project_id, repository_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		o.ObligationID, digest, payload,
+		sc.Subject, sc.AuthorityNamespace, sc.TenantID, sc.ProjectID, sc.RepositoryID)
 	if err == nil {
 		return nil
 	}
@@ -282,14 +316,14 @@ func (s *PostgresStore) RecordVerifiedOutcome(ctx context.Context, v verifyapi.V
 	if !v.Sealed() {
 		return fmt.Errorf("%w: RecordVerifiedOutcome requires a verifier-produced record", verifyapi.ErrUnverified)
 	}
-	if s.acceptanceKey == nil {
-		return fmt.Errorf("%w: store has no acceptance key; refusing to persist unsealed authority", verifyapi.ErrAcceptance)
+	if s.acceptanceKeyring == nil {
+		return fmt.Errorf("%w: store has no acceptance keyring; refusing to persist unsealed authority", verifyapi.ErrAcceptance)
 	}
 	ob, err := s.GetObligation(ctx, v.SubmittedClaim.ObligationID)
 	if err != nil {
 		return err
 	}
-	rec, err := verifyapi.Accept(ob, v, s.acceptanceKey, s.verifyNow())
+	rec, err := verifyapi.AcceptWithKeyring(ob, v, nil, s.acceptanceKeyring, s.verifyNow())
 	if err != nil {
 		return err
 	}
@@ -330,7 +364,11 @@ func (s *PostgresStore) recordOutcomeTx(ctx context.Context, claim, bound verify
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	var obJSON []byte
-	err = tx.QueryRow(ctx, `SELECT payload FROM verification_obligations WHERE obligation_id = $1`, claim.ObligationID).Scan(&obJSON)
+	var obScope SubjectScope
+	err = tx.QueryRow(ctx, `
+		SELECT payload, subject, authority_namespace, tenant_id, project_id, repository_id
+		FROM verification_obligations WHERE obligation_id = $1`, claim.ObligationID).
+		Scan(&obJSON, &obScope.Subject, &obScope.AuthorityNamespace, &obScope.TenantID, &obScope.ProjectID, &obScope.RepositoryID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("%w: obligation %q", verifyapi.ErrNotFound, claim.ObligationID)
 	}
@@ -341,6 +379,9 @@ func (s *PostgresStore) recordOutcomeTx(ctx context.Context, claim, bound verify
 	if err := json.Unmarshal(obJSON, &ob); err != nil {
 		return fmt.Errorf("verifystore: decode obligation %q: %w", claim.ObligationID, err)
 	}
+	// Columns are authoritative (P7): bind against the obligation with its
+	// subject/scope restored from the normalized columns.
+	ob = ApplyScope(ob, obScope)
 	if err := verifyapi.Bind(ob, bound, s.verifyNow()); err != nil {
 		return err
 	}
@@ -382,6 +423,14 @@ func (s *PostgresStore) recordOutcomeTx(ctx context.Context, claim, bound verify
 		}
 	}
 
+	// Write-all (P7): the index columns are denormalized from the CLAIM
+	// payload (the JSONB written here), and the subject/scope columns from
+	// the obligation loaded above — both derived from the same values as
+	// the JSONB in this one statement, so the columns and the payload
+	// cannot diverge after any insert or upgrade.
+	idx := ClaimIndexOf(stored)
+	sc := ScopeOfObligation(ob)
+
 	// Insert, or upgrade an equivalent claim/row. The DO UPDATE predicate
 	// is the idempotency gate: it only fires when the content digest
 	// matches, and a verified write never downgrades is_verified.
@@ -390,33 +439,51 @@ func (s *PostgresStore) recordOutcomeTx(ctx context.Context, claim, bound verify
 		err = tx.QueryRow(ctx, `
 			INSERT INTO verification_outcomes (
 				verification_id, obligation_id, is_verified, content_digest,
-				claim, evidence, acceptance, group_id, candidate_id, started_at, completed_at, verified_at)
-			VALUES ($1, $2, TRUE, $3, $4, $5, $6, $7, $8, $9, $10, now())
+				claim, evidence, acceptance, group_id, candidate_id, started_at, completed_at, verified_at,
+				authority_namespace, tenant_id, project_id, repository_id)
+			VALUES ($1, $2, TRUE, $3, $4, $5, $6, $7, $8, $9, $10, now(), $11, $12, $13, $14)
 			ON CONFLICT (verification_id) DO UPDATE SET
 				is_verified = TRUE,
 				claim = EXCLUDED.claim,
 				evidence = EXCLUDED.evidence,
 				acceptance = EXCLUDED.acceptance,
+				group_id = EXCLUDED.group_id,
+				candidate_id = EXCLUDED.candidate_id,
+				started_at = EXCLUDED.started_at,
+				completed_at = EXCLUDED.completed_at,
+				authority_namespace = EXCLUDED.authority_namespace,
+				tenant_id = EXCLUDED.tenant_id,
+				project_id = EXCLUDED.project_id,
+				repository_id = EXCLUDED.repository_id,
 				verified_at = COALESCE(verification_outcomes.verified_at, now())
 			WHERE verification_outcomes.content_digest = EXCLUDED.content_digest
 			RETURNING verification_id`,
 			claim.VerificationID, claim.ObligationID, digest, claimJSON, evidenceJSON, acceptanceJSON,
-			bound.Resources.VerificationGroupID, bound.Resources.CandidateID,
-			utcTime(bound.StartedAt), utcTime(bound.CompletedAt)).Scan(&written)
+			idx.GroupID, idx.CandidateID, idx.StartedAt, idx.CompletedAt,
+			sc.AuthorityNamespace, sc.TenantID, sc.ProjectID, sc.RepositoryID).Scan(&written)
 	} else {
 		err = tx.QueryRow(ctx, `
 			INSERT INTO verification_outcomes (
 				verification_id, obligation_id, is_verified, content_digest,
-				claim, evidence, group_id, candidate_id, started_at, completed_at)
-			VALUES ($1, $2, FALSE, $3, $4, NULL, $5, $6, $7, $8)
+				claim, evidence, group_id, candidate_id, started_at, completed_at,
+				authority_namespace, tenant_id, project_id, repository_id)
+			VALUES ($1, $2, FALSE, $3, $4, NULL, $5, $6, $7, $8, $9, $10, $11, $12)
 			ON CONFLICT (verification_id) DO UPDATE SET
-				claim = EXCLUDED.claim
+				claim = EXCLUDED.claim,
+				group_id = EXCLUDED.group_id,
+				candidate_id = EXCLUDED.candidate_id,
+				started_at = EXCLUDED.started_at,
+				completed_at = EXCLUDED.completed_at,
+				authority_namespace = EXCLUDED.authority_namespace,
+				tenant_id = EXCLUDED.tenant_id,
+				project_id = EXCLUDED.project_id,
+				repository_id = EXCLUDED.repository_id
 			WHERE verification_outcomes.content_digest = EXCLUDED.content_digest
 				AND verification_outcomes.is_verified = FALSE
 			RETURNING verification_id`,
 			claim.VerificationID, claim.ObligationID, digest, claimJSON,
-			bound.Resources.VerificationGroupID, bound.Resources.CandidateID,
-			utcTime(stored.StartedAt), utcTime(stored.CompletedAt)).Scan(&written)
+			idx.GroupID, idx.CandidateID, idx.StartedAt, idx.CompletedAt,
+			sc.AuthorityNamespace, sc.TenantID, sc.ProjectID, sc.RepositoryID).Scan(&written)
 	}
 	if err == nil && written != "" {
 		if err := tx.Commit(ctx); err != nil {
@@ -467,13 +534,20 @@ func loadGroupTx(ctx context.Context, tx pgx.Tx, id string) (verifyapi.Speculati
 	return g, nil
 }
 
-// GetObligation fetches a stored obligation by id.
+// GetObligation fetches a stored obligation by id. The normalized
+// subject/scope columns are authoritative (P7): the returned obligation has
+// its Subject and SubjectRef restored from the columns, so a tampered
+// payload cannot present a different authority subject than the row indexes.
 func (s *PostgresStore) GetObligation(ctx context.Context, id string) (verifyapi.VerificationObligation, error) {
 	if err := ctx.Err(); err != nil {
 		return verifyapi.VerificationObligation{}, err
 	}
 	var raw []byte
-	err := s.pool.QueryRow(ctx, `SELECT payload FROM verification_obligations WHERE obligation_id = $1`, id).Scan(&raw)
+	var sc SubjectScope
+	err := s.pool.QueryRow(ctx, `
+		SELECT payload, subject, authority_namespace, tenant_id, project_id, repository_id
+		FROM verification_obligations WHERE obligation_id = $1`, id).
+		Scan(&raw, &sc.Subject, &sc.AuthorityNamespace, &sc.TenantID, &sc.ProjectID, &sc.RepositoryID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return verifyapi.VerificationObligation{}, fmt.Errorf("%w: obligation %q", verifyapi.ErrNotFound, id)
 	}
@@ -484,7 +558,7 @@ func (s *PostgresStore) GetObligation(ctx context.Context, id string) (verifyapi
 	if err := json.Unmarshal(raw, &o); err != nil {
 		return verifyapi.VerificationObligation{}, fmt.Errorf("verifystore: decode obligation %q: %w", id, err)
 	}
-	return o, nil
+	return ApplyScope(o, sc), nil
 }
 
 // GetOutcome fetches any stored outcome (claim or verified) by id. It is
@@ -539,8 +613,8 @@ func (s *PostgresStore) QueryOutcome(ctx context.Context, id string) (verifyapi.
 	if len(acceptanceJSON) == 0 {
 		return verifyapi.VerifiedOutcome{}, fmt.Errorf("%w: outcome %q has no acceptance record", verifyapi.ErrAcceptance, id)
 	}
-	if s.acceptanceKey == nil {
-		return verifyapi.VerifiedOutcome{}, fmt.Errorf("%w: store has no acceptance key; refusing to restore authority from a row", verifyapi.ErrAcceptance)
+	if s.acceptanceKeyring == nil {
+		return verifyapi.VerifiedOutcome{}, fmt.Errorf("%w: store has no acceptance keyring; refusing to restore authority from a row", verifyapi.ErrAcceptance)
 	}
 	// Model A: the claim column is the SUBMITTED claim; the evidence column
 	// carries the derived outcome plus the resolved evidence.
@@ -561,14 +635,16 @@ func (s *PostgresStore) QueryOutcome(ctx context.Context, id string) (verifyapi.
 		return verifyapi.VerifiedOutcome{}, err
 	}
 	// The seal cannot be serialized; restore it ONLY through the acceptance
-	// integrity check (verifyapi.RestoreVerifiedOutcome).
-	return verifyapi.RestoreVerifiedOutcome(verifyapi.PersistedVerified{
+	// integrity check (verifyapi.RestoreVerifiedOutcome). The keyring
+	// resolves the record's KeyID so a record sealed under a rotated-out
+	// key still verifies while that key remains in the keyring.
+	return verifyapi.RestoreVerifiedOutcomeWithKeyring(verifyapi.PersistedVerified{
 		Obligation:     ob,
 		SubmittedClaim: submitted,
 		Outcome:        payload.Outcome,
 		Evidence:       payload.Evidence,
 		Acceptance:     acceptance,
-	}, s.acceptanceKey)
+	}, nil, s.acceptanceKeyring)
 }
 
 // OutcomesForObligation lists every recorded outcome answering the
