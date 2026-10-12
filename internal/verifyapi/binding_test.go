@@ -4,6 +4,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
 // testClock is a controllable registry clock for freshness tests.
@@ -32,10 +34,14 @@ func baseObligation(t *testing.T) VerificationObligation {
 		SourceSnapshotDigest:       mustDigest(t, "snapshot"),
 		VerificationContractDigest: mustDigest(t, "contract"),
 		RequiredChecks:             []string{"digest-match", "signature"},
-		RequiredAssurance:          "attested-v1",
-		Freshness:                  FreshnessPolicy{MaxAgeSeconds: 3600},
-		OpaqueCorrelationMetadata:  map[string]string{"trace": "abc"},
-		IssuedAt:                   time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
+		// RequiredAssurance must equal the DERIVED profile name of the
+		// evidence under test: an attestation without assurance facts
+		// derives model.UnprovenExecutionFacts → "uncontrolled". Fixtures
+		// that attest richer facts override this to the derived name.
+		RequiredAssurance:         model.AssuranceUncontrolled.Name(),
+		Freshness:                 FreshnessPolicy{MaxAgeSeconds: 3600},
+		OpaqueCorrelationMetadata: map[string]string{"trace": "abc"},
+		IssuedAt:                  time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
 	}
 }
 

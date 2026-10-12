@@ -46,6 +46,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/staging"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage/migrations"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/verifyapi"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/version"
 	"go.opentelemetry.io/otel/codes"
 )
@@ -147,6 +148,20 @@ type Server struct {
 	// deployments; callers load it into AuthStore after construction.
 	AuthStore *auth.TokenStore
 	AuthFile  string
+
+	// Verification, when non-nil, mounts the additive
+	// /api/v1/verifications/* surface backed by the production
+	// verifyapi.Service (Authorizer + EvidenceVerifier + durable
+	// VerificationStore). Nil keeps the surface unmounted (404): the
+	// verification substrate is opt-in and fails closed without
+	// configuration. The ServiceHandler itself refuses unauthenticated
+	// requests; the Service's Authorizer enforces subject-level tenancy.
+	Verification *verifyapi.Service
+	// VerificationScopes maps authenticated principal subjects to the
+	// authority SubjectRef they may act in for /api/v1/verifications/*. An
+	// unlisted subject holds a zero scope and is denied on named subjects
+	// (fail closed) unless the principal is admin.
+	VerificationScopes map[string]verifyapi.SubjectRef
 
 	mu      sync.Mutex
 	runs    map[string]model.Run
@@ -1297,6 +1312,11 @@ func (s *Server) Handler() http.Handler {
 	// summary from ONE consistency point (cursor first), so a controller can
 	// start browsing with after=cursor and miss no committed transition.
 	mux.HandleFunc("GET /api/v1/execution-snapshot", s.executionSnapshot)
+	// Additive verification substrate (/api/v1/verifications/*): mounted
+	// only when a Service is configured. The facade authenticates fail
+	// closed and authorizes per SubjectRef; without configuration the
+	// subtree is simply absent.
+	s.mountVerifications(mux)
 	// The auth middleware runs inside statusLogger/recoverer and outside
 	// s.auth so authenticated principals are available to handlers; s.auth
 	// keeps the legacy bearer checks and classifies routes. The rate

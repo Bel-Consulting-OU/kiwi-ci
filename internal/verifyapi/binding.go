@@ -64,6 +64,11 @@ func (o VerificationObligation) Validate() error {
 	if o.Subject == "" {
 		return fmt.Errorf("%w: subject is required", ErrInvalid)
 	}
+	if o.SubjectRef != nil {
+		if err := o.SubjectRef.Validate(); err != nil {
+			return err
+		}
+	}
 	if err := validateDigest("immutable_candidate_digest", o.ImmutableCandidateDigest); err != nil {
 		return err
 	}
@@ -320,7 +325,8 @@ func (g SpeculativeGroup) Validate() error {
 //
 //   - the outcome names the obligation;
 //   - candidate, snapshot and contract digests equal the obligation's;
-//   - the claimed assurance profile equals the required one;
+//   - a pass claim's assurance profile equals the required one (a fail or
+//     partial records the profile it actually achieved and may be lower);
 //   - a pass claim covers every required check and is not cancelled;
 //   - the freshness policy holds at now for the outcome's entire window
 //     (started_at included: pre-issued work is refused);
@@ -344,10 +350,10 @@ func Bind(obligation VerificationObligation, outcome VerificationOutcome, now ti
 	if outcome.ContractDigest != obligation.VerificationContractDigest {
 		return fmt.Errorf("%w: contract digest %s does not match obligation %s", ErrBinding, outcome.ContractDigest, obligation.VerificationContractDigest)
 	}
-	if outcome.AssuranceProfile != obligation.RequiredAssurance {
-		return fmt.Errorf("%w: assurance profile %q does not match required %q", ErrBinding, outcome.AssuranceProfile, obligation.RequiredAssurance)
-	}
 	if outcome.Outcome == OutcomePass {
+		if outcome.AssuranceProfile != obligation.RequiredAssurance {
+			return fmt.Errorf("%w: assurance profile %q does not match required %q", ErrBinding, outcome.AssuranceProfile, obligation.RequiredAssurance)
+		}
 		if outcome.Resources.Cancelled {
 			return fmt.Errorf("%w: cancelled execution cannot claim pass", ErrBinding)
 		}

@@ -39,9 +39,9 @@ type ProvenanceEvidenceVerifier struct {
 }
 
 // Verify implements EvidenceVerifier over real provenance envelopes.
-func (p *ProvenanceEvidenceVerifier) Verify(ctx context.Context, outcome VerificationOutcome) (VerifiedOutcome, error) {
+func (p *ProvenanceEvidenceVerifier) Verify(ctx context.Context, obligation VerificationObligation, submittedClaim VerificationOutcome) (DerivedVerifiedOutcome, error) {
 	if p == nil || p.Resolve == nil {
-		return VerifiedOutcome{}, fmt.Errorf("%w: verifier has no evidence loader", ErrUnverified)
+		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: verifier has no evidence loader", ErrUnverified)
 	}
 	f := &FuncEvidenceVerifier{
 		Identity: p.Identity,
@@ -50,7 +50,7 @@ func (p *ProvenanceEvidenceVerifier) Verify(ctx context.Context, outcome Verific
 			return resolveProvenanceAttestation(ctx, ref, p)
 		},
 	}
-	return f.Verify(ctx, outcome)
+	return f.Verify(ctx, obligation, submittedClaim)
 }
 
 // resolveProvenanceAttestation loads one signed envelope and cryptographically
@@ -94,6 +94,15 @@ func resolveProvenanceAttestation(ctx context.Context, ref string, p *Provenance
 		ExecutionID:       execID,
 		EvidenceRoot:      Digest(att.EvidenceRootSHA256),
 		AttestationDigest: Digest(digest),
+		// Job status and assurance facts come from the SIGNED attestation
+		// block only — never from the caller's claim. The verifier derives
+		// Result and AssuranceProfile from these.
+		Status:          att.Status,
+		AssuranceSchema: att.SchemaVersion,
+	}
+	if att.ExecutionAssurance.Facts != nil {
+		f := *att.ExecutionAssurance.Facts
+		res.Facts = &f
 	}
 	// Durable job facts come from the SIGNED attestation block only (job
 	// started_at/finished_at), never from the caller's claim. A statement
@@ -104,6 +113,15 @@ func resolveProvenanceAttestation(ctx context.Context, ref string, p *Provenance
 		res.Attested = &AttestedResourceFacts{
 			StartedAt:  *att.StartedAt,
 			FinishedAt: *att.FinishedAt,
+		}
+	}
+	// Named checks are bound by structured signed result evidence: each
+	// test-report suite the attestation commits (its suite digest covers the
+	// ordered cases) binds its report name as a completed check. Caller
+	// strings never enter here.
+	for _, rep := range att.TestReports {
+		if rep.Name != "" {
+			res.Checks = append(res.Checks, rep.Name)
 		}
 	}
 	return res, nil

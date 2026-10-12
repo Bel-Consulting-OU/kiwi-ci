@@ -34,13 +34,16 @@ func newSignedAttestationFixture(t *testing.T) signedAttestationFixture {
 	start := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	finish := start.Add(90 * time.Second)
 
-	// The evidence root binds the FULL artifact-side evidence graph.
+	// The evidence root binds the FULL artifact-side evidence graph. The
+	// test-report suite names are the structured signed check results the
+	// verifier will derive as CompletedChecks authority.
 	evidenceRoot := provenance.ExecutionEvidenceRoot(provenance.ExecutionEvidenceGraph{
 		Artifacts: []provenance.ExecutionEvidenceArtifact{
 			{Name: "bin", SHA256: strings.Repeat("1", 64), Size: 42, Generation: 7, ProvenanceSHA256: strings.Repeat("2", 64)},
 		},
 		TestReports: []provenance.ExecutionAttestationReport{
-			{Name: "test", SuiteDigest: strings.Repeat("3", 64), Generation: 7},
+			{Name: "digest-match", SuiteDigest: strings.Repeat("3", 64), Generation: 7},
+			{Name: "signature", SuiteDigest: strings.Repeat("5", 64), Generation: 7},
 		},
 		Snapshots: []provenance.ExecutionAttestationSnapshot{
 			{ID: "snap-1", Phase: model.SnapshotPhasePreJob, SHA256: strings.Repeat("4", 64), Generation: 7},
@@ -71,6 +74,10 @@ func newSignedAttestationFixture(t *testing.T) signedAttestationFixture {
 			FilesystemIsolated:        true,
 			NetworkMode:               model.NetworkModeFactDefault,
 			DeclaredAuthorityMediated: true,
+		},
+		TestReports: []provenance.ExecutionAttestationReport{
+			{Name: "digest-match", SuiteDigest: strings.Repeat("3", 64), Generation: 7},
+			{Name: "signature", SuiteDigest: strings.Repeat("5", 64), Generation: 7},
 		},
 		ExternalEffects: model.EffectsKiwiMediated,
 	})
@@ -108,6 +115,30 @@ func fixtureVerifier(fx signedAttestationFixture, ref string) *ProvenanceEvidenc
 			return fx.envelope, nil
 		},
 		TrustedKey: fx.pub,
+	}
+}
+
+// provenanceFixtureObligation returns an obligation whose RequiredAssurance
+// equals the DERIVED profile of the signed attestation fixture: its container
+// + mediated-authority facts derive model.AssuranceKiwiMediatedAuthority.
+// RequiredChecks stay the suite names the fixture's test reports bind.
+func provenanceFixtureObligation(t *testing.T) VerificationObligation {
+	t.Helper()
+	ob := baseObligation(t)
+	ob.RequiredAssurance = model.AssuranceKiwiMediatedAuthority.Name()
+	return ob
+}
+
+// bareResolvedAttestation is the injected-resolver shape that binds the
+// obligation's required checks explicitly and reports a successful job.
+func bareResolvedAttestation(t *testing.T, execID string, root Digest) ResolvedAttestation {
+	t.Helper()
+	return ResolvedAttestation{
+		ExecutionID:       execID,
+		EvidenceRoot:      root,
+		AttestationDigest: mustDigest(t, "bare-att-digest"),
+		Status:            "success",
+		Checks:            []string{"digest-match", "signature"},
 	}
 }
 
@@ -159,7 +190,7 @@ func TestRawPassWithFakeEvidenceRootIsNotAuthoritative(t *testing.T) {
 // does the outcome satisfy QueryOutcome as a proven pass.
 func TestVerifiedOutcomeWithRealProvenanceFixtureIsAuthoritative(t *testing.T) {
 	fx := newSignedAttestationFixture(t)
-	ob := baseObligation(t)
+	ob := provenanceFixtureObligation(t)
 	reg := NewRegistry(func() time.Time { return ob.IssuedAt.Add(30 * time.Second) })
 	if err := reg.SubmitObligation(ob); err != nil {
 		t.Fatalf("SubmitObligation = %v", err)
@@ -171,7 +202,7 @@ func TestVerifiedOutcomeWithRealProvenanceFixtureIsAuthoritative(t *testing.T) {
 	v.ExecutionIDs = []string{fx.attemptID}
 
 	verifier := fixtureVerifier(fx, "attestation-1")
-	vo, err := verifier.Verify(context.Background(), v)
+	vo, err := verifier.Verify(context.Background(), ob, v)
 	if err != nil {
 		t.Fatalf("Verify real provenance fixture = %v", err)
 	}
@@ -216,7 +247,7 @@ func TestVerifiedOutcomeWithRealProvenanceFixtureIsAuthoritative(t *testing.T) {
 // derived outcome window and cannot be caller-inflated.
 func TestRecordVerifiedOutcomeFillsAttestedWallTime(t *testing.T) {
 	fx := newSignedAttestationFixture(t)
-	ob := baseObligation(t)
+	ob := provenanceFixtureObligation(t)
 	reg := NewRegistry(func() time.Time { return ob.IssuedAt.Add(30 * time.Second) })
 	if err := reg.SubmitObligation(ob); err != nil {
 		t.Fatalf("SubmitObligation = %v", err)
@@ -230,7 +261,7 @@ func TestRecordVerifiedOutcomeFillsAttestedWallTime(t *testing.T) {
 	v.Resources.Measured = &MeasuredResourceFacts{DurationNS: 1 << 40, WallTimeNS: 1 << 40}
 
 	verifier := fixtureVerifier(fx, "attestation-1")
-	vo, err := verifier.Verify(context.Background(), v)
+	vo, err := verifier.Verify(context.Background(), ob, v)
 	if err != nil {
 		t.Fatalf("Verify real provenance fixture = %v", err)
 	}
@@ -255,9 +286,12 @@ func TestRecordVerifiedOutcomeFillsAttestedWallTime(t *testing.T) {
 	if m == nil {
 		t.Fatal("Measured is nil after verified record")
 	}
-	wantDerived := v.CompletedAt.Sub(v.StartedAt).Nanoseconds()
+	// Model A: the authoritative window is the ATTESTED job window when the
+	// evidence carries one, so DurationNS follows that window — not the
+	// caller's proposed window.
+	const wantDerived = int64(90 * time.Second)
 	if m.DurationNS != wantDerived {
-		t.Fatalf("Measured.DurationNS = %d, want derived %d", m.DurationNS, wantDerived)
+		t.Fatalf("Measured.DurationNS = %d, want attested-window derived %d", m.DurationNS, wantDerived)
 	}
 	if m.WallTimeNS != wantWallNS {
 		t.Fatalf("Measured.WallTimeNS = %d, want attested %d", m.WallTimeNS, wantWallNS)
@@ -280,11 +314,13 @@ func TestMeasuredWallTimeUnfilledWithoutAttestedWindow(t *testing.T) {
 				ExecutionID:       v.ExecutionIDs[0],
 				EvidenceRoot:      root,
 				AttestationDigest: mustDigest(t, "bare-att-digest"),
+				Status:            "success",
+				Checks:            []string{"digest-match", "signature"},
 				// No Attested facts: older statements carry no job window.
 			}, nil
 		},
 	}
-	vo, err := f.Verify(context.Background(), v)
+	vo, err := f.Verify(context.Background(), ob, v)
 	if err != nil {
 		t.Fatalf("Verify = %v", err)
 	}
@@ -359,6 +395,11 @@ func TestVerifiedOutcomeWithContractAttestationV6Fixture(t *testing.T) {
 
 	root := Digest(st.Attestation.EvidenceRootSHA256)
 	ob := baseObligation(t)
+	// The committed fixture attests sealed_pinned_no_network facts and binds
+	// the named test-report suite "test": the obligation must demand exactly
+	// what the signed evidence can derive.
+	ob.RequiredAssurance = model.AssuranceSealedPinnedNoNetwork.Name()
+	ob.RequiredChecks = []string{"test", CheckJobStatusSuccess, CheckEvidenceRoot}
 	reg := NewRegistry(func() time.Time { return ob.IssuedAt.Add(30 * time.Second) })
 	if err := reg.SubmitObligation(ob); err != nil {
 		t.Fatalf("SubmitObligation = %v", err)
@@ -379,7 +420,7 @@ func TestVerifiedOutcomeWithContractAttestationV6Fixture(t *testing.T) {
 		},
 		TrustedKey: pub,
 	}
-	vo, err := verifier.Verify(context.Background(), v)
+	vo, err := verifier.Verify(context.Background(), ob, v)
 	if err != nil {
 		t.Fatalf("Verify attestation_v6 fixture = %v", err)
 	}
@@ -398,36 +439,64 @@ func TestVerifiedOutcomeWithContractAttestationV6Fixture(t *testing.T) {
 	}
 }
 
-// TestEvidenceVerifierRefusesFakeRootLaundering proves the verifier will not
-// seal a pass whose claimed evidence_root disagrees with what the signatures
-// prove — the fake-root laundering path is closed before anything is stored.
-func TestEvidenceVerifierRefusesFakeRootLaundering(t *testing.T) {
+// TestEvidenceVerifierDerivesRootOverFakeClaimedRoot is the P1 laundering
+// close: a caller may CLAIM pass with a fabricated evidence_root, but the
+// derived record carries only the root the signatures prove. The fake value
+// survives solely as the SubmittedClaim proposal and never becomes authority.
+func TestEvidenceVerifierDerivesRootOverFakeClaimedRoot(t *testing.T) {
 	fx := newSignedAttestationFixture(t)
-	ob := baseObligation(t)
+	ob := provenanceFixtureObligation(t)
 	v := baseOutcome(t, ob)
 	v.EvidenceRoot = mustDigest(t, "totally-fake-root")
 	v.ProvenanceRefs = []string{"attestation-1"}
 	v.ExecutionIDs = []string{fx.attemptID}
+	v.Outcome = OutcomePass
+	v.AssuranceProfile = "sealed_pinned_no_network" // caller inflation
 
 	verifier := fixtureVerifier(fx, "attestation-1")
-	if _, err := verifier.Verify(context.Background(), v); !errors.Is(err, ErrEvidence) {
-		t.Fatalf("Verify fake root = %v, want ErrEvidence", err)
+	vo, err := verifier.Verify(context.Background(), ob, v)
+	if err != nil {
+		t.Fatalf("Verify fake root = %v (Model A keeps the proposal and derives truth)", err)
+	}
+	if vo.Outcome.EvidenceRoot != fx.evidenceRoot {
+		t.Fatalf("derived evidence root = %s, want resolved %s", vo.Outcome.EvidenceRoot, fx.evidenceRoot)
+	}
+	if vo.SubmittedClaim.EvidenceRoot != mustDigest(t, "totally-fake-root") {
+		t.Fatal("submitted claim must keep the proposed (fake) root for audit")
+	}
+	if vo.Outcome.AssuranceProfile == "sealed_pinned_no_network" {
+		t.Fatal("derived assurance must not echo the caller's inflated profile")
+	}
+	if vo.Outcome.AssuranceProfile != model.AssuranceKiwiMediatedAuthority.Name() {
+		t.Fatalf("derived assurance = %q, want %q", vo.Outcome.AssuranceProfile, model.AssuranceKiwiMediatedAuthority.Name())
+	}
+	if !vo.ProvenPass() {
+		t.Fatal("derived record over real evidence and covered checks must be a proven pass")
 	}
 }
 
-// TestEvidenceVerifierRefusesClaimedUnboundExecutionID: a claimed execution
-// id that no verified attestation binds is refused.
-func TestEvidenceVerifierRefusesClaimedUnboundExecutionID(t *testing.T) {
+// TestEvidenceVerifierDerivesExecIDsOverForgedClaim: a claimed execution id
+// that no verified attestation binds never enters the derived authority — it
+// is kept only as the proposal (Model A) and the derived set is exactly what
+// the signatures bind.
+func TestEvidenceVerifierDerivesExecIDsOverForgedClaim(t *testing.T) {
 	fx := newSignedAttestationFixture(t)
-	ob := baseObligation(t)
+	ob := provenanceFixtureObligation(t)
 	v := baseOutcome(t, ob)
 	v.EvidenceRoot = fx.evidenceRoot
 	v.ProvenanceRefs = []string{"attestation-1"}
 	v.ExecutionIDs = []string{fx.attemptID, "forged-exec"}
 
 	verifier := fixtureVerifier(fx, "attestation-1")
-	if _, err := verifier.Verify(context.Background(), v); !errors.Is(err, ErrEvidence) {
-		t.Fatalf("Verify forged execution id = %v, want ErrEvidence", err)
+	vo, err := verifier.Verify(context.Background(), ob, v)
+	if err != nil {
+		t.Fatalf("Verify forged execution id = %v (Model A keeps the proposal and derives truth)", err)
+	}
+	if len(vo.Outcome.ExecutionIDs) != 1 || vo.Outcome.ExecutionIDs[0] != fx.attemptID {
+		t.Fatalf("derived execution ids = %v, want [%s]", vo.Outcome.ExecutionIDs, fx.attemptID)
+	}
+	if !equalStringSlices(vo.SubmittedClaim.ExecutionIDs, []string{fx.attemptID, "forged-exec"}) {
+		t.Fatalf("submitted claim ids = %v, want the proposal preserved", vo.SubmittedClaim.ExecutionIDs)
 	}
 }
 
@@ -435,7 +504,7 @@ func TestEvidenceVerifierRefusesClaimedUnboundExecutionID(t *testing.T) {
 // tampered payload, never resolves to evidence.
 func TestEvidenceVerifierRefusesUnsignedOrTamperedEnvelope(t *testing.T) {
 	fx := newSignedAttestationFixture(t)
-	ob := baseObligation(t)
+	ob := provenanceFixtureObligation(t)
 
 	t.Run("tampered payload", func(t *testing.T) {
 		var env provenance.Envelope
@@ -464,7 +533,7 @@ func TestEvidenceVerifierRefusesUnsignedOrTamperedEnvelope(t *testing.T) {
 			Resolve:    func(context.Context, string) ([]byte, error) { return tampered, nil },
 			TrustedKey: fx.pub,
 		}
-		if _, err := verifier.Verify(context.Background(), v); !errors.Is(err, ErrEvidence) {
+		if _, err := verifier.Verify(context.Background(), ob, v); !errors.Is(err, ErrEvidence) {
 			t.Fatalf("Verify tampered envelope = %v, want ErrEvidence", err)
 		}
 	})
@@ -491,7 +560,7 @@ func TestEvidenceVerifierRefusesUnsignedOrTamperedEnvelope(t *testing.T) {
 			Resolve:    func(context.Context, string) ([]byte, error) { return raw, nil },
 			TrustedKey: fx.pub, // trust a DIFFERENT key than the signer
 		}
-		if _, err := verifier.Verify(context.Background(), v); !errors.Is(err, ErrEvidence) {
+		if _, err := verifier.Verify(context.Background(), ob, v); !errors.Is(err, ErrEvidence) {
 			t.Fatalf("Verify under wrong key = %v, want ErrEvidence", err)
 		}
 		_ = otherPub
@@ -502,13 +571,13 @@ func TestEvidenceVerifierRefusesUnsignedOrTamperedEnvelope(t *testing.T) {
 // resolve, so it can never become authoritative.
 func TestEvidenceVerifierRequiresRefs(t *testing.T) {
 	fx := newSignedAttestationFixture(t)
-	ob := baseObligation(t)
+	ob := provenanceFixtureObligation(t)
 	v := baseOutcome(t, ob)
 	v.EvidenceRoot = fx.evidenceRoot
 	v.ProvenanceRefs = nil
 
 	verifier := fixtureVerifier(fx, "attestation-1")
-	if _, err := verifier.Verify(context.Background(), v); !errors.Is(err, ErrEvidence) {
+	if _, err := verifier.Verify(context.Background(), ob, v); !errors.Is(err, ErrEvidence) {
 		t.Fatalf("Verify without refs = %v, want ErrEvidence", err)
 	}
 }
@@ -526,12 +595,14 @@ func TestFuncEvidenceVerifierSealRules(t *testing.T) {
 		ExecutionID:       "exec-1",
 		EvidenceRoot:      mustDigest(t, "resolved-root"),
 		AttestationDigest: mustDigest(t, "att-digest"),
+		Status:            "success",
+		Checks:            []string{"digest-match", "signature"},
 	}
 	f := &FuncEvidenceVerifier{
 		Identity: "func-verifier/v1",
 		Resolve:  func(context.Context, string) (ResolvedAttestation, error) { return ok, nil },
 	}
-	vo, err := f.Verify(context.Background(), v)
+	vo, err := f.Verify(context.Background(), ob, v)
 	if err != nil {
 		t.Fatalf("Verify = %v", err)
 	}
@@ -541,7 +612,7 @@ func TestFuncEvidenceVerifierSealRules(t *testing.T) {
 
 	noIdent := *f
 	noIdent.Identity = ""
-	if _, err := noIdent.Verify(context.Background(), v); !errors.Is(err, ErrUnverified) {
+	if _, err := noIdent.Verify(context.Background(), ob, v); !errors.Is(err, ErrUnverified) {
 		t.Fatalf("Verify without identity = %v, want ErrUnverified", err)
 	}
 
@@ -551,17 +622,20 @@ func TestFuncEvidenceVerifierSealRules(t *testing.T) {
 		Identity: "func-verifier/v1",
 		Resolve:  func(context.Context, string) (ResolvedAttestation, error) { return incomplete, nil },
 	}
-	if _, err := f2.Verify(context.Background(), v); !errors.Is(err, ErrEvidence) {
+	if _, err := f2.Verify(context.Background(), ob, v); !errors.Is(err, ErrEvidence) {
 		t.Fatalf("Verify incomplete resolution = %v, want ErrEvidence", err)
 	}
 }
 
 // TestRestoreVerifiedOutcomeRoundTrip: durable stores cannot serialize the
-// unexported seal, so RestoreVerifiedOutcome rehydrates a previously sealed
-// record and ProvenPass survives the round trip. Incomplete evidence is
-// refused instead of quietly losing the proven-pass bit.
+// unexported seal, so Accept + RestoreVerifiedOutcome rehydrates a previously
+// sealed record through the MAC-checked acceptance path and ProvenPass
+// survives the round trip. Incomplete or tampered evidence is refused instead
+// of quietly losing the proven-pass bit.
 func TestRestoreVerifiedOutcomeRoundTrip(t *testing.T) {
 	ob := baseObligation(t)
+	ob.RequiredChecks = []string{CheckJobStatusSuccess, CheckEvidenceRoot}
+	ob.RequiredAssurance = "no_injected_credentials"
 	v := baseOutcome(t, ob)
 	v.EvidenceRoot = mustDigest(t, "resolved-root")
 	v.ProvenanceRefs = []string{"att-1"}
@@ -574,18 +648,35 @@ func TestRestoreVerifiedOutcomeRoundTrip(t *testing.T) {
 				ExecutionID:       "exec-1",
 				EvidenceRoot:      mustDigest(t, "resolved-root"),
 				AttestationDigest: mustDigest(t, "att-digest"),
+				Status:            string(model.StatusSuccess),
+				Facts:             &model.ExecutionFacts{FilesystemIsolated: true},
 			}, nil
 		},
 	}
-	sealed, err := f.Verify(context.Background(), v)
+	sealed, err := f.Verify(context.Background(), ob, v)
 	if err != nil {
 		t.Fatalf("Verify = %v", err)
 	}
 	if !sealed.Sealed() || !sealed.ProvenPass() {
-		t.Fatal("want sealed proven pass before restore")
+		t.Fatalf("want sealed proven pass before restore (outcome %q)", sealed.Outcome.Outcome)
 	}
 
-	restored, err := RestoreVerifiedOutcome(sealed.Outcome, sealed.Evidence)
+	key, err := NewHMACAcceptanceKey("acc-restore", []byte("restore-test-secret-32-bytes!"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := Accept(ob, sealed, key, time.Date(2026, 1, 2, 3, 6, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("Accept = %v", err)
+	}
+	persisted := PersistedVerified{
+		Obligation:     ob,
+		SubmittedClaim: sealed.SubmittedClaim,
+		Outcome:        sealed.Outcome,
+		Evidence:       sealed.Evidence,
+		Acceptance:     rec,
+	}
+	restored, err := RestoreVerifiedOutcome(persisted, key)
 	if err != nil {
 		t.Fatalf("RestoreVerifiedOutcome = %v", err)
 	}
@@ -596,15 +687,248 @@ func TestRestoreVerifiedOutcomeRoundTrip(t *testing.T) {
 		t.Fatalf("restored verifier identity = %q, want %q", restored.Evidence.VerifierIdentity, sealed.Evidence.VerifierIdentity)
 	}
 
-	// Truncated evidence must not restore as authoritative.
-	bad := sealed.Evidence
-	bad.VerifierIdentity = ""
-	if _, err := RestoreVerifiedOutcome(sealed.Outcome, bad); !errors.Is(err, ErrUnverified) {
-		t.Fatalf("restore without identity = %v, want ErrUnverified", err)
+	// Tampered / truncated evidence must not restore as authoritative.
+	bad := persisted
+	bad.Evidence.AttestationDigests = nil
+	if _, err := RestoreVerifiedOutcome(bad, key); err == nil {
+		t.Fatal("restore without attestation digests must fail")
 	}
-	bad = sealed.Evidence
-	bad.AttestationDigests = nil
-	if _, err := RestoreVerifiedOutcome(sealed.Outcome, bad); !errors.Is(err, ErrUnverified) {
-		t.Fatalf("restore without attestation digests = %v, want ErrUnverified", err)
+	bad = persisted
+	bad.Evidence.VerifierIdentity = ""
+	if _, err := RestoreVerifiedOutcome(bad, key); err == nil {
+		t.Fatal("restore without verifier identity must fail")
+	}
+	// A wrong acceptance key can never recreate authority.
+	other, err := NewHMACAcceptanceKey("acc-other", []byte("another-secret-32-bytes-long!!"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RestoreVerifiedOutcome(persisted, other); err == nil {
+		t.Fatal("restore under a foreign acceptance key must fail")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// P1-A adversarial: real evidence + caller Result=pass/assurance=high is
+// never an authoritative pass when the job failed or the required checks are
+// not bound by signed result evidence.
+// ---------------------------------------------------------------------------
+
+// adversarialSignedFixture builds a REAL signed execution attestation with
+// the given job status and test-report set (the only two knobs the adversary
+// does not control: the signature and evidence root are genuine).
+func adversarialSignedFixture(t *testing.T, status string, reports []provenance.ExecutionAttestationReport) signedAttestationFixture {
+	t.Helper()
+	start := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	finish := start.Add(90 * time.Second)
+	evidenceRoot := provenance.ExecutionEvidenceRoot(provenance.ExecutionEvidenceGraph{
+		Artifacts: []provenance.ExecutionEvidenceArtifact{
+			{Name: "bin", SHA256: strings.Repeat("1", 64), Size: 42, Generation: 7, ProvenanceSHA256: strings.Repeat("2", 64)},
+		},
+		TestReports: reports,
+	})
+	st, err := provenance.ExecutionAttestationStatement(provenance.ExecutionAttestationInput{
+		RunID:                  "run-adv",
+		JobID:                  "job-adv",
+		Generation:             7,
+		Status:                 status,
+		StartedAt:              &start,
+		FinishedAt:             &finish,
+		CapsuleDigest:          strings.Repeat("a", 64),
+		ExecutionCapsuleDigest: strings.Repeat("b", 64),
+		Artifacts: []provenance.ExecutionAttestationArtifact{
+			{Name: "bin", SHA256: strings.Repeat("1", 64), Size: 42, ProvenanceSHA256: strings.Repeat("2", 64)},
+		},
+		EvidenceRootSHA256: evidenceRoot,
+		ExecutionSemantics: model.ExecutionSemanticsVersion,
+		ExecutionAssuranceFacts: model.ExecutionFacts{
+			Runtime:                   model.RuntimeFactContainer,
+			FilesystemIsolated:        true,
+			NetworkMode:               model.NetworkModeFactDefault,
+			DeclaredAuthorityMediated: true,
+		},
+		TestReports:     reports,
+		ExternalEffects: model.EffectsKiwiMediated,
+	})
+	if err != nil {
+		t.Fatalf("build adversarial attestation: %v", err)
+	}
+	pub, priv, err := provenance.NewProvenanceKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := provenance.Sign(st, "kid-adv", priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := EvidenceEnvelopeJSON(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return signedAttestationFixture{
+		envelope:     raw,
+		evidenceRoot: Digest(evidenceRoot),
+		attemptID:    st.AttemptID,
+		pub:          pub,
+	}
+}
+
+// TestAdversarialCallerPassHighWithFailedJobIsNotProvenPass: real signed
+// evidence of a FAILED job, while the caller proposes Result=pass and
+// assurance=sealed_pinned_no_network with every required check named. The
+// derived record must not be a proven pass — authority follows the signed
+// job status, not the proposal.
+func TestAdversarialCallerPassHighWithFailedJobIsNotProvenPass(t *testing.T) {
+	fx := adversarialSignedFixture(t, "failure", []provenance.ExecutionAttestationReport{
+		{Name: "digest-match", SuiteDigest: strings.Repeat("3", 64), Generation: 7},
+		{Name: "signature", SuiteDigest: strings.Repeat("5", 64), Generation: 7},
+	})
+	ob := provenanceFixtureObligation(t)
+	v := baseOutcome(t, ob)
+	v.EvidenceRoot = fx.evidenceRoot
+	v.ProvenanceRefs = []string{"attestation-1"}
+	v.ExecutionIDs = []string{fx.attemptID}
+	// Caller inflation: claim a pass under a stronger profile than the facts
+	// prove, with every required check named.
+	v.Outcome = OutcomePass
+	v.AssuranceProfile = "sealed_pinned_no_network"
+	v.CompletedChecks = []string{"digest-match", "signature"}
+
+	verifier := fixtureVerifier(fx, "attestation-1")
+	vo, err := verifier.Verify(context.Background(), ob, v)
+	if err != nil {
+		t.Fatalf("Verify = %v", err)
+	}
+	if vo.ProvenPass() {
+		t.Fatal("ProvenPass = true, want false: the signed job status is failure")
+	}
+	if vo.Outcome.Outcome != OutcomeFail {
+		t.Fatalf("derived result = %q, want fail (signed job status is failure)", vo.Outcome.Outcome)
+	}
+	if vo.SubmittedClaim.Outcome != OutcomePass || vo.SubmittedClaim.AssuranceProfile != "sealed_pinned_no_network" {
+		t.Fatal("the caller's pass/high proposal must be preserved on SubmittedClaim")
+	}
+	if vo.Outcome.AssuranceProfile == "sealed_pinned_no_network" {
+		t.Fatal("derived assurance must not echo the caller's inflated profile")
+	}
+	if vo.Evidence.JobStatus != "failure" {
+		t.Fatalf("derived job status = %q, want failure", vo.Evidence.JobStatus)
+	}
+
+	// Even if a caller tries to persist it, the record is not a proven pass.
+	reg := NewRegistry(func() time.Time { return ob.IssuedAt.Add(30 * time.Second) })
+	if err := reg.SubmitObligation(ob); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.RecordVerifiedOutcome(vo); err != nil {
+		t.Fatalf("RecordVerifiedOutcome = %v", err)
+	}
+	got, err := reg.QueryOutcome(v.VerificationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ProvenPass() {
+		t.Fatal("QueryOutcome must not report a proven pass for a failed job")
+	}
+}
+
+// TestAdversarialCallerPassWithUnboundChecksIsNotProvenPass: real signed
+// evidence whose test reports do NOT bind the obligation's required check
+// names. The caller lists those names on the claim and proposes Result=pass —
+// the derived CompletedChecks contain only what IS bound, and the derived
+// result is partial, never a proven pass. Caller strings are not authority.
+func TestAdversarialCallerPassWithUnboundChecksIsNotProvenPass(t *testing.T) {
+	// The signed evidence binds only the suite "other-suite" — none of the
+	// obligation's required check names.
+	fx := adversarialSignedFixture(t, "success", []provenance.ExecutionAttestationReport{
+		{Name: "other-suite", SuiteDigest: strings.Repeat("9", 64), Generation: 7},
+	})
+	ob := provenanceFixtureObligation(t)
+	v := baseOutcome(t, ob)
+	v.EvidenceRoot = fx.evidenceRoot
+	v.ProvenanceRefs = []string{"attestation-1"}
+	v.ExecutionIDs = []string{fx.attemptID}
+	v.Outcome = OutcomePass
+	v.AssuranceProfile = "sealed_pinned_no_network"
+	v.CompletedChecks = []string{"digest-match", "signature"} // caller strings: NOT authority
+
+	verifier := fixtureVerifier(fx, "attestation-1")
+	vo, err := verifier.Verify(context.Background(), ob, v)
+	if err != nil {
+		t.Fatalf("Verify = %v", err)
+	}
+	if vo.ProvenPass() {
+		t.Fatal("ProvenPass = true, want false: required checks are not bound by signed result evidence")
+	}
+	if vo.Outcome.Outcome != OutcomePartial {
+		t.Fatalf("derived result = %q, want partial (checks missing)", vo.Outcome.Outcome)
+	}
+	// Derived CompletedChecks contain only what the signatures bind.
+	for _, c := range vo.Outcome.CompletedChecks {
+		if c == "digest-match" || c == "signature" {
+			t.Fatalf("derived completed checks %v must not contain caller-only names", vo.Outcome.CompletedChecks)
+		}
+	}
+	if !equalStringSlices(vo.SubmittedClaim.CompletedChecks, []string{"digest-match", "signature"}) {
+		t.Fatal("the caller's check-name proposal must be preserved on SubmittedClaim")
+	}
+	hasStructural := false
+	for _, c := range vo.Outcome.CompletedChecks {
+		if c == CheckJobStatusSuccess || c == CheckEvidenceRoot {
+			hasStructural = true
+		}
+		if c == "other-suite" {
+			hasStructural = true
+		}
+	}
+	if !hasStructural {
+		t.Fatalf("derived completed checks %v must contain the bound structural/named checks", vo.Outcome.CompletedChecks)
+	}
+	if vo.Outcome.AssuranceProfile == "sealed_pinned_no_network" {
+		t.Fatal("derived assurance must not echo the caller's inflated profile")
+	}
+}
+
+// TestAdversarialCallerPassMissingEvidenceChecksIsNotProvenPass: the bare
+// structural derivation (status success + evidence root present) never
+// satisfies an obligation that demands named checks the attestation cannot
+// bind. Caller-named CompletedChecks are ignored entirely.
+func TestAdversarialCallerPassMissingEvidenceChecksIsNotProvenPass(t *testing.T) {
+	ob := baseObligation(t)
+	v := baseOutcome(t, ob)
+	v.EvidenceRoot = mustDigest(t, "adv-root")
+	v.ProvenanceRefs = []string{"adv-1"}
+	v.ExecutionIDs = []string{"exec-1"}
+	v.Outcome = OutcomePass
+	v.AssuranceProfile = "sealed_pinned_no_network"
+	v.CompletedChecks = []string{"digest-match", "signature", "extra-claim"}
+
+	// The attestation carries NO named check results at all.
+	f := &FuncEvidenceVerifier{
+		Identity: "adv-verifier/v1",
+		Resolve: func(context.Context, string) (ResolvedAttestation, error) {
+			return ResolvedAttestation{
+				ExecutionID:       "exec-1",
+				EvidenceRoot:      mustDigest(t, "adv-root"),
+				AttestationDigest: mustDigest(t, "adv-att"),
+				Status:            "success",
+			}, nil
+		},
+	}
+	vo, err := f.Verify(context.Background(), ob, v)
+	if err != nil {
+		t.Fatalf("Verify = %v", err)
+	}
+	if vo.ProvenPass() {
+		t.Fatal("ProvenPass = true, want false: named required checks are unbound")
+	}
+	if vo.Outcome.Outcome != OutcomePartial {
+		t.Fatalf("derived result = %q, want partial", vo.Outcome.Outcome)
+	}
+	if !equalStringSlices(vo.Outcome.CompletedChecks, []string{CheckJobStatusSuccess, CheckEvidenceRoot}) {
+		t.Fatalf("derived completed checks = %v, want only the bound structural pair", vo.Outcome.CompletedChecks)
+	}
+	if !equalStringSlices(vo.SubmittedClaim.CompletedChecks, []string{"digest-match", "signature", "extra-claim"}) {
+		t.Fatal("the caller's check-name proposal must be preserved on SubmittedClaim")
 	}
 }

@@ -214,10 +214,12 @@ dogfood-release-model:
 #   DF-UPGRADE-002  N-1 binary → HEAD binary on one state directory
 #   DF-SELF-002     G1 → G2 binary self-build from the same source tree
 #   DF-RELEASE-001  exact packaged bytes install → serve → work → evidence
-# Name-required so the suite cannot silently lose them. Skip is allowed only
-# for a git worktree/N-1 build failure inside TestSysDFUpgrade002NMinusOne.
+# Name-required so the suite cannot silently lose them. KIWI_REQUIRE_N_MINUS_ONE=1
+# makes a missing/unbuildable N-1 a hard failure (never a skip) so release
+# certification cannot drop DF-UPGRADE-002; a released N-1 artifact may be
+# supplied via KIWI_N_MINUS_ONE_BIN / KIWI_N_MINUS_ONE_SHA256.
 dogfood-release-artifacts:
-	./scripts/dogfood-run.sh 15m \
+	KIWI_REQUIRE_N_MINUS_ONE=1 ./scripts/dogfood-run.sh 15m \
 		--run 'TestSysDFUpgrade|TestSysDFSelf|TestSysDFRelease' \
 		--require TestSysDFUpgrade002NMinusOne \
 		--require TestSysDFSelf002G1ToG2 \
@@ -267,13 +269,14 @@ dogfood-production:
 dogfood-all: dogfood-local dogfood-system dogfood-production dogfood-release-artifacts dogfood-distributed dogfood-adversarial dogfood-upgrade dogfood-scale dogfood-release-model
 
 # release-gate is the production dogfood closure: live dist topology, soak,
-# DR restore, N-1 binary upgrade, G1→G2 self-build, packaged artifact, and
+# DR restore, N-1 binary upgrade (fail-closed — KIWI_REQUIRE_N_MINUS_ONE=1
+# via dogfood-release-artifacts), G1→G2 self-build, packaged artifact, and
 # the untrusted-container evidence lane, plus the critical model/system
 # contracts. Automation that needs "release safe" uses THIS target.
 # dogfood-release-model is the faster model-only subset.
 .PHONY: release-gate
 release-gate: dogfood-fast dogfood-system dogfood-production dogfood-release-artifacts
-	@echo "RELEASE GATE green: dist topology, soak, DR restore, N-1 upgrade, G1→G2 self-build, packaged artifact, untrusted-container evidence lane."
+	@echo "RELEASE GATE green: dist topology, soak, DR restore, N-1 upgrade (fail-closed), G1→G2 self-build, packaged artifact, untrusted-container evidence lane."
 
 # staticcheck-all is the CI check: it is exactly the pinned command run by
 # .woodpecker/linux-amd64.yml. `staticcheck` runs the same pinned command

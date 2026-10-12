@@ -26,7 +26,9 @@ import (
 //	DF-RELEASE-001  exact packaged bytes install → serve → work → evidence
 //
 // Skip policy is narrow: only a git worktree/build failure may skip
-// DF-UPGRADE-002. The other two must run.
+// DF-UPGRADE-002 — and even that is a hard failure under
+// KIWI_REQUIRE_N_MINUS_ONE=1 (set by `make release-gate`). The other two
+// must run.
 
 const (
 	// goToolchainPath overrides the Go used for source builds in these
@@ -38,7 +40,100 @@ const (
 	// nMinusOneScanDepth is how many recent commits to scan when picking an
 	// N-1 worktree SHA (after the preferred named anchors).
 	nMinusOneScanDepth = 15
+
+	// requireNMinusOneEnv turns DF-UPGRADE-002's narrow skip policy into a
+	// hard failure: when set to 1/true/yes, a missing or unbuildable N-1 is
+	// t.Fatal, never t.Skip. `make release-gate` /
+	// `make dogfood-release-artifacts` set it so release certification
+	// cannot skip the N-1 proof.
+	requireNMinusOneEnv = "KIWI_REQUIRE_N_MINUS_ONE"
+	// nMinusOneBinEnv names a pre-built released N-1 artifact to upgrade
+	// from (preferred over building a git worktree).
+	nMinusOneBinEnv = "KIWI_N_MINUS_ONE_BIN"
+	// nMinusOneSHA256Env pins the SHA-256 of the released artifact named by
+	// nMinusOneBinEnv. A mismatch is ALWAYS a hard failure — the wrong
+	// bytes must never certify a release.
+	nMinusOneSHA256Env = "KIWI_N_MINUS_ONE_SHA256"
+	// nMinusOneSHAEnv forces the N-1 worktree commit (skips the history
+	// scan). Used by the fail-closed tests to point at an unbuildable SHA.
+	nMinusOneSHAEnv = "KIWI_N_MINUS_ONE_SHA"
 )
+
+// nMinusOneRequired reports whether DF-UPGRADE-002 must fail closed instead
+// of skipping when no N-1 artifact can be produced.
+func nMinusOneRequired() bool {
+	v := strings.TrimSpace(os.Getenv(requireNMinusOneEnv))
+	return v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
+}
+
+// nMinusOneFatalSkip is the testing surface failOrSkipNMinusOne needs —
+// *testing.T satisfies it, and the fail-closed tests use a recorder to pin
+// Fatal-vs-Skip without failing the parent test.
+type nMinusOneFatalSkip interface {
+	Helper()
+	Fatalf(format string, args ...any)
+	Skipf(format string, args ...any)
+}
+
+// failOrSkipNMinusOne reports a missing/unbuildable N-1. Under
+// KIWI_REQUIRE_N_MINUS_ONE this is a hard failure (release-gate must never
+// silently drop the N-1 proof); otherwise the historical narrow skip.
+func failOrSkipNMinusOne(t nMinusOneFatalSkip, format string, args ...any) {
+	t.Helper()
+	if nMinusOneRequired() {
+		t.Fatalf(format, args...)
+	} else {
+		t.Skipf(format, args...)
+	}
+}
+
+// releasedNMinusOne returns the released N-1 artifact named by
+// KIWI_N_MINUS_ONE_BIN when configured. The bytes are hash-checked against
+// KIWI_N_MINUS_ONE_SHA256 when that pin is set; a mismatch is always fatal.
+// Returns ("", "", nil) when no released artifact is configured.
+func releasedNMinusOne(t *testing.T) (binPath, sha string, err error) {
+	t.Helper()
+	binPath = strings.TrimSpace(os.Getenv(nMinusOneBinEnv))
+	if binPath == "" {
+		return "", "", nil
+	}
+	if st, serr := os.Stat(binPath); serr != nil || st.IsDir() {
+		return "", "", fmt.Errorf("released N-1 artifact %q is not a readable file: %v", binPath, serr)
+	}
+	sha = sha256File(t, binPath)
+	if want := strings.TrimSpace(strings.ToLower(os.Getenv(nMinusOneSHA256Env))); want != "" {
+		if sha != want {
+			return "", "", fmt.Errorf("released N-1 artifact %q sha256 = %s, want pinned %s", binPath, sha, want)
+		}
+	}
+	return binPath, sha, nil
+}
+
+// buildNMinusOneWorktree builds the N-1 product binary from a real git
+// worktree at the N-1 commit. Returns an error (never skips) when the SHA
+// cannot be resolved, the worktree cannot be created, or the build fails —
+// the caller decides skip vs fatal via failOrSkipNMinusOne.
+func buildNMinusOneWorktree(t *testing.T, srcDir, goBin, n1SHA, outPath string) error {
+	t.Helper()
+	wt := filepath.Join(t.TempDir(), "kiwi-n1")
+	add := exec.Command("git", "worktree", "add", "--detach", wt, n1SHA)
+	add.Dir = srcDir
+	if out, err := add.CombinedOutput(); err != nil {
+		return fmt.Errorf("git worktree add %s: %v\n%s", n1SHA, err, out)
+	}
+	defer func() {
+		rm := exec.Command("git", "worktree", "remove", "--force", wt)
+		rm.Dir = srcDir
+		_ = rm.Run()
+	}()
+	build := exec.Command(goBin, "build", "-o", outPath, "./cmd/kiwi")
+	build.Dir = wt
+	build.Env = os.Environ()
+	if out, err := build.CombinedOutput(); err != nil {
+		return fmt.Errorf("N-1 go build from %s: %v\n%s", n1SHA, err, out)
+	}
+	return nil
+}
 
 // goTool returns the Go toolchain used for host and in-job builds.
 func goTool(t *testing.T) string {
@@ -353,37 +448,44 @@ func assertBinaryVersion(t *testing.T, bin string) string {
 // a real N-1 product binary owns a state directory and writes run history
 // over the public API; a real HEAD product binary then takes the SAME state
 // directory (binary upgrade), still serves that history, and accepts new
-// work. Skips only when the git worktree or the N-1 build fails.
+// work. Skips only when the git worktree or the N-1 build fails — and under
+// KIWI_REQUIRE_N_MINUS_ONE=1 (set by `make release-gate`) even that is a
+// hard failure, so release certification cannot silently drop this proof.
+//
+// A released N-1 artifact (KIWI_N_MINUS_ONE_BIN, optionally hash-pinned by
+// KIWI_N_MINUS_ONE_SHA256) is preferred over building a git worktree.
 func TestSysDFUpgrade002NMinusOne(t *testing.T) {
 	srcDir := moduleRoot(t)
 	goBin := goTool(t)
 
-	// Locate a prior commit that still builds cmd/kiwi.
-	n1SHA := pickNMinusOneSHA(t, srcDir)
-	if n1SHA == "" {
-		t.Skip("DF-UPGRADE-002: no prior commit produced a buildable N-1 worktree")
-	}
-
-	// Real git worktree at the N-1 commit — the N-1 tree is that commit's
-	// bytes, not a filtered copy of HEAD.
-	wt := filepath.Join(t.TempDir(), "kiwi-n1")
-	add := exec.Command("git", "worktree", "add", "--detach", wt, n1SHA)
-	add.Dir = srcDir
-	if out, err := add.CombinedOutput(); err != nil {
-		t.Skipf("DF-UPGRADE-002 skip: git worktree add %s failed: %v\n%s", n1SHA, err, out)
-	}
-	defer func() {
-		rm := exec.Command("git", "worktree", "remove", "--force", wt)
-		rm.Dir = srcDir
-		_ = rm.Run()
-	}()
-
 	n1Bin := filepath.Join(t.TempDir(), "kiwi-n1")
-	build := exec.Command(goBin, "build", "-o", n1Bin, "./cmd/kiwi")
-	build.Dir = wt
-	build.Env = os.Environ()
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Skipf("DF-UPGRADE-002 skip: N-1 go build failed: %v\n%s", err, out)
+	// Prefer the released artifact when one is configured and its bytes
+	// hash-check; fall back to a real N-1 worktree build otherwise.
+	relBin, relSHA, relErr := releasedNMinusOne(t)
+	if relErr != nil {
+		// Wrong bytes on a released artifact is always fatal — never skip.
+		t.Fatalf("DF-UPGRADE-002: released N-1 artifact: %v", relErr)
+	}
+	var n1SHA string
+	switch {
+	case relBin != "":
+		n1SHA = relSHA
+		if err := copyFile(relBin, n1Bin); err != nil {
+			t.Fatalf("DF-UPGRADE-002: install released N-1 artifact: %v", err)
+		}
+		if got := sha256File(t, n1Bin); got != n1SHA {
+			t.Fatalf("DF-UPGRADE-002: installed N-1 sha256 = %s, want released %s", got, n1SHA)
+		}
+		t.Logf("DF-UPGRADE-002: using released N-1 artifact %s sha256=%s", relBin, n1SHA)
+	default:
+		// Locate a prior commit that still builds cmd/kiwi.
+		n1SHA = pickNMinusOneSHA(t, srcDir)
+		if n1SHA == "" {
+			failOrSkipNMinusOne(t, "DF-UPGRADE-002: no prior commit produced a buildable N-1 worktree (set %s=1 to fail closed, or supply %s/%s)", requireNMinusOneEnv, nMinusOneBinEnv, nMinusOneSHA256Env)
+		}
+		if err := buildNMinusOneWorktree(t, srcDir, goBin, n1SHA, n1Bin); err != nil {
+			failOrSkipNMinusOne(t, "DF-UPGRADE-002: N-1 worktree build failed: %v", err)
+		}
 	}
 	assertBinaryVersion(t, n1Bin)
 
@@ -454,10 +556,123 @@ func TestSysDFUpgrade002NMinusOne(t *testing.T) {
 	}
 }
 
+// TestNMinusOneRequireModeFailsClosed pins the P1-D policy: under
+// KIWI_REQUIRE_N_MINUS_ONE=1 a missing or unbuildable N-1 is a hard failure
+// (the release gate must never skip DF-UPGRADE-002), a released artifact
+// with a wrong SHA-256 is always fatal, and the resolution helpers report
+// failure rather than inventing an artifact.
+func TestNMinusOneRequireModeFailsClosed(t *testing.T) {
+	srcDir := moduleRoot(t)
+
+	t.Run("require env is honored", func(t *testing.T) {
+		t.Setenv(requireNMinusOneEnv, "")
+		if nMinusOneRequired() {
+			t.Fatal("empty env reported as require mode")
+		}
+		t.Setenv(requireNMinusOneEnv, "1")
+		if !nMinusOneRequired() {
+			t.Fatal("KIWI_REQUIRE_N_MINUS_ONE=1 not detected as require mode")
+		}
+		t.Setenv(requireNMinusOneEnv, "true")
+		if !nMinusOneRequired() {
+			t.Fatal("KIWI_REQUIRE_N_MINUS_ONE=true not detected as require mode")
+		}
+		t.Setenv(requireNMinusOneEnv, "0")
+		if nMinusOneRequired() {
+			t.Fatal("KIWI_REQUIRE_N_MINUS_ONE=0 reported as require mode")
+		}
+	})
+
+	t.Run("unbuildable SHA resolves to no artifact", func(t *testing.T) {
+		// A forced SHA that names no commit: the worktree cannot be built
+		// and the resolver must report absent — the caller's skip-or-fatal
+		// policy then fails closed under require mode.
+		t.Setenv(nMinusOneSHAEnv, "0000000000000000000000000000000000000000")
+		if got := pickNMinusOneSHA(t, srcDir); got != "" {
+			t.Fatalf("pickNMinusOneSHA(unknown forced SHA) = %q, want empty", got)
+		}
+	})
+
+	t.Run("worktree build of unknown SHA errors", func(t *testing.T) {
+		t.Setenv(nMinusOneSHAEnv, "")
+		goBin := goTool(t)
+		err := buildNMinusOneWorktree(t, srcDir, goBin,
+			"0000000000000000000000000000000000000000",
+			filepath.Join(t.TempDir(), "kiwi-n1"))
+		if err == nil {
+			t.Fatal("buildNMinusOneWorktree(unknown SHA) succeeded, want error")
+		}
+	})
+
+	t.Run("released artifact SHA mismatch always fails", func(t *testing.T) {
+		bin := filepath.Join(t.TempDir(), "fake-released-kiwi")
+		if err := os.WriteFile(bin, []byte("#!/bin/sh\necho fake kiwi\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv(nMinusOneBinEnv, bin)
+		t.Setenv(nMinusOneSHA256Env, strings.Repeat("0", 64))
+		_, _, err := releasedNMinusOne(t)
+		if err == nil {
+			t.Fatal("releasedNMinusOne with a wrong pinned sha256 succeeded, want error")
+		}
+		// And with no pin the artifact is accepted (hash recorded).
+		t.Setenv(nMinusOneSHA256Env, "")
+		gotBin, gotSHA, err := releasedNMinusOne(t)
+		if err != nil {
+			t.Fatalf("releasedNMinusOne without pin = %v", err)
+		}
+		if gotBin != bin || gotSHA == "" {
+			t.Fatalf("releasedNMinusOne = (%q, %q), want (%q, non-empty)", gotBin, gotSHA, bin)
+		}
+	})
+
+	t.Run("require mode fatal policy", func(t *testing.T) {
+		rec := &nMinusOneCallRecorder{}
+		t.Setenv(requireNMinusOneEnv, "1")
+		failOrSkipNMinusOne(rec, "DF-UPGRADE-002 require-mode probe")
+		if rec.fatal == "" {
+			t.Fatalf("require mode: failOrSkipNMinusOne did not Fatalf (skipped=%q)", rec.skip)
+		}
+		if rec.skip != "" {
+			t.Fatalf("require mode: failOrSkipNMinusOne also Skipf: %q", rec.skip)
+		}
+		rec2 := &nMinusOneCallRecorder{}
+		t.Setenv(requireNMinusOneEnv, "")
+		failOrSkipNMinusOne(rec2, "DF-UPGRADE-002 skip-mode probe")
+		if rec2.skip == "" || rec2.fatal != "" {
+			t.Fatalf("skip mode: want Skipf only, got fatal=%q skip=%q", rec2.fatal, rec2.skip)
+		}
+	})
+}
+
+// nMinusOneCallRecorder records Fatal/Skip calls for the fail-closed policy
+// tests (a real *testing.T cannot observe Fatal from outside).
+type nMinusOneCallRecorder struct{ fatal, skip string }
+
+func (r *nMinusOneCallRecorder) Helper() {}
+func (r *nMinusOneCallRecorder) Fatalf(format string, args ...any) {
+	r.fatal = fmt.Sprintf(format, args...)
+}
+func (r *nMinusOneCallRecorder) Skipf(format string, args ...any) {
+	r.skip = fmt.Sprintf(format, args...)
+}
+
 // pickNMinusOneSHA walks recent history for a commit that is not HEAD and can
-// form a worktree. Returns "" when none is acceptable (caller skips).
+// form a worktree. KIWI_N_MINUS_ONE_SHA forces the commit (and is how the
+// fail-closed tests point at an unbuildable SHA). Returns "" when none is
+// acceptable (caller skips or fatals per KIWI_REQUIRE_N_MINUS_ONE).
 func pickNMinusOneSHA(t *testing.T, srcDir string) string {
 	t.Helper()
+	if forced := strings.TrimSpace(os.Getenv(nMinusOneSHAEnv)); forced != "" {
+		rev := exec.Command("git", "rev-parse", "--verify", forced+"^{commit}")
+		rev.Dir = srcDir
+		if o, err := rev.CombinedOutput(); err == nil {
+			return strings.TrimSpace(string(o))
+		}
+		// Unresolvable forced SHA: report it as absent so the caller's
+		// skip-or-fatal policy decides (require mode fails closed).
+		return ""
+	}
 	log := exec.Command("git", "log", "--format=%H", "-n", fmt.Sprint(nMinusOneScanDepth))
 	log.Dir = srcDir
 	out, err := log.CombinedOutput()

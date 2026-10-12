@@ -78,7 +78,8 @@ func TestMemoryStoreClaimIsNotProvenPass(t *testing.T) {
 func TestMemoryStoreVerifiedOutcomeIsAuthoritative(t *testing.T) {
 	ctx := context.Background()
 	fx := newSignedAttestationFixture(t)
-	ob := baseObligation(t)
+	ob := provenanceFixtureObligation(t)
+	ob.RequiredChecks = []string{CheckJobStatusSuccess, CheckEvidenceRoot}
 	st := NewMemoryStore(func() time.Time { return ob.IssuedAt.Add(30 * time.Second) })
 	if err := st.SubmitObligation(ctx, ob); err != nil {
 		t.Fatal(err)
@@ -89,7 +90,7 @@ func TestMemoryStoreVerifiedOutcomeIsAuthoritative(t *testing.T) {
 	v.ProvenanceRefs = []string{"attestation-1"}
 	v.ExecutionIDs = []string{fx.attemptID}
 
-	vo, err := fixtureVerifier(fx, "attestation-1").Verify(ctx, v)
+	vo, err := fixtureVerifier(fx, "attestation-1").Verify(ctx, ob, v)
 	if err != nil {
 		t.Fatalf("Verify = %v", err)
 	}

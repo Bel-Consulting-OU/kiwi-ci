@@ -208,6 +208,14 @@ func classifyRoute(r *http.Request) routeTier {
 	if runnerPath(r.Method, r.URL.Path) {
 		return tierRunner
 	}
+	// The verification substrate (/api/v1/verifications/*) is an
+	// authenticated principal surface: the tier gate admits any store
+	// principal (or admin / legacy open mode) and the Service's Authorizer
+	// makes the subject-level decision. Fail closed lives in the Service,
+	// not in a blanket admin gate.
+	if strings.HasPrefix(r.URL.Path, verificationPrefix) {
+		return tierRBAC
+	}
 	if _, ok := capabilityRouteFor(r.Method, r.URL.Path); ok {
 		return tierCapability
 	}

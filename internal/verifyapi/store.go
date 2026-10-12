@@ -42,9 +42,9 @@ type VerificationStore interface {
 	// authoritative; only RecordVerifiedOutcome discharges an obligation.
 	// Idempotent on VerificationID.
 	RecordOutcome(ctx context.Context, v VerificationOutcome) error
-	// RecordVerifiedOutcome records a verifier-produced VerifiedOutcome as
-	// the authoritative result. Idempotent on VerificationID.
-	RecordVerifiedOutcome(ctx context.Context, v VerifiedOutcome) error
+	// RecordVerifiedOutcome records a verifier-produced DerivedVerifiedOutcome
+	// as the authoritative result. Idempotent on VerificationID.
+	RecordVerifiedOutcome(ctx context.Context, v DerivedVerifiedOutcome) error
 	// GetObligation fetches a stored obligation by id.
 	GetObligation(ctx context.Context, id string) (VerificationObligation, error)
 	// GetOutcome fetches any stored outcome (claim or verified) by id. It is
@@ -52,7 +52,7 @@ type VerificationStore interface {
 	GetOutcome(ctx context.Context, id string) (VerificationOutcome, error)
 	// QueryOutcome fetches the authoritative verified record. Claims never
 	// satisfy it as a proven pass (ErrUnverified).
-	QueryOutcome(ctx context.Context, id string) (VerifiedOutcome, error)
+	QueryOutcome(ctx context.Context, id string) (DerivedVerifiedOutcome, error)
 	// OutcomesForObligation lists every recorded outcome answering the
 	// obligation, ordered by verification id.
 	OutcomesForObligation(ctx context.Context, obligationID string) ([]VerificationOutcome, error)
@@ -125,7 +125,7 @@ func (m *MemoryStore) RecordOutcome(ctx context.Context, v VerificationOutcome) 
 
 // RecordVerifiedOutcome records an authoritative result; VerificationID is
 // the idempotency key.
-func (m *MemoryStore) RecordVerifiedOutcome(ctx context.Context, v VerifiedOutcome) error {
+func (m *MemoryStore) RecordVerifiedOutcome(ctx context.Context, v DerivedVerifiedOutcome) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -158,9 +158,9 @@ func (m *MemoryStore) GetOutcome(ctx context.Context, id string) (VerificationOu
 }
 
 // QueryOutcome fetches the authoritative verified record.
-func (m *MemoryStore) QueryOutcome(ctx context.Context, id string) (VerifiedOutcome, error) {
+func (m *MemoryStore) QueryOutcome(ctx context.Context, id string) (DerivedVerifiedOutcome, error) {
 	if err := ctx.Err(); err != nil {
-		return VerifiedOutcome{}, err
+		return DerivedVerifiedOutcome{}, err
 	}
 	return m.r.QueryOutcome(id)
 }

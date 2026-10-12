@@ -19,14 +19,16 @@ import (
 // The registry never invents executions or evidence: outcome.ExecutionIDs and
 // outcome.EvidenceRoot are caller-supplied references into the
 // execution/provenance surfaces until an EvidenceVerifier cryptographically
-// resolves them into a VerifiedOutcome.
+// resolves them into a DerivedVerifiedOutcome.
 //
 // # Acceptance boundary
 //
 // RecordOutcome stores a CLAIM: the outcome is validated and bound, but it is
 // never proof. Only RecordVerifiedOutcome stores an authoritative result, and
-// it accepts only sealed VerifiedOutcome values (server-created by an
-// EvidenceVerifier). QueryOutcome returns authoritative records only — a raw
+// it accepts only sealed DerivedVerifiedOutcome values (server-created by an
+// EvidenceVerifier, with every authority-bearing value DERIVED from the
+// signed evidence — the caller's submission is a proposal preserved on
+// SubmittedClaim). QueryOutcome returns authoritative records only — a raw
 // claim never satisfies it as a proven pass (ErrUnverified).
 type Registry struct {
 	mu          sync.RWMutex
@@ -35,9 +37,9 @@ type Registry struct {
 	// outcomes holds every recorded claim (and the outcome side of verified
 	// records) keyed by verification id.
 	outcomes map[string]VerificationOutcome
-	// verified holds ONLY sealed VerifiedOutcome records. Membership here is
-	// what makes a result authoritative.
-	verified     map[string]VerifiedOutcome
+	// verified holds ONLY sealed DerivedVerifiedOutcome records. Membership
+	// here is what makes a result authoritative.
+	verified     map[string]DerivedVerifiedOutcome
 	groups       map[string]SpeculativeGroup
 	capabilities map[string]VerifierCapability
 }
@@ -52,7 +54,7 @@ func NewRegistry(clock func() time.Time) *Registry {
 		clock:        clock,
 		obligations:  make(map[string]VerificationObligation),
 		outcomes:     make(map[string]VerificationOutcome),
-		verified:     make(map[string]VerifiedOutcome),
+		verified:     make(map[string]DerivedVerifiedOutcome),
 		groups:       make(map[string]SpeculativeGroup),
 		capabilities: make(map[string]VerifierCapability),
 	}
@@ -126,15 +128,22 @@ func (r *Registry) RecordOutcome(v VerificationOutcome) error {
 	return nil
 }
 
-// RecordVerifiedOutcome stores a sealed VerifiedOutcome as the AUTHORITATIVE
-// result of its verification. Only records produced by an EvidenceVerifier
-// are accepted: an unsealed value (including a raw submitted outcome) is
-// refused with ErrUnverified, so a forged evidence_root can never become a
-// proven pass. The outcome inside is validated and bound exactly like a
-// claim (including the substrate-derived Measured facts); a claim already
-// stored under the same verification id is upgraded only when it is the same
-// submission as the verified record's outcome.
-func (r *Registry) RecordVerifiedOutcome(v VerifiedOutcome) error {
+// RecordVerifiedOutcome stores a sealed DerivedVerifiedOutcome as the
+// AUTHORITATIVE result of its verification. Only records produced by an
+// EvidenceVerifier (or restored through the acceptance integrity path) are
+// accepted: an unsealed value (including a raw submitted outcome) is refused
+// with ErrUnverified, so a forged evidence_root can never become a proven
+// pass. The derived Outcome inside is validated and bound exactly like a
+// claim (including the substrate-derived Measured facts).
+//
+// Model A split: the caller's submission is kept AS-IS as the stored claim
+// (GetOutcome / OutcomesForObligation), and the derived Outcome is stored as
+// the authoritative record (QueryOutcome). A claim already stored under the
+// same verification id is upgraded only when it is the same submission as the
+// record's SubmittedClaim — the derived outcome itself is allowed (and
+// expected) to differ from the claim, because the claim is a proposal and the
+// derived values are authority.
+func (r *Registry) RecordVerifiedOutcome(v DerivedVerifiedOutcome) error {
 	if !v.Sealed() {
 		return fmt.Errorf("%w: RecordVerifiedOutcome requires a verifier-produced record", ErrUnverified)
 	}
@@ -144,7 +153,10 @@ func (r *Registry) RecordVerifiedOutcome(v VerifiedOutcome) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, exists := r.verified[out.VerificationID]; exists {
+	if existing, exists := r.verified[out.VerificationID]; exists {
+		if claimEquivalent(existing.Outcome, out) {
+			return nil
+		}
 		return fmt.Errorf("%w: outcome %q", ErrExists, out.VerificationID)
 	}
 	ob, ok := r.obligations[out.ObligationID]
@@ -168,24 +180,38 @@ func (r *Registry) RecordVerifiedOutcome(v VerifiedOutcome) error {
 	// only from the sealed evidence's attested job facts (nil on a record
 	// whose attestations carry no window).
 	out.Resources.Measured = DeriveMeasuredFacts(out, v.Evidence.Attested)
-	if claim, exists := r.outcomes[out.VerificationID]; exists {
-		if !claimEquivalent(claim, out) {
+	// Model A: the claim side is stored as submitted, never overwritten by
+	// the derived outcome.
+	claim := cloneOutcome(v.SubmittedClaim)
+	claim.Resources.Measured = DeriveMeasuredFacts(claim, nil)
+	if stored, exists := r.outcomes[out.VerificationID]; exists {
+		if !claimCompatible(stored, claim) {
 			return fmt.Errorf("%w: outcome %q already recorded as a different claim", ErrExists, out.VerificationID)
 		}
+	} else {
+		r.outcomes[out.VerificationID] = claim
 	}
-	stored := cloneOutcome(out)
-	r.outcomes[out.VerificationID] = stored
 	seal := v
-	seal.Outcome = stored
-	r.verified[out.VerificationID] = cloneVerified(seal)
+	seal.Outcome = cloneOutcome(out)
+	r.verified[out.VerificationID] = cloneDerived(seal)
 	return nil
 }
 
 // claimEquivalent reports whether a stored claim and a verified record's
-// outcome are the same submission. Binding-relevant fields, evidence claims
-// and the reported resource facts are all compared (the substrate-derived
-// Measured subset is excluded — it is filled at record time) so two different
-// runs cannot share one verification id.
+// outcome are the same submission. Binding-relevant fields, the evidence
+// root and the reported resource facts are compared exactly (the
+// substrate-derived Measured subset is excluded — it is filled at record
+// time) so two different runs cannot share one verification id.
+//
+// ExecutionIDs use Model A canonicalization instead of strict list equality:
+// the submitted claim and the verified evidence keep their id sets DISTINCT
+// forever, so evidence-derived id upgrades (empty→one, subset→full,
+// duplicates, reordering) must never be treated as claim conflicts. The two
+// sets are therefore compared set-wise and a subset relation in either
+// direction is accepted; disjoint or partially-overlapping sets remain a
+// conflict (a claim naming an id the other side does not is a different
+// submission — Verify already refuses any claimed id the attestations do
+// not bind).
 func claimEquivalent(a, b VerificationOutcome) bool {
 	if !(a.VerificationID == b.VerificationID &&
 		a.ObligationID == b.ObligationID &&
@@ -196,10 +222,12 @@ func claimEquivalent(a, b VerificationOutcome) bool {
 		a.AssuranceProfile == b.AssuranceProfile &&
 		a.EvidenceRoot == b.EvidenceRoot &&
 		equalStringSlices(a.CompletedChecks, b.CompletedChecks) &&
-		equalStringSlices(a.ExecutionIDs, b.ExecutionIDs) &&
 		equalStringSlices(a.ProvenanceRefs, b.ProvenanceRefs) &&
 		a.StartedAt.Equal(b.StartedAt) &&
 		a.CompletedAt.Equal(b.CompletedAt)) {
+		return false
+	}
+	if !executionIDsCompatible(a.ExecutionIDs, b.ExecutionIDs) {
 		return false
 	}
 	ra, rb := a.Resources, b.Resources
@@ -219,22 +247,67 @@ func equalStringSlices(a, b []string) bool {
 	return true
 }
 
+// claimCompatible reports whether a stored claim and a sealed record's
+// SubmittedClaim are the same submission. It is claimEquivalent on every
+// dimension except ExecutionIDs, where a subset/superset relationship is
+// tolerated: a pre-Model-A sealed record carries the evidence-derived id set
+// on its claim side, which is an upgrade of the raw claim (not a different
+// claim). Partially-overlapping or disjoint id sets remain a conflict.
+func claimCompatible(a, b VerificationOutcome) bool {
+	aa, bb := a, b
+	aa.ExecutionIDs, bb.ExecutionIDs = nil, nil
+	if !claimEquivalent(aa, bb) {
+		return false
+	}
+	return executionIDsCompatible(a.ExecutionIDs, b.ExecutionIDs)
+}
+
+// executionIDsCompatible reports whether two execution-id lists may belong to
+// the same claim under Model A. Duplicates and ordering are canonicalized
+// away; one side being a subset of the other is an evidence-derived id
+// upgrade (or a raw claim naming fewer ids than the evidence resolved) and
+// is compatible. Disjoint or partially-overlapping sets are not.
+func executionIDsCompatible(a, b []string) bool {
+	sa, sb := stringSet(a), stringSet(b)
+	return isSubset(sa, sb) || isSubset(sb, sa)
+}
+
+func stringSet(ids []string) map[string]struct{} {
+	s := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		s[id] = struct{}{}
+	}
+	return s
+}
+
+func isSubset(sub, super map[string]struct{}) bool {
+	if len(sub) > len(super) {
+		return false
+	}
+	for id := range sub {
+		if _, ok := super[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 // QueryOutcome fetches the authoritative verified record for a verification
 // id. A raw submitted outcome kept as a claim never satisfies this query as a
 // proven pass: a claim-only id returns ErrUnverified and an unknown id
 // returns ErrNotFound. Callers that accept claims may read them via Outcome /
 // OutcomesForObligation; callers that need proof must use QueryOutcome (see
-// VerifiedOutcome.ProvenPass).
-func (r *Registry) QueryOutcome(id string) (VerifiedOutcome, error) {
+// DerivedVerifiedOutcome.ProvenPass).
+func (r *Registry) QueryOutcome(id string) (DerivedVerifiedOutcome, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	if v, ok := r.verified[id]; ok {
-		return cloneVerified(v), nil
+		return cloneDerived(v), nil
 	}
 	if _, ok := r.outcomes[id]; ok {
-		return VerifiedOutcome{}, fmt.Errorf("%w: outcome %q is an unverified claim", ErrUnverified, id)
+		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: outcome %q is an unverified claim", ErrUnverified, id)
 	}
-	return VerifiedOutcome{}, fmt.Errorf("%w: outcome %q", ErrNotFound, id)
+	return DerivedVerifiedOutcome{}, fmt.Errorf("%w: outcome %q", ErrNotFound, id)
 }
 
 // Outcome fetches a stored outcome by id. This returns claims as well as the
@@ -326,6 +399,12 @@ func (r *Registry) CompareGroup(groupID string) (GroupComparison, error) {
 		if !rf.Speculative || rf.VerificationGroupID != groupID {
 			continue
 		}
+		// Prefer the DERIVED authoritative outcome when one exists: its
+		// Measured facts are substrate-filled from evidence. The claim is
+		// the fallback for claim-only members.
+		if seal, ok := r.verified[v.VerificationID]; ok {
+			v = seal.Outcome
+		}
 		if err := BindGroup(g, v); err != nil {
 			return GroupComparison{}, err
 		}
@@ -411,6 +490,10 @@ func cloneCapability(c VerifierCapability) VerifierCapability {
 func cloneObligation(o VerificationObligation) VerificationObligation {
 	out := o
 	out.RequiredChecks = append([]string(nil), o.RequiredChecks...)
+	if o.SubjectRef != nil {
+		s := *o.SubjectRef
+		out.SubjectRef = &s
+	}
 	if o.OpaqueCorrelationMetadata != nil {
 		out.OpaqueCorrelationMetadata = make(map[string]string, len(o.OpaqueCorrelationMetadata))
 		for k, v := range o.OpaqueCorrelationMetadata {
@@ -445,14 +528,20 @@ func cloneResources(r ResourceFacts) ResourceFacts {
 	return r
 }
 
-func cloneVerified(v VerifiedOutcome) VerifiedOutcome {
+func cloneDerived(v DerivedVerifiedOutcome) DerivedVerifiedOutcome {
 	out := v
+	out.SubmittedClaim = cloneOutcome(v.SubmittedClaim)
 	out.Outcome = cloneOutcome(v.Outcome)
 	out.Evidence.ExecutionIDs = append([]string(nil), v.Evidence.ExecutionIDs...)
 	out.Evidence.AttestationDigests = append([]Digest(nil), v.Evidence.AttestationDigests...)
+	out.Evidence.CompletedChecks = append([]string(nil), v.Evidence.CompletedChecks...)
 	if v.Evidence.Attested != nil {
 		a := *v.Evidence.Attested
 		out.Evidence.Attested = &a
+	}
+	if v.Evidence.ObservedControls != nil {
+		c := *v.Evidence.ObservedControls
+		out.Evidence.ObservedControls = &c
 	}
 	return out
 }

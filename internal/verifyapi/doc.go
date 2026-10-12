@@ -70,18 +70,38 @@
 //
 // Structural binding alone is not proof: a caller can submit Result=pass with
 // matching digests and an arbitrary evidence_root. The EvidenceVerifier is
-// the acceptance boundary before verifyapi becomes authoritative. Verify
-// cryptographically resolves the outcome's evidence references (signed
-// execution attestations: signatures, subject-digested evidence blocks,
-// evidence roots) and returns a server-created VerifiedOutcome carrying the
-// resolved execution ids, evidence root, attestation digests and verifier
-// identity. Only a VerifiedOutcome may be stored as authoritative
-// (Registry.RecordVerifiedOutcome). Unverified submitted outcomes can be
-// kept as claims (RecordOutcome) but never satisfy QueryOutcome as a proven
-// pass: a claim-only id answers ErrUnverified. The concrete adapter
-// (ProvenanceEvidenceVerifier) calls internal/provenance.VerifyWith and
-// VerifyExecutionAttestation; the FuncEvidenceVerifier seam keeps those
-// imports injectable.
+// the acceptance boundary before verifyapi becomes authoritative, and it
+// DERIVES authority from authenticated evidence (Model A): Verify(obligation,
+// submittedClaim) cryptographically resolves the claim's evidence references
+// (signed execution attestations: signatures, subject-digested evidence
+// blocks, evidence roots, job status, assurance facts, observed controls,
+// bound checks) and returns a server-created DerivedVerifiedOutcome whose
+// Result, CompletedChecks, AssuranceProfile, ExecutionIDs, EvidenceRoot and
+// Measured resource facts all come from what the signatures prove — never
+// from the caller's proposal. The caller's submission is preserved verbatim
+// on SubmittedClaim and authorizes nothing; a check only counts as completed
+// when structured signed result evidence binds it (attestation facts, a
+// test-report suite, an explicit signed check result). A pass requires the
+// signed job status success AND full obligation check coverage by those
+// derived checks. Only a DerivedVerifiedOutcome may be stored as
+// authoritative (Registry.RecordVerifiedOutcome). Unverified submitted
+// outcomes can be kept as claims (RecordOutcome) but never satisfy
+// QueryOutcome as a proven pass: a claim-only id answers ErrUnverified. The
+// concrete adapter (ProvenanceEvidenceVerifier) calls
+// internal/provenance.VerifyWith and VerifyExecutionAttestation; the
+// FuncEvidenceVerifier seam keeps those imports injectable.
+//
+// # Acceptance integrity (durable restore)
+//
+// A durable database row is never authority: the process seal cannot be
+// serialized. Acceptance is the durable stand-in — Accept() computes an
+// AcceptanceRecord (versioned digests of the exact (obligation, outcome,
+// evidence) triple, algorithm, key id, and a MAC under the ACCEPTANCE key,
+// which is separate from the runner evidence keys) at persist time, and
+// RestoreVerifiedOutcome() re-checks those digests plus the MAC before
+// resealing. An unsigned row, a tampered payload, a flipped verified flag or
+// a wrong MAC can never produce ProvenPass. The PostgresStore read path goes
+// through exactly this check.
 //
 // # Verifier capabilities
 //

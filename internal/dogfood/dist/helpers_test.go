@@ -431,6 +431,25 @@ func apiGet(t *testing.T, baseURL, token, path string, out any) int {
 	return resp.StatusCode
 }
 
+// apiGetBytes performs an authenticated GET and returns the raw body bytes
+// and status code (no JSON decoding) — used for artifact downloads whose
+// bytes must be hash-compared across backup/restore.
+func apiGetBytes(t *testing.T, baseURL, token, path string) (int, []byte) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, baseURL+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", path, err)
+	}
+	defer resp.Body.Close()
+	payload, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	return resp.StatusCode, payload
+}
+
 // apiPost performs an authenticated POST and decodes the JSON response.
 func apiPost(t *testing.T, baseURL, token, path string, body any, out any) (int, []byte) {
 	t.Helper()

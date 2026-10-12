@@ -68,6 +68,14 @@ type VerificationObligation struct {
 	// Subject names what is being verified (artifact name, service id, …).
 	// Opaque to the substrate.
 	Subject string `json:"subject"`
+	// SubjectRef, when set, pins the authority subject of this obligation
+	// (namespace / tenant / project / repository). It participates in the
+	// canonical obligation digest and in store idempotency: the same
+	// content digests under a different SubjectRef are a different
+	// obligation and are never interchangeable authority. Nil (or the zero
+	// ref) means the obligation carries no authority subject — the legacy
+	// single-tenant shape. See SubjectRef.
+	SubjectRef *SubjectRef `json:"subject_ref,omitempty"`
 	// ImmutableCandidateDigest pins the exact candidate under verification.
 	// Any different digest is a different obligation.
 	ImmutableCandidateDigest Digest `json:"immutable_candidate_digest"`
