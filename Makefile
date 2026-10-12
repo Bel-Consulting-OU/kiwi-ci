@@ -182,16 +182,20 @@ dogfood-scale:
 
 # DF7 release-candidate closure for the pieces that gate a release today:
 # evidence truthfulness, quota, effects, self-host generation limit.
-# dogfood-release-model runs what is implemented today. It is NOT a release
-# gate: production closure scenarios are still missing (see banner).
+# dogfood-release-model is the faster model+system subset and is NOT a
+# release gate. The production proofs (DF-DIST-001 / DF-SCALE-002 /
+# DF-DR-001 live topology, soak and DR, plus the binary proofs) run under
+# `make dogfood-production` / `make dogfood-release-artifacts`, which
+# `make release-gate` requires.
 dogfood-release-model:
-	@echo "RELEASE DOGFOOD (model+system, NOT a release gate) — production scenarios still MISSING:"
-	@echo "  DF-DIST-001     live multi-process topology (postgres/objectstore/2 runners)"
-	@echo "  DF-SCALE-002    live resource-leak / soak"
-	@echo "  DF-DR-001       backup → destroy → restore"
+	@echo "RELEASE DOGFOOD (model+system subset, NOT a release gate)."
+	@echo "Production proofs run under make release-gate:"
+	@echo "  DF-DIST-001     live multi-process topology (postgres/objectstore/2 runners) — dogfood-production"
+	@echo "  DF-SCALE-002    live resource-leak / soak — dogfood-production"
+	@echo "  DF-DR-001       backup → destroy → restore — dogfood-production"
 	@echo "  (binary proofs DF-UPGRADE-002 / DF-SELF-002 / DF-RELEASE-001: make dogfood-release-artifacts)"
 	@echo "  (DF1 system proofs are real: make dogfood-system — NewPersistent + HTTP + runner)"
-	@echo "Running the implemented suite anyway:"
+	@echo "Running the implemented subset anyway:"
 	./scripts/dogfood-run.sh 180m \
 		--run 'TestDFEVID|TestDFQUOTA|TestDFEFFECT|TestDFSELF|TestDFBOOT|TestDogfoodResult|TestScenarioResult' \
 		--require TestDFEVID001 \

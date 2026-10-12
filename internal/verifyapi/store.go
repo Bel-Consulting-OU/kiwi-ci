@@ -24,11 +24,11 @@ import (
 //
 //   - MemoryStore (this package) is the in-process reference implementation
 //     and the one the unit tests pin the contract against.
-//   - PostgresStore (internal/storage) is the PRODUCTION durable
-//     implementation. It is deliberately not defined in this package: the
-//     verification contract stays free of database drivers and migrations,
-//     and the storage layer owns the SQL schema, transactions and HA
-//     behavior. Host applications that need durability construct a
+//   - PostgresStore (internal/storage/verifystore) is the PRODUCTION
+//     durable implementation. It is deliberately not defined in this
+//     package: the verification contract stays free of database drivers and
+//     migrations, and the storage layer owns the SQL schema, transactions
+//     and HA behavior. Host applications that need durability construct a
 //     PostgresStore there and depend on this interface here.
 //
 // Every method takes a context for cancellation and for store-side deadlines

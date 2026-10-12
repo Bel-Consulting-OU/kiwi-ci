@@ -34,6 +34,12 @@ type VerifiedEvidence struct {
 	// AttestationDigests are the canonical subject digests of the verified
 	// attestation statements (the digests their signatures bind).
 	AttestationDigests []Digest `json:"attestation_digests"`
+	// Attested holds the durable execution facts the verified attestations
+	// carry (job started_at/finished_at), when any of them do. Nil when the
+	// attestations carry no job window — e.g. older statements — in which
+	// case Measured.WallTimeNS stays unfilled rather than guessed. Filled
+	// exclusively from signature-checked attestation material.
+	Attested *AttestedResourceFacts `json:"attested,omitempty"`
 	// VerifierIdentity names the evidence verifier that produced this record.
 	VerifierIdentity string `json:"verifier_identity"`
 	// VerifiedAt is when the verifier resolved the evidence (verifier clock).
@@ -84,11 +90,18 @@ func (v VerifiedOutcome) ProvenPass() bool {
 
 // ResolvedAttestation is one cryptographically resolved execution
 // attestation: the execution identity it binds, the evidence root it commits,
-// and the canonical digest its signature covers.
+// the canonical digest its signature covers, and — when the signed statement
+// carries a job execution window — the attested job facts themselves.
 type ResolvedAttestation struct {
 	ExecutionID       string
 	EvidenceRoot      Digest
 	AttestationDigest Digest
+	// Attested carries the durable job facts the signature covers (job
+	// started_at/finished_at). Optional: nil when the statement carries no
+	// window; the verifier then records no attested wall time instead of
+	// inventing one. A resolver must copy these from the signed attestation
+	// only — never from the caller's claim.
+	Attested *AttestedResourceFacts
 }
 
 // AttestationResolver cryptographically resolves one opaque evidence
@@ -188,9 +201,45 @@ func (f *FuncEvidenceVerifier) Verify(ctx context.Context, outcome VerificationO
 		ExecutionIDs:       execIDs,
 		EvidenceRoot:       root,
 		AttestationDigests: digests,
+		Attested:           mergeAttested(resolved),
 		VerifierIdentity:   f.Identity,
 		VerifiedAt:         now(),
 	})
+}
+
+// mergeAttested folds the attested job facts of every resolved attestation
+// into one window. Fail closed on a partial set: if some attestations carry a
+// job window and others do not, or any window is inverted, the merged facts
+// are dropped entirely (nil) rather than reported as attested from a subset —
+// a half-attested window would overstate what the signatures prove. When
+// every attestation carries a window, the merged facts are the envelope
+// (earliest start, latest finish) of the attested executions.
+func mergeAttested(resolved []ResolvedAttestation) *AttestedResourceFacts {
+	if len(resolved) == 0 {
+		return nil
+	}
+	var merged *AttestedResourceFacts
+	for _, att := range resolved {
+		if att.Attested == nil {
+			return nil
+		}
+		a := *att.Attested
+		if a.StartedAt.IsZero() || a.FinishedAt.IsZero() || a.FinishedAt.Before(a.StartedAt) {
+			return nil
+		}
+		if merged == nil {
+			m := a
+			merged = &m
+			continue
+		}
+		if a.StartedAt.Before(merged.StartedAt) {
+			merged.StartedAt = a.StartedAt
+		}
+		if a.FinishedAt.After(merged.FinishedAt) {
+			merged.FinishedAt = a.FinishedAt
+		}
+	}
+	return merged
 }
 
 // sealVerifiedOutcome builds a sealed VerifiedOutcome. It is the only way
@@ -222,4 +271,18 @@ func sealVerifiedOutcome(outcome VerificationOutcome, evidence VerifiedEvidence)
 	}
 	out.Outcome.ExecutionIDs = append([]string(nil), evidence.ExecutionIDs...)
 	return out, nil
+}
+
+// RestoreVerifiedOutcome rehydrates a persisted authoritative record: the
+// (outcome, evidence) pair a durable VerificationStore previously accepted
+// via RecordVerifiedOutcome. The unexported seal cannot be serialized, so
+// this is the ONLY way authority survives a process restart; it applies the
+// same completeness rules as first sealing, so a truncated or edited row is
+// refused instead of quietly losing the proven-pass bit.
+//
+// It never mints first authority. Callers must pass only values that were
+// sealed when written (the production PostgresStore calls this on its read
+// path); application code should go through QueryOutcome.
+func RestoreVerifiedOutcome(outcome VerificationOutcome, evidence VerifiedEvidence) (VerifiedOutcome, error) {
+	return sealVerifiedOutcome(outcome, evidence)
 }

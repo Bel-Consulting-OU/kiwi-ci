@@ -95,16 +95,105 @@ type VerificationObligation struct {
 	IssuedAt time.Time `json:"issued_at"`
 }
 
-// MeasuredResourceFacts are substrate-derived facts of one verification
-// execution. They are never caller-asserted: the registry fills them at
-// record time from the outcome's own execution interval (and, later, from
-// execution evidence), so a resource comparison cannot be gamed by a
-// dishonest reporter. Extend this type only with quantities the substrate
-// itself can derive or verify.
+// FactSource identifies how one resource fact became known to the
+// substrate. It is the audit vocabulary for the economics surface: every
+// quantity is derived, attested, or reported — never "trusted by default".
+type FactSource string
+
+const (
+	// FactSourceDerived: the substrate computed the value itself from
+	// fields it validates at record time (e.g. DurationNS from the
+	// outcome's execution interval). A caller cannot inflate it.
+	FactSourceDerived FactSource = "derived"
+	// FactSourceAttested: the value was bound by cryptographically
+	// resolved execution evidence (a signed execution attestation resolved
+	// through the AttestationResolver seam), not by caller assertion.
+	FactSourceAttested FactSource = "attested"
+	// FactSourceReported: caller assertion only. CPU time, peak memory,
+	// I/O and cache counters stay reported until runners emit attested
+	// measurements for them; treat them as trustworthy only as far as the
+	// reporter is.
+	FactSourceReported FactSource = "reported"
+)
+
+// FactSourceOf reports the provenance of one resource fact by name. Use the
+// qualified names "measured.duration_ns" (derived) and
+// "measured.wall_time_ns" (attested) for the Measured subset; the
+// ResourceFacts wire field names ("cpu_time_ns", "wall_time_ns", …) are all
+// reported today. An unknown name returns "" so a new field must be marked
+// deliberately before it can claim a source.
+func FactSourceOf(name string) FactSource {
+	switch name {
+	case "measured.duration_ns":
+		return FactSourceDerived
+	case "measured.wall_time_ns":
+		return FactSourceAttested
+	case "queue_latency_ns", "execution_latency_ns", "wall_time_ns",
+		"cpu_time_ns", "peak_memory_bytes", "io_bytes", "cache_hits",
+		"cache_misses", "runner_class", "retry_count", "cancelled",
+		"duplicate_avoided", "speculative":
+		return FactSourceReported
+	default:
+		return ""
+	}
+}
+
+// AttestedResourceFacts are execution facts carried by a verified execution
+// attestation — the durable job facts an execution store or runner signed,
+// never a caller claim. The verifier copies them from cryptographically
+// resolved attestation material only (see ResolvedAttestation.Attested).
+//
+// Scope: until runners emit attested CPU/memory/cache measurements, those
+// quantities stay REPORTED on ResourceFacts and are deliberately absent
+// here. Extend this type only with facts a signed attestation actually
+// carries.
+type AttestedResourceFacts struct {
+	// StartedAt / FinishedAt are the job execution window the signed
+	// attestation carries (the job's started_at/finished_at). Both must be
+	// set and started_at <= finished_at or the facts are not attested.
+	StartedAt  time.Time `json:"started_at"`
+	FinishedAt time.Time `json:"finished_at"`
+}
+
+// WallTimeNS returns the attested job wall window in nanoseconds
+// (finished_at - started_at).
+func (a AttestedResourceFacts) WallTimeNS() int64 {
+	return a.FinishedAt.Sub(a.StartedAt).Nanoseconds()
+}
+
+// DeriveMeasuredFacts builds the Measured subset of one outcome record:
+// DurationNS is always derived from the outcome's own execution interval
+// (the registry overwrites any caller-supplied value so a dishonest reporter
+// cannot inflate a comparison), and WallTimeNS is filled only from attested
+// execution facts when the evidence resolver supplied them. attested may be
+// nil (claim path, or evidence carrying no job window), in which case
+// WallTimeNS stays zero and is not attested.
+func DeriveMeasuredFacts(v VerificationOutcome, attested *AttestedResourceFacts) *MeasuredResourceFacts {
+	m := &MeasuredResourceFacts{
+		DurationNS: v.CompletedAt.Sub(v.StartedAt).Nanoseconds(),
+	}
+	if attested != nil {
+		m.WallTimeNS = attested.WallTimeNS()
+	}
+	return m
+}
+
+// MeasuredResourceFacts are substrate-filled facts of one verification
+// execution. They are never caller-asserted: the registry overwrites any
+// caller-supplied value at record time, so a resource comparison cannot be
+// gamed by a dishonest reporter. Extend this type only with quantities the
+// substrate itself can derive or verify from execution evidence.
 type MeasuredResourceFacts struct {
 	// DurationNS is the execution window in nanoseconds
 	// (completed_at - started_at), derived by the registry at record time.
+	// source: derived.
 	DurationNS int64 `json:"duration_ns"`
+	// WallTimeNS is the job wall window taken from verified execution
+	// evidence (the attested job started_at/finished_at resolved through
+	// the AttestationResolver seam). Zero when no attested window was
+	// resolved — a claim path never fills it.
+	// source: attested.
+	WallTimeNS int64 `json:"wall_time_ns,omitempty"`
 }
 
 // ResourceFacts are the neutral economic facts of one verification execution.
@@ -112,12 +201,13 @@ type MeasuredResourceFacts struct {
 // dimensions or vendor concepts here. All durations are nanoseconds and all
 // sizes are bytes so serialization is unit-stable.
 //
-// Every field of ResourceFacts is a REPORTED fact: a caller assertion about
-// the execution. CPU time, memory, I/O and cache counters are reported until
+// Provenance of each quantity (see FactSource / FactSourceOf): every scalar
+// field on this struct is a REPORTED fact — a caller assertion about the
+// execution. CPU time, memory, I/O and cache counters stay reported until
 // they are tied to execution evidence (an attested runner measurement or an
 // equivalent provenance binding); treat them as trustworthy only as far as
-// the reporter is. Substrate-derived quantities live in Measured and are
-// filled by the registry at record time.
+// the reporter is. Substrate-derived and attested quantities live in Measured
+// and are filled by the registry at record time, never by the caller.
 type ResourceFacts struct {
 	QueueLatencyNS      int64  `json:"queue_latency_ns"`
 	ExecutionLatencyNS  int64  `json:"execution_latency_ns"`
@@ -134,10 +224,12 @@ type ResourceFacts struct {
 	Speculative         bool   `json:"speculative"`
 	VerificationGroupID string `json:"verification_group_id,omitempty"`
 	CandidateID         string `json:"candidate_id,omitempty"`
-	// Measured holds substrate-derived facts (currently the execution
-	// duration from started_at/completed_at). Optional on the wire; the
-	// registry fills it at record time and overwrites any caller-supplied
-	// value. Callers should leave it nil.
+	// Measured holds substrate-derived and attested facts: DurationNS is
+	// always derived from started_at/completed_at at record time, and
+	// WallTimeNS is filled from attested execution facts when the evidence
+	// resolver supplied them. Optional on the wire; the registry fills it
+	// at record time and overwrites any caller-supplied value. Callers
+	// should leave it nil.
 	Measured *MeasuredResourceFacts `json:"measured,omitempty"`
 }
 

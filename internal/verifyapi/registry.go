@@ -14,7 +14,8 @@ import (
 //
 // Storage is intentionally in-memory: persisting verification state is the
 // host application's concern (see VerificationStore / MemoryStore; the
-// production durable implementation is PostgresStore in the storage layer).
+// production durable implementation is PostgresStore in
+// internal/storage/verifystore).
 // The registry never invents executions or evidence: outcome.ExecutionIDs and
 // outcome.EvidenceRoot are caller-supplied references into the
 // execution/provenance surfaces until an EvidenceVerifier cryptographically
@@ -116,11 +117,11 @@ func (r *Registry) RecordOutcome(v VerificationOutcome) error {
 			return err
 		}
 	}
-	// Measured facts are substrate-derived, never caller-asserted: overwrite
-	// any supplied value so a dishonest reporter cannot inflate a comparison.
-	v.Resources.Measured = &MeasuredResourceFacts{
-		DurationNS: v.CompletedAt.Sub(v.StartedAt).Nanoseconds(),
-	}
+	// Measured facts are substrate-derived/attested, never caller-asserted:
+	// overwrite any supplied value so a dishonest reporter cannot inflate a
+	// comparison. A claim has no resolved evidence, so it gets derived facts
+	// only (no attested wall time).
+	v.Resources.Measured = DeriveMeasuredFacts(v, nil)
 	r.outcomes[v.VerificationID] = cloneOutcome(v)
 	return nil
 }
@@ -162,10 +163,11 @@ func (r *Registry) RecordVerifiedOutcome(v VerifiedOutcome) error {
 			return err
 		}
 	}
-	// Measured facts are substrate-derived, never caller-asserted.
-	out.Resources.Measured = &MeasuredResourceFacts{
-		DurationNS: out.CompletedAt.Sub(out.StartedAt).Nanoseconds(),
-	}
+	// Measured facts are substrate-derived/attested, never caller-asserted.
+	// DurationNS is derived from the outcome window; WallTimeNS is filled
+	// only from the sealed evidence's attested job facts (nil on a record
+	// whose attestations carry no window).
+	out.Resources.Measured = DeriveMeasuredFacts(out, v.Evidence.Attested)
 	if claim, exists := r.outcomes[out.VerificationID]; exists {
 		if !claimEquivalent(claim, out) {
 			return fmt.Errorf("%w: outcome %q already recorded as a different claim", ErrExists, out.VerificationID)
@@ -448,6 +450,10 @@ func cloneVerified(v VerifiedOutcome) VerifiedOutcome {
 	out.Outcome = cloneOutcome(v.Outcome)
 	out.Evidence.ExecutionIDs = append([]string(nil), v.Evidence.ExecutionIDs...)
 	out.Evidence.AttestationDigests = append([]Digest(nil), v.Evidence.AttestationDigests...)
+	if v.Evidence.Attested != nil {
+		a := *v.Evidence.Attested
+		out.Evidence.Attested = &a
+	}
 	return out
 }
 

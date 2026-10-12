@@ -636,7 +636,9 @@ func TestRecordOutcomeFillsMeasured(t *testing.T) {
 		t.Fatalf("SubmitObligation = %v", err)
 	}
 	v := baseOutcome(t, ob)
-	v.Resources.Measured = &MeasuredResourceFacts{DurationNS: 999} // dishonest reporter
+	// Dishonest reporter: tries to inflate the derived duration and to
+	// smuggle an "attested" wall time on the claim path.
+	v.Resources.Measured = &MeasuredResourceFacts{DurationNS: 999, WallTimeNS: 999}
 	if err := r.RecordOutcome(v); err != nil {
 		t.Fatalf("RecordOutcome = %v", err)
 	}
@@ -650,6 +652,50 @@ func TestRecordOutcomeFillsMeasured(t *testing.T) {
 	}
 	if stored.Resources.Measured.DurationNS != want {
 		t.Fatalf("Measured.DurationNS = %d, want %d", stored.Resources.Measured.DurationNS, want)
+	}
+	// A claim has no resolved evidence, so no attested wall time may appear
+	// no matter what the caller asserted.
+	if stored.Resources.Measured.WallTimeNS != 0 {
+		t.Fatalf("Measured.WallTimeNS on claim path = %d, want 0 (claims cannot attest)", stored.Resources.Measured.WallTimeNS)
+	}
+}
+
+// TestDerivedDurationNotCallerInflatable pins the arithmetic behind the
+// inflation guard: the derived duration is exactly the execution interval the
+// binding layer validated, so shrinking or stretching the reported window
+// cannot change it without also changing the bound timestamps (which
+// freshness checks constrain).
+func TestDerivedDurationNotCallerInflatable(t *testing.T) {
+	v := baseObligation(t)
+	out := baseOutcome(t, v)
+	inflated := out
+	inflated.Resources.Measured = &MeasuredResourceFacts{DurationNS: 1 << 40}
+	m := DeriveMeasuredFacts(inflated, nil)
+	if m.DurationNS != out.CompletedAt.Sub(out.StartedAt).Nanoseconds() {
+		t.Fatalf("derived duration = %d, want the bound execution interval", m.DurationNS)
+	}
+	if m.WallTimeNS != 0 {
+		t.Fatalf("derived wall time = %d, want 0 without attested facts", m.WallTimeNS)
+	}
+}
+
+// TestFactSourceMarksReportedAndMeasured pins the audit vocabulary: the
+// scalar ResourceFacts fields are reported, measured.duration_ns is derived,
+// and measured.wall_time_ns is attested (or unfilled).
+func TestFactSourceMarksReportedAndMeasured(t *testing.T) {
+	for _, name := range []string{"cpu_time_ns", "peak_memory_bytes", "cache_hits", "cache_misses", "wall_time_ns", "io_bytes"} {
+		if got := FactSourceOf(name); got != FactSourceReported {
+			t.Errorf("FactSourceOf(%q) = %q, want reported (CPU/memory/cache stay reported until runners attest them)", name, got)
+		}
+	}
+	if got := FactSourceOf("measured.duration_ns"); got != FactSourceDerived {
+		t.Errorf("FactSourceOf(measured.duration_ns) = %q, want derived", got)
+	}
+	if got := FactSourceOf("measured.wall_time_ns"); got != FactSourceAttested {
+		t.Errorf("FactSourceOf(measured.wall_time_ns) = %q, want attested", got)
+	}
+	if got := FactSourceOf("no_such_field"); got != "" {
+		t.Errorf("FactSourceOf(unknown) = %q, want empty (unmarked fields claim no source)", got)
 	}
 }
 

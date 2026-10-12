@@ -276,8 +276,13 @@ func (r ResourceFacts) validate() error {
 			return fmt.Errorf("%w: speculative resources require candidate_id", ErrInvalid)
 		}
 	}
-	if r.Measured != nil && r.Measured.DurationNS < 0 {
-		return fmt.Errorf("%w: measured.duration_ns must be >= 0", ErrInvalid)
+	if r.Measured != nil {
+		if r.Measured.DurationNS < 0 {
+			return fmt.Errorf("%w: measured.duration_ns must be >= 0", ErrInvalid)
+		}
+		if r.Measured.WallTimeNS < 0 {
+			return fmt.Errorf("%w: measured.wall_time_ns must be >= 0", ErrInvalid)
+		}
 	}
 	return nil
 }

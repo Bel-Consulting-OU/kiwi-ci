@@ -223,10 +223,10 @@ exceed execution authority; untrusted execution cannot poison trusted cache.
 Machine-readable mapping: `public capability → dogfood scenario IDs`
 (`docs/DOGFOOD_MATRIX.md`). A new CLI/API/schema feature requires dogfood
 coverage or an explicit `dogfood_not_applicable: <reason>` that code review
-can challenge. Enforce the mapping in review today; an automated
-`surfacecheck` gate for the matrix is planned (the existing surfacecheck
-guards cover DF0 pipeline markers, package test presence, and script
-inventory).
+can challenge. The mapping is enforced by `TestDogfoodMatrixMatchesRegistry`
+(the matrix's implemented-ID list must equal the scenario registry) plus the
+review rule; the broader `surfacecheck` package guards cover DF0 pipeline
+markers, package test presence, and script inventory.
 
 ## Scenario IDs
 
@@ -268,30 +268,36 @@ requires:
 
 | Proof | Test |
 |---|---|
-| DF-DIST-001 live topology (server + 2 runners + client) | `TestSysDFDist001` |
-| DF-DR-001 backup → destroy → restore | `TestSysDFDr001` |
+| DF-DIST-001 live topology (server + 2 runners + client) | `TestSysDFDist001Integration` (`internal/dogfood/dist`) |
+| DF-DR-001 backup → destroy → restore (production storage) | `TestSysDFDr001PostgresObjectStoreIntegration` (`internal/dogfood/dist`) |
+| DF-DR-001 backup → destroy → restore (FS/dev mode) | `TestSysDFDr001FSMode` (`internal/dogfood/system`) |
 | DF-SCALE-002 soak + runner churn / resource recovery | `TestSysDFScale002Soak` |
 | DF-UPGRADE-002 N-1 binary → HEAD on same state | `TestSysDFUpgrade002NMinusOne` |
 | DF-SELF-002 G0→G1→G2 binary self-build | `TestSysDFSelf002G1ToG2` |
 | DF-RELEASE-001 exact packaged artifact lifecycle | `TestSysDFRelease001PackagedArtifact` |
 | Untrusted-container / evidence lane | `TestSysUntrustedContainerEvidenceLane` |
 
+Every name above is a real `func Test…` and is `--require`d by its suite in
+the Makefile (`TestMakefileRequiresOnlyExistingTests` enforces the pairing).
+
 ## Implemented vs planned
 
 The harness, oracle, hostile runner, fakes and the scenario kernel below are
-**implemented and green** under `make dogfood-*`. Suites whose live
-multi-process topology (real postgres/objectstore, packaged-binary install,
-10k-job soak) is not yet online still run their harness-level proofs through
-`scripts/dogfood-run.sh`, which **fails closed** on a filter that matches
-zero tests.
+**implemented and green** under `make dogfood-*`. The live multi-process
+topology (real PostgreSQL + object/blob store, two real runners), the
+production DR drill, the packaged-binary install lifecycle and the
+fixed-workload soak + churn are online as `TestSys*` system/dist proofs and
+run through `make release-gate`. What remains planned is the long multi-hour
+/10k-job soak scale, DF3 chaos at scale and the DF5 real-forge canary.
 
 | Implemented now | Planned next wave |
 |---|---|
-| DF-BOOT-001, DF-EVID-001..005, DF-LEASE-001/002, DF-QUOTA-001, DF-EFFECT-001/002, DF-SELF-001 (G0/G1/G2 limit), DF-UPGRADE-001 (evidence compat), DF-SCALE-001 (harness workload) — **model species** | DF3 process/network chaos at scale, DF5 real-forge canary, long multi-hour soak |
-| DF-BOOT-001 / DF-EVID-001 / DF-LEASE-001 / DF-QUOTA-001 — **system species** via `TestSys*` in `internal/dogfood/system/` (real `NewPersistent` + HTTP + runner). Fail-closed arms (stale lease generation → 409, untrusted hard-quota gate, untrusted rootless floor) always run. Boot/restart and evidence success arms run an untrusted container job when rootless Docker satisfies the untrusted policy floor, and otherwise run a TRUSTED native job through the product trusted ingress (`TestSysTrustedIngress` signed GitHub webhook, `TestSysTrustedScheduleIngress` trusted schedule) — so they execute on hosts without rootless Docker instead of skipping. Direct API submissions stay untrusted (the product force-clears `Trusted`); the store is never mutated to fake trust. | postgres/objectstore system topology, real-forge webhook canary |
-| G0/G1/G2 recursion refusal (`Harness.BeginGeneration`) | full G0→G1→G2 self-build of a release binary |
+| DF-BOOT-001, DF-EVID-001..005, DF-LEASE-001/002, DF-QUOTA-001, DF-EFFECT-001/002, DF-SELF-001 (G0/G1/G2 limit), DF-UPGRADE-001 (evidence compat), DF-SCALE-001 (harness workload) — **model species** | DF3 process/network chaos at scale, DF5 real-forge canary, long multi-hour / 10k-job soak |
+| DF-BOOT-001 / DF-EVID-001 / DF-LEASE-001 / DF-QUOTA-001 — **system species** via `TestSys*` in `internal/dogfood/system/` (real `NewPersistent` + HTTP + runner). Fail-closed arms (stale lease generation → 409, untrusted hard-quota gate, untrusted rootless floor) always run. Boot/restart and evidence success arms run an untrusted container job when rootless Docker satisfies the untrusted policy floor, and otherwise run a TRUSTED native job through the product trusted ingress (`TestSysTrustedIngress` signed GitHub webhook, `TestSysTrustedScheduleIngress` trusted schedule) — so they execute on hosts without rootless Docker instead of skipping. Direct API submissions stay untrusted (the product force-clears `Trusted`); the store is never mutated to fake trust. | real-forge webhook canary |
+| DF-DIST-001 / DF-DR-001 (postgres + object store) — **system species** via `TestSysDFDist001Integration` / `TestSysDFDr001PostgresObjectStoreIntegration` in `internal/dogfood/dist` (real PostgreSQL, real server + runners processes, pg_dump backup/restore) | — |
+| G0/G1/G2 recursion refusal (`Harness.BeginGeneration`) **and** full G0→G1→G2 self-build of a release binary (`TestSysDFSelf002G1ToG2`) | — |
 | `dogfood-result.json` shape (`MarshalResult`, `TestDogfoodResultJSONShape`) | suite-level artifact emission of the result bundle on disk |
-| DF0 `.kiwi/pipeline.yaml` + dogfood YAML schema validation | surfacecheck gate over DOGFOOD_MATRIX.md |
+| DF0 `.kiwi/pipeline.yaml` + dogfood YAML schema validation; DOGFOOD_MATRIX.md ↔ scenario-registry match gate (`TestDogfoodMatrixMatchesRegistry`) | broader `surfacecheck` integration of the matrix gate |
 
 ## Highest-value initial set
 
@@ -356,8 +362,8 @@ make dogfood-distributed
 make dogfood-adversarial
 make dogfood-upgrade
 make dogfood-scale
-make dogfood-release-model   # NOT a release gate
-make release-gate           # fails closed until production closure
+make dogfood-release-model   # model+system subset, NOT a release gate
+make release-gate           # production closure: fails closed on any missing proof
 make dogfood-all
 ```
 

@@ -80,9 +80,10 @@ are roadmap IDs and are not yet executable proofs.
 
 
 A new public capability must map to dogfood scenario IDs or carry an
-explicit exemption. Review enforces this today; an automated surfacecheck
-gate over this file is planned. IDs below that are not yet in
-`internal/dogfood/scenarios/registry.go` are **planned** rows — the
+explicit exemption. Review enforces this today, and
+`TestDogfoodMatrixMatchesRegistry` mechanically checks that the implemented
+ID list in this file equals the scenario registry. IDs below that are not
+yet in `internal/dogfood/scenarios/registry.go` are **planned** rows — the
 implemented registry is the source of truth for what runs green.
 
 ```yaml

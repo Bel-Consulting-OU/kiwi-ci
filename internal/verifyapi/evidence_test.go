@@ -209,6 +209,126 @@ func TestVerifiedOutcomeWithRealProvenanceFixtureIsAuthoritative(t *testing.T) {
 	}
 }
 
+// TestRecordVerifiedOutcomeFillsAttestedWallTime proves the measured facts
+// gain a second, attested quantity: when the resolved execution attestation
+// carries a job window (started_at/finished_at), the registry fills
+// Measured.WallTimeNS from those signed facts — while DurationNS stays the
+// derived outcome window and cannot be caller-inflated.
+func TestRecordVerifiedOutcomeFillsAttestedWallTime(t *testing.T) {
+	fx := newSignedAttestationFixture(t)
+	ob := baseObligation(t)
+	reg := NewRegistry(func() time.Time { return ob.IssuedAt.Add(30 * time.Second) })
+	if err := reg.SubmitObligation(ob); err != nil {
+		t.Fatalf("SubmitObligation = %v", err)
+	}
+
+	v := baseOutcome(t, ob)
+	v.EvidenceRoot = fx.evidenceRoot
+	v.ProvenanceRefs = []string{"attestation-1"}
+	v.ExecutionIDs = []string{fx.attemptID}
+	// Dishonest reporter attempts to inflate both measured quantities.
+	v.Resources.Measured = &MeasuredResourceFacts{DurationNS: 1 << 40, WallTimeNS: 1 << 40}
+
+	verifier := fixtureVerifier(fx, "attestation-1")
+	vo, err := verifier.Verify(context.Background(), v)
+	if err != nil {
+		t.Fatalf("Verify real provenance fixture = %v", err)
+	}
+	if vo.Evidence.Attested == nil {
+		t.Fatal("verified evidence has no attested facts; the fixture carries a job window")
+	}
+	// The fixture attestation binds a 90s job window (started_at →
+	// finished_at) — that is the number that must surface, not the caller's.
+	const wantWallNS = int64(90 * time.Second)
+	if vo.Evidence.Attested.WallTimeNS() != wantWallNS {
+		t.Fatalf("attested wall time = %d, want %d", vo.Evidence.Attested.WallTimeNS(), wantWallNS)
+	}
+
+	if err := reg.RecordVerifiedOutcome(vo); err != nil {
+		t.Fatalf("RecordVerifiedOutcome = %v", err)
+	}
+	got, err := reg.QueryOutcome(v.VerificationID)
+	if err != nil {
+		t.Fatalf("QueryOutcome = %v", err)
+	}
+	m := got.Outcome.Resources.Measured
+	if m == nil {
+		t.Fatal("Measured is nil after verified record")
+	}
+	wantDerived := v.CompletedAt.Sub(v.StartedAt).Nanoseconds()
+	if m.DurationNS != wantDerived {
+		t.Fatalf("Measured.DurationNS = %d, want derived %d", m.DurationNS, wantDerived)
+	}
+	if m.WallTimeNS != wantWallNS {
+		t.Fatalf("Measured.WallTimeNS = %d, want attested %d", m.WallTimeNS, wantWallNS)
+	}
+}
+
+// TestMeasuredWallTimeUnfilledWithoutAttestedWindow: an attestation that
+// carries no job window resolves without attested facts, so the measured wall
+// time stays zero rather than being guessed from the claim.
+func TestMeasuredWallTimeUnfilledWithoutAttestedWindow(t *testing.T) {
+	ob := baseObligation(t)
+	v := baseOutcome(t, ob)
+	v.ExecutionIDs = v.ExecutionIDs[:1]
+	root := v.EvidenceRoot
+	v.ProvenanceRefs = []string{"bare-att"}
+	f := &FuncEvidenceVerifier{
+		Identity: "verifyapi-bare-verifier/v1",
+		Resolve: func(context.Context, string) (ResolvedAttestation, error) {
+			return ResolvedAttestation{
+				ExecutionID:       v.ExecutionIDs[0],
+				EvidenceRoot:      root,
+				AttestationDigest: mustDigest(t, "bare-att-digest"),
+				// No Attested facts: older statements carry no job window.
+			}, nil
+		},
+	}
+	vo, err := f.Verify(context.Background(), v)
+	if err != nil {
+		t.Fatalf("Verify = %v", err)
+	}
+	if vo.Evidence.Attested != nil {
+		t.Fatalf("Attested = %+v, want nil when the attestation carries no window", vo.Evidence.Attested)
+	}
+	if m := DeriveMeasuredFacts(vo.Outcome, vo.Evidence.Attested); m.WallTimeNS != 0 {
+		t.Fatalf("Measured.WallTimeNS = %d, want 0 without attested facts", m.WallTimeNS)
+	}
+}
+
+// TestMergeAttestedFailsClosedOnPartialFacts: a mixed evidence set (some
+// attestations with a window, some without) must not produce a partially
+// attested wall time — the merged facts are dropped entirely.
+func TestMergeAttestedFailsClosedOnPartialFacts(t *testing.T) {
+	start := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	finish := start.Add(time.Minute)
+	withFacts := ResolvedAttestation{Attested: &AttestedResourceFacts{StartedAt: start, FinishedAt: finish}}
+	withoutFacts := ResolvedAttestation{}
+
+	if got := mergeAttested([]ResolvedAttestation{withFacts, withoutFacts}); got != nil {
+		t.Fatalf("mergeAttested(partial) = %+v, want nil", got)
+	}
+	if got := mergeAttested([]ResolvedAttestation{withoutFacts}); got != nil {
+		t.Fatalf("mergeAttested(no facts) = %+v, want nil", got)
+	}
+	inverted := ResolvedAttestation{Attested: &AttestedResourceFacts{StartedAt: finish, FinishedAt: start}}
+	if got := mergeAttested([]ResolvedAttestation{inverted}); got != nil {
+		t.Fatalf("mergeAttested(inverted) = %+v, want nil", got)
+	}
+	// Two complete windows merge to their envelope (earliest start, latest finish).
+	second := ResolvedAttestation{Attested: &AttestedResourceFacts{
+		StartedAt:  start.Add(30 * time.Second),
+		FinishedAt: finish.Add(30 * time.Second),
+	}}
+	got := mergeAttested([]ResolvedAttestation{withFacts, second})
+	if got == nil {
+		t.Fatal("mergeAttested(two windows) = nil, want envelope")
+	}
+	if !got.StartedAt.Equal(start) || !got.FinishedAt.Equal(finish.Add(30*time.Second)) {
+		t.Fatalf("merged window = [%s, %s], want [%s, %s]", got.StartedAt, got.FinishedAt, start, finish.Add(30*time.Second))
+	}
+}
+
 // TestVerifiedOutcomeWithContractAttestationV6Fixture proves the committed
 // historical contract fixture (testdata/contracts/attestation_v6.json) can be
 // signed and resolved end-to-end through the acceptance boundary.
@@ -433,5 +553,58 @@ func TestFuncEvidenceVerifierSealRules(t *testing.T) {
 	}
 	if _, err := f2.Verify(context.Background(), v); !errors.Is(err, ErrEvidence) {
 		t.Fatalf("Verify incomplete resolution = %v, want ErrEvidence", err)
+	}
+}
+
+// TestRestoreVerifiedOutcomeRoundTrip: durable stores cannot serialize the
+// unexported seal, so RestoreVerifiedOutcome rehydrates a previously sealed
+// record and ProvenPass survives the round trip. Incomplete evidence is
+// refused instead of quietly losing the proven-pass bit.
+func TestRestoreVerifiedOutcomeRoundTrip(t *testing.T) {
+	ob := baseObligation(t)
+	v := baseOutcome(t, ob)
+	v.EvidenceRoot = mustDigest(t, "resolved-root")
+	v.ProvenanceRefs = []string{"att-1"}
+	v.ExecutionIDs = []string{"exec-1"}
+
+	f := &FuncEvidenceVerifier{
+		Identity: "restore-verifier/v1",
+		Resolve: func(context.Context, string) (ResolvedAttestation, error) {
+			return ResolvedAttestation{
+				ExecutionID:       "exec-1",
+				EvidenceRoot:      mustDigest(t, "resolved-root"),
+				AttestationDigest: mustDigest(t, "att-digest"),
+			}, nil
+		},
+	}
+	sealed, err := f.Verify(context.Background(), v)
+	if err != nil {
+		t.Fatalf("Verify = %v", err)
+	}
+	if !sealed.Sealed() || !sealed.ProvenPass() {
+		t.Fatal("want sealed proven pass before restore")
+	}
+
+	restored, err := RestoreVerifiedOutcome(sealed.Outcome, sealed.Evidence)
+	if err != nil {
+		t.Fatalf("RestoreVerifiedOutcome = %v", err)
+	}
+	if !restored.Sealed() || !restored.ProvenPass() {
+		t.Fatal("restored record must stay sealed and proven")
+	}
+	if restored.Evidence.VerifierIdentity != sealed.Evidence.VerifierIdentity {
+		t.Fatalf("restored verifier identity = %q, want %q", restored.Evidence.VerifierIdentity, sealed.Evidence.VerifierIdentity)
+	}
+
+	// Truncated evidence must not restore as authoritative.
+	bad := sealed.Evidence
+	bad.VerifierIdentity = ""
+	if _, err := RestoreVerifiedOutcome(sealed.Outcome, bad); !errors.Is(err, ErrUnverified) {
+		t.Fatalf("restore without identity = %v, want ErrUnverified", err)
+	}
+	bad = sealed.Evidence
+	bad.AttestationDigests = nil
+	if _, err := RestoreVerifiedOutcome(sealed.Outcome, bad); !errors.Is(err, ErrUnverified) {
+		t.Fatalf("restore without attestation digests = %v, want ErrUnverified", err)
 	}
 }

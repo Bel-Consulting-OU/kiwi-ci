@@ -90,11 +90,23 @@ func resolveProvenanceAttestation(ctx context.Context, ref string, p *Provenance
 	if execID == "" {
 		execID = st.AttemptID
 	}
-	return ResolvedAttestation{
+	res := ResolvedAttestation{
 		ExecutionID:       execID,
 		EvidenceRoot:      Digest(att.EvidenceRootSHA256),
 		AttestationDigest: Digest(digest),
-	}, nil
+	}
+	// Durable job facts come from the SIGNED attestation block only (job
+	// started_at/finished_at), never from the caller's claim. A statement
+	// that carries no window — or an inverted one — resolves without
+	// attested facts so Measured.WallTimeNS stays unfilled instead of
+	// guessed.
+	if att.StartedAt != nil && att.FinishedAt != nil && !att.FinishedAt.Before(*att.StartedAt) {
+		res.Attested = &AttestedResourceFacts{
+			StartedAt:  *att.StartedAt,
+			FinishedAt: *att.FinishedAt,
+		}
+	}
+	return res, nil
 }
 
 // EvidenceEnvelopeJSON marshals a provenance.Envelope the way evidence

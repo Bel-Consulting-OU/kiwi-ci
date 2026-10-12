@@ -48,17 +48,23 @@
 // ascending verification_id), so repeated comparisons over the same records
 // always return identical rows and the same winner.
 //
-// # Resource facts: reported vs measured
+// # Resource facts: reported vs measured vs attested
 //
 // ResourceFacts carries the neutral economics of an execution. All of its
 // scalar fields are REPORTED facts — caller assertions — and stay that way
 // until they are tied to execution evidence (an attested runner measurement
 // or equivalent provenance binding). CPU time and memory in particular are
-// reported numbers, not verified ones. The optional Measured subset is
-// substrate-derived: the registry fills it at record time from the outcome's
-// own execution interval (currently completed_at - started_at) and overwrites
-// any caller-supplied value, so a dishonest reporter cannot inflate a
-// comparison.
+// reported numbers, not verified ones. FactSource / FactSourceOf is the
+// audit vocabulary for this distinction (derived | attested | reported).
+// The optional Measured subset is substrate-filled: the registry derives
+// DurationNS at record time from the outcome's own execution interval
+// (completed_at - started_at) and overwrites any caller-supplied value, so a
+// dishonest reporter cannot inflate a comparison. Measured.WallTimeNS is
+// filled only from attested execution facts — the job started_at/finished_at
+// carried by a signature-checked execution attestation and surfaced through
+// the AttestationResolver seam — and stays zero when the evidence carries no
+// job window. Until runners emit attested CPU/memory/cache measurements,
+// those quantities deliberately remain reported.
 //
 // # Evidence acceptance boundary
 //
