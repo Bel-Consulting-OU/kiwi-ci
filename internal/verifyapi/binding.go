@@ -21,7 +21,10 @@ var (
 	// to those dimensions is a different obligation.
 	ErrBinding = errors.New("verifyapi: binding mismatch")
 	// ErrFreshness is returned when an obligation is expired or the outcome
-	// is stale relative to the obligation's freshness policy.
+	// window falls outside the obligation's freshness policy. That includes
+	// work that started before the obligation was issued (or before
+	// freshness.not_before): the entire execution interval must lie inside
+	// the policy window.
 	ErrFreshness = errors.New("verifyapi: freshness violation")
 	// ErrGroupBinding is returned when an outcome claims a speculative group
 	// but is not comparable to it (unknown group/candidate, or a base
@@ -29,22 +32,25 @@ var (
 	ErrGroupBinding = errors.New("verifyapi: speculative group mismatch")
 )
 
-// validDigest reports whether s is a plausible content digest: non-empty and
-// consisting only of lowercase hex characters. Length is not pinned so
-// truncated or extended digest algorithms remain representable; the binding
-// rule itself is exact string equality, not algorithm identity.
-func validDigest(d Digest) bool {
+// digestLen is the fixed length of a SHA-256 content digest in lowercase hex.
+const digestLen = 64
+
+// validateDigest reports whether d is a well-formed SHA-256 content digest:
+// exactly 64 lowercase hex characters. Digest fields are the binding atoms of
+// the contract, so acceptance is fail-closed at construction, bind and decode
+// — truncated, extended, uppercase or non-hex values are all refused.
+func validateDigest(field string, d Digest) error {
 	s := string(d)
-	if len(s) == 0 {
-		return false
+	if len(s) != digestLen {
+		return fmt.Errorf("%w: %s must be a %d-char lowercase hex digest, got %d chars", ErrInvalid, field, digestLen, len(s))
 	}
-	for i := 0; i < len(s); i++ {
+	for i := 0; i < digestLen; i++ {
 		c := s[i]
 		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-			return false
+			return fmt.Errorf("%w: %s contains non-hex character %q at index %d", ErrInvalid, field, s[i], i)
 		}
 	}
-	return true
+	return nil
 }
 
 // Validate reports whether the obligation is structurally sound. It fails
@@ -58,14 +64,14 @@ func (o VerificationObligation) Validate() error {
 	if o.Subject == "" {
 		return fmt.Errorf("%w: subject is required", ErrInvalid)
 	}
-	if !validDigest(o.ImmutableCandidateDigest) {
-		return fmt.Errorf("%w: immutable_candidate_digest is not a digest", ErrInvalid)
+	if err := validateDigest("immutable_candidate_digest", o.ImmutableCandidateDigest); err != nil {
+		return err
 	}
-	if !validDigest(o.SourceSnapshotDigest) {
-		return fmt.Errorf("%w: source_snapshot_digest is not a digest", ErrInvalid)
+	if err := validateDigest("source_snapshot_digest", o.SourceSnapshotDigest); err != nil {
+		return err
 	}
-	if !validDigest(o.VerificationContractDigest) {
-		return fmt.Errorf("%w: verification_contract_digest is not a digest", ErrInvalid)
+	if err := validateDigest("verification_contract_digest", o.VerificationContractDigest); err != nil {
+		return err
 	}
 	if len(o.RequiredChecks) == 0 {
 		return fmt.Errorf("%w: required_checks must be non-empty", ErrInvalid)
@@ -94,7 +100,9 @@ func (o VerificationObligation) Validate() error {
 
 // validate reports whether the freshness policy is well-formed and
 // constrains at least one dimension. A policy that constrains nothing would
-// let an obligation live forever, which the contract forbids.
+// let an obligation live forever, which the contract forbids. An unsatisfiable
+// window (not_before after not_after, or not_before past the max-age bound)
+// is refused here so the obligation cannot be issued in the first place.
 func (p FreshnessPolicy) validate(issuedAt time.Time) error {
 	if p.MaxAgeSeconds == 0 && p.NotAfter == nil {
 		return fmt.Errorf("%w: freshness policy must set max_age_seconds or not_after", ErrInvalid)
@@ -108,6 +116,18 @@ func (p FreshnessPolicy) validate(issuedAt time.Time) error {
 	if p.NotAfter != nil && !issuedAt.IsZero() && p.NotAfter.Before(issuedAt) {
 		return fmt.Errorf("%w: freshness not_after precedes issued_at", ErrInvalid)
 	}
+	if p.NotBefore != nil && p.NotAfter != nil && p.NotAfter.Before(*p.NotBefore) {
+		return fmt.Errorf("%w: freshness not_after precedes not_before", ErrInvalid)
+	}
+	if p.NotBefore != nil && p.MaxAgeSeconds > 0 && !issuedAt.IsZero() {
+		// started_at must be >= not_before and completed_at <= issued+max_age
+		// with started_at <= completed_at; a not_before past that bound leaves
+		// no satisfiable interval.
+		latestStart := issuedAt.Add(time.Duration(p.MaxAgeSeconds) * time.Second)
+		if p.NotBefore.After(latestStart) {
+			return fmt.Errorf("%w: freshness not_before %s falls outside max_age window ending %s", ErrInvalid, p.NotBefore.UTC().Format(time.RFC3339), latestStart.UTC().Format(time.RFC3339))
+		}
+	}
 	return nil
 }
 
@@ -115,17 +135,36 @@ func (p FreshnessPolicy) validate(issuedAt time.Time) error {
 // given instant against an outcome window of [startedAt, completedAt]. It is
 // the single freshness rule both the registry and direct callers share:
 //
+//   - interval start: started_at must be at or after
+//     max(issued_at, freshness.not_before). Work that began before the
+//     obligation existed (or before the policy window opened) can never
+//     satisfy a later obligation — pre-issued proofs are refused even when
+//     their completion time is in range;
+//   - interval order: started_at must not be after completed_at;
 //   - hard expiry: now must not be past not_after, and neither must the
 //     outcome's completed_at (a completion claimed after expiry cannot
 //     launder the claim);
 //   - max age: completed_at must fall within max_age_seconds of issued_at.
 //
 // A zero completed_at is treated as "not yet completed" and checked against
-// now, so an in-flight recording still cannot outrun expiry.
+// now, so an in-flight recording still cannot outrun expiry. A zero startedAt
+// precedes any real issuance and is therefore refused.
 func (o VerificationObligation) CheckFreshness(now, startedAt, completedAt time.Time) error {
 	end := completedAt
 	if end.IsZero() {
 		end = now
+	}
+	// The entire execution interval must begin after the obligation's
+	// issuance and any not_before delay.
+	notBefore := o.IssuedAt
+	if o.Freshness.NotBefore != nil && o.Freshness.NotBefore.After(notBefore) {
+		notBefore = *o.Freshness.NotBefore
+	}
+	if startedAt.Before(notBefore) {
+		return fmt.Errorf("%w: outcome started_at %s precedes %s", ErrFreshness, startedAt.UTC().Format(time.RFC3339), notBefore.UTC().Format(time.RFC3339))
+	}
+	if end.Before(startedAt) {
+		return fmt.Errorf("%w: outcome completed_at %s precedes started_at %s", ErrFreshness, end.UTC().Format(time.RFC3339), startedAt.UTC().Format(time.RFC3339))
 	}
 	if o.Freshness.NotAfter != nil {
 		if now.After(*o.Freshness.NotAfter) {
@@ -137,9 +176,6 @@ func (o VerificationObligation) CheckFreshness(now, startedAt, completedAt time.
 	}
 	if o.Freshness.MaxAgeSeconds > 0 {
 		maxAge := time.Duration(o.Freshness.MaxAgeSeconds) * time.Second
-		if end.Before(o.IssuedAt) {
-			return fmt.Errorf("%w: outcome completed_at precedes issued_at", ErrFreshness)
-		}
 		if end.Sub(o.IssuedAt) > maxAge {
 			return fmt.Errorf("%w: outcome is stale (age %s exceeds max_age %s)", ErrFreshness, end.Sub(o.IssuedAt), maxAge)
 		}
@@ -157,14 +193,14 @@ func (v VerificationOutcome) Validate() error {
 	if v.ObligationID == "" {
 		return fmt.Errorf("%w: obligation_id is required", ErrInvalid)
 	}
-	if !validDigest(v.CandidateDigest) {
-		return fmt.Errorf("%w: candidate_digest is not a digest", ErrInvalid)
+	if err := validateDigest("candidate_digest", v.CandidateDigest); err != nil {
+		return err
 	}
-	if !validDigest(v.SnapshotDigest) {
-		return fmt.Errorf("%w: snapshot_digest is not a digest", ErrInvalid)
+	if err := validateDigest("snapshot_digest", v.SnapshotDigest); err != nil {
+		return err
 	}
-	if !validDigest(v.ContractDigest) {
-		return fmt.Errorf("%w: contract_digest is not a digest", ErrInvalid)
+	if err := validateDigest("contract_digest", v.ContractDigest); err != nil {
+		return err
 	}
 	if !v.Outcome.Valid() {
 		return fmt.Errorf("%w: outcome %q is not pass/fail/partial", ErrInvalid, v.Outcome)
@@ -172,8 +208,8 @@ func (v VerificationOutcome) Validate() error {
 	if v.AssuranceProfile == "" {
 		return fmt.Errorf("%w: assurance_profile is required", ErrInvalid)
 	}
-	if v.EvidenceRoot == "" {
-		return fmt.Errorf("%w: evidence_root is required", ErrInvalid)
+	if err := validateDigest("evidence_root", v.EvidenceRoot); err != nil {
+		return err
 	}
 	if v.StartedAt.IsZero() {
 		return fmt.Errorf("%w: started_at is required", ErrInvalid)
@@ -198,6 +234,9 @@ func (v VerificationOutcome) Validate() error {
 // validate reports whether the resource facts are structurally sound: no
 // negative measurements, and a non-empty runner class so rows stay
 // comparable. Durations are nanoseconds and sizes are bytes by contract.
+// The optional Measured subset is substrate-derived and validated here so a
+// malformed record cannot enter the registry; the registry overwrites it at
+// record time from the execution interval.
 func (r ResourceFacts) validate() error {
 	if r.QueueLatencyNS < 0 {
 		return fmt.Errorf("%w: queue_latency_ns must be >= 0", ErrInvalid)
@@ -237,6 +276,9 @@ func (r ResourceFacts) validate() error {
 			return fmt.Errorf("%w: speculative resources require candidate_id", ErrInvalid)
 		}
 	}
+	if r.Measured != nil && r.Measured.DurationNS < 0 {
+		return fmt.Errorf("%w: measured.duration_ns must be >= 0", ErrInvalid)
+	}
 	return nil
 }
 
@@ -246,8 +288,8 @@ func (g SpeculativeGroup) Validate() error {
 	if g.VerificationGroupID == "" {
 		return fmt.Errorf("%w: verification_group_id is required", ErrInvalid)
 	}
-	if !validDigest(g.BaseSnapshotDigest) {
-		return fmt.Errorf("%w: base_snapshot_digest is not a digest", ErrInvalid)
+	if err := validateDigest("base_snapshot_digest", g.BaseSnapshotDigest); err != nil {
+		return err
 	}
 	if len(g.CandidateDigests) == 0 {
 		return fmt.Errorf("%w: candidate_digests must be non-empty", ErrInvalid)
@@ -256,8 +298,8 @@ func (g SpeculativeGroup) Validate() error {
 		if id == "" {
 			return fmt.Errorf("%w: candidate_digests contains an empty candidate id", ErrInvalid)
 		}
-		if !validDigest(d) {
-			return fmt.Errorf("%w: candidate_digests[%s] is not a digest", ErrInvalid, id)
+		if err := validateDigest("candidate_digests["+id+"]", d); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -275,7 +317,8 @@ func (g SpeculativeGroup) Validate() error {
 //   - candidate, snapshot and contract digests equal the obligation's;
 //   - the claimed assurance profile equals the required one;
 //   - a pass claim covers every required check and is not cancelled;
-//   - the freshness policy holds at now for the outcome's window;
+//   - the freshness policy holds at now for the outcome's entire window
+//     (started_at included: pre-issued work is refused);
 //   - the outcome itself is structurally valid.
 func Bind(obligation VerificationObligation, outcome VerificationOutcome, now time.Time) error {
 	if err := obligation.Validate(); err != nil {

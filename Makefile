@@ -252,7 +252,8 @@ dogfood-production:
 		--require TestSysDFScale002Soak \
 		--require TestSysUntrustedContainerEvidenceLane \
 		--require TestSysDFDist001 \
-		--require TestSysDFDr001 \
+		--require TestSysDFDr001PostgresObjectStore \
+		--require TestSysDFDr001FSMode \
 		-- ./internal/dogfood/system/ ./internal/dogfood/dist/
 
 # All dogfood suites including production proofs. release-gate is the

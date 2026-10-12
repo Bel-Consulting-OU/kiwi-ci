@@ -13,8 +13,8 @@ func (c *testClock) now() time.Time { return c.t }
 
 func mustDigest(t *testing.T, seed string) Digest {
 	t.Helper()
-	// Any stable lowercase-hex string is a valid digest under the package
-	// rule; tests use deterministic pseudo-digests so fixtures are readable.
+	// Digests are exactly 64 lowercase hex chars; tests use deterministic
+	// pseudo-digests so fixtures are readable.
 	const hexDigits = "0123456789abcdef"
 	d := make([]byte, 64)
 	for i := range d {
@@ -51,7 +51,7 @@ func baseOutcome(t *testing.T, ob VerificationObligation) VerificationOutcome {
 		AssuranceProfile: ob.RequiredAssurance,
 		CompletedChecks:  []string{"digest-match", "signature"},
 		ExecutionIDs:     []string{"exec-1", "exec-2"},
-		EvidenceRoot:     "evidence-root-1",
+		EvidenceRoot:     mustDigest(t, "evidence"),
 		Resources: ResourceFacts{
 			QueueLatencyNS:     1_000_000,
 			ExecutionLatencyNS: 5_000_000_000,
@@ -187,6 +187,112 @@ func TestFreshnessMaxAgeEnforced(t *testing.T) {
 	}
 }
 
+// TestFreshnessIntervalMustStartAfterIssue is the P1 adversarial rule: the
+// ENTIRE proof execution interval must begin at or after the obligation's
+// issuance. Pre-issued work (started before issued_at) can never satisfy a
+// later obligation, even when completed_at is in range.
+func TestFreshnessIntervalMustStartAfterIssue(t *testing.T) {
+	ob := baseObligation(t) // MaxAgeSeconds 3600
+	issued := ob.IssuedAt
+
+	// started < issued < completed MUST fail with ErrFreshness.
+	v := baseOutcome(t, ob)
+	v.StartedAt = issued.Add(-10 * time.Second)
+	v.CompletedAt = issued.Add(5 * time.Second)
+	err := Bind(ob, v, issued.Add(30*time.Second))
+	if !errors.Is(err, ErrFreshness) {
+		t.Fatalf("started < issued < completed accepted: err = %v, want ErrFreshness", err)
+	}
+
+	// Direct CheckFreshness has the same rule.
+	if err := ob.CheckFreshness(issued.Add(30*time.Second), issued.Add(-10*time.Second), issued.Add(5*time.Second)); !errors.Is(err, ErrFreshness) {
+		t.Fatalf("CheckFreshness pre-issued window = %v, want ErrFreshness", err)
+	}
+
+	// started == issued == completed is OK (instantaneous proof at issue).
+	v = baseOutcome(t, ob)
+	v.StartedAt = issued
+	v.CompletedAt = issued
+	if err := Bind(ob, v, issued); err != nil {
+		t.Fatalf("started == issued == completed refused: %v", err)
+	}
+
+	// started == issued < completed is OK.
+	v = baseOutcome(t, ob)
+	v.StartedAt = issued
+	v.CompletedAt = issued.Add(5 * time.Second)
+	if err := Bind(ob, v, issued.Add(30*time.Second)); err != nil {
+		t.Fatalf("started == issued < completed refused: %v", err)
+	}
+
+	// started after issued is OK.
+	v = baseOutcome(t, ob)
+	v.StartedAt = issued.Add(time.Second)
+	v.CompletedAt = issued.Add(5 * time.Second)
+	if err := Bind(ob, v, issued.Add(30*time.Second)); err != nil {
+		t.Fatalf("started after issued refused: %v", err)
+	}
+
+	// completed before started is refused (interval order).
+	v = baseOutcome(t, ob)
+	v.StartedAt = issued.Add(10 * time.Second)
+	v.CompletedAt = issued.Add(5 * time.Second)
+	if err := ob.CheckFreshness(issued.Add(30*time.Second), v.StartedAt, v.CompletedAt); !errors.Is(err, ErrFreshness) {
+		t.Fatalf("completed before started accepted: err = %v, want ErrFreshness", err)
+	}
+}
+
+// TestFreshnessNotBeforeWindow proves freshness.not_before delays the start
+// of the acceptable execution interval: work starting after issue but before
+// not_before is still refused.
+func TestFreshnessNotBeforeWindow(t *testing.T) {
+	ob := baseObligation(t)
+	notBefore := ob.IssuedAt.Add(60 * time.Second)
+	ob.Freshness = FreshnessPolicy{MaxAgeSeconds: 3600, NotBefore: &notBefore}
+
+	// started after issued but before not_before is refused.
+	v := baseOutcome(t, ob)
+	v.StartedAt = ob.IssuedAt.Add(30 * time.Second)
+	v.CompletedAt = ob.IssuedAt.Add(90 * time.Second)
+	err := Bind(ob, v, ob.IssuedAt.Add(120*time.Second))
+	if !errors.Is(err, ErrFreshness) {
+		t.Fatalf("started before not_before accepted: err = %v, want ErrFreshness", err)
+	}
+
+	// started == not_before is OK.
+	v.StartedAt = notBefore
+	v.CompletedAt = notBefore.Add(time.Second)
+	if err := Bind(ob, v, notBefore.Add(10*time.Second)); err != nil {
+		t.Fatalf("started == not_before refused: %v", err)
+	}
+
+	// started after max(issued, not_before) is OK.
+	v.StartedAt = notBefore.Add(10 * time.Second)
+	v.CompletedAt = notBefore.Add(20 * time.Second)
+	if err := Bind(ob, v, notBefore.Add(30*time.Second)); err != nil {
+		t.Fatalf("started after not_before refused: %v", err)
+	}
+}
+
+// TestFreshnessPolicyWindowValidation refuses an unsatisfiable freshness
+// window at obligation construction time (fail closed before any outcome).
+func TestFreshnessPolicyWindowValidation(t *testing.T) {
+	ob := baseObligation(t)
+	notBefore := ob.IssuedAt.Add(10 * time.Second)
+	notAfter := ob.IssuedAt.Add(5 * time.Second)
+	ob.Freshness = FreshnessPolicy{NotBefore: &notBefore, NotAfter: &notAfter}
+	if err := ob.Validate(); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("not_after before not_before = %v, want ErrInvalid", err)
+	}
+
+	ob = baseObligation(t)
+	notBefore = ob.IssuedAt.Add(4000 * time.Second) // past max_age 3600
+	ob.Freshness = FreshnessPolicy{MaxAgeSeconds: 3600, NotBefore: &notBefore}
+	if err := ob.Validate(); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("not_before outside max_age window = %v, want ErrInvalid", err)
+	}
+}
+
 func TestRegistryFreshnessUsesClock(t *testing.T) {
 	clk := &testClock{t: time.Date(2026, 1, 2, 3, 0, 0, 0, time.UTC)}
 	r := NewRegistry(clk.now)
@@ -211,6 +317,74 @@ func TestRegistryFreshnessUsesClock(t *testing.T) {
 	v2.CompletedAt = clk.t.Add(time.Second)
 	if err := r.RecordOutcome(v2); !errors.Is(err, ErrFreshness) {
 		t.Fatalf("RecordOutcome after expiry = %v, want ErrFreshness", err)
+	}
+}
+
+// TestRegistryRefusesPreIssuedOutcome proves the registry applies the interval
+// rule at record time: nothing is stored when started_at precedes issued_at.
+func TestRegistryRefusesPreIssuedOutcome(t *testing.T) {
+	r := NewRegistry(nil)
+	ob := baseObligation(t)
+	if err := r.SubmitObligation(ob); err != nil {
+		t.Fatalf("SubmitObligation = %v", err)
+	}
+	v := baseOutcome(t, ob)
+	v.StartedAt = ob.IssuedAt.Add(-time.Minute)
+	v.CompletedAt = ob.IssuedAt.Add(10 * time.Second)
+	if err := r.RecordOutcome(v); !errors.Is(err, ErrFreshness) {
+		t.Fatalf("RecordOutcome pre-issued = %v, want ErrFreshness", err)
+	}
+	if got := r.OutcomesForObligation(ob.ObligationID); len(got) != 0 {
+		t.Fatalf("outcomes stored after refusal = %d, want 0", len(got))
+	}
+}
+
+// TestDigestValidation pins the SHA-256 digest shape: exactly 64 lowercase
+// hex chars. Truncated, extended, uppercase, empty and non-hex values are all
+// refused at Validate/Bind/decode.
+func TestDigestValidation(t *testing.T) {
+	good := mustDigest(t, "candidate")
+	if err := validateDigest("test", good); err != nil {
+		t.Fatalf("64-char lowercase hex rejected: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		d    Digest
+	}{
+		{"63-char", Digest(string(good[:63]))},
+		{"65-char", Digest(string(good) + "a")},
+		{"uppercase", Digest("A" + string(good[1:]))},
+		{"empty", Digest("")},
+		{"non-hex", Digest("z" + string(good[1:]))},
+		{"mixed-case-mid", Digest(string(good[:32]) + "B" + string(good[33:]))},
+	}
+	for _, tc := range cases {
+		if err := validateDigest("test", tc.d); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("validateDigest(%s) = %v, want ErrInvalid", tc.name, err)
+		}
+	}
+
+	// Obligation construction fails closed on a malformed pin.
+	ob := baseObligation(t)
+	ob.ImmutableCandidateDigest = "deadbeef" // not 64 hex chars
+	if err := ob.Validate(); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("obligation with short digest = %v, want ErrInvalid", err)
+	}
+
+	// Outcome construction fails closed on a malformed evidence root.
+	v := baseOutcome(t, baseObligation(t))
+	v.EvidenceRoot = "evidence-root-1"
+	if err := v.Validate(); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("outcome with non-digest evidence_root = %v, want ErrInvalid", err)
+	}
+
+	// Bind refuses a malformed digest even if the caller skipped Validate.
+	ob = baseObligation(t)
+	v = baseOutcome(t, ob)
+	v.EvidenceRoot = Digest(string(good[:63]))
+	if err := Bind(ob, v, ob.IssuedAt.Add(30*time.Second)); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("Bind with 63-char evidence_root = %v, want ErrInvalid", err)
 	}
 }
 
@@ -267,7 +441,7 @@ func TestSpeculativeGroupThreeCandidatesSharedBase(t *testing.T) {
 			Outcome:          OutcomePass,
 			AssuranceProfile: ob.RequiredAssurance,
 			CompletedChecks:  []string{"digest-match"},
-			EvidenceRoot:     "evidence-" + cand,
+			EvidenceRoot:     mustDigest(t, "evidence-"+cand),
 			Resources:        rf,
 			StartedAt:        ob.IssuedAt.Add(time.Duration(i+1) * time.Second),
 			CompletedAt:      ob.IssuedAt.Add(time.Duration(i+2) * time.Second),
@@ -312,7 +486,7 @@ func TestSpeculativeGroupThreeCandidatesSharedBase(t *testing.T) {
 		Outcome:          OutcomePass,
 		AssuranceProfile: "attested-v1",
 		CompletedChecks:  []string{"digest-match"},
-		EvidenceRoot:     "evidence-bad",
+		EvidenceRoot:     mustDigest(t, "evidence-bad"),
 		Resources: ResourceFacts{
 			RunnerClass:         "standard",
 			Speculative:         true,
@@ -339,11 +513,173 @@ func TestSpeculativeGroupThreeCandidatesSharedBase(t *testing.T) {
 	}
 }
 
-// equalFacts compares resource facts with the speculative/group fields reset,
-// because the fixtures in the table omit group bookkeeping until submit time.
+// TestCompareGroupDeterministicSelection proves CompareGroup picks a
+// canonical attempt per candidate (latest completed_at, ties broken by
+// ascending verification_id) and that two calls over the same records return
+// identical ordering and winner.
+func TestCompareGroupDeterministicSelection(t *testing.T) {
+	r := NewRegistry(nil)
+	base := mustDigest(t, "base-snapshot")
+	group := SpeculativeGroup{
+		VerificationGroupID: "grp-det",
+		BaseSnapshotDigest:  base,
+		CandidateDigests: map[string]Digest{
+			"alpha": mustDigest(t, "alpha"),
+			"beta":  mustDigest(t, "beta"),
+		},
+	}
+	if err := r.RegisterGroup(group); err != nil {
+		t.Fatalf("RegisterGroup = %v", err)
+	}
+
+	issued := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	record := func(vid, cand, candID string, completed time.Time) {
+		t.Helper()
+		ob := VerificationObligation{
+			ObligationID:               "ob-" + vid,
+			Subject:                    candID,
+			ImmutableCandidateDigest:   group.CandidateDigests[candID],
+			SourceSnapshotDigest:       base,
+			VerificationContractDigest: mustDigest(t, "contract"),
+			RequiredChecks:             []string{"digest-match"},
+			RequiredAssurance:          "attested-v1",
+			Freshness:                  FreshnessPolicy{MaxAgeSeconds: 3600},
+			IssuedAt:                   issued,
+		}
+		if err := r.SubmitObligation(ob); err != nil {
+			t.Fatalf("SubmitObligation %s = %v", vid, err)
+		}
+		v := VerificationOutcome{
+			VerificationID:   vid,
+			ObligationID:     ob.ObligationID,
+			CandidateDigest:  ob.ImmutableCandidateDigest,
+			SnapshotDigest:   base,
+			ContractDigest:   ob.VerificationContractDigest,
+			Outcome:          OutcomePass,
+			AssuranceProfile: ob.RequiredAssurance,
+			CompletedChecks:  []string{"digest-match"},
+			EvidenceRoot:     mustDigest(t, "evidence-"+vid),
+			Resources: ResourceFacts{
+				RunnerClass:         "standard",
+				ExecutionLatencyNS:  100,
+				Speculative:         true,
+				VerificationGroupID: group.VerificationGroupID,
+				CandidateID:         candID,
+			},
+			StartedAt:   completed.Add(-time.Second),
+			CompletedAt: completed,
+		}
+		if err := r.RecordOutcome(v); err != nil {
+			t.Fatalf("RecordOutcome %s = %v", vid, err)
+		}
+	}
+
+	// alpha: three attempts. Two share the latest completed_at (t+20), so
+	// the ascending-verification_id tie-break picks ver-alpha-late over
+	// ver-alpha-mid; ver-alpha-early (t+10) loses on completed_at.
+	record("ver-alpha-early", "alpha", "alpha", issued.Add(10*time.Second))
+	record("ver-alpha-mid", "alpha", "alpha", issued.Add(20*time.Second))
+	record("ver-alpha-late", "alpha", "alpha", issued.Add(20*time.Second))
+
+	// beta: two attempts; the later completed_at is strictly newer and wins
+	// even though its verification id sorts later.
+	record("ver-beta-a", "beta", "beta", issued.Add(30*time.Second))
+	record("ver-beta-b", "beta", "beta", issued.Add(40*time.Second))
+
+	var first GroupComparison
+	for i := 0; i < 2; i++ {
+		cmp, err := r.CompareGroup("grp-det")
+		if err != nil {
+			t.Fatalf("CompareGroup #%d = %v", i, err)
+		}
+		if i == 0 {
+			first = cmp
+			continue
+		}
+		if len(cmp.Candidates) != len(first.Candidates) {
+			t.Fatalf("candidate count drift: %d vs %d", len(cmp.Candidates), len(first.Candidates))
+		}
+		for j := range cmp.Candidates {
+			if !sameCandidateFacts(cmp.Candidates[j], first.Candidates[j]) {
+				t.Fatalf("CompareGroup not deterministic at row %d:\nfirst = %+v\nsecond = %+v", j, first.Candidates[j], cmp.Candidates[j])
+			}
+		}
+	}
+
+	if len(first.Candidates) != 2 {
+		t.Fatalf("candidates = %d, want 2", len(first.Candidates))
+	}
+	alpha := first.Candidates[0]
+	if alpha.CandidateID != "alpha" {
+		t.Fatalf("row 0 = %q, want alpha", alpha.CandidateID)
+	}
+	// Tie on completed_at at t+20: ascending verification_id picks
+	// ver-alpha-late (l < m).
+	if alpha.VerificationID != "ver-alpha-late" {
+		t.Fatalf("alpha winner = %q, want ver-alpha-late", alpha.VerificationID)
+	}
+	beta := first.Candidates[1]
+	if beta.CandidateID != "beta" {
+		t.Fatalf("row 1 = %q, want beta", beta.CandidateID)
+	}
+	if beta.VerificationID != "ver-beta-b" {
+		t.Fatalf("beta winner = %q, want ver-beta-b (latest completed_at)", beta.VerificationID)
+	}
+}
+
+// TestRecordOutcomeFillsMeasured proves the registry derives Measured.DurationNS
+// from the execution interval and overwrites any caller-supplied value.
+func TestRecordOutcomeFillsMeasured(t *testing.T) {
+	r := NewRegistry(nil)
+	ob := baseObligation(t)
+	if err := r.SubmitObligation(ob); err != nil {
+		t.Fatalf("SubmitObligation = %v", err)
+	}
+	v := baseOutcome(t, ob)
+	v.Resources.Measured = &MeasuredResourceFacts{DurationNS: 999} // dishonest reporter
+	if err := r.RecordOutcome(v); err != nil {
+		t.Fatalf("RecordOutcome = %v", err)
+	}
+	stored, err := r.Outcome(v.VerificationID)
+	if err != nil {
+		t.Fatalf("Outcome = %v", err)
+	}
+	want := v.CompletedAt.Sub(v.StartedAt).Nanoseconds()
+	if stored.Resources.Measured == nil {
+		t.Fatal("Measured is nil after record")
+	}
+	if stored.Resources.Measured.DurationNS != want {
+		t.Fatalf("Measured.DurationNS = %d, want %d", stored.Resources.Measured.DurationNS, want)
+	}
+}
+
+// sameCandidateFacts compares two comparison rows by value, including the
+// pointed-to Measured facts (struct equality would compare pointer identity).
+func sameCandidateFacts(a, b CandidateFacts) bool {
+	if a.CandidateID != b.CandidateID ||
+		a.CandidateDigest != b.CandidateDigest ||
+		a.VerificationID != b.VerificationID ||
+		a.Outcome != b.Outcome {
+		return false
+	}
+	ar, br := a.Resources, b.Resources
+	if (ar.Measured == nil) != (br.Measured == nil) {
+		return false
+	}
+	if ar.Measured != nil && *ar.Measured != *br.Measured {
+		return false
+	}
+	ar.Measured, br.Measured = nil, nil
+	return ar == br
+}
+
+// equalFacts compares resource facts with the speculative/group fields and
+// substrate-derived Measured reset, because the fixtures in the table omit
+// group bookkeeping and measured values until submit time.
 func equalFacts(a, b ResourceFacts) bool {
 	a.Speculative, b.Speculative = false, false
 	a.VerificationGroupID, b.VerificationGroupID = "", ""
 	a.CandidateID, b.CandidateID = "", ""
+	a.Measured, b.Measured = nil, nil
 	return a == b
 }

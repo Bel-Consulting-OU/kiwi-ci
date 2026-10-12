@@ -29,9 +29,12 @@ import (
 // DF-UPGRADE-002. The other two must run.
 
 const (
-	// goToolchainPath is the host Go used for every source build in these
-	// proofs (the same toolchain the repo's Makefile pins).
-	goToolchainPath = "/opt/homebrew/bin/go"
+	// goToolchainPath overrides the Go used for source builds in these
+	// proofs. Empty means resolve via exec.LookPath("go") so the production
+	// gate is portable across Linux/macOS CI hosts (never a developer-local
+	// Homebrew path). Release packaging must still consume the exact built
+	// artifact bytes — this toolchain only builds that artifact once.
+	goToolchainPath = ""
 	// nMinusOneScanDepth is how many recent commits to scan when picking an
 	// N-1 worktree SHA (after the preferred named anchors).
 	nMinusOneScanDepth = 15
@@ -40,14 +43,16 @@ const (
 // goTool returns the Go toolchain used for host and in-job builds.
 func goTool(t *testing.T) string {
 	t.Helper()
-	if st, err := os.Stat(goToolchainPath); err == nil && !st.IsDir() {
-		return goToolchainPath
+	if env := os.Getenv("KIWI_TEST_GO"); env != "" {
+		if st, err := os.Stat(env); err == nil && !st.IsDir() {
+			return env
+		}
 	}
-	p, err := exec.LookPath("go")
-	if err != nil {
-		t.Fatalf("go toolchain not found at %s or on PATH: %v", goToolchainPath, err)
+	if p, err := exec.LookPath("go"); err == nil {
+		return p
 	}
-	return p
+	t.Fatalf("go toolchain not found on PATH (set KIWI_TEST_GO to override)")
+	return ""
 }
 
 // moduleRoot locates the repository root (the directory holding go.mod).

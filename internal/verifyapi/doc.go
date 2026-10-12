@@ -24,11 +24,17 @@
 //
 // # Freshness
 //
-// Every obligation carries a FreshnessPolicy (hard expiry and/or maximum
-// age). Recording an outcome for an expired or stale obligation is refused.
-// Freshness is evaluated against the registry clock at record time and
-// against the outcome's own timestamps, so a backdated or post-expiry
-// completion cannot launder an expired claim.
+// Every obligation carries a FreshnessPolicy (optional not_before delay,
+// hard expiry and/or maximum age). Recording an outcome for an expired or
+// stale obligation is refused. The ENTIRE proof execution interval must lie
+// inside the policy window: started_at is at or after
+// max(issued_at, freshness.not_before), completed_at is at or before
+// not_after (when set) and within max_age of issued_at, and started_at <=
+// completed_at. Pre-issued work — an execution that began before the
+// obligation existed — can never satisfy a later obligation, even when its
+// completion timestamp is in range. Freshness is evaluated against the
+// registry clock at record time and against the outcome's own timestamps, so
+// a backdated or post-expiry completion cannot launder an expired claim.
 //
 // # Speculative groups
 //
@@ -37,6 +43,61 @@
 // (same field semantics, same base state) so a caller can pick among candidates
 // without re-deriving measurements. Comparability is structural: CompareGroup
 // refuses to line up outcomes that do not share the group's base snapshot.
+// When a candidate has several recorded attempts, CompareGroup selects one
+// canonical attempt deterministically (latest completed_at, ties broken by
+// ascending verification_id), so repeated comparisons over the same records
+// always return identical rows and the same winner.
+//
+// # Resource facts: reported vs measured
+//
+// ResourceFacts carries the neutral economics of an execution. All of its
+// scalar fields are REPORTED facts — caller assertions — and stay that way
+// until they are tied to execution evidence (an attested runner measurement
+// or equivalent provenance binding). CPU time and memory in particular are
+// reported numbers, not verified ones. The optional Measured subset is
+// substrate-derived: the registry fills it at record time from the outcome's
+// own execution interval (currently completed_at - started_at) and overwrites
+// any caller-supplied value, so a dishonest reporter cannot inflate a
+// comparison.
+//
+// # Evidence acceptance boundary
+//
+// Structural binding alone is not proof: a caller can submit Result=pass with
+// matching digests and an arbitrary evidence_root. The EvidenceVerifier is
+// the acceptance boundary before verifyapi becomes authoritative. Verify
+// cryptographically resolves the outcome's evidence references (signed
+// execution attestations: signatures, subject-digested evidence blocks,
+// evidence roots) and returns a server-created VerifiedOutcome carrying the
+// resolved execution ids, evidence root, attestation digests and verifier
+// identity. Only a VerifiedOutcome may be stored as authoritative
+// (Registry.RecordVerifiedOutcome). Unverified submitted outcomes can be
+// kept as claims (RecordOutcome) but never satisfy QueryOutcome as a proven
+// pass: a claim-only id answers ErrUnverified. The concrete adapter
+// (ProvenanceEvidenceVerifier) calls internal/provenance.VerifyWith and
+// VerifyExecutionAttestation; the FuncEvidenceVerifier seam keeps those
+// imports injectable.
+//
+// # Verifier capabilities
+//
+// A VerifierCapability advertises what one verifier can check (kind, version,
+// claim classes, assurance levels, platforms, evidence types). The Registry
+// can register and query capabilities so a caller can discover a fit
+// verifier; capabilities are advertising, not enforcement — the binding rule
+// and the EvidenceVerifier remain the only acceptance boundary. Class and
+// level values are opaque strings defined by the verification contract
+// ecosystem.
+//
+// # Durable store contract
+//
+// VerificationStore is the persistence-shaped contract over the same domain
+// operations (SubmitObligation / RecordOutcome / RecordVerifiedOutcome / Get*
+// / QueryOutcome / CompareGroup), with ObligationID as the submit idempotency
+// key. MemoryStore is the in-process reference implementation. PostgresStore
+// in internal/storage is the PRODUCTION durable implementation — it is
+// deliberately not defined here so the verification contract carries no
+// database drivers, schema or migrations. Host applications that need
+// durability depend on VerificationStore and construct a PostgresStore in the
+// storage layer.
 //
 // # Wire format
 //

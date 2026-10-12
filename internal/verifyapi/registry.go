@@ -13,16 +13,32 @@ import (
 // API of this package — the HTTP facade is a thin mapping over it.
 //
 // Storage is intentionally in-memory: persisting verification state is the
-// host application's concern (callers that need durability wrap the registry
-// or copy its records into their own stores). The registry never invents
-// executions or evidence: outcome.ExecutionIDs and outcome.EvidenceRoot are
-// caller-supplied references into the execution/provenance surfaces.
+// host application's concern (see VerificationStore / MemoryStore; the
+// production durable implementation is PostgresStore in the storage layer).
+// The registry never invents executions or evidence: outcome.ExecutionIDs and
+// outcome.EvidenceRoot are caller-supplied references into the
+// execution/provenance surfaces until an EvidenceVerifier cryptographically
+// resolves them into a VerifiedOutcome.
+//
+// # Acceptance boundary
+//
+// RecordOutcome stores a CLAIM: the outcome is validated and bound, but it is
+// never proof. Only RecordVerifiedOutcome stores an authoritative result, and
+// it accepts only sealed VerifiedOutcome values (server-created by an
+// EvidenceVerifier). QueryOutcome returns authoritative records only — a raw
+// claim never satisfies it as a proven pass (ErrUnverified).
 type Registry struct {
 	mu          sync.RWMutex
 	clock       func() time.Time
 	obligations map[string]VerificationObligation
-	outcomes    map[string]VerificationOutcome
-	groups      map[string]SpeculativeGroup
+	// outcomes holds every recorded claim (and the outcome side of verified
+	// records) keyed by verification id.
+	outcomes map[string]VerificationOutcome
+	// verified holds ONLY sealed VerifiedOutcome records. Membership here is
+	// what makes a result authoritative.
+	verified     map[string]VerifiedOutcome
+	groups       map[string]SpeculativeGroup
+	capabilities map[string]VerifierCapability
 }
 
 // NewRegistry returns an empty registry reading wall time from the given
@@ -32,10 +48,12 @@ func NewRegistry(clock func() time.Time) *Registry {
 		clock = time.Now
 	}
 	return &Registry{
-		clock:       clock,
-		obligations: make(map[string]VerificationObligation),
-		outcomes:    make(map[string]VerificationOutcome),
-		groups:      make(map[string]SpeculativeGroup),
+		clock:        clock,
+		obligations:  make(map[string]VerificationObligation),
+		outcomes:     make(map[string]VerificationOutcome),
+		verified:     make(map[string]VerifiedOutcome),
+		groups:       make(map[string]SpeculativeGroup),
+		capabilities: make(map[string]VerifierCapability),
 	}
 }
 
@@ -68,8 +86,11 @@ func (r *Registry) Obligation(id string) (VerificationObligation, error) {
 
 // RecordOutcome validates the outcome, binds it to its obligation under the
 // binding rule and freshness policy at the registry clock, optionally binds
-// it to a speculative group, and stores it. Every failure is a refusal: the
-// record is not stored and no claim is discharged.
+// it to a speculative group, fills the substrate-derived Measured resource
+// facts from the execution interval, and stores it as a CLAIM. Every failure
+// is a refusal: the record is not stored and no claim is discharged. A
+// recorded claim is never authoritative — it must be evidence-verified and
+// stored via RecordVerifiedOutcome to discharge an obligation as proven.
 func (r *Registry) RecordOutcome(v VerificationOutcome) error {
 	if err := v.Validate(); err != nil {
 		return err
@@ -95,11 +116,128 @@ func (r *Registry) RecordOutcome(v VerificationOutcome) error {
 			return err
 		}
 	}
+	// Measured facts are substrate-derived, never caller-asserted: overwrite
+	// any supplied value so a dishonest reporter cannot inflate a comparison.
+	v.Resources.Measured = &MeasuredResourceFacts{
+		DurationNS: v.CompletedAt.Sub(v.StartedAt).Nanoseconds(),
+	}
 	r.outcomes[v.VerificationID] = cloneOutcome(v)
 	return nil
 }
 
-// Outcome fetches a stored outcome by id.
+// RecordVerifiedOutcome stores a sealed VerifiedOutcome as the AUTHORITATIVE
+// result of its verification. Only records produced by an EvidenceVerifier
+// are accepted: an unsealed value (including a raw submitted outcome) is
+// refused with ErrUnverified, so a forged evidence_root can never become a
+// proven pass. The outcome inside is validated and bound exactly like a
+// claim (including the substrate-derived Measured facts); a claim already
+// stored under the same verification id is upgraded only when it is the same
+// submission as the verified record's outcome.
+func (r *Registry) RecordVerifiedOutcome(v VerifiedOutcome) error {
+	if !v.Sealed() {
+		return fmt.Errorf("%w: RecordVerifiedOutcome requires a verifier-produced record", ErrUnverified)
+	}
+	out := v.Outcome
+	if err := out.Validate(); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.verified[out.VerificationID]; exists {
+		return fmt.Errorf("%w: outcome %q", ErrExists, out.VerificationID)
+	}
+	ob, ok := r.obligations[out.ObligationID]
+	if !ok {
+		return fmt.Errorf("%w: obligation %q", ErrNotFound, out.ObligationID)
+	}
+	if err := Bind(ob, out, r.clock()); err != nil {
+		return err
+	}
+	if out.Resources.Speculative {
+		g, ok := r.groups[out.Resources.VerificationGroupID]
+		if !ok {
+			return fmt.Errorf("%w: group %q", ErrGroupBinding, out.Resources.VerificationGroupID)
+		}
+		if err := BindGroup(g, out); err != nil {
+			return err
+		}
+	}
+	// Measured facts are substrate-derived, never caller-asserted.
+	out.Resources.Measured = &MeasuredResourceFacts{
+		DurationNS: out.CompletedAt.Sub(out.StartedAt).Nanoseconds(),
+	}
+	if claim, exists := r.outcomes[out.VerificationID]; exists {
+		if !claimEquivalent(claim, out) {
+			return fmt.Errorf("%w: outcome %q already recorded as a different claim", ErrExists, out.VerificationID)
+		}
+	}
+	stored := cloneOutcome(out)
+	r.outcomes[out.VerificationID] = stored
+	seal := v
+	seal.Outcome = stored
+	r.verified[out.VerificationID] = cloneVerified(seal)
+	return nil
+}
+
+// claimEquivalent reports whether a stored claim and a verified record's
+// outcome are the same submission. Binding-relevant fields, evidence claims
+// and the reported resource facts are all compared (the substrate-derived
+// Measured subset is excluded — it is filled at record time) so two different
+// runs cannot share one verification id.
+func claimEquivalent(a, b VerificationOutcome) bool {
+	if !(a.VerificationID == b.VerificationID &&
+		a.ObligationID == b.ObligationID &&
+		a.CandidateDigest == b.CandidateDigest &&
+		a.SnapshotDigest == b.SnapshotDigest &&
+		a.ContractDigest == b.ContractDigest &&
+		a.Outcome == b.Outcome &&
+		a.AssuranceProfile == b.AssuranceProfile &&
+		a.EvidenceRoot == b.EvidenceRoot &&
+		equalStringSlices(a.CompletedChecks, b.CompletedChecks) &&
+		equalStringSlices(a.ExecutionIDs, b.ExecutionIDs) &&
+		equalStringSlices(a.ProvenanceRefs, b.ProvenanceRefs) &&
+		a.StartedAt.Equal(b.StartedAt) &&
+		a.CompletedAt.Equal(b.CompletedAt)) {
+		return false
+	}
+	ra, rb := a.Resources, b.Resources
+	ra.Measured, rb.Measured = nil, nil
+	return ra == rb
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// QueryOutcome fetches the authoritative verified record for a verification
+// id. A raw submitted outcome kept as a claim never satisfies this query as a
+// proven pass: a claim-only id returns ErrUnverified and an unknown id
+// returns ErrNotFound. Callers that accept claims may read them via Outcome /
+// OutcomesForObligation; callers that need proof must use QueryOutcome (see
+// VerifiedOutcome.ProvenPass).
+func (r *Registry) QueryOutcome(id string) (VerifiedOutcome, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if v, ok := r.verified[id]; ok {
+		return cloneVerified(v), nil
+	}
+	if _, ok := r.outcomes[id]; ok {
+		return VerifiedOutcome{}, fmt.Errorf("%w: outcome %q is an unverified claim", ErrUnverified, id)
+	}
+	return VerifiedOutcome{}, fmt.Errorf("%w: outcome %q", ErrNotFound, id)
+}
+
+// Outcome fetches a stored outcome by id. This returns claims as well as the
+// outcome side of verified records; it is NOT proof of verification — use
+// QueryOutcome for the authoritative record.
 func (r *Registry) Outcome(id string) (VerificationOutcome, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -151,11 +289,28 @@ func (r *Registry) Group(id string) (SpeculativeGroup, error) {
 	return cloneGroup(g), nil
 }
 
+// betterAttempt reports whether a is the canonical attempt over b when both
+// answer the same candidate in a speculative group. The rule is a total order
+// over distinct outcomes (verification ids are unique), so map iteration order
+// cannot change the winner: latest completed_at wins; ties break by ascending
+// verification_id.
+func betterAttempt(a, b VerificationOutcome) bool {
+	if !a.CompletedAt.Equal(b.CompletedAt) {
+		return a.CompletedAt.After(b.CompletedAt)
+	}
+	return a.VerificationID < b.VerificationID
+}
+
 // CompareGroup lines up the resource facts of every recorded outcome in a
-// speculative group into comparable rows ordered by candidate id. Outcomes
-// whose base snapshot does not match the group (which BindGroup prevents from
-// being recorded) can never appear; the check is repeated at comparison time
-// so a caller that reads across surfaces still gets fail-closed behavior.
+// speculative group into comparable rows ordered by candidate id. When a
+// candidate has several recorded outcomes, exactly one canonical attempt is
+// selected deterministically: the outcome with the latest completed_at wins,
+// ties broken by ascending verification_id. Two CompareGroup calls over the
+// same stored records therefore always return identical rows and the same
+// winner. Outcomes whose base snapshot does not match the group (which
+// BindGroup prevents from being recorded) can never appear; the check is
+// repeated at comparison time so a caller that reads across surfaces still
+// gets fail-closed behavior.
 func (r *Registry) CompareGroup(groupID string) (GroupComparison, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -172,7 +327,10 @@ func (r *Registry) CompareGroup(groupID string) (GroupComparison, error) {
 		if err := BindGroup(g, v); err != nil {
 			return GroupComparison{}, err
 		}
-		byCandidate[rf.CandidateID] = v
+		prev, exists := byCandidate[rf.CandidateID]
+		if !exists || betterAttempt(v, prev) {
+			byCandidate[rf.CandidateID] = v
+		}
 	}
 	ids := make([]string, 0, len(g.CandidateDigests))
 	for id := range g.CandidateDigests {
@@ -200,6 +358,54 @@ func (r *Registry) CompareGroup(groupID string) (GroupComparison, error) {
 	}, nil
 }
 
+// RegisterCapability validates and stores a verifier capability row.
+// (kind, version) is the identity: a duplicate is refused rather than
+// silently replaced, so capability advertising cannot be overwritten by a
+// later registrant.
+func (r *Registry) RegisterCapability(c VerifierCapability) error {
+	if err := c.Validate(); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := capabilityKey(c)
+	if _, exists := r.capabilities[key]; exists {
+		return fmt.Errorf("%w: capability %s/%s", ErrExists, c.Kind, c.Version)
+	}
+	r.capabilities[key] = cloneCapability(c)
+	return nil
+}
+
+// QueryCapabilities returns the registered capabilities matching every
+// non-empty query dimension, ordered by (kind, version) for deterministic
+// iteration. A zero query lists them all.
+func (r *Registry) QueryCapabilities(q CapabilityQuery) []VerifierCapability {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []VerifierCapability
+	for _, c := range r.capabilities {
+		if q.matches(c) {
+			out = append(out, cloneCapability(c))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Kind != out[j].Kind {
+			return out[i].Kind < out[j].Kind
+		}
+		return out[i].Version < out[j].Version
+	})
+	return out
+}
+
+func cloneCapability(c VerifierCapability) VerifierCapability {
+	out := c
+	out.ClaimClasses = append([]string(nil), c.ClaimClasses...)
+	out.AssuranceLevels = append([]string(nil), c.AssuranceLevels...)
+	out.Platforms = append([]string(nil), c.Platforms...)
+	out.EvidenceTypes = append([]string(nil), c.EvidenceTypes...)
+	return out
+}
+
 func cloneObligation(o VerificationObligation) VerificationObligation {
 	out := o
 	out.RequiredChecks = append([]string(nil), o.RequiredChecks...)
@@ -212,6 +418,10 @@ func cloneObligation(o VerificationObligation) VerificationObligation {
 	if o.Freshness.NotAfter != nil {
 		t := *o.Freshness.NotAfter
 		out.Freshness.NotAfter = &t
+	}
+	if o.Freshness.NotBefore != nil {
+		t := *o.Freshness.NotBefore
+		out.Freshness.NotBefore = &t
 	}
 	return out
 }
@@ -226,7 +436,19 @@ func cloneOutcome(v VerificationOutcome) VerificationOutcome {
 }
 
 func cloneResources(r ResourceFacts) ResourceFacts {
+	if r.Measured != nil {
+		m := *r.Measured
+		r.Measured = &m
+	}
 	return r
+}
+
+func cloneVerified(v VerifiedOutcome) VerifiedOutcome {
+	out := v
+	out.Outcome = cloneOutcome(v.Outcome)
+	out.Evidence.ExecutionIDs = append([]string(nil), v.Evidence.ExecutionIDs...)
+	out.Evidence.AttestationDigests = append([]Digest(nil), v.Evidence.AttestationDigests...)
+	return out
 }
 
 func cloneGroup(g SpeculativeGroup) SpeculativeGroup {

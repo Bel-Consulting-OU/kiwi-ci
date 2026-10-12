@@ -12,7 +12,13 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
-// TestSysDFDr001 proves DF-DR-001 — backup → destroy → restore:
+// TestSysDFDr001FSMode is the DEV/FS disaster-recovery drill (NewPersistent
+// filesystem state.json + attestation files). It is NOT the production DR
+// contract: production state is PostgreSQL plus blob/object storage (see
+// docs/disaster-recovery.md). Production DR is TestSysDFDr001PostgresObjectStore
+// in internal/dogfood/dist.
+//
+// TestSysDFDr001FSMode proves the FS-mode variant of backup → destroy → restore:
 //
 //  1. NewPersistent on DataDir1, submit+complete trusted-native work via
 //     the signed GitHub webhook ingress.
@@ -34,7 +40,7 @@ import (
 // and reported ("if possible" per the scenario contract). Restoring to the
 // same path — the common DR drill — is proven in the same test via a
 // second cycle that preserves absolute refs.
-func TestSysDFDr001(t *testing.T) {
+func TestSysDFDr001FSMode(t *testing.T) {
 	trusted := useTrustedNative(t)
 	if !trusted {
 		t.Setenv("KIWI_ALLOW_UNQUOTAED_UNTRUSTED_DISK", "1")

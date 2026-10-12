@@ -49,7 +49,15 @@ func moduleRoot(t *testing.T) string {
 func buildKiwi(t *testing.T, dir string) string {
 	t.Helper()
 	bin := filepath.Join(dir, "kiwi")
-	cmd := exec.Command("/opt/homebrew/bin/go", "build", "-o", bin, "./cmd/kiwi")
+	goBin := os.Getenv("KIWI_TEST_GO")
+	if goBin == "" {
+		var err error
+		goBin, err = exec.LookPath("go")
+		if err != nil {
+			t.Fatalf("go toolchain not found on PATH (set KIWI_TEST_GO to override): %v", err)
+		}
+	}
+	cmd := exec.Command(goBin, "build", "-o", bin, "./cmd/kiwi")
 	cmd.Dir = moduleRoot(t)
 	cmd.Env = os.Environ()
 	if out, err := cmd.CombinedOutput(); err != nil {

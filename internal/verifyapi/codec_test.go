@@ -53,6 +53,24 @@ func TestResourceFactsSerialization(t *testing.T) {
 	if back != rf {
 		t.Fatalf("round trip = %+v, want %+v", back, rf)
 	}
+	// The substrate-derived Measured subset is optional on the wire and
+	// round-trips as a pointer field.
+	withMeasured := rf
+	withMeasured.Measured = &MeasuredResourceFacts{DurationNS: 42}
+	raw2, err := json.Marshal(withMeasured)
+	if err != nil {
+		t.Fatalf("marshal measured: %v", err)
+	}
+	if !bytes.Contains(raw2, []byte(`"measured"`)) {
+		t.Fatalf("serialized facts missing measured: %s", raw2)
+	}
+	var back2 ResourceFacts
+	if err := json.Unmarshal(raw2, &back2); err != nil {
+		t.Fatalf("unmarshal measured: %v", err)
+	}
+	if back2.Measured == nil || back2.Measured.DurationNS != 42 {
+		t.Fatalf("measured round trip = %+v, want duration 42", back2.Measured)
+	}
 	// Negative measurements are refused (fail closed on garbage).
 	bad := rf
 	bad.CPUTimeNS = -1
@@ -64,6 +82,12 @@ func TestResourceFactsSerialization(t *testing.T) {
 	bad.VerificationGroupID = ""
 	if err := bad.validate(); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("speculative without group id = %v, want ErrInvalid", err)
+	}
+	// A negative substrate-derived duration is refused.
+	bad = rf
+	bad.Measured = &MeasuredResourceFacts{DurationNS: -1}
+	if err := bad.validate(); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("negative measured.duration_ns = %v, want ErrInvalid", err)
 	}
 }
 
@@ -130,6 +154,47 @@ func TestObligationDocumentRoundTrip(t *testing.T) {
 	raw, _ = MarshalObligation(ob)
 	if _, err := UnmarshalObligation(raw); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("empty required_checks = %v, want ErrInvalid", err)
+	}
+}
+
+// TestCodecRejectsMalformedDigests proves digests fail closed at decode as
+// well as Validate/Bind: a document whose pinned digest is not exactly 64
+// lowercase hex chars is refused.
+func TestCodecRejectsMalformedDigests(t *testing.T) {
+	ob := baseObligation(t)
+	raw, err := MarshalObligation(ob)
+	if err != nil {
+		t.Fatalf("MarshalObligation = %v", err)
+	}
+	good := string(ob.ImmutableCandidateDigest)
+	mutations := []struct {
+		name string
+		old  string
+		new  string
+	}{
+		{"63-char", good, good[:63]},
+		{"65-char", good, good + "a"},
+		{"uppercase", good, "A" + good[1:]},
+		{"empty", good, ""},
+		{"non-hex", good, "z" + good[1:]},
+	}
+	for _, tc := range mutations {
+		mutated := bytes.Replace(raw, []byte(`"`+good+`"`), []byte(`"`+tc.new+`"`), 1)
+		if _, err := UnmarshalObligation(mutated); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("decode %s digest = %v, want ErrInvalid", tc.name, err)
+		}
+	}
+
+	// Same rule for the outcome's evidence_root.
+	v := baseOutcome(t, baseObligation(t))
+	raw, err = MarshalOutcome(v)
+	if err != nil {
+		t.Fatalf("MarshalOutcome = %v", err)
+	}
+	er := string(v.EvidenceRoot)
+	mutated := bytes.Replace(raw, []byte(`"`+er+`"`), []byte(`"`+er[:63]+`"`), 1)
+	if _, err := UnmarshalOutcome(mutated); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("decode 63-char evidence_root = %v, want ErrInvalid", err)
 	}
 }
 
