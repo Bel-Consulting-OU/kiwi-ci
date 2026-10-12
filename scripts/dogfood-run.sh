@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# dogfood-run.sh runs one dogfood suite and FAILS CLOSED unless every
-# REQUIRED test in the suite actually executed.
+# dogfood-run.sh runs one dogfood suite and fails closed unless every
+# required test in the suite actually executed.
 #
 # The earlier "filter matched at least one test" check was too weak: a suite
 # named TestDFUPGRADE|TestOther stayed green if TestDFUPGRADE vanished as
 # long as TestOther still matched. A dogfood suite is a release contract, so
-# each suite lists the tests it OWNS; missing any of them is a red suite.
+# each suite lists the tests it owns; missing any of them is a red suite.
 #
 # Usage:
 #   scripts/dogfood-run.sh <timeout> --run <regexp> --require <TestName> [--require ...] \
@@ -98,11 +98,11 @@ fi
 
 # Every required test must have executed AND not skipped. A prefix match
 # counts (TestDFEVID001 is satisfied by TestDFEVID001GenerationAndVerify).
-# A required test that only t.Skip'd is MISSING: "required present" means the
+# A required test that only t.Skip'd is missing: "required present" means the
 # body ran, not that Go emitted === RUN before skipping.
 skipped=()
 for req in "${required[@]}"; do
-  # If every matching === RUN is followed by --- SKIP for that name, treat as missing.
+  # If every matching === RUN is followed by a skip result for that name, treat as missing.
   if grep -q "^--- SKIP: ${req}" "$out" && ! grep -q "^--- PASS: ${req}" "$out" && ! grep -q "^--- FAIL: ${req}" "$out"; then
     skipped+=("$req")
   fi

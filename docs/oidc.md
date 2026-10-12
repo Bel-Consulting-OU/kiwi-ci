@@ -10,6 +10,7 @@ credentials.
   `id_token_signing_alg_values_supported: ["EdDSA"]`,
   `subject_types_supported: ["public"]`,
   `response_types_supported: ["id_token"]`.
+
 - `GET /api/v1/oidc/jwks` — the public Ed25519 key (`kty: OKP`,
   `crv: Ed25519`, `alg: EdDSA`, `kid`).
 
@@ -30,17 +31,23 @@ The request must present the job's active lease. The server issues an
 Ed25519-signed ID token with:
 
 - `iss` — the external URL;
+
 - `aud` — the requested audience;
+
 - `sub` — `repo:<owner/name>:ref:<ref>:job:<key>`;
+
 - `exp` — short expiry.
 
 ## Permissions and policy
 
 - The pipeline must declare `permissions.id_token: true` on the job.
+
 - Untrusted jobs are denied OIDC issuance entirely (hard floor).
+
 - The effective policy's `OIDC` field is an audience allowlist; `nil`
   permits any audience (trusted default), an empty non-nil list denies
   all issuance, and a non-nil list permits only listed audiences.
+
 - `permissions.id_token` with no allowed audiences is a policy
   violation at admission.
 
@@ -55,13 +62,18 @@ Each key carries a 32-hex `kid` derived from 16 bytes of `crypto/rand`.
 Key rotation is fully implemented:
 
 - active + previous verification keys, each `kid`-indexed;
+
 - `not-before` / `retire-after` timestamps (previous keys stay
   verifiable for 72h after rotation);
+
 - active keys older than 30 days rotate automatically at issuance;
+
 - the trust root is never replaced atomically — previous keys remain in
   the JWKS until retired;
+
 - the JWKS document serves `Cache-Control: public, max-age=300` and an
   `ETag` with `If-None-Match` 304 handling;
+
 - every issuance is audited (`oidc.issued`) with job, audience, and
   `kid` metadata.
 

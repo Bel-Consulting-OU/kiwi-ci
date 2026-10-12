@@ -4,6 +4,10 @@ Kiwi CI executes repository-controlled code. The runner is a security
 boundary, not a convenience layer. This document describes how to report
 problems, which versions are supported, and the response you can expect.
 
+Evidence note: `Signature verified` (record integrity) and `tests passed`
+(observed outcomes) are two distinct results. Do not treat one as proof of
+the other.
+
 ## Supported versions
 
 | Version | Supported | Notes |
@@ -25,6 +29,7 @@ Private channels, in order of preference:
 1. **GitHub private security advisory**: open a private advisory against
    https://github.com/Bel-Consulting-OU/kiwi-ci (visible only to
    maintainers).
+
 2. **Email**: security@bel-consulting.eu — monitored by the
    maintainers. If it bounces, use the private advisory path above;
    the advisory is the authoritative channel for coordinated
@@ -33,20 +38,27 @@ Private channels, in order of preference:
 Include in your report:
 
 - the affected component and version (or commit);
+
 - a description of the vulnerability;
+
 - steps to reproduce, including a minimal pipeline YAML where relevant;
+
 - impact and any conditions required (trusted vs. untrusted runs,
   single-tenant vs. multi-tenant deployments);
+
 - whether you have a proposed fix or want coordinated disclosure.
 
 ### Response expectations
 
 - **Acknowledgment**: within 48 hours of a report via either channel.
+
 - **Triage**: a severity assessment and a decision (fix, mitigation,
   out of scope) within 7 days.
+
 - **Fix**: for confirmed issues we aim to ship a fix within **90 days**.
   Severe issues (untrusted code escape, secret disclosure, lease
   impersonation) are treated as blockers and fixed ahead of normal work.
+
 - **Disclosure**: coordinated release. We publish an advisory after the
   fix lands, unless you ask us to delay. We will credit reporters who
   want credit.
@@ -60,14 +72,19 @@ In scope:
 
 - runner-side code execution boundaries (native/container/Tart
   isolation, `internal/executor`, `internal/safefs`);
+
 - the control plane API (`internal/server`), including lease handling,
   webhook verification, OIDC token issuance, secret delivery, and
   artifact/cache endpoints;
+
 - admission policy (`internal/policy`), capability intersection, and
   trust-domain handling;
+
 - runner identity and enrollment (`internal/runnerpki`, mTLS binding,
   protocol negotiation);
+
 - storage and state handling (`internal/storage`, leases, receipts);
+
 - the pipeline parser/expression engine (`internal/pipeline`,
   `internal/expr`): parser crashes, denial-of-service inputs, and
   expression injection.
@@ -76,9 +93,11 @@ Out of scope:
 
 - issues that require the attacker to already control the host the
   runner executes on;
+
 - misconfigurations that require operator action beyond documented
   settings (for example, running untrusted pipelines with
   `runtime: native` after explicitly overriding policy);
+
 - third-party forges, cloud providers, or secret stores themselves.
 
 ## Embargo and coordinated disclosure
@@ -87,6 +106,7 @@ Reported vulnerabilities are embargoed until a fix is available or the
 90-day window closes. Under embargo:
 
 - do not share exploitation details publicly;
+
 - you may share the fact that you reported an issue with people who
   need to know (for example, your own operations team).
 

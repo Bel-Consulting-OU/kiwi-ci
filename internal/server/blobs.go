@@ -1166,19 +1166,16 @@ func (s *Server) openArtifact(ctx context.Context, rec model.ArtifactRecord) (io
 func cacheNamespace(j model.Job) (repo, trust string) {
 	repo = repoIDForJob(j)
 	repo = strings.TrimSpace(repo)
-	trust = "untrusted"
-	if j.Trusted {
-		trust = "trusted"
-	}
+	trust = cache.TrustDomain(j.Trusted)
 	return repo, trust
 }
 
 // cacheFileKey maps the server-derived (repo, trust, logicalKey) triple onto
 // the 64-hex on-disk key so a cache entry can never collide across
-// repositories or trust domains.
+// repositories or trust domains. The formula is the shared
+// cache.ManifestKey derivation.
 func cacheFileKey(repo, trust, logicalKey string) string {
-	sum := sha256.Sum256([]byte(repo + "\x00" + trust + "\x00" + logicalKey))
-	return hex.EncodeToString(sum[:])
+	return cache.ManifestKey(repo, trust, logicalKey)
 }
 
 // cacheLease verifies the job-lease contract for a cache request via the

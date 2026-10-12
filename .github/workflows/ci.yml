@@ -33,6 +33,7 @@ jobs:
         run: |
           go run ./cmd/filemap --check
           ./scripts/docs-links-check.sh
+          ./scripts/docs-lint.sh --source --baseline scripts/docs-lint-baseline.txt
       - name: unit tests
         run: go test -count=1 -timeout=40m ./...
       - name: dogfood-fast (model proofs)
@@ -75,3 +76,12 @@ jobs:
           go-version-file: go.mod
       - name: fuzz smoke (5s per target)
         run: ./scripts/fuzz-smoke.sh 5s
+
+  workflow-lint:
+    name: Workflow lint (actionlint)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # actionlint 1.7.12

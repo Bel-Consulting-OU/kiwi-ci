@@ -1,0 +1,13 @@
+{
+  "comment": "SHA-256 manifest of the N-1 compatibility corpus. Every file is N-1 producer output (git worktree at the N-1 commit, emitted by N-1 storage APIs). Files are immutable: regenerating under changed encoding breaks TestCompatCorpusNMinusOneConsumedByHead.",
+  "producer": {
+    "commit": "fb8a366335ecb5137d994929b34aa41387ddd812",
+    "method": "git worktree add --detach <N-1 sha>; go run ./compatemit (calls internal/storage completion-receipt + observed-runtime APIs of the N-1 tree)",
+    "go_version": "go1.27.2"
+  },
+  "files": {
+    "completion_receipt.json": "f648db23ec515422b2a69725b54c7a051caef01e78b0d16c9aae677afc0ed43d",
+    "observed_runtime.json": "3facd05c8f1053bf39a12dfefe6f6091a1421aff77a954b4f15a9667df6c7d4b",
+    "observed_runtime_control.json": "63a522278fdf0d39ecb890badae8dfefc58838ce322442d2ca9c023be85ec948"
+  }
+}

@@ -53,7 +53,7 @@ exist on the surface (see [Non-goals](#non-goals)).
 Each rule states what must hold for **any** admitted fragment, the enforcing
 code, and the test that fails if the enforcement is removed.
 
-### L1 — Only QUEUED nodes may ever be added
+### L1 — Only queued nodes may ever be added
 
 Every child written by the fragment path is constructed with
 `Status: model.StatusQueued` (`internal/server/dynamic.go:544`) under the
@@ -85,13 +85,11 @@ are byte-identical after an admission, including the generating parent);
 
 ### L3 — A newly introduced prerequisite may only target an unstarted (queued) node
 
-Every edge introduced by a fragment ends at a node created by that same
-fragment, which is queued by L1. The generating parent gains no new
-prerequisites; fragment-internal edges point only at fragment keys. Targeting a
-running or terminal node is not expressible: every `deps` key and every
-dependency value must be a declared fragment key, and a name outside the
-fragment (including the parent's own key or any existing run job) is refused
-whole.
+Every edge introduced by a fragment ends at a node created by that same fragment, which is queued by L1.
+The generating parent gains no new prerequisites; fragment-internal edges point only at fragment keys.
+Targeting a running or terminal node is not expressible.
+ Every `deps` key and every dependency value must be a declared fragment key, and a name outside the fragment (including the parent's own key or any existing run job) is refused whole.
+
 
 Tests: `TestGraphMutationNeverMutatesCommittedNodes`,
 `TestGraphMutationAddDependencyStaysInsideFragment`,
@@ -183,15 +181,11 @@ plus the PostgreSQL integration twins in `internal/storage/postgres_run_key_conf
 
 ### L9 — Generation is lease-authorized and commit-time fenced
 
-A mutation requires the parent's live lease: authorization runs before the
-receipt lookup so a stale generation or token can never observe committed
-children (`authorizeRunnerLease` `internal/server/runner_lease.go:42`), and the
-store re-evaluates the complete predicate `{running, runner, generation, token,
-storage-clock expiry}` on the locked parent inside the insertion transaction
-(`ValidateGeneratedParentLease` `internal/storage/store.go:1008`;
-`internal/storage/postgres.go:5173`; memory `internal/server/dynamic.go:628`).
-Every refusal wraps `ErrLeaseLost` and maps to `409`, never a misleading `400`
-(`internal/server/dynamic.go:149`).
+A mutation requires the parent's live lease.
+ Authorization runs before the receipt lookup so a stale generation or token can never observe committed children (`authorizeRunnerLease` `internal/server/runner_lease.go:42`),.
+The store re-evaluates the complete predicate `{running, runner, generation, token, storage-clock expiry}` on the locked parent inside the insertion transaction (`ValidateGeneratedParentLease` `internal/storage/store.go:1008`; `internal/storage/postgres.go:5173`; memory `internal/server/dynamic.go:628`).
+Every refusal wraps `ErrLeaseLost` and maps to `409`, never a misleading `400` (`internal/server/dynamic.go:149`).
+
 
 Tests: `TestGeneratedFragmentStaleGenerationCannotReplay`,
 `TestGeneratedFragmentRacedLeaseLossMaps409Not400`,
@@ -206,14 +200,15 @@ Mutation is **content-addressed**, **slot-idempotent** and
   (`internal/api/v1/generated.go:34`), recomputed by the server. Identical
   emissions produce the identical id and converge; the runner retry path
   re-sends the same body (`internal/runner/runner.go:2808`).
+
 - Slot idempotence: `(parent job, mutation slot)` admits exactly one digest;
   an identical re-emission under any later lease generation replays the
   original children, while a nondeterministic re-emission (different digest)
   fails closed `409`.
-- Generation authorization: the presented lease generation must still be live
-  at both the request gate and the commit-time predicate, but it never becomes
-  part of the mutation identity — an infrastructure retry of the same logical
-  parent under a new generation replays rather than duplicates.
+
+- - Generation authorization: the presented lease generation must still be live at both the request gate and the commit-time predicate, but it never becomes part of the mutation identity.
+   an infrastructure retry of the same logical parent under a new generation replays rather than duplicates.
+  
 
 ## Non-goals
 
@@ -241,6 +236,7 @@ rather than claimed as enforcement:
 1. Queue-only insertion (L1) is enforced by the admission path that constructs
    the jobs; the storage layer accepts already-admitted compiled jobs and does
    not re-assert the status.
+
 2. Run-scoped key uniqueness (L8) has a database index backstop that is
    intentionally skipped on pre-existing dirty `(run_id, key)` databases
    (migration `0048`); the admission check remains authoritative there.

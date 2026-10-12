@@ -1,6 +1,9 @@
-# Kiwi CI
+<p align="center">
+  <img src="docs/brand/assets/logo-lockup.png" alt="Kiwi CI" width="320">
+</p>
 
-**Execution, with evidence.**
+<p align="center"><strong>Execution, with evidence.</strong></p>
+<p align="center"><em>Run. Record. Verify.</em></p>
 
 Kiwi CI is a single-binary CI/CD engine: one Go program runs as a local
 CLI, a control plane, and a runner. It executes the same compiled
@@ -8,9 +11,9 @@ pipeline DAG locally and remotely, with first-class caches, artifacts,
 retries, cancellation, secrets, and an auditable execution boundary for
 untrusted code.
 
-*Run. Record. Verify.* — verification refers to evidence and declared
-checks; a signature establishes record integrity, while tests report
-their observed outcomes. Those are two distinct results.
+Verification refers to evidence and declared checks; a signature
+establishes record integrity, while tests report their observed outcomes.
+Those are two distinct results.
 
 Architecturally Kiwi is **deterministic execution, verification and
 evidence infrastructure built for dynamic workloads**: ordinary CI, build
@@ -30,19 +33,24 @@ bit-reproducibility, and what Kiwi does not guarantee) is public in
   intelligence, downstream pipelines, deployments, snapshots, and
   digest-pinned reusable components. See
   [docs/pipeline-reference.md](docs/pipeline-reference.md).
+
 - **Local/remote parity**: `kiwi run` and remote runners execute the
   same compiled DAG. Local runs get isolated per-job workspaces.
+
 - **Backends**: native (process-group cancellation), hardened Docker
   containers (rootless verification, capability drop, immutable image
   enforcement), and disposable Tart VMs on Apple Silicon.
+
 - **Control plane**: PostgreSQL-backed scheduler with per-job leases,
   HA leader election, REST API, web dashboard, audit log, and
   Prometheus metrics. The runs collection is keyset-paginated so older
   runs stay reachable; see [docs/runs-api.md](docs/runs-api.md).
+
 - **Security**: capability-based admission policy with a deny-by-default
   untrusted floor, mTLS runner enrollment, HMAC-only lease tokens,
   sealed secret delivery, OIDC token issuance, and hardened archive
   extraction. See [docs/security-model.md](docs/security-model.md).
+
 - **Invariants**: the core correctness invariants (terminal outcomes, atomic
   ledgers, lease fencing, scoped event recovery, replay effect-safety for
   Kiwi-mediated effects and declared surfaces, graph-history stability,
@@ -52,16 +60,20 @@ bit-reproducibility, and what Kiwi does not guarantee) is public in
   that mapping is treated as a broken invariant. The constrained dynamic-graph
   mutation algebra (operations, legality rules, non-goals) is defined in
   [docs/graph-mutations.md](docs/graph-mutations.md).
+
 - **Forge integrations**: GitHub (App auth, Checks API), GitLab, and
   Forgejo webhooks with verified signatures, trigger matching, and
   deduplicated deliveries.
+
 - **Explainability**: `kiwi explain --why JOB` shows why a job would or
   would not run; queued jobs carry machine-readable queue reasons.
 
 ## Requirements
 
 - Go 1.27.2 or later.
+
 - `git` on the PATH.
+
 - Docker (for `runtime: container`) and Tart (for `runtime: tart`)
   only where those runtimes are used.
 
@@ -195,7 +207,7 @@ environment variable; see
 
 One process runs the control plane and one local runner; Ctrl-C drains
 both. The command is intentionally minimal: no TLS, no PostgreSQL, no
-mTLS, no remote runners. It starts the SAME `app.Server` and
+mTLS, no remote runners. It starts the same `app.Server` and
 `app.Runner` implementations the dedicated commands use, so the
 single-machine mode cannot drift into a second, weaker server. The state
 directory holds the durable state, the runner identity/cache tree, and
@@ -284,10 +296,10 @@ uses, and executes the recorded effective job against the restored
 workspace snapshot. A record that no longer re-verifies is refused.
 `--attempt N` selects the snapshot uploaded under lease generation N
 (default: the newest generation for the job); `--debug-rerun` preserves the
-old debugging behavior of compiling the CURRENT local `--pipeline` file
+old debugging behavior of compiling the current local `--pipeline` file
 (warning: execution semantics may then differ from the recorded run).
 
-"Exact" is exact about WHAT is re-executed — the recorded compiled job and
+"Exact" is exact about what is re-executed — the recorded compiled job and
 the restored workspace snapshot — not a claim of bit-reproducible outputs:
 external services, clocks, network state and undeclared step behavior stay
 outside Kiwi's view, so a re-run can produce different observable results.
@@ -298,7 +310,7 @@ define which Kiwi-mediated effects exist at all.
 
 Exact replay is historically faithful, not automatically safe to re-execute:
 it enforces the recorded network/sandbox/resource policy but runs the
-historical step scripts with your CURRENT local credentials. A recorded job
+historical step scripts with your current local credentials. A recorded job
 that DECLARES external-effect surfaces (deployment phases, step secrets,
 OIDC audiences) is therefore refused unless `--allow-external-effects` is
 passed. The safety claim is scoped to Kiwi-mediated effects and the surfaces
@@ -384,9 +396,11 @@ Operational requirements for the Woodpecker instance:
 
 - Every execution and service image is **pinned by OCI digest** in the
   workflow files.
+
 - `WOODPECKER_FORCE_IGNORE_SERVICE_FAILURE=false` on the server, so the
   PostgreSQL service being down fails `integration-coverage` instead of
   being ignored (see [docs/production-deployment.md](docs/production-deployment.md)).
+
 - The `integration-coverage` PostgreSQL step exports
   `PGOPTIONS="-c jit=off"`: PostgreSQL's LLVM JIT can crash a backend
   mid-query under the concurrent clone/`DROP DATABASE ... WITH (FORCE)`
@@ -395,6 +409,7 @@ Operational requirements for the Woodpecker instance:
   execution optimization, not semantics, so the lane pins it off rather than
   depending on JIT being safe on every agent host. `PGOPTIONS` is honored by
   pgx and applies to derived clone DSNs as well.
+
 - `docker-workspace-diagnostic` mounts the agent host's Docker socket into
   its steps (`volumes: - /var/run/docker.sock:/var/run/docker.sock`), so the
   repository must be marked **trusted** in Woodpecker; `capability=docker`
@@ -413,6 +428,7 @@ Operational requirements for the Woodpecker instance:
   skips instead of reddening every HEAD; a compatible backend (or a
   bind-mount-free replacement lane) must be promoted to a required push
   context in `scripts/gh-branch-protection.sh` when it exists.
+
 - Commit-status contexts use Woodpecker's canonical
   `ci/woodpecker/<event>/<workflow>` form, with the pull_request event mapped
   to the literal `pr`, so branch protection requires names like

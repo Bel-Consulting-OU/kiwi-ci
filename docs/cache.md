@@ -15,8 +15,11 @@ cache:
 ```
 
 - `paths` — workspace-relative roots captured and restored.
+
 - `key` — logical key base.
+
 - `hash_files` — globs whose contents are folded into the key.
+
 - `restore_keys` — fallback keys tried in order on a primary miss.
 
 ## Key computation
@@ -41,6 +44,7 @@ cache state later consumed by trusted runs.
   path escapes, with archive/expanded/file size, entry count, depth,
   path length, and compression ratio limits, and only the declared
   roots are extracted.
+
 - Save runs only when the job succeeds. Saves are atomic
   (write temp, rename) and enforce a maximum cache size.
 
@@ -89,6 +93,8 @@ write and read.
 ## Limits
 
 - Max cache bytes is configurable per store.
+
 - Cache paths must be relative (no absolute paths, no `..`).
+
 - Untrusted jobs: cache read/write stays allowed but namespaced; all
   other capabilities are denied.

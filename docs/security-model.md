@@ -13,6 +13,7 @@ Every run is classified as trusted or untrusted:
 
 - **Trusted**: pushes to the repository's own branches (or API
   submissions authenticated by a principal with trusted-run rights).
+
 - **Untrusted**: pull/merge requests from forks, and any other
   repository-controlled input not backed by a trusted identity.
 
@@ -51,13 +52,17 @@ check` evaluates the same admission locally.
 - Each job is leased to exactly one runner for a bounded time
   (default 45 seconds), extended by heartbeats. See
   [ha.md](ha.md).
+
 - A lease has a generation counter. Completion is idempotent through a
   generation-bound receipt, so a retried completion cannot apply twice.
+
 - The raw lease token exists only in runner memory. The control plane
   persists only the HMAC-SHA256 of the token under a server-local key,
   so a stolen database does not yield active capabilities.
+
 - Cancelled or completed jobs lose their lease immediately; dead leases
   are never accepted for mutation endpoints.
+
 - Runners self-cancel when the control plane is unreachable past the
   acknowledged lease deadline, so at most one valid generation of a job
   can execute after its lease expires.
@@ -78,12 +83,15 @@ accepted.
 - Secrets are declared in the pipeline; values are resolved by the
   server-side broker only for jobs holding an active lease, under the
   effective secret allowlist.
+
 - Delivery uses X25519+HKDF+AES-GCM sealed envelopes opened by the
   runner, optionally with one-time semantics per (name, repository,
   environment). The server does not persist plaintext.
+
 - On the runner, step-level secrets exist only in that step's
   environment map and are masked from logs (raw, URL-encoded, base64,
   JSON-escaped, and shell-quoted forms).
+
 - Job-level secrets resolve once into the job environment; step secrets
   never reach other steps, cache keys, or persisted state.
 
@@ -109,18 +117,12 @@ acknowledged loopback development instance). See
 [production-deployment.md](production-deployment.md) and
 `kiwi.example.toml`.
 
-When a provider and static entries are both configured, resolution forms a
-fail-closed chain. `secret_broker.fallback_on` (a TOML array, default
-`["not_found"]`) lists the provider error classes that permit advancing to
-the next broker; only `not_found` and `unavailable` are accepted.
-Authorization (`401`), policy (`403`), malformed-response, and cancellation
-failures ALWAYS fail closed: the authoritative error is returned (classified
-and with the provider named) and the later broker is never consulted, so a
-Vault denial or outage can never be masked by delivering a static secret.
-Provider failures are classified as `not_found` (absent secret), `unavailable`
-(5xx, network/TLS failure, timeout, invalid endpoint, cancellation),
-`unauthorized`, `forbidden`, or `malformed`; provider response bodies are
-never copied into error messages.
+When a provider and static entries are both configured, resolution forms a fail-closed chain.
+`secret_broker.fallback_on` (a TOML array, default `["not_found"]`) lists the provider error classes that permit advancing to the next broker; only `not_found` and `unavailable` are accepted.
+Authorization (`401`), policy (`403`), malformed-response, and cancellation failures always fail closed.
+ The authoritative error is returned (classified and with the provider named) and the later broker is never consulted, so a Vault denial or outage can never be masked by delivering a static secret.
+Provider failures are classified as `not_found` (absent secret), `unavailable` (5xx, network/TLS failure, timeout, invalid endpoint, cancellation), `unauthorized`, `forbidden`, or `malformed`; provider response bodies are never copied into error messages.
+
 
 ## OIDC
 
@@ -146,7 +148,7 @@ as global grants or per-repository grants: `execution.events:read`
 `GET /api/v1/execution-snapshot` bootstrap), `evidence:read` (audit
 trail and exact-replay pipeline exports), `checkpoints:read` (workspace
 snapshot listing/download) and `runs:cancel`. The snapshot and the
-unscoped event cursor read require the capability GLOBALLY (they span
+unscoped event cursor read require the capability globally (they span
 repositories); a `run_id`-scoped event read also accepts read access to
 that run's repository. Every capability route is enforced by the tier
 gate and re-resolved against the addressed repository in the handler;
@@ -156,9 +158,12 @@ runner credentials never satisfy a capability.
 
 1. **Admission** (enqueue): capability intersection, trust floor,
    component resolution, trigger matching.
+
 2. **Lease** (dispatch): label matching, environment concurrency,
    dependency outcomes, queue quotas.
+
 3. **Lease endpoints** (runtime): active-lease checks, declared-secret
    scoping, OIDC audiences, artifact contracts.
+
 4. **Runner** (execution): clean environment, immutable images for
    untrusted jobs, network policy, per-step secret scoping, log masking.

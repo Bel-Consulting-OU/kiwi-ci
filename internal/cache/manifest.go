@@ -42,6 +42,27 @@ type signature struct {
 	Sig   string `json:"sig"`
 }
 
+// TrustDomain maps a job's trust flag onto the cache trust-domain string.
+// It is the single derivation behind the control-plane cache namespace
+// (server.cacheNamespace) and the signed manifest payload: an untrusted job
+// and a trusted job sharing one logical key address different namespaces, so
+// an untrusted write can never become a trusted read.
+func TrustDomain(trusted bool) string {
+	if trusted {
+		return "trusted"
+	}
+	return "untrusted"
+}
+
+// ManifestKey maps (repository, trust domain, logical key) onto the durable
+// on-disk / table namespace key. The triple is the whole identity of a cache
+// entry: a key produced under one trust domain can never collide with the
+// same logical key under the other.
+func ManifestKey(repo, trustDomain, logicalKey string) string {
+	sum := sha256.Sum256([]byte(repo + "\x00" + trustDomain + "\x00" + logicalKey))
+	return hex.EncodeToString(sum[:])
+}
+
 func ValidateManifest(m CacheManifest) error {
 	if m.Version != 1 {
 		return fmt.Errorf("cache: unsupported manifest version %d", m.Version)

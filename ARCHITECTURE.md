@@ -1,9 +1,10 @@
 # Kiwi CI architecture
 
-Kiwi CI separates **orchestration** from **execution** while keeping one
-pipeline compiler and one expression engine for local and remote use.
-One binary plays three roles: CLI (`kiwi run`, `validate`, `explain`),
-control plane (`kiwi server`), and worker (`kiwi runner`).
+**Execution, with evidence.** Kiwi CI separates **orchestration** from
+**execution** while keeping one pipeline compiler and one expression
+engine for local and remote use. One binary plays three roles: CLI
+(`kiwi run`, `validate`, `explain`), control plane (`kiwi server`), and
+worker (`kiwi runner`).
 
 ## Flow
 

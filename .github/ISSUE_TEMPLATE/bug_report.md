@@ -1,16 +1,19 @@
 ---
 name: Bug report
-about: Report a defect in Kiwi CI
+about: Report a defect in Kiwi CI (Execution, with evidence.)
 title: ''
 labels: bug
 assignees: ''
 ---
+
+<!-- Kiwi CI: Execution, with evidence. Keep facts, policies, and outcomes distinct. -->
 
 ## Environment
 
 - Kiwi version (`kiwi version`):
 - Operating system:
 - Server mode (dev/production, PostgreSQL or in-memory):
+- Backend (native/container/Tart), if relevant:
 
 ## Summary
 
@@ -37,6 +40,13 @@ What should happen.
 
 What happens instead, including the full error message and relevant log
 lines.
+
+## Evidence
+
+If available, what was **recorded** vs what was **observed** (for
+example: `Signature verified` vs `tests passed` — those are two distinct
+results). Link to a run/attempt id or attestation only if it is already
+redacted of secrets.
 
 ## Additional context
 

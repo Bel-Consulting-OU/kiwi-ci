@@ -7,17 +7,22 @@ GitHub API, and publishes check runs back to the repository.
 
 1. In the repository (or organization) settings, add a webhook to
    `https://<your-kiwi-host>/hooks/github`.
+
 2. Content type: `application/json`.
+
 3. Secret: the value of `--github-webhook-secret` (or
    `KIWI_GITHUB_WEBHOOK_SECRET`). Kiwi verifies `X-Hub-Signature-256`
    before processing anything.
+
 4. Events: `Pushes` and `Pull requests` at minimum.
 
 ## Trust handling
 
 - Push events are trusted.
+
 - Pull requests from the same repository are trusted; pull requests
   from forks are untrusted.
+
 - For fork PRs, the pipeline definition is fetched from the base
   commit of the base repository; the fork code is checked out
   separately. Untrusted runs get the hard capability floor: no secrets,
@@ -30,6 +35,7 @@ Two modes:
 
 - **Personal access token** (`--github-token`): used for fetching
   private pipeline files and changed-file lists.
+
 - **GitHub App** (`github.app_id` + `github.private_key_path`): the
   recommended mode. The App authenticates with short-lived installation
   access tokens minted from RS256-signed JWTs, cached per repository

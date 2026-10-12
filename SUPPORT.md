@@ -1,5 +1,10 @@
 # Support
 
+**Execution, with evidence.** — when reporting a problem, separate what
+was requested from what was effective, and a test result from evidence
+integrity. See [docs/brand/README.md](docs/brand/README.md) for product
+voice.
+
 ## Documentation
 
 Start with [README.md](README.md) for a quick start, then:

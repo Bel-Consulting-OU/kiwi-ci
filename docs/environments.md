@@ -27,9 +27,12 @@ jobs:
 ```
 
 - `environment.name` — matches `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`.
+
 - `environment.approval` — the job waits in `waiting_approval` until an
   operator approves it.
+
 - `environment.branches` — restrict the environment to these branches.
+
 - `environment.concurrency` — maximum simultaneous running jobs in this
   environment (0 = unlimited).
 
@@ -41,9 +44,11 @@ environments.
 
 - Approval is required per job; the queue reason `WAITING_APPROVAL` is
   reported until someone approves.
+
 - `POST /api/v1/jobs/{id}/approve` (or `kiwi approve <job>`) approves a
   waiting job. The approving actor is recorded from the authenticated
   principal.
+
 - Jobs whose environment branch filter does not match the run's branch
   are blocked.
 

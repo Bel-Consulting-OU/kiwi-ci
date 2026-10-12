@@ -16,3 +16,7 @@ What does this change do and why?
       description
 - [ ] Security-sensitive changes keep deny-by-default policy and add
       regression tests
+- [ ] UI/copy follows [docs/brand/README.md](../docs/brand/README.md):
+      lockup artwork only (do not redraw or retype the `kiwi CI`
+      wordmark), palette from `docs/brand/assets/brand-tokens.*`, and
+      `Signature verified` kept distinct from `tests passed`

@@ -61,8 +61,10 @@ Rules:
 
 - The harness **never mutates Kiwi's database** to make a scenario pass.
   Direct DB access is a **read-only secondary oracle** only.
+
 - Primary validation goes through the same CLI/API/protocol surfaces real
   customers use.
+
 - A test inside Kiwi cannot prove Kiwi survives being killed. The outer
   harness can.
 
@@ -87,10 +89,15 @@ Kiwi build of the same source as G1; G1 builds G2.
 Require (not byte-identical binaries unless bit-reproducibility is guaranteed):
 
 - identical source identity
+
 - expected dependency identity
+
 - expected execution semantics
+
 - successful behavioral conformance
+
 - valid attestations
+
 - compatible verifier behavior
 
 Generation limit: harness records `G0/G1/G2` and refuses unintended recursion.
@@ -154,12 +161,19 @@ For important scenarios, success is not "process exited 0". Validate up to
 eight independent surfaces (`internal/dogfood.Oracle`):
 
 1. Client result
+
 2. Authoritative state
+
 3. Ledger
+
 4. Runner authority (claim generation/ownership)
+
 5. Artifacts/cache
+
 6. Evidence
+
 7. External effects (fake sink count is authoritative)
+
 8. Recovery (same truth after restart/reconnect)
 
 Critical scenarios fail if these disagree.
@@ -212,11 +226,9 @@ unit/property test
 + at least one system dogfood scenario where practical
 ```
 
-Examples: single authoritative terminal result; transition/ledger atomicity;
-stale lease cannot mutate authority; authorized event recovery; replay cannot
-silently introduce effects; dynamic mutation cannot rewrite committed history;
-speculation has one committer; terminal states are monotonic; credentials never
-exceed execution authority; untrusted execution cannot poison trusted cache.
+Examples: single authoritative terminal result.
+ transition/ledger atomicity; stale lease cannot mutate authority; authorized event recovery; replay cannot silently introduce effects; dynamic mutation cannot rewrite committed history; speculation has one committer; terminal states are monotonic; credentials never exceed execution authority; untrusted execution cannot poison trusted cache.
+
 
 ## Public-surface coverage is measurable
 
@@ -287,17 +299,41 @@ The harness, oracle, hostile runner, fakes and the scenario kernel below are
 topology (real PostgreSQL + object/blob store, two real runners), the
 production DR drill, the packaged-binary install lifecycle and the
 fixed-workload soak + churn are online as `TestSys*` system/dist proofs and
-run through `make release-gate`. What remains planned is the long multi-hour
-/10k-job soak scale, DF3 chaos at scale and the DF5 real-forge canary.
+run through `make release-gate`. The planned column lists only work that
+cannot run without external credentials (a live forge). Work that needs no
+external credentials but is still unwritten sits in
+[Not yet implemented](#not-yet-implemented) — it is not "planned", it is
+missing.
 
 | Implemented now | Planned next wave |
 |---|---|
-| DF-BOOT-001, DF-EVID-001..005, DF-LEASE-001/002, DF-QUOTA-001, DF-EFFECT-001/002, DF-SELF-001 (G0/G1/G2 limit), DF-UPGRADE-001 (evidence compat), DF-SCALE-001 (harness workload) — **model species** | DF3 process/network chaos at scale, DF5 real-forge canary, long multi-hour / 10k-job soak |
-| DF-BOOT-001 / DF-EVID-001 / DF-LEASE-001 / DF-QUOTA-001 — **system species** via `TestSys*` in `internal/dogfood/system/` (real `NewPersistent` + HTTP + runner). Fail-closed arms (stale lease generation → 409, untrusted hard-quota gate, untrusted rootless floor) always run. Boot/restart and evidence success arms run an untrusted container job when rootless Docker satisfies the untrusted policy floor, and otherwise run a TRUSTED native job through the product trusted ingress (`TestSysTrustedIngress` signed GitHub webhook, `TestSysTrustedScheduleIngress` trusted schedule) — so they execute on hosts without rootless Docker instead of skipping. Direct API submissions stay untrusted (the product force-clears `Trusted`); the store is never mutated to fake trust. | real-forge webhook canary |
+| DF-BOOT-001, DF-EVID-001..005, DF-LEASE-001/002, DF-QUOTA-001, DF-EFFECT-001/002, DF-SELF-001 (G0/G1/G2 limit), DF-UPGRADE-001 (evidence compat), DF-SCALE-001 (harness workload) — **model species** | — |
+| DF-ART-001 (artifact finalization crash windows via `internal/artifact`), DF-CACHE-001 (untrusted→trusted cache poison via `internal/cache`) — **component species** | — |
+| DF-BOOT-001 / DF-EVID-001 / DF-LEASE-001 / DF-QUOTA-001 — **system species** via `TestSys*` in `internal/dogfood/system/` (real `NewPersistent` + HTTP + runner). Fail-closed arms (stale lease generation → 409, untrusted hard-quota gate, untrusted rootless floor) always run. Boot/restart and evidence success arms run an untrusted container job when rootless Docker satisfies the untrusted policy floor, and otherwise run a TRUSTED native job through the product trusted ingress (`TestSysTrustedIngress` signed GitHub webhook, `TestSysTrustedScheduleIngress` trusted schedule) — so they execute on hosts without rootless Docker instead of skipping. Direct API submissions stay untrusted (the product force-clears `Trusted`); the store is never mutated to fake trust. | DF5 real-forge canary (live forge webhooks / PR events — needs external forge credentials) |
 | DF-DIST-001 / DF-DR-001 (postgres + object store) — **system species** via `TestSysDFDist001Integration` / `TestSysDFDr001PostgresObjectStoreIntegration` in `internal/dogfood/dist` (real PostgreSQL, real server + runners processes, pg_dump backup/restore) | — |
 | G0/G1/G2 recursion refusal (`Harness.BeginGeneration`) **and** full G0→G1→G2 self-build of a release binary (`TestSysDFSelf002G1ToG2`) | — |
-| `dogfood-result.json` shape (`MarshalResult`, `TestDogfoodResultJSONShape`) | suite-level artifact emission of the result bundle on disk |
-| DF0 `.kiwi/pipeline.yaml` + dogfood YAML schema validation; DOGFOOD_MATRIX.md ↔ scenario-registry match gate (`TestDogfoodMatrixMatchesRegistry`) | broader `surfacecheck` integration of the matrix gate |
+| `dogfood-result.json` shape (`MarshalResult`, `TestDogfoodResultJSONShape`) | — |
+| DF0 `.kiwi/pipeline.yaml` + dogfood YAML schema validation; DOGFOOD_MATRIX.md ↔ scenario-registry match gate (`TestDogfoodMatrixMatchesRegistry`, `TestDogfoodMatrixGateMatchesRegistry` in `surfacecheck`) | — |
+
+## Not yet implemented
+
+Highest-value scenarios (and supporting arms) that are still missing and
+need **no external credentials** — they are absent, not deferred behind a
+canary. Each keeps its permanent ID; implementing one means adding the
+registry row, a `Test…` that `Lookup`s it, and the matrix-list update the
+match gate enforces.
+
+```text
+DF-EVENT-001    scoped retention/recovery
+DF-EVENT-002    snapshot-to-stream concurrent handoff
+
+DF-DAG-001      dynamic graph expansion
+DF-DAG-002      graph mutation + cancellation + restart
+
+DF3 process/network chaos at scale
+long multi-hour / 10k-job soak scale
+suite-level artifact emission of the dogfood-result bundle on disk
+```
 
 ## Highest-value initial set
 
@@ -310,14 +346,8 @@ DF-DIST-001     server + two real runners + production storage
 DF-LEASE-001    stale runner after reassignment
 DF-LEASE-002    completion vs lease expiry race
 
-DF-EVENT-001    scoped retention/recovery
-DF-EVENT-002    snapshot-to-stream concurrent handoff
-
 DF-ART-001      crash through artifact finalization boundaries
 DF-CACHE-001    untrusted-to-trusted cache poisoning attempt
-
-DF-DAG-001      dynamic graph expansion
-DF-DAG-002      graph mutation + cancellation + restart
 
 DF-SPEC-001     three speculative candidates / one committer
 DF-SPEC-002     server crash during winner selection
@@ -341,6 +371,10 @@ DF-SCALE-002    runner churn/resource-leak test
 
 DF-RELEASE-001  fresh install from final release artifact
 ```
+
+DF-EVENT-001/002 and DF-DAG-001/002 live in
+[Not yet implemented](#not-yet-implemented): they keep their IDs and their
+matrix rows, but they are not in this set until a test exists.
 
 ## Execution cadence
 
@@ -382,6 +416,7 @@ Two static guards keep the contract honest:
 
 - `TestMakefileRequiresOnlyExistingTests` — every `--require` name must
   match a real `func Test…` (prefix match, same rule as the runner).
+
 - `TestEveryRegistryScenarioHasATest` — every closed-registry scenario ID
   must be `Lookup`'d by at least one test.
 
@@ -477,10 +512,15 @@ The harness is **internal**. It is not a supported user command.
 ## Anti-patterns (do not do)
 
 - Put every full-system scenario into `.kiwi/pipeline.yaml`
+
 - Let mocks be happy-path-only (mocks need delay/drop/duplicate/malformed/500 knobs)
+
 - Depend 100% on public providers **or** 100% on mocks
+
 - Silently retry flaky scenarios until green
+
 - Claim dogfood-complete without Gates A–L (see DOGFOOD_MATRIX.md)
+
 - Redesign the execution model, event recovery, lease fencing, replay,
   speculation, or evidence architecture while dogfood is the correctness
   engine — fix only what dogfood proves broken

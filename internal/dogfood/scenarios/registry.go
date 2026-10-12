@@ -1,5 +1,11 @@
 package scenarios
 
+import (
+	"regexp"
+	"sort"
+	"strings"
+)
+
 // ScenarioID is a stable dogfood scenario identifier.
 type ScenarioID string
 
@@ -64,6 +70,21 @@ const (
 	// ScenarioScaleFixedWorkload is DF-SCALE-001: a fixed high-volume
 	// lifecycle with attempt accounting and no hidden retries.
 	ScenarioScaleFixedWorkload ScenarioID = "DF-SCALE-001"
+
+	// ScenarioArtifactFinalizationCrash is DF-ART-001: crash through the
+	// artifact finalization boundaries. Positive arm: a fully finalized
+	// artifact is durable and verifies against its manifest. Negative arms:
+	// a crash after rename but before the manifest never yields an
+	// acknowledged artifact; a crash before rename publishes nothing; a
+	// canceled capture publishes nothing.
+	ScenarioArtifactFinalizationCrash ScenarioID = "DF-ART-001"
+
+	// ScenarioCacheUntrustedPoison is DF-CACHE-001: an untrusted producer
+	// cannot poison the trusted cache. Positive arm: a trusted restore of a
+	// key it published is a hit. Negative arms: an untrusted write never
+	// lands in the trusted namespace of the same logical key, and rewriting
+	// the signed manifest's trust domain invalidates its signature.
+	ScenarioCacheUntrustedPoison ScenarioID = "DF-CACHE-001"
 )
 
 // Entry is one registry row: the stable identity, what each arm proves, and
@@ -339,6 +360,34 @@ var Registry = []Entry{
 		NegativeArm:         "hidden retries are non-green",
 		CapabilityIDs:       []string{"run.create"},
 	},
+	{
+		ID:                  ScenarioArtifactFinalizationCrash,
+		Tier:                "DF3",
+		Implemented:         true,
+		MandatoryForPR:      false,
+		MandatoryForMain:    false,
+		MandatoryForNightly: true,
+		MandatoryForRelease: true,
+		Species:             "component",
+		Name:                "crash through artifact finalization boundaries",
+		PositiveArm:         "a finalized artifact is durable and verifies against its manifest",
+		NegativeArm:         "crash after rename / before manifest, crash before rename, and canceled capture publish nothing acknowledged",
+		CapabilityIDs:       []string{"artifact.publish"},
+	},
+	{
+		ID:                  ScenarioCacheUntrustedPoison,
+		Tier:                "DF3",
+		Implemented:         true,
+		MandatoryForPR:      false,
+		MandatoryForMain:    false,
+		MandatoryForNightly: true,
+		MandatoryForRelease: true,
+		Species:             "component",
+		Name:                "untrusted-to-trusted cache poisoning attempt",
+		PositiveArm:         "trusted restore of a key the trusted domain published is a hit",
+		NegativeArm:         "untrusted write never lands in the trusted namespace; a rewritten trust domain invalidates the signed manifest",
+		CapabilityIDs:       []string{"cache.restore", "cache.publish"},
+	},
 }
 
 // Lookup returns the registry entry for id.
@@ -349,4 +398,51 @@ func Lookup(id ScenarioID) (Entry, bool) {
 		}
 	}
 	return Entry{}, false
+}
+
+// CheckMatrixImplementedIDs reports every drift between the "Implemented
+// scenario IDs" list of docs/DOGFOOD_MATRIX.md and the registry's
+// Implemented set. An empty result means the doc and the registry agree.
+// Both TestDogfoodMatrixMatchesRegistry (this package) and the surfacecheck
+// matrix gate call this one implementation so CI cannot pass while the two
+// disagree.
+func CheckMatrixImplementedIDs(doc string) []string {
+	const heading = "## Implemented scenario IDs"
+	start := strings.Index(doc, heading)
+	if start < 0 {
+		return []string{`DOGFOOD_MATRIX.md has no "Implemented scenario IDs" section`}
+	}
+	rest := doc[start+len(heading):]
+	if end := strings.Index(rest, "\n## "); end >= 0 {
+		rest = rest[:end]
+	}
+	idRe := regexp.MustCompile(`DF-[A-Z0-9]+-\d+`)
+	docIDs := map[string]bool{}
+	for _, m := range idRe.FindAllString(rest, -1) {
+		docIDs[m] = true
+	}
+	if len(docIDs) == 0 {
+		return []string{"Implemented scenario IDs section lists no IDs"}
+	}
+
+	regImplemented := map[string]bool{}
+	for _, e := range Registry {
+		if e.Implemented {
+			regImplemented[string(e.ID)] = true
+		}
+	}
+
+	var drift []string
+	for id := range regImplemented {
+		if !docIDs[id] {
+			drift = append(drift, "Implemented registry ID "+id+" is missing from DOGFOOD_MATRIX.md implemented list")
+		}
+	}
+	for id := range docIDs {
+		if !regImplemented[id] {
+			drift = append(drift, "DOGFOOD_MATRIX.md claims "+id+" is implemented, but the registry does not")
+		}
+	}
+	sort.Strings(drift)
+	return drift
 }

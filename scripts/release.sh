@@ -10,7 +10,7 @@
 #                        * VERSION (if set) equals the tag without "v"
 #                        * the tag points at HEAD and HEAD is the tagged commit
 #                        * the working tree is clean
-#                        * the recorded commit is the FULL 40-char lowercase SHA
+#                        * the recorded commit is the full 40-char lowercase SHA
 #                        * the Ed25519 signing key is present (unless the caller
 #                          explicitly opts into an unsigned disaster release)
 #                      The tag is never inferred from a branch name. On
@@ -67,7 +67,7 @@
 #   COMMIT / REF                  build identity overrides. In release mode
 #                                 COMMIT must be the full 40-char SHA of the
 #                                 tagged commit.
-#   REPO                          repository URL override (default: origin)
+#   $REPO                         repository URL override (default: origin)
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

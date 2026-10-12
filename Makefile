@@ -1,5 +1,5 @@
 .PHONY: build test test-unit test-race test-integration integration test-adversarial test-shuffle test-stress \
-	fuzz coverage coverage-ci coverage-floor coverage-package-floor staticcheck govulncheck cross schema-check surface-check dockerfile-buildargs-check docs-check license-check license-notice repro-build \
+	fuzz coverage coverage-ci coverage-floor coverage-package-floor staticcheck govulncheck cross schema-check surface-check dockerfile-buildargs-check docs-check docs-lint license-check license-notice repro-build \
 	toolchain-check tla2tools fmt lint run clean protect-branch \
 	dogfood-fast dogfood-local dogfood-system dogfood-production dogfood-release-artifacts dogfood-distributed dogfood-adversarial dogfood-upgrade dogfood-scale dogfood-release-model dogfood-all
 
@@ -142,10 +142,11 @@ dogfood-distributed:
 		--require TestTopologyShapes
 
 # DF3 nightly chaos: lease races, hostile-runner modes, deterministic fault
-# windows, evidence mismatch. Safety AND liveness.
+# windows, evidence mismatch, artifact finalization crash windows, cache
+# trust poison. Safety AND liveness.
 dogfood-adversarial:
 	./scripts/dogfood-run.sh 180m \
-		--run 'TestDFLEASE|TestDFEVID|TestDFQUOTA|TestDFEFFECT|TestEightOracle|TestNoHiddenRetries|TestFaultPoints|TestNewModeMatrix|TestExpectationsAreLayered' \
+		--run 'TestDFLEASE|TestDFEVID|TestDFQUOTA|TestDFEFFECT|TestDFART|TestDFCACHE|TestEightOracle|TestNoHiddenRetries|TestFaultPoints|TestNewModeMatrix|TestExpectationsAreLayered' \
 		--require TestDFLEASE001 \
 		--require TestDFLEASE002 \
 		--require TestDFEVID002 \
@@ -153,6 +154,8 @@ dogfood-adversarial:
 		--require TestDFEVID004 \
 		--require TestDFQUOTA001 \
 		--require TestDFEFFECT002 \
+		--require TestDFART001 \
+		--require TestDFCACHE001 \
 		--require TestNewModeMatrix \
 		--require TestExpectationsAreLayered \
 		--require TestEightOracleDisagreementFails \
@@ -197,7 +200,7 @@ dogfood-release-model:
 	@echo "  (DF1 system proofs are real: make dogfood-system — NewPersistent + HTTP + runner)"
 	@echo "Running the implemented subset anyway:"
 	./scripts/dogfood-run.sh 180m \
-		--run 'TestDFEVID|TestDFQUOTA|TestDFEFFECT|TestDFSELF|TestDFBOOT|TestDogfoodResult|TestScenarioResult' \
+		--run 'TestDFEVID|TestDFQUOTA|TestDFEFFECT|TestDFSELF|TestDFBOOT|TestDFART|TestDFCACHE|TestDogfoodResult|TestScenarioResult' \
 		--require TestDFEVID001 \
 		--require TestDFEVID002 \
 		--require TestDFEVID003 \
@@ -208,6 +211,8 @@ dogfood-release-model:
 		--require TestDFEFFECT002 \
 		--require TestDFSELF001 \
 		--require TestDFBOOT001 \
+		--require TestDFART001 \
+		--require TestDFCACHE001 \
 		--require TestDogfoodResultJSONShape
 
 # Release-artifact proofs (SYSTEM species, real product binaries):
@@ -389,7 +394,14 @@ schema-check: toolchain-check
 surface-check:
 	go test ./internal/surfacecheck/ -count=1
 
-docs-check:
+# docs-lint: the Kiwi CI prose filter (em-dash density, sentence length,
+# all-caps, filler vocabulary, contrast, bold, nested parens, remediation
+# history, duplicate sentences). Baseline ratchets at zero — any new
+# violation fails CI.
+docs-lint:
+	./scripts/docs-lint.sh --source --baseline scripts/docs-lint-baseline.txt
+
+docs-check: docs-lint
 	test -f docs/threat-model.md
 	test -f ADVERSARIAL_TEST_MATRIX.md
 	test -f SECURITY.md
@@ -402,6 +414,9 @@ docs-check:
 	test -f docs/brand/assets/logo-lockup.png
 	test -f docs/brand/assets/logo-lockup-dark.png
 	test -f docs/brand/assets/favicon.png
+	test -f docs/brand/assets/github-social-preview.png
+	test -f .github/ISSUE_TEMPLATE/config.yml
+	test -f .github/PULL_REQUEST_TEMPLATE.md
 	@# No stale references to abandoned CI systems.
 	@! grep -rn "github/workflows/native" README.md docs/ CONTRIBUTING.md .woodpecker/ 2>/dev/null
 	@! grep -rn "placeholder address" SECURITY.md 2>/dev/null

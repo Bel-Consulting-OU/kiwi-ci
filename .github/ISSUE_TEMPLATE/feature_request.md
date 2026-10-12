@@ -1,10 +1,13 @@
 ---
 name: Feature request
-about: Propose a new Kiwi CI capability
+about: Propose a new Kiwi CI capability (Execution, with evidence.)
 title: ''
 labels: enhancement
 assignees: ''
 ---
+
+<!-- Kiwi CI: Execution, with evidence. Prefer specific verbs: Run pipeline,
+     View evidence, Replay job, Verify signature. -->
 
 ## Problem
 
@@ -25,6 +28,8 @@ about.
 
 ## Impact
 
-Who benefits (local users, self-hosted servers, multi-tenant
-deployments) and whether it affects the security model (trusted vs.
-untrusted execution, policy, secrets).
+Who benefits (developers running the same pipeline locally, platform
+teams operating workers/leases/policies, verification consumers checking
+signatures and digests) and whether it affects the security model
+(trusted vs. untrusted execution, policy, secrets). Keep requested
+controls separate from effective facts and observed receipts.

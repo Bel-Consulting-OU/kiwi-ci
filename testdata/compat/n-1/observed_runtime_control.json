@@ -1,0 +1,25 @@
+{
+  "os": "linux",
+  "arch": "amd64",
+  "runtime_name": "docker",
+  "runtime_version": "25.0.3",
+  "main_image": "alpine:3.20",
+  "main_image_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "service_images": {
+    "db": "postgres:16"
+  },
+  "service_image_digests": {
+    "db": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "components": {
+    "libfoo": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  },
+  "captured_at": "2026-01-02T03:04:05Z",
+  "control": {
+    "runtime": "docker",
+    "sandbox_started": true,
+    "network_enforced": "none",
+    "root_filesystem_read_only": true,
+    "workspace_quota_enforced": true
+  }
+}

@@ -20,8 +20,10 @@ to restore a Kiwi CI deployment.
 Standard Postgres tooling applies:
 
 - `pg_dump` the `kiwi` database on a schedule (nightly minimum).
+
 - Use PITR (`archive_command` + WAL shipping) for tighter RPO on
   production deployments.
+
 - Test restores periodically; a backup that has never been restored is
   a rumor.
 
@@ -35,9 +37,11 @@ up out-of-band with restricted access. Losing them:
 
 - **lease.key** — running leases become unverifiable; cancel all runs
   and restart clean. A new key is generated on next start.
+
 - **oidc-keyring.json** — issued tokens become unverifiable; providers
   must be reconfigured for the new keys (see [oidc.md](oidc.md) for the
   rotation model).
+
 - **runner CA** — enrolled runners fail mTLS; re-enroll or reload the
   CA from backup.
 
@@ -45,6 +49,7 @@ up out-of-band with restricted access. Losing them:
 
 - `fs` backend: back up the blob path; digests make objects immutable
   and deduplicable, so `rsync` is safe and cheap.
+
 - `s3` backend: enable bucket versioning or replication.
 
 CAS integrity is verified on write and read, so a silent corruption
@@ -53,11 +58,15 @@ surfaces as a digest mismatch rather than a poisoned payload.
 ## Restore procedure
 
 1. Restore PostgreSQL to a point in time.
+
 2. Restore the key files and data directory (or regenerate and
    re-enroll).
+
 3. Restore the blob store; verify digests.
+
 4. Start a single instance, run `kiwi database migrate`/`database
    status` to confirm the schema version.
+
 5. Bring up remaining instances and runners.
 
 ## Replay semantics
@@ -66,10 +75,13 @@ Several subsystems are explicitly replay-safe:
 
 - **Completion receipts**: runner completions carry a generation-bound
   receipt; replaying a completion is a no-op for the same generation.
+
 - **Webhook deliveries**: forge delivery IDs are deduplicated, so
   re-delivered events return the original run.
+
 - **Outbox**: unflushed forge-status intents are replayed on startup
   and are idempotent by external ID.
+
 - **Expired leases**: recovered only within the job's infrastructure
   retry budget; runners self-cancel on lost contact, so replay cannot
   duplicate concurrent execution.
@@ -79,6 +91,7 @@ Several subsystems are explicitly replay-safe:
 - RPO: nightly `pg_dump` gives 24h worst case; PITR shrinks it to
   minutes. Blob store backups can lag further without data loss for
   immutable objects.
+
 - RTO: minutes with a warm standby instance and automated restore;
   budget for `pg_dump` restore time plus digest verification for large
   blob stores.

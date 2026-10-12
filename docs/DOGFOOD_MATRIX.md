@@ -51,7 +51,8 @@ authority is involved, at least one negative scenario.
 
 This list is the doc-side mirror of every `Implemented: true` row in
 `internal/dogfood/scenarios/registry.go`. `TestDogfoodMatrixMatchesRegistry`
-fails on any drift in either direction. IDs outside this list (including the
+and the `surfacecheck` matrix gate (`TestDogfoodMatrixGateMatchesRegistry`)
+fail on any drift in either direction. IDs outside this list (including the
 planned families below) are roadmap, not executable proofs.
 
 - DF-BOOT-001
@@ -68,21 +69,24 @@ planned families below) are roadmap, not executable proofs.
 - DF-SELF-001
 - DF-UPGRADE-001
 - DF-SCALE-001
+- DF-ART-001
+- DF-CACHE-001
 
 ## Public-surface → scenario mapping
 
 Scenario IDs use the `DF-<FAMILY>-<NNN>` taxonomy. Families currently in
 the registry: `BOOT`, `EVID`, `LEASE`, `QUOTA`, `EFFECT`, `SELF`, `UPGRADE`,
-`SCALE`. Matrix rows may also name planned families (`LIFE`, `RACE`, `ART`,
-`CACHE`, `REPLAY`, `POLICY`, `SNAP`, `CAP`, `CHAOS`, `DIST`, `DR`, `RELEASE`,
+`SCALE`, `ART`, `CACHE`. Matrix rows may also name planned families (`LIFE`,
+`RACE`, `REPLAY`, `POLICY`, `SNAP`, `CAP`, `CHAOS`, `DIST`, `DR`, `RELEASE`,
 `FORGE`, `AUTH`, `DAG`, `SCHED`, `RUNNER`, `EXEC`, `EVENT`, `SPEC`) — those
 are roadmap IDs and are not yet executable proofs.
 
 
 A new public capability must map to dogfood scenario IDs or carry an
 explicit exemption. Review enforces this today, and
-`TestDogfoodMatrixMatchesRegistry` mechanically checks that the implemented
-ID list in this file equals the scenario registry. IDs below that are not
+`TestDogfoodMatrixMatchesRegistry` / `TestDogfoodMatrixGateMatchesRegistry`
+mechanically check that the implemented ID list in this file equals the
+scenario registry. IDs below that are not
 yet in `internal/dogfood/scenarios/registry.go` are **planned** rows — the
 implemented registry is the source of truth for what runs green.
 
@@ -197,11 +201,9 @@ endpoint.
 
 ## Hostile data set
 
-Dogfood intentionally uses: very long branch names, Unicode, spaces, quotes,
-shell metacharacters, unusual file names, deep trees, symlinks, large logs,
-zero-byte artifacts, scaled multi-GB streams, malformed UTF-8 where the
-interface permits bytes, duplicate keys, invalid YAML, unknown schema fields,
-stale schema versions.
+Dogfood intentionally uses.
+ Very long branch names, Unicode, spaces, quotes, shell metacharacters, unusual file names, deep trees, symlinks, large logs, zero-byte artifacts, scaled multi-GB streams, malformed UTF-8 where the interface permits bytes, duplicate keys, invalid YAML, unknown schema fields, stale schema versions.
+
 
 ## Execution-dogfood result bundle
 

@@ -7,7 +7,7 @@ the contract an audit, a reviewer, or a future contributor checks against.
 **How to use this document.** Every change that touches a core subsystem MUST
 update the affected invariant's mapping (enforcement points and/or regression
 tests) in the same change. If the mapping is not updated, the invariant is
-ASSUMED BROKEN, not assumed intact: reviewers treat a stale row as a defect and
+assumed broken, not assumed intact: reviewers treat a stale row as a defect and
 the surface is treated as unproven until the mapping is repaired. Statuses must
 describe the tree as it is, never aspirations; a gap is listed explicitly and
 may only be marked closed once the enforcing code and its regression test both
@@ -16,7 +16,7 @@ exist.
 **Evidence rule.** Any NEW invariant must land with at least one randomized or
 fault-injected test (a randomized/property lane, a chaos/fault-injection test,
 or a fuzz target), or it is assumed unenforced and must not be marked
-enforced+tested. The per-invariant evidence map below is the audit's record of
+enforced+tested. The per-invariant evidence map below is the recorded map of
 which class of evidence backs every status.
 
 Line numbers are a convenience for the tree at the time of writing and drift
@@ -54,7 +54,7 @@ Every status above is backed by executable evidence in at least one of four
 classes. This table names that evidence per invariant. A `—` is an honest
 gap in that class, not a claim of coverage; the residual risk of a gap is
 stated in the Notes column. The assurance vocabulary
-([facts and derived profiles](evidence-contract.md#4-execution-assurance-facts-first-profiles-derived))
+[facts and derived profiles](evidence-contract.md#4-execution-assurance-facts-first-profiles-derived)
 and the precise
 [what Kiwi does not guarantee](evidence-contract.md#8-what-kiwi-does-not-guarantee)
 boundary live in [docs/evidence-contract.md](evidence-contract.md).
@@ -72,11 +72,11 @@ boundary live in [docs/evidence-contract.md](evidence-contract.md).
 | I9 | OIDC/secret commit suites (`TestOIDCIssuanceGenerationChangedBeforeCommitReturns409`, `TestSecretGenerationChangedBeforeCommitReturns409`, `TestSecretConcurrentRequestsOnlyOneReturnsEnvelope`, `TestIssueSecretClaimSingleUseAcrossReplicas`, `TestOIDCIssuanceNeverReturnsJWTWithoutDurableAudit`) | — | Chaos matrix replays secret/OIDC requests under a dead generation => refused (OIDC 401 from the cleared credential) | `FuzzSecretIssueRequest` (arbitrary bodies against a live lease and a static broker on a fresh server: never panics; every verdict is 2xx or 4xx; a 2xx returns a sealed envelope and replays idempotently; a 4xx persists no receipt and is deterministic; the broker's plaintext never appears in ANY response) and `FuzzOIDCRequest` (arbitrary OIDC bodies with a live lease: never panics; every verdict is 2xx or 4xx; a 2xx carries a token and replays idempotently; a rejected issuance leaks no credential and is deterministic) | Status: enforced+tested. |
 | I10 | `TestJobCacheLeaseNamespacedPutGet`, `TestJobCacheRejectsNamespaceHeaders`, `TestCacheManifestCarriesServerDerivedNamespace`, `TestPruneCacheManifestsTrustDomainIsolationFS`, `TestCacheNamespaceSeparatesSameNameAcrossForges` | — | Chaos matrix cache-manifest replay under a dead generation => refused; trust-domain prune isolation tests | `FuzzCacheManifest` fuzzes the manifest parser, not namespace derivation (which is not parser input) | Status: enforced+tested. |
 
-**Formal mirror.** [`formal/kiwi_lease.tla`](../formal/kiwi_lease.tla) (with
-[`formal/README.md`](../formal/README.md)) is a bounded TLA+ model of the
+**Formal mirror.** [`formal/kiwi_lease.tla`](../formal/kiwi_lease.tla) with
+[`formal/README.md`](../formal/README.md) is a bounded TLA+ model of the
 job x generation x lease x runner x cancel x retry protocol with `TypeOK`,
 `NoTwoWinners`, `StaleOwnerCannotCommit`, `TerminalityMonotonic` and
-`CancelCannotResurrect`; its mirror table maps every model action to the
+`CancelCannotResurrect`. Its mirror table maps every model action to the
 I1/I3/I8 enforcement points and the property/chaos tests named above. Model
 and implementation must be updated together. The shipped instance is
 model-checked manually (TLC2 2.19: complete state graph, no error; see
@@ -84,46 +84,50 @@ model-checked manually (TLC2 2.19: complete state graph, no error; see
 
 **Non-fuzzable residual (stated honestly).** Commit-time interleavings
 (stale generation racing a lease supersede, expiry while waiting for a row
-lock, cancel racing a completion) are state-machine races, not parseable
-inputs; they are covered by the randomized reference-model lane
-(`TestPropertySchedulerModelMachine`) and the fault/chaos lanes, and are
-explicitly NOT claimed as fuzz coverage. Upgrade interleavings (an old
+lock, cancel racing a completion) are state-machine races rather than parseable
+inputs. They are covered by the randomized reference-model lane
+(`TestPropertySchedulerModelMachine`) and the fault/chaos lanes. They are
+explicitly not claimed as fuzz coverage. Upgrade interleavings (an old
 runner against an upgraded server, mixed replica fleets during a rolling
-upgrade) are a compatibility matrix over version PAIRS, not parseable bytes:
-they are covered by the runner protocol negotiation tests
+upgrade) are a compatibility matrix over version pairs rather than parseable
+bytes. They are covered by the runner protocol negotiation tests
 (`TestCheckServerProtocol`, `TestNextRefusesTaskRequiringNewerProtocol`,
 `TestRunnerProtocolVersionAdditiveJSON`) and the rolling-upgrade gates in
-`docs/upgrades.md`, not by a fuzz target. Speculation interleavings cannot
-be fuzzed until the I7 surface exists, because there is no speculative
-request surface to feed.
+`docs/upgrades.md`. They are not covered by a fuzz target. Speculation
+interleavings cannot be fuzzed until the I7 surface exists, because there is
+no speculative request surface to feed.
 
 ---
 
 ## I1 — One terminal outcome
 
-**Statement.** A job and a run reach at most one terminal outcome. A repeated
+**Statement (I1).** A job and a run reach at most one terminal outcome. A repeated
 completion of the same `(job, lease generation)` is acknowledged from its
 durable receipt when the content matches and is refused (`409`) when it
 conflicts; a commit that lost a race can never overwrite the recorded outcome.
 A run's aggregate status is derived only from its jobs, becomes terminal only
 when every job is terminal, and a cancelled run is frozen.
 
-**Enforcement points.**
+**Enforcement points (I1).**
 - `model.Status.Terminal()` — the closed terminal set (success, failure,
   cancelled, skipped, blocked): `internal/model/model.go:22`.
+
 - `(*PostgresStore).CompleteJob` — per-`(job, generation)` receipt replay:
   same digest is an idempotent ack, different digest is `ErrCompletionConflict`:
   `internal/storage/postgres.go:2393` (conflict gate ~:2446-2584).
+
 - `(*Server).completionReplayReadyLocked` / completion receipt matching
   (fs/memory mirror of the same rule): `internal/server/completion_digest.go`.
+
 - `recomputeRunStatus` — terminal only when `terminal == total`; a
   `cancelled` run returns unchanged: `internal/storage/postgres.go:2904`
   (freeze at :2911). In-memory mirror `refreshRunLocked`:
   `internal/server/server.go` (`refreshRunLocked`), same early return for
   `StatusCancelled`.
+
 - Terminal runs stay terminal for cancel requests (I8).
 
-**Regression tests.**
+**Regression tests (I1).**
 - `TestCompletionReplayV2RuntimeEvidence`,
   `TestCompletionLegacyV1ReceiptComponentReplayDBFake`,
   `TestCompletionLegacyV1ReceiptComponentReplayFS`,
@@ -138,15 +142,15 @@ when every job is terminal, and a cancelled run is frozen.
 - `TestPostgresIntegrationServerCompletionRaceDifferingResults`
   (`internal/server/crash_race_pg_test.go`).
 
-**Status.** enforced+tested.
+**Status (I1):** enforced+tested.
 
 ---
 
 ## I2 — State transition and ledger emission commit atomically
 
-**Statement.** In the canonical (PostgreSQL) store, every state mutation that
-has a semantic ledger event commits the mutation and the event in ONE
-transaction: a failed or blocked ledger append rolls the mutation back (fail
+**Statement (I2).** In the canonical (PostgreSQL) store, every state mutation that
+has a semantic ledger event commits the mutation and the event in one
+transaction. A failed or blocked ledger append rolls the mutation back (fail
 closed), so a committed transition can never be missing its event and an event
 can never describe a transition that did not commit. The filesystem/memory
 stores append the event next to the mutation but are explicitly
@@ -172,7 +176,7 @@ cursor order.
 | OIDC issuance | `oidc.issued` | `(*PostgresStore).CommitOIDCIssuance` — `internal/storage/postgres_oidc_issue.go:518` |
 | Execution attestation | `execution.attested` | `(*PostgresStore).CommitExecutionAttestation` — `internal/storage/attestations.go:60` |
 
-**Regression tests (rollback).**
+**Regression tests (I2, rollback).**
 - `TestPostgresIntegrationSemanticEventAppendFailureRollsBack`
   (`internal/storage/execution_events_semantic_pg_it_test.go:247`): with the
   event append blocked by a trigger, the artifact row is absent and the
@@ -190,14 +194,14 @@ cursor order.
   `TestEventsFSBestEffortCanonicalFalse` (`internal/server/events_test.go`,
   `internal/server/events_retention_test.go`).
 
-**Status.** enforced+tested for canonical PostgreSQL. The fs/memory path is
+**Status (I2):** enforced+tested for canonical PostgreSQL. The fs/memory path is
 best-effort by documented design, not a gap against this invariant.
 
 ---
 
 ## I3 — A stale lease never mutates authoritative state
 
-**Statement.** A durable mutation performed under a lease must re-validate the
+**Statement (I3).** A durable mutation performed under a lease must re-validate the
 lease against the store's own clock and locked row at commit time. A lease
 whose holder, generation or token changed — or that expired while the request
 waited — commits nothing and is refused as a stale lease (HTTP `409`), even
@@ -219,16 +223,16 @@ when the request passed the authentication gate earlier.
 | Leader-only mutations | Leadership epoch fence (`ErrStaleLeader`) on every leader-owned transaction | `beginFencedTx` (`internal/storage`) | `TestIntegrationLeaderFence...` (`internal/server/leader_fence_it_test.go`), scheduler epoch tests |
 
 **Rolling-upgrade protocol floor (I3 / rolling upgrade).** A runner whose
-negotiated WIRE-SEMANTIC protocol is below `model.JobRequiresProtocol` never
-receives a new lease: `/next` answers HTTP `409 RUNNER_PROTOCOL_UNSUPPORTED`
-before any claim or reservation mutation — enforced identically in the
+negotiated `WIRE-SEMANTIC` protocol is below `model.JobRequiresProtocol` never
+receives a new lease. `/next` answers HTTP `409 RUNNER_PROTOCOL_UNSUPPORTED`
+before any claim or reservation mutation. The refusal is enforced identically in the
 memory path (`(*Server).next`) and the DB path (`(*Server).nextDB`) through
-`writeRunnerProtocolUnsupported`/`effectiveRunnerProtocol` — while
-heartbeat, logs and completion for already-claimed work stay governed by the
-SAME generation-based commit fences in the matrix above. Registration
+`writeRunnerProtocolUnsupported`/`effectiveRunnerProtocol`. Heartbeat,
+logs and completion for already-claimed work stay governed by the
+same generation-based commit fences in the matrix above. Registration
 refuses a runner below the configured floor
 (`server.min_runner_protocol`, default `model.RunnerProtocolVersion`) with
-`400` and stores nothing; the negotiated version is persisted additively on
+`400` and stores nothing. The negotiated version is persisted additively on
 the runner payload (`model.Runner.ProtocolVersion`; absent = legacy v1), and
 every leased task advertises the required `protocol_version`. Regression
 tests: `TestNextRefusesLegacyRunnerButDrainsClaimedWork`,
@@ -251,8 +255,8 @@ tests: `TestNextRefusesLegacyRunnerButDrainsClaimedWork`,
   `(*PostgresStore).AppendLogBatch` (`internal/storage/logbatch.go`)
   now locks the job row and evaluates the live-lease predicate
   (`lockedLeaseJobTx`: status running, holder = runnerID, generation,
-  unexpired lease at the post-lock database clock) in the SAME transaction
-  as the batch receipt and the lines; it runs BEFORE the per-identity
+  unexpired lease at the post-lock database clock) in the same transaction
+  as the batch receipt and the lines. It runs before the per-identity
   receipt dedupe, so a retry of a still-live batch stays an idempotent 204
   while a superseded/revoked/expired generation is `ErrLeaseLost` and
   commits nothing. The single-line path is
@@ -263,43 +267,45 @@ tests: `TestNextRefusesLegacyRunnerButDrainsClaimedWork`,
   409 (`leaseCommitRefused` / `writeLeaseAuthError`), and the per-line
   fallback now requires the transactional capability: a DB store without
   `LeaseLogStore` fails closed with 503 instead of an unfenced append.
-  The former late-log grace contract is REMOVED: a superseded generation is
+  The former late-log grace contract is removed: a superseded generation is
   unconditionally rejected, and only a live generation can replay a batch
   idempotently. In memory/fs mode the lease re-check and the store append now
   run in the same `s.mu` critical section in both handlers (batch and
   single-line), so a revocation cannot interleave between them there either.
+
 - **GAP-2 — closed. Test-report memory/fs commit is lease-fenced.**
   `(*Server).uploadTestReport` (`internal/server/testintel.go`) now
   re-validates the identical `validActiveLease` predicate under `s.mu`
   (the memory store's transaction) immediately before the report row, the
-  history fold and the durable persist path run; a lease that was
+  history fold and the durable persist path run. A lease that was
   superseded, revoked or expired between the request gate and the commit
-  persists nothing and answers 409 — including a replay of a delivery that
+  persists nothing and answers 409. That includes a replay of a delivery that
   another live generation already persisted, mirroring the DB fence's
   predicate-before-replay precedence.
+
 - **Chaos matrix.** `TestLeaseFenceChaosMatrixStaleGenerationRejected`
   (`internal/server/lease_fence_chaos_test.go`) claims a job at generation
   1, loses the lease through the store recovery path (token cleared, job
-  requeued), has a second runner claim generation 2 and complete
-  successfully, then replays every generation-1 request runner A can still
-  make — heartbeat, single log, log batch, artifact, snapshot, cache
-  manifest, secret, OIDC, test report, completion, generated fragment —
-  and asserts each is rejected 409/403 (OIDC answers 401 from the cleared
+  requeued), and has a second runner claim generation 2 and complete
+  successfully. It then replays every generation-1 request runner A can still
+  make: heartbeat, single log, log batch, artifact, snapshot, cache
+  manifest, secret, OIDC, test report, completion, generated fragment.
+  Each replay is rejected 409/403 (OIDC answers 401 from the cleared
   credential) with the entire authoritative state byte-identical, including
   B's completion receipt/link and the absence of any generation-1 row/event.
 
 **Deliberate residual (documented, not a gap).** The transactional lease
 predicates (`lockedLeaseJobTx`, `LeaseCommitStore`, `LeaseLogStore`,
-`ValidateGeneratedParentLease`) deliberately do NOT re-verify the presented
-token hash: the predicate is runner id + generation + status + database
+`ValidateGeneratedParentLease`) deliberately do not re-verify the presented
+token hash. The predicate is runner id + generation + status + database
 clock, and token possession is proven once at request start
 (`authorizeRunnerLease`). Re-hashing the token inside every metadata
 transaction would add a second credential path with no additional authority
-(revocation clears the token hash AND the holder/generation/status, so the
+(revocation clears the token hash and the holder/generation/status, so the
 predicate already fails closed). The OIDC endpoint is the one exception
-because its wire credential IS the raw lease token.
+because its wire credential is the raw lease token.
 
-**Status.** enforced+tested. The former GAP-1 and GAP-2 are closed by the
+**Status (I3):** enforced+tested. The former GAP-1 and GAP-2 are closed by the
 commit fences and regression tests above; no open gaps remain for this
 invariant.
 
@@ -307,15 +313,15 @@ invariant.
 
 ## I4 — Scoped consumers can always recover exactly their authorized view
 
-**Statement.** An execution-event consumer reads under a scope (global, one
-repository, or one run). Authorization is enforced before any store read; the
+**Statement (I4).** An execution-event consumer reads under a scope (global, one
+repository, or one run). Authorization is enforced before any store read. The
 cursor is bound to the scope it was issued for (a cursor cannot be replayed
-against a different repository/run); retention prunes per scope so a scoped
-consumer's unread frontier is never silently deleted, and once the scope's
+against a different repository/run). Retention prunes per scope so a scoped
+consumer's unread frontier is never silently deleted. Once the scope's
 frontier does advance past a cursor the read answers `410 cursor_expired`
 with the frontier and latest cursor instead of silently truncating.
 
-**Enforcement points** (the landed scope-correct retention change).
+**Enforcement points (I4)** (the landed scope-correct retention change).
 - Scope types and per-scope frontier: `storage.ExecutionEventScope`
   (`Kind`: global/repo/run), `ExecutionEventRetentionReadStore` and
   `ExecutionEventScopedRetentionStore` (`ScopedRetainedFrom`) in
@@ -336,11 +342,11 @@ with the frontier and latest cursor instead of silently truncating.
 - Authorization before store access: `requireExecutionEventsRead`
   (`internal/server/events.go`) — global reads require a global capability,
   repo/run reads require the matching repository grant.
-- Expiry decision from the SCOPED frontier, never a defaulted 0:
+- Expiry decision from the scoped frontier, never a defaulted 0:
   `storage.ExecutionEventCursorExpired`, `writeCursorExpired`
   (`internal/server/events.go`).
 
-**Regression tests.**
+**Regression tests (I4).**
 - Scope isolation, scoped resume matrix, stream scope, cursor binding
   (`409 cursor_scope_mismatch`), retention racing scoped pagination, repo
   access loss, fs execution snapshot scope:
@@ -366,30 +372,30 @@ with the frontier and latest cursor instead of silently truncating.
   `TestEventsFSLifecycleParity` (`internal/server/events_test.go`),
   `TestControllerCapabilityEventScope` (`internal/server/capability_routes_test.go`).
 
-**Status.** enforced+tested.
+**Status (I4):** enforced+tested.
 
 ---
 
 ## I5 — Exact replay cannot add external effects or work unless authorized
 
-**Statement.** `kiwi replay` reconstructs a recorded job and re-executes it
+**Statement (I5).** `kiwi replay` reconstructs a recorded job and re-executes it
 locally. It can never add external effects or work to the world unless the
 operator explicitly authorizes the gated surfaces: it cannot schedule child
 jobs, submit runs, enqueue outbox work, or upload a generated fragment. The
 only path that could turn a recorded `generate:` fragment into control-plane
-work — `executor.Options.GenerateUpload` — is deliberately never wired by
-replay; step-declared effects (deployment phases, secrets, OIDC) are refused
+work (`executor.Options.GenerateUpload`) is deliberately never wired by
+replay. Step-declared effects (deployment phases, secrets, OIDC) are refused
 unless `--allow-external-effects` is passed, and the residual undeclared-effect
 risk is always warned about. Exact replay also never silently reinterprets a
 record produced under a different execution-engine semantics: see
 "Reproducibility boundary" below. The claim is scoped to effects Kiwi mediates
-and surfaces the recorded job declares; behavior a step performs itself
-(within the recorded policy) is outside it — see
+and surfaces the recorded job declares. Behavior a step performs itself
+(within the recorded policy) is outside it. See
 [effect classes](evidence-contract.md#4-execution-assurance-facts-first-profiles-derived)
 and [what Kiwi does not guarantee](evidence-contract.md#8-what-kiwi-does-not-guarantee).
 
-**Enforcement points.**
-- Replay never sets `GenerateUpload`; a replayed generator executes its step
+**Enforcement points (I5).**
+- Replay never sets `GenerateUpload`. A replayed generator executes its step
   locally, reads the declared fragment for validation, and uploads nothing:
   `internal/app/replay.go` (invariant comment at the execution site),
   executor read/upload split at `internal/executor/executor.go:1049-1091`
@@ -404,7 +410,7 @@ and [what Kiwi does not guarantee](evidence-contract.md#8-what-kiwi-does-not-gua
 - Control-plane access is read-only: the replay client issues only GETs
   (recorded pipeline, snapshot pages, snapshot archive).
 
-**Regression tests.**
+**Regression tests (I5).**
 - `TestReplayExactGeneratorNeverSchedulesChildren`
   (`internal/app/replay_generator_invariant_test.go`): exact replay of a
   recorded generator job succeeds (the step produced `fragment.json` locally),
@@ -419,7 +425,7 @@ and [what Kiwi does not guarantee](evidence-contract.md#8-what-kiwi-does-not-gua
   `TestReplayExactRefusesMismatchedPayload`
   (`internal/app/replay_exact_test.go`).
 
-**Status.** enforced+tested.
+**Status (I5):** enforced+tested.
 
 ---
 
@@ -439,25 +445,26 @@ replay pipeline export), not process suspension.
 
 ## Reproducibility boundary — execution semantics vs wire schema
 
-**Statement.** Every run and job Kiwi creates carries an explicit
-EXECUTION-ENGINE SEMANTIC version: `model.ExecutionSemanticsVersion`
+**Statement (semantics).** Every run and job Kiwi creates carries an explicit
+execution-engine semantic version: `model.ExecutionSemanticsVersion`
 (`kiwi.execution.v2`). It is deliberately not the wire/serialization schema
-(`model.RunnerProtocolVersion` plus the per-record `schemaVersion` fields):
-two builds may exchange the same fields while INTERPRETING durable state or a
-compiled job differently. The stamp is durable state; it travels into the
+(`model.RunnerProtocolVersion` plus the per-record `schemaVersion` fields).
+Two builds may exchange the same fields while interpreting durable state or a
+compiled job differently. The stamp is durable state. It travels into the
 signed evidence (the execution attestation's canonical digest and the artifact
-provenance statement) and into workspace snapshot records, and exact replay
+provenance statement) and into workspace snapshot records. Exact replay
 refuses to reinterpret a record produced under a different non-empty version
 under the current engine.
 
 **Bump rule.** Any change to how the scheduler, the runner or the executor
-interprets durable state or compiled jobs — a changed MEANING of existing
-state, not a field addition the existing semantics safely ignore — MUST bump
+interprets durable state or compiled jobs must bump
 `model.ExecutionSemanticsVersion` and document the new semantics on the
-constant. Records persisted before stamping existed carry the empty string;
-exact replay assumes the current semantics for them and prints a warning.
+constant. A changed meaning of existing state counts. A field addition the
+existing semantics safely ignore does not. Records persisted before stamping
+existed carry the empty string. Exact replay assumes the current semantics for
+them and prints a warning.
 
-**Enforcement points.**
+**Enforcement points (semantics).**
 - Constant and stamp fields: `model.ExecutionSemanticsVersion`,
   `model.Run.ExecutionSemantics`, `model.Job.ExecutionSemantics` and
   `model.SnapshotRecord.ExecutionSemantics` (`internal/model/model.go`).
@@ -477,9 +484,9 @@ exact replay assumes the current semantics for them and prints a warning.
   signature. `kiwi verify` prints the verified value and enforces the
   optional `--execution-semantics` constraint.
 - Exact replay decision table: `replayExecutionSemanticsCheck`
-  (`internal/app/replay.go`) — equal to the current version: proceed; EMPTY
+  (`internal/app/replay.go`). Equal to the current version: proceed. Empty
   (pre-stamp legacy record): warn that current semantics are assumed, then
-  proceed; any OTHER value: refuse naming the recorded and current versions,
+  proceed. Any other value: refuse naming the recorded and current versions,
   unless the forensic `--allow-unknown-semantics` escape hatch is passed
   (loud warning; `--debug-rerun` is exempt because it never claims to
   reproduce the recorded execution).
@@ -488,11 +495,11 @@ exact replay assumes the current semantics for them and prints a warning.
   replay client reads it from the recorded data.
 
 **Related.** Exact replay (I5) and the constrained graph-mutation algebra
-([graph-mutations.md](graph-mutations.md)): a graph mutation may only ADD
+[graph-mutations.md](graph-mutations.md): a graph mutation may only ADD
 nodes to its run (`AddNode`/`AddDependency`/`ExpandFanout`), so it can never
 introduce a job stamped with semantics different from its run's.
 
-**Regression tests.**
+**Regression tests (semantics).**
 - `TestExecutionSemanticsConstants`, `TestExecutionSemanticsAdditiveJSON`
   (`internal/model/runner_protocol_test.go`).
 - `TestEnqueueStampsExecutionSemanticsMemory`,
@@ -523,23 +530,23 @@ introduce a job stamped with semantics different from its run's.
   (`internal/storage/postgres_roundtrip_it_test.go`): payload-additive in
   PostgreSQL, legacy payloads read back empty.
 
-**Status.** enforced+tested.
+**Status (semantics):** enforced+tested.
 
 ---
 
 ## I6 — Graph mutation cannot invalidate committed history
 
-**Statement.** A dynamic pipeline fragment may only add jobs to its run. It
-cannot rewrite or shadow a committed job row: the `(parent job, mutation slot)`
-key admits exactly one winning fragment per slot, an idempotent replay returns
-the recorded receipt, a different fragment for the same slot is refused, and a
+**Statement (I6).** A dynamic pipeline fragment may only add jobs to its run. It
+cannot rewrite or shadow a committed job row. The `(parent job, mutation slot)`
+key admits exactly one winning fragment per slot. An idempotent replay returns
+the recorded receipt. A different fragment for the same slot is refused, and a
 child key that collides with an existing run job (run-scoped logical identity)
 is refused before any insert. Committed history is therefore stable under any
 late, duplicated, or racing graph mutation.
 
 **Constrained algebra.** The mutation surface is defined as a deliberately
-limited operation algebra — AddNode, AddConditionalNode, AddDependency,
-ExpandFanout, CancelPendingSubgraph, SealSubgraph — with explicit legality
+limited operation algebra: AddNode, AddConditionalNode, AddDependency,
+ExpandFanout, CancelPendingSubgraph, SealSubgraph. It carries explicit legality
 rules (queued-only insertion, no rewrite of a committed node's prerequisite
 set, fragment-confined edges, acyclic graphs, depth/count caps,
 slot-idempotent replay, run-scoped key uniqueness) and explicit non-goals
@@ -547,7 +554,7 @@ slot-idempotent replay, run-scoped key uniqueness) and explicit non-goals
 Each rule is mapped to enforcement and tests in
 [graph-mutations.md](graph-mutations.md).
 
-**Enforcement points.**
+**Enforcement points (I6).**
 - Mutation-slot winner: `(parent_job_id, mutation_slot)` unique index
   (migration `0047`); `InsertGeneratedFragmentTx` resolves the slot under the
   parent job lock and refuses conflicts with `ErrGeneratedMutationConflict`
@@ -559,7 +566,7 @@ Each rule is mapped to enforcement and tests in
   `(parent, slot, fragment)`, and the lease generation recorded at commit is
   re-checked before a replay (`TestGeneratedFragmentStaleGenerationCannotReplay`).
 
-**Regression tests.**
+**Regression tests (I6).**
 - `TestDynamicFragmentReplayIdempotent`,
   `TestDynamicFragmentDifferentIDConflicts`,
   `TestGeneratedFragmentInsertionPredicateParity`,
@@ -592,37 +599,37 @@ Each rule is mapped to enforcement and tests in
   `TestPostgresIntegrationUpgradeWithDuplicateRunKeysSkipsUniqueIndex`
   (`internal/storage/postgres_run_key_conflict_it_test.go`).
 
-**Status.** enforced+tested.
+**Status (I6):** enforced+tested.
 
 ---
 
 ## I7 — Speculative execution has a single winner
 
-**Statement (pre-committed).** When speculative execution of a job is added,
+**Statement (I7, pre-committed).** When speculative execution of a job is added,
 at most one speculative attempt may commit the outcome for a given
 `(job, lease generation)`; losing speculators must be cancelled and must
 commit nothing (no completion, no ledger event, no external effect). The
 winner is decided by the same compare-and-commit fence every other lease-owned
 mutation uses (I3/I1).
 
-**Surface in this tree.** ABSENT. There is no speculation scheduler, no
+**Surface in this tree.** Absent. There is no speculation scheduler, no
 speculative lease class, and no speculative outcome handling; the repository
 contains only `ROADMAP.md` prewarming (image/VM prewarming, which executes no
 jobs). Grep for `speculat` finds no execution surface.
 
-**Enforcement points.** None (surface absent). Any future implementation MUST
+**Enforcement points (I7).** None (surface absent). Any future implementation MUST
 reuse the per-`(job, generation)` commit fence and the single-terminal-outcome
 receipts (I1) and update this section with enforcement points and tests.
 
-**Status.** pre-committed, surface absent — explicitly NOT a claim about
+**Status (I7):** pre-committed, surface absent — explicitly NOT a claim about
 existing behavior.
 
 ---
 
 ## I8 — Cancellation and terminal monotonicity
 
-**Statement.** A run or job never leaves a terminal state, and repeating a
-cancel or approve request produces ONE logical transition:
+**Statement (I8).** A run or job never leaves a terminal state. Repeating a
+cancel or approve request produces one logical transition:
 - `POST /runs/{id}/cancel` on an already-terminal run (success, failure,
   cancelled, skipped, blocked) returns `200` with the current run and performs
   no state change, no second `run.cancelled` audit row and no forge status
@@ -630,7 +637,7 @@ cancel or approve request produces ONE logical transition:
   job/run cancellation, forge publication.
 - `POST /jobs/{id}/approve` on an already-approved, non-terminal job returns
   `200` with the current job and performs no second `job.approved` audit row,
-  no second `approval.granted` event and no approver rewrite: the FIRST
+  no second `approval.granted` event and no approver rewrite. The first
   approver (`ApprovedBy`, and `ApprovedAt` when set) is preserved. Terminal
   jobs still answer `409`, jobs that do not require approval still answer
   `409`, and the first approval is unchanged.
@@ -641,36 +648,42 @@ Note on the run surface: there is no distinct non-terminal "cancelling" state
 (no `StatusCancelling`, no `CancelledAt`) in this tree. The durable record of a
 cancel is exactly the terminal `cancelled` outcome, so "already recorded" is
 the terminal branch. Concurrent duplicate cancels are serialized by the
-store's transactional `CancelRunJobs` (exactly one transition); the
+store's transactional `CancelRunJobs` (exactly one transition). The
 evidence-first audit ordering means a loser of that race can still have placed
-its audit row before observing the winner — a documented, bounded residual
+its audit row before observing the winner. That is a documented, bounded residual
 (the transition itself is single).
 
-**Enforcement points.**
+**Enforcement points (I8).**
 - Memory cancel: `(*Server).cancelRun` — `internal/server/server.go:6031`
   (terminal replay before audit/persist/forge).
+
 - DB cancel: `(*Server).cancelRunDB` — `internal/server/server.go:6111`
   (terminal replay before audit/scheduler/forge).
+
 - Cancellation transition (skips terminal jobs, freezes the run):
-  `(*Server).cancelRunLocked` — `internal/server/server.go:6171`;
-  transactional DB mirror `(*PostgresStore).CancelRunJobs` —
+  `(*Server).cancelRunLocked` — `internal/server/server.go:6171`.
+  Transactional DB mirror `(*PostgresStore).CancelRunJobs` is at
   `internal/storage/postgres.go:3205`.
+
 - Memory approve: `(*Server).approveJob` — `internal/server/server.go:5677`.
+
 - DB approve: `(*Server).approveJobDB` — `internal/server/server.go:5767`.
+
 - Store-level approve idempotency under the row lock (no second
   `approval.granted`, first approver kept): `(*PostgresStore).ApproveJob` —
-  `internal/storage/postgres.go:1685`; memStore mirror —
+  `internal/storage/postgres.go:1685`. MemStore mirror is at
   `internal/storage/faultstore.go:2567` (FaultyStore wrapper at `:369`).
+
 - Run aggregation freeze: `recomputeRunStatus` —
   `internal/storage/postgres.go:2904`.
 
-**Regression tests.**
+**Regression tests (I8).**
 - `TestCancelRunIdempotentMemory`, `TestCancelRunIdempotentDB`,
   `TestApproveJobIdempotentMemory`, `TestApproveJobIdempotentDB`
   (`internal/server/idempotent_cancel_approve_test.go`): double cancel = one
-  audit row + one forge publish (+ one scheduler call in DB mode);
-  cancel-after-success stays success with no audit/forge; double approve = one
-  audit row + one event with the first approver kept; 409 refusals unchanged.
+  audit row + one forge publish (+ one scheduler call in DB mode).
+  Cancel-after-success stays success with no audit/forge. Double approve = one
+  audit row + one event with the first approver kept. 409 refusals unchanged.
 - `TestMemStoreApproveJobIdempotentReplay`
   (`internal/storage/approve_idempotency_test.go`).
 - `TestPostgresIntegrationApproveJobIdempotentReplay`
@@ -683,28 +696,29 @@ its audit row before observing the winner — a documented, bounded residual
 - `TestExecutionEventTerminalStatusesIncludeBlocked`
   (`internal/storage/execution_events_test.go`).
 
-**Status.** enforced+tested.
+**Status (I8):** enforced+tested.
 
 ---
 
 ## I9 — Credentials never exceed the execution that requested them
 
-**Statement.** A credential is issued only to the execution that was
-authorized to request it, for exactly what that execution declared, and it is
-bound to the attempt that requested it:
+**Statement (I9).** A credential is issued only to the execution that was
+authorized to request it, for exactly what that execution declared. It is
+bound to the attempt that requested it.
+
 - OIDC: the requested audience must be in the job's enqueue-time capability
-  allowlist; claims are derived from the locked job identity (run, job,
-  attempt) and audience; issuance and its audit event commit in one
+  allowlist. Claims are derived from the locked job identity (run, job,
+  attempt) and audience. Issuance and its audit event commit in one
   transaction under a full commit-time lease predicate (holder, generation,
-  token hash, DB-clock expiry), replay of the same `(job, generation, name)`
+  token hash, DB-clock expiry). Replay of the same `(job, generation, name)`
   returns the recorded delivery.
-- Secrets: only step/policy-declared names are issued; the value is sealed to
+- Secrets: only step/policy-declared names are issued. The value is sealed to
   the runner's ephemeral key with AAD binding runner/job/generation/name and
-  the claim is single-use; a replay of the same `(job, generation, name)`
-  converges on the recorded envelope; a lease that changed or expired before
+  the claim is single-use. A replay of the same `(job, generation, name)`
+  converges on the recorded envelope. A lease that changed or expired before
   commit gets nothing.
 
-**Enforcement points.**
+**Enforcement points (I9).**
 - OIDC issuance gates: audience allowlist + lease token + live lease +
   incarnation + schema fence — `(*Server).issueOIDC`
   (`internal/server/oidc.go:727`, audience gate ~`:799`); commit-time
@@ -718,7 +732,7 @@ bound to the attempt that requested it:
   receipt replay, single-use claims; AAD `secretAAD`
   (`internal/server/secret.go:135`).
 
-**Regression tests.**
+**Regression tests (I9).**
 - `TestOIDCIssuanceGenerationChangedBeforeCommitReturns409`,
   `TestOIDCIssuanceIdentityChangedBetweenAuthAndCommitReturns409`,
   `TestOIDCIssuanceClaimsDerivedFromLockedIdentity`,
@@ -739,21 +753,21 @@ bound to the attempt that requested it:
 - `TestIntegrationLeaseCommitPredicatesRevoked` (artifact/snapshot/report
   commit fence) — `internal/storage/lease_commit_it_test.go`.
 
-**Status.** enforced+tested.
+**Status (I9):** enforced+tested.
 
 ---
 
 ## I10 — Untrusted execution cannot populate a trusted cache namespace
 
-**Statement.** A cache entry's namespace is derived server-side from the
-LEASED job's canonical repository identity and trust domain, never from client
-headers or client-supplied names; an untrusted job therefore reads and writes
-only the `untrusted` namespace of its repository, cannot observe or poison the
+**Statement (I10).** A cache entry's namespace is derived server-side from the
+leased job's canonical repository identity and trust domain, never from client
+headers or client-supplied names. An untrusted job therefore reads and writes
+only the `untrusted` namespace of its repository. It cannot observe or poison the
 `trusted` namespace, and namespace/trust headers on cache requests are
 rejected. Cache publication is additionally lease-fenced (I3), and cache
 pruning is trust-domain isolated.
 
-**Enforcement points.**
+**Enforcement points (I10).**
 - Namespace derivation: `cacheNamespace` (canonical repo + trusted/untrusted)
   and `cacheFileKey` (sha256 over repo, trust, logical key) —
   `internal/server/blobs.go:1142`, `:1155`; used by both upload and download
@@ -764,7 +778,7 @@ pruning is trust-domain isolated.
   `ErrLeaseLost` without a live lease) — `internal/server/blobs.go:1453`,
   `internal/storage/lease_commit.go`.
 
-**Regression tests.**
+**Regression tests (I10).**
 - `TestJobCacheLeaseNamespacedPutGet`,
   `TestJobCacheRejectsNamespaceHeaders`,
   `TestCacheManifestCarriesServerDerivedNamespace`
@@ -778,4 +792,4 @@ pruning is trust-domain isolated.
 - `TestCacheNamespaceSeparatesSameNameAcrossForges`
   (`internal/server/repoidentity_test.go`).
 
-**Status.** enforced+tested.
+**Status (I10):** enforced+tested.

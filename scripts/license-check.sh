@@ -97,10 +97,9 @@ classify() {
 
 		# Allowlisted permissive families are matched by their canonical
 		# core phrases only: a grant fragment alone is not a license. The
-		# shared disclaimer shape below covers the "THE SOFTWARE IS
-		# PROVIDED "AS IS"" wording of MIT/BSD/ISC/0BSD/Unlicense and
-		# the PostgreSQL "SOFTWARE PROVIDED HEREUNDER IS ON AN "AS IS"
-		# BASIS" wording.
+		# shared disclaimer shape below covers the MIT/BSD/ISC/0BSD/Unlicense
+		# "software is provided as-is" wording and the PostgreSQL
+		# software-provided-hereunder as-is disclaimer wording.
 		as_is = ((low ~ /software is provided/ ||
 		          low ~ /software provided hereunder/ ||
 		          low ~ /as is. basis/) && low ~ /as is/)
@@ -415,7 +414,7 @@ collect_licenses() {
 
 # license_verdict DIR prints the judgement the scan reaches for a module:
 # "PASS <ids>" when every license file is allowlisted, "FAIL <ids>" when a
-# file is recognized but disallowed, "FAIL UNRECOGNIZED" when a file has no
+# file is recognized but disallowed, the fail-unrecognized verdict when a file has no
 # known marker, and "FAIL NO-LICENSE-FILE" when nothing was found.
 license_verdict() {
 	_lv_eval="$TMPDIR_ROOT/verdict.tsv"

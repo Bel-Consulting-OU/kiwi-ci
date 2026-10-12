@@ -3,8 +3,6 @@ package scenarios
 import (
 	"os"
 	"path/filepath"
-	"regexp"
-	"strings"
 	"testing"
 )
 
@@ -90,50 +88,16 @@ func TestRequiredTestPrefixesMatchScenarioIDs(t *testing.T) {
 // doc's "Implemented scenario IDs" list must be exactly the registry's
 // Implemented set. A registry ID missing from the doc is an undocumented
 // proof; a doc ID that is not Implemented in the registry is a claimed proof
-// that does not run.
+// that does not run. The surfacecheck matrix gate invokes the same
+// CheckMatrixImplementedIDs logic so CI surface-check catches drift even
+// when this package's tests are not in the invoked set.
 func TestDogfoodMatrixMatchesRegistry(t *testing.T) {
 	root := repoRoot(t)
 	raw, err := os.ReadFile(filepath.Join(root, "docs", "DOGFOOD_MATRIX.md"))
 	if err != nil {
 		t.Fatalf("read DOGFOOD_MATRIX.md: %v", err)
 	}
-	doc := string(raw)
-
-	// The implemented list lives under its own heading so the check stays
-	// mechanical and the rest of the matrix may name planned IDs freely.
-	const heading = "## Implemented scenario IDs"
-	start := strings.Index(doc, heading)
-	if start < 0 {
-		t.Fatalf("DOGFOOD_MATRIX.md has no %q section", heading)
-	}
-	rest := doc[start+len(heading):]
-	if end := strings.Index(rest, "\n## "); end >= 0 {
-		rest = rest[:end]
-	}
-	idRe := regexp.MustCompile(`DF-[A-Z0-9]+-\d+`)
-	docIDs := map[string]bool{}
-	for _, m := range idRe.FindAllString(rest, -1) {
-		docIDs[m] = true
-	}
-	if len(docIDs) == 0 {
-		t.Fatal("Implemented scenario IDs section lists no IDs")
-	}
-
-	regImplemented := map[string]bool{}
-	for _, e := range Registry {
-		if e.Implemented {
-			regImplemented[string(e.ID)] = true
-		}
-	}
-
-	for id := range regImplemented {
-		if !docIDs[id] {
-			t.Errorf("Implemented registry ID %s is missing from DOGFOOD_MATRIX.md implemented list", id)
-		}
-	}
-	for id := range docIDs {
-		if !regImplemented[id] {
-			t.Errorf("DOGFOOD_MATRIX.md claims %s is implemented, but the registry does not", id)
-		}
+	for _, d := range CheckMatrixImplementedIDs(string(raw)) {
+		t.Error(d)
 	}
 }

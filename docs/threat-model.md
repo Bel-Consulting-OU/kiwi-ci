@@ -88,20 +88,21 @@ privilege). Status: **Mitigated** (implemented and tested), **Partial**
 
 ## Residual risks to track
 
-1. **OIDC key rotation** — the key ring keeps a rotated-out signing key
-   in the JWKS for a 72-hour previous-verification window, so tokens it
-   signed stay verifiable across a rotation; a compromise is still a
-   live-key event, but verifiers are not cut off immediately and no
-   provider reconfiguration is forced within the window
-   (`internal/server/oidc.go`: `oidcPreviousKeyRetireAfter`).
+1. 1.
+  **OIDC key rotation** — the key ring keeps a rotated-out signing key in the JWKS for a 72-hour previous-verification window, so tokens it signed stay verifiable across a rotation.
+   a compromise is still a live-key event, but verifiers are not cut off immediately and no provider reconfiguration is forced within the window (`internal/server/oidc.go`: `oidcPreviousKeyRetireAfter`).
+  
+
 2. **Bearer-token runner mode** — shared runner tokens remain a
    supported configuration; prefer enrollment-based mTLS in multi-tenant
    environments.
+
 3. **Deployment/snapshot records** — persist durably: through
    `DeploymentStore`/`SnapshotStore` in PostgreSQL mode (`deployments`,
    `workspace_snapshots` tables) and through the data-dir state file in
    filesystem mode. They are lost on restart only in the stateless
    in-memory dev mode (no database and no `--data-dir`).
+
 4. **SBOM/Sigstore gates** — implemented as server-side artifact
    contract gates: a declared `sbom` format is validated on upload, and
    a `sigstore` gate is cryptographically verified against configured
@@ -110,10 +111,12 @@ privilege). Status: **Mitigated** (implemented and tested), **Partial**
    `422`), and a required Sigstore gate with no configured trust root
    fails closed (`422`) rather than being skipped
    (`internal/server/supplychain_gate.go`).
+
 5. **OpenTelemetry export** — implemented: setting
    `observability.otel_endpoint`/`--otel-endpoint` installs an OTLP/HTTP
    exporter that emits request, forge-intake, enqueue, lease and
    completion spans (`internal/server/tracing.go`). There is no
    OpenTelemetry metrics/log pipeline yet.
+
 6. **Windows Job Object cancellation** — process-group kill covers
    common cases but not all descendants.

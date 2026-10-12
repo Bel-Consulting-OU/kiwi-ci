@@ -83,47 +83,79 @@ jobs:
 A job has a `steps` list (required, at least one step) plus:
 
 - `name` — display name.
+
 - `needs` — list of job IDs this job depends on. The DAG is validated:
   unknown dependencies, duplicates, self-references, and cycles are
   rejected. A job whose dependency fails is `blocked` unless its `if`
   condition admits the failed status.
+
 - `if` — condition expression evaluated against the aggregate dependency
   status. See [conditions.md](conditions.md).
+
 - `runner` — required runner labels; a runner must carry all of them.
+
 - `runtime` — `native`, `container`, or `tart` (see below).
+
 - `image` — container image (`runtime: container`). Untrusted jobs must
   pin an `@sha256:` digest.
+
 - `vm` — Tart VM reference (`runtime: tart`); required for Tart.
+
 - `network` — `bridge`, `host`, or `none`.
+
 - `shell` — see shell resolution below.
+
 - `timeout`, `queue_timeout` — Go durations (`30s`, `15m`).
+
 - `retry` — `max` (attempts beyond the first), `backoff` (exponential,
   default 1s), `on` (retry classes; see below).
+
 - `infra_retries` — extra attempts budget for lost-runner requeueing by
   the control plane.
+
 - `env` — job-level environment.
+
 - `matrix` — see below.
+
 - `paths`, `paths_ignore` — glob filters over the event's changed files.
+
 - `services` — sidecar containers (see below).
+
 - `cache` — cache restore/save declarations.
+
 - `artifacts` — artifact upload declarations.
+
 - `downloads` — artifact downloads from dependency jobs.
+
 - `test_reports` — JUnit globs uploaded for test intelligence.
+
 - `environment` — protected-environment targeting (see
   [environments.md](environments.md)).
+
 - `permissions` — `id_token: true`.
+
 - `outputs` — named job outputs, interpolatable by dependents.
+
 - `sandbox` — `rootless`, `read_only_rootfs`, `network`.
+
 - `placement` — `regions`, `labels` steering.
+
 - `resources` — `cpu`, `memory`, `disk`, `pids` (see
   [Resources](#resources)).
+
 - `tests` — `reports`, `manifest`, `shards`, `retry_failed`,
   `quarantine_flaky`.
+
 - `generate` — child graph generation (`path`, `max_jobs`, `max_depth`).
+
 - `downstream` — trigger a pipeline in another repository.
+
 - `deployment` — `canary`, `verify`, `rollback` step lists.
+
 - `snapshot` — `on` events that capture a workspace snapshot.
+
 - `component` — `name@sha256:...` reference; resolved server-side.
+
 - `with` — component input values.
 
 ### Matrix
@@ -139,8 +171,10 @@ to a base job expands to every combination.
 
 - `native`: runs on the runner host. Must not set `image` or `vm`.
   Denied for untrusted pipelines.
+
 - `container`: Docker-isolated Linux jobs. Image required at execution
   time.
+
 - `tart`: disposable Apple Silicon VMs. `vm` is required.
 
 ### Steps
@@ -197,13 +231,11 @@ created with `--internal`, so the job can reach its services but not the
 internet. With no services, those policies map to network `none`
 (container backend) or fail closed (Tart backend).
 
-Untrusted pipelines may declare at most **8 services per job**. A ninth
-service is rejected at ADMISSION — before the run is signed, persisted or
-queued — with `400` and reason `untrusted_service_ceiling_exceeded`; the
-executor additionally re-checks the same ceiling immediately before it
-starts any service container, so a job can never reach execution with an
-unenforceable service fan-out. Trusted pipelines keep the absolute
-`32`-service limit.
+Untrusted pipelines may declare at most **8 services per job**.
+A ninth service is rejected at admission — before the run is signed, persisted or queued — with `400` and reason `untrusted_service_ceiling_exceeded`.
+ the executor additionally re-checks the same ceiling immediately before it starts any service container, so a job can never reach execution with an unenforceable service fan-out.
+Trusted pipelines keep the absolute `32`-service limit.
+
 
 ### Resources
 
@@ -228,9 +260,11 @@ semantics are:
   signed or persisted (`400`, reason `untrusted_resource_ceiling_exceeded`,
   message naming the field, the requested value and the ceiling) — it is
   never silently clamped;
+
 - a dimension the job leaves **unset** is filled with the ceiling value,
   so every untrusted job runs with limits even when it never mentions
   `resources`;
+
 - **trusted** jobs are unconstrained by these ceilings and keep their
   declared resources exactly, including requests above every ceiling.
 
@@ -327,11 +361,10 @@ Enforced on every admission path (`internal/pipeline/validate.go`):
 | Artifact definitions | 128 |
 | Output keys | 256 |
 
-Also rejected: absolute paths and `..` components in path fields,
-negative or zero explicit durations, unknown shells/network modes/runtime
-combinations, non-scalar matrix values, empty matrix dimensions, invalid
-IDs, duplicate step IDs, duplicate dependencies, duplicate artifact
-names, unknown interpolation contexts, and unterminated `${{ ... }}`.
+Also rejected.
+ Absolute paths and `..` components in path fields, negative or zero explicit durations, unknown shells/network modes/runtime combinations, non-scalar matrix values, empty matrix dimensions, invalid IDs, duplicate step IDs, duplicate dependencies, duplicate artifact names, unknown interpolation contexts, and unterminated `${{ ...
+}}`.
+
 
 ## YAML restrictions
 

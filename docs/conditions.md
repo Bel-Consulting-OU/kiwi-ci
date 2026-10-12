@@ -31,10 +31,14 @@ explicit `if` runs only while the job status still admits `success()`.
 ## Condition syntax
 
 - `success()`, `failure()`, `cancelled()`, `always()`
+
 - `branchMatch('<glob>')` — true when the branch being built matches the
   quoted glob
+
 - `!expr`, `a && b`, `a || b`, parentheses
+
 - comparisons: `left == right`, `left != right`
+
 - left-hand values: `status`, `event`, `branch`, `env.NAME`, or a
   quoted literal; right-hand values are literals
 
@@ -101,7 +105,9 @@ map key is an evaluation error.
 
 - `contains(a, b)`, `startsWith(a, b)`, `endsWith(a, b)` — string
   predicates.
+
 - `fromJSON(s)`, `toJSON(s)` — parse and re-emit compact JSON.
+
 - `hashFiles('glob', ...)` — SHA-256 over the sorted matched files
   (workspace-relative path plus content), first 12 hex characters,
   evaluated against the workspace. Comma-separated globs inside one
@@ -117,8 +123,10 @@ evaluation error.
 
 1. **Compile time** (matrix): holes referencing only `matrix.*` are
    substituted deterministically; everything else stays literal.
+
 2. **Execution time** (outputs): `needs.*` and `steps.*` holes are
    resolved once upstream jobs or earlier steps have finished.
+
 3. **Server enqueue**: `repo`, `branch`, `ref`, `sha`, `event` contexts
    are available to the server-side concurrency group expansion.
 

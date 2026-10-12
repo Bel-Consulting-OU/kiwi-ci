@@ -1,7 +1,7 @@
 #!/bin/sh
 # gh-branch-protection.sh configures main-branch protection for Kiwi CI.
 #
-# INVARIANT: a required status context must come from a workflow that actually
+# Invariant: a required status context must come from a workflow that actually
 # runs on the event being gated. Woodpecker's status format is
 # `ci/woodpecker/<event>/<workflow>[/<axis>]`, with `pull_request` mapped to
 # the literal `pr` (verified against server/forge/common/status.go in
@@ -15,7 +15,7 @@
 #
 # Woodpecker publishes ONE commit status per workflow and event, not one per
 # step, so the lanes inside a workflow are not separately requireable. The
-# three contexts above are the COMPLETE pull_request workflow set (re-verified
+# three contexts above are the complete pull_request workflow set (re-verified
 # against every .woodpecker/*.yml `when`; internal/workflowguard fails the
 # build if an entry names a workflow that never runs on its claimed event) and
 # therefore carry the whole PR lane matrix:
@@ -29,7 +29,7 @@
 #                            (merged unit+integration coverage floor)
 #
 # The native windows/macos lanes and docker-integration run on trusted events
-# only (push/manual/tag) and stay post-merge gates (see NATIVE_CONTEXTS and
+# only (push/manual/tag) and stay post-merge gates (see $NATIVE_CONTEXTS and
 # the docker-workspace note below); never add them to the required PR list.
 #
 # docker-workspace is deliberately NOT required anywhere. It mounts the agent
@@ -43,7 +43,7 @@
 # not exist; see commit 6d2138e), so requiring its push context would make
 # every HEAD red forever. Its workflow is now
 # `docker-workspace-diagnostic` (non-blocking, `failure: ignore`), and it is
-# deliberately absent from CONTEXTS, PUSH_CONTEXTS and NATIVE_CONTEXTS. If
+# deliberately absent from $CONTEXTS, $PUSH_CONTEXTS and $NATIVE_CONTEXTS. If
 # repository settings still require the old `ci/woodpecker/push/docker-workspace`
 # context, remove it there: no workflow publishes that context anymore. When
 # a compatible backend (or a bind-mount-free replacement lane) exists, promote
@@ -66,7 +66,7 @@
 # Matrix workflows append `/<axis_id>`; none of the workflows here use a
 # matrix, so the plain three-segment form is what the lists below name.
 #
-# The script refuses to install a context it has NEVER observed on a recent
+# The script refuses to install a context it has never observed on a recent
 # commit, so abandoned or mistyped context names cannot silently weaken (or
 # brick) protection. Requires repository admin.
 #

@@ -7,15 +7,18 @@ through the Forgejo API, and publishes commit statuses.
 
 1. In the repository settings, add a webhook to
    `https://<your-kiwi-host>/hooks/forgejo`.
+
 2. Secret: the value of `forgejo.webhook_secret` (or
    `KIWI_FORGEJO_WEBHOOK_SECRET`). Kiwi verifies the HMAC-SHA256
    signature (the same `X-Hub-Signature-256` scheme GitHub uses) before
    processing anything.
+
 3. Events: `Push` and `Pull Request` at minimum.
 
 ## Events handled
 
 - `push` — enqueues a run.
+
 - `pull_request` — `opened`, `reopened`, `synchronize` (and equivalent
   action names) enqueue runs. Pull requests from forks are untrusted:
   the pipeline definition is read from the base commit, fork code is

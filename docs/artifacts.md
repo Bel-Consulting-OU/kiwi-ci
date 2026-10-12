@@ -16,8 +16,10 @@ artifacts:
 
 - `paths` — workspace-relative globs captured (symlinks and special
   files are never captured).
+
 - `if` — condition over the job status; artifacts can be captured on
   failure for diagnostics.
+
 - `retention` — Go duration or `forever`/`infinite`/`never`. Expired
   artifacts are removed by the server's garbage collector.
 
@@ -68,5 +70,7 @@ succeeds — clients never observe half-created artifacts.
 ## Limits
 
 - Artifact paths must be relative (no absolute paths, no `..`).
+
 - Duplicate artifact names in a job are rejected.
+
 - Extraction of downloaded artifacts is hardened via `internal/safefs`.

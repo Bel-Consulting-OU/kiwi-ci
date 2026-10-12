@@ -20,13 +20,10 @@ cursor can walk the whole history.
 | `limit` | `1000` | `1`..`10000` | Maximum runs in one page. Absent, unparsable, or non-positive values select the default; values above the cap are clamped to the cap. The effective bound is advertised on every response as `X-Kiwi-Runs-Limit-Cap`. |
 | `cursor` | *(empty)* | opaque | Position returned by the previous page (`X-Kiwi-Next-Cursor` header). Omit it (or pass it empty) for the newest page. A malformed cursor is rejected with `400 Bad Request` and the opaque body `invalid cursor`; the value is never echoed or interpreted beyond the cursor encoding. |
 
-The collection is gated by the coarse read gate (admin/global read, or any
-repository read grant); a reader without any read capability is answered
-`403`, not an empty `200`. The gate is not the per-run decision: the
-principal's normalized repository-read predicate is resolved once per request
-(`runAuthzPolicy`) and applied **inside** the paged query, before the page
-boundary exists, so no returned row, count, timestamp or cursor is ever
-derived from a run the caller cannot read.
+The collection is gated by the coarse read gate (admin/global read, or any repository read grant); a reader without any read capability is answered `403`, not an empty `200`.
+The gate is not the per-run decision.
+ The principal's normalized repository-read predicate is resolved once per request (`runAuthzPolicy`) and applied **inside** the paged query, before the page boundary exists, so no returned row, count, timestamp or cursor is ever derived from a run the caller cannot read.
+
 
 ## Response
 
@@ -60,11 +57,12 @@ opaque `400`.
 
 - **Ordering.** Pages are consecutive windows of one total order,
   `(created_at DESC, id DESC)`. The first page is the newest `limit` runs.
-- **Keyset, not offsets.** A page contains only runs strictly older than the
-  cursor position `(created_at, id)`. A run created between two page reads is
-  newer than the cursor and is simply not part of the remaining walk of that
-  traversal (a fresh first-page request sees it); it can never shift a page
-  boundary, so a walk never returns a run twice and never skips one.
+
+- - **Keyset, not offsets.** A page contains only runs strictly older than the cursor position `(created_at, id)`.
+  A run created between two page reads is newer than the cursor and is simply not part of the remaining walk of that traversal (a fresh first-page request sees it).
+   it can never shift a page boundary, so a walk never returns a run twice and never skips one.
+  
+
 - **Authorization happens before paging.** The principal's normalized
   repository-read predicate is a clause of the same query that computes the
   keyset boundary, so the page is cut from the authorized rows alone. The
@@ -73,6 +71,7 @@ opaque `400`.
   filter. A repository-scoped reader therefore sees only pages of visible
   runs, and can never observe the position, count or density of an
   inaccessible run.
+
 - **Terminal empty pages carry no cursor.** Because the boundary is computed
   on authorized rows, an empty authorized page is the end of the walk: it is
   answered `200` with an empty JSON array and no `X-Kiwi-Next-Cursor`.

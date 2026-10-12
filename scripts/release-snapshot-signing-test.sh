@@ -126,7 +126,7 @@ clone_repo() {
 
 # release_env runs the script under test with a minimal environment: only the
 # stub bin directory ahead of the normal PATH, HOME, the inline signing key,
-# and the release-tool log path. No ambient VERSION/COMMIT/BUILD_DATE/SIGNING
+# and the release-tool log path. No ambient VERSION/COMMIT/BUILD_DATE/$SIGNING
 # variables can leak into the run.
 release_env() {
 	log="$1"

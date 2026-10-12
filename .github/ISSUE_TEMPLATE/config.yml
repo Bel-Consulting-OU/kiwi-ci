@@ -1,0 +1,12 @@
+# GitHub issue configuration for Kiwi CI.
+#
+# Brand: Execution, with evidence. Keep issue voice specific and calm —
+# facts, policies, and outcomes stay distinct. See docs/brand/README.md.
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/Bel-Consulting-OU/kiwi-ci/blob/main/SECURITY.md
+    about: Report security issues privately — do not file a public issue.
+  - name: Documentation & brand
+    url: https://github.com/Bel-Consulting-OU/kiwi-ci/blob/main/docs/brand/README.md
+    about: Visual identity, voice, and product documentation map.

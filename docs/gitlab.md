@@ -7,9 +7,11 @@ GitLab API, and publishes commit statuses.
 
 1. In the project settings, add a webhook to
    `https://<your-kiwi-host>/hooks/gitlab`.
+
 2. Secret token: the value of `--gitlab-webhook-secret`-equivalent
    `gitlab.webhook_secret` (or `KIWI_GITLAB_WEBHOOK_SECRET`). Kiwi
    verifies the `X-Gitlab-Token` header before processing anything.
+
 3. Triggers: `Push events` and `Merge request events` at minimum.
 
 Ping events are acknowledged without action.
@@ -17,6 +19,7 @@ Ping events are acknowledged without action.
 ## Events handled
 
 - `push` — enqueues a run when the head SHA is known.
+
 - `merge_request` — actions `opened`, `reopened`, and `synchronize`
   enqueue runs. Merge requests from forks are untrusted: the pipeline
   definition is read from the base commit and the fork code is checked
