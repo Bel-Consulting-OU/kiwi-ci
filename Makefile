@@ -259,17 +259,20 @@ dogfood-system:
 
 # Production-closure SYSTEM species: live resource-leak/soak (DF-SCALE-002),
 # the untrusted container + hard quota + signed v6 evidence lane, the live
-# multi-process topology (DF-DIST-001), and backup→destroy→restore
-# (DF-DR-001). These are name-required so the production suite cannot
-# silently lose them.
+# multi-process topology (DF-DIST-001), backup→destroy→restore (DF-DR-001),
+# and the single canonical production release scenario (full chain:
+# N-1→N, >=2 runners, high-assurance controls, signed evidence, kill/
+# failover/retry, DR, packaged artifact). These are name-required so the
+# production suite cannot silently lose them.
 dogfood-production:
 	./scripts/dogfood-run.sh 20m \
-		--run 'TestSysDFScale002|TestSysUntrusted|TestSysDFDist|TestSysDFDr' \
+		--run 'TestSysDFScale002|TestSysUntrusted|TestSysDFDist|TestSysDFDr|TestSysDFCanonical' \
 		--require TestSysDFScale002Soak \
 		--require TestSysUntrustedContainerEvidenceLane \
 		--require TestSysDFDist001 \
 		--require TestSysDFDr001PostgresObjectStore \
 		--require TestSysDFDr001FSMode \
+		--require TestSysDFCanonicalReleaseScenario \
 		-- ./internal/dogfood/system/ ./internal/dogfood/dist/
 
 # All dogfood suites including production proofs. release-gate is the
@@ -278,15 +281,19 @@ dogfood-production:
 # DF0 is .kiwi/pipeline.yaml.
 dogfood-all: dogfood-local dogfood-system dogfood-production dogfood-release-artifacts dogfood-distributed dogfood-adversarial dogfood-upgrade dogfood-scale dogfood-release-model
 
-# release-gate is the production dogfood closure: live dist topology, soak,
-# DR restore, N-1 binary upgrade (fail-closed — KIWI_REQUIRE_N_MINUS_ONE=1
-# via dogfood-release-artifacts), G1→G2 self-build, packaged artifact, and
-# the untrusted-container evidence lane, plus the critical model/system
-# contracts. Automation that needs "release safe" uses THIS target.
+# release-gate is the production dogfood closure: the single canonical
+# production release scenario (N-1→N, live dist topology with >=2 runners,
+# high-assurance controls, signed evidence, kill/failover/retry, backup→
+# destroy→restore, packaged artifact), live resource-leak/soak, the
+# standalone DR drills, N-1 binary upgrade (fail-closed —
+# KIWI_REQUIRE_N_MINUS_ONE=1 via dogfood-release-artifacts), G1→G2 self-build,
+# packaged artifact proof, and the untrusted-container evidence lane, plus
+# the critical model/system contracts. Automation that needs "release safe"
+# uses THIS target.
 # dogfood-release-model is the faster model-only subset.
 .PHONY: release-gate
 release-gate: dogfood-fast dogfood-system dogfood-production dogfood-release-artifacts
-	@echo "RELEASE GATE green: dist topology, soak, DR restore, N-1 upgrade (fail-closed), G1→G2 self-build, packaged artifact, untrusted-container evidence lane."
+	@echo "RELEASE GATE green: canonical release scenario, dist topology, soak, DR restore, N-1 upgrade (fail-closed), G1→G2 self-build, packaged artifact, untrusted-container evidence lane."
 
 # staticcheck-all is the CI check: it is exactly the pinned command run by
 # .woodpecker/linux-amd64.yml. `staticcheck` runs the same pinned command

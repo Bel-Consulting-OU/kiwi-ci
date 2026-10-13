@@ -2,10 +2,12 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/version"
 )
 
 // statePersistenceDegradedBody is the fixed /readiness body for a control
@@ -22,6 +24,34 @@ const (
 	runKeyIndexMissingBody = "database is missing the run key identity index"
 	runKeyIndexUnknownBody = "database run key identity index not verifiable"
 )
+
+// versionInfo reports build identity and the compatibility contract as one
+// unauthenticated document. It never touches the store: the compatibility
+// surface is generated from version.ContractVersions at compile time, so a
+// control plane whose database is down still answers this probe. The body is
+// the version.Full() map plus the RenderCompatibilityJSON object under
+// "compatibility", so an operator or a peer can discover what this binary
+// produces and consumes without reading the repository docs.
+func (s *Server) versionInfo(w http.ResponseWriter, _ *http.Request) {
+	full := version.Full()
+	var compat map[string]any
+	if err := json.Unmarshal(version.RenderCompatibilityJSON(), &compat); err != nil {
+		// RenderCompatibilityJSON is a compile-time document: a parse
+		// failure is a build defect, not an operational condition. Fail
+		// closed with 500 rather than emit a partial identity.
+		http.Error(w, "version document unavailable", http.StatusInternalServerError)
+		return
+	}
+	body := make(map[string]any, len(full)+1)
+	for k, v := range full {
+		body[k] = v
+	}
+	body["compatibility"] = compat
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		return
+	}
+}
 
 // liveness reports that the process is up. It never checks dependencies:
 // a live control plane that cannot reach its store must still report

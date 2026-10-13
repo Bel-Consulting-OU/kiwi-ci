@@ -1,0 +1,66 @@
+{
+  "comment": "Generated from internal/version.ContractVersions as the produces/consumes map. Do not hand-edit compatibility.json — run KIWI_GEN=1 go test ./internal/version -run TestGenerateCompatibilityDocs. produces is what this build writes; consumes is what this build still reads (historical encodings first, current last); storage_schema/minimum_reader/minimum_writer pin the persisted-state schema floor.",
+  "produces": {
+    "attestation_digest": "kiwi-ci/execution-attestation-digest/v1",
+    "compiled_job_schema": "1",
+    "completion_result_hash": "3",
+    "event_schema": "1",
+    "evidence_root_digest": "kiwi-ci/execution-evidence-root/v1",
+    "evidence_schema": "6",
+    "execution_semantics": "kiwi.execution.v2",
+    "observed_runtime_digest_v1": "kiwi-ci/observed-runtime/v1",
+    "observed_runtime_digest_v2": "kiwi-ci/observed-runtime/v2",
+    "pipeline_schema": "1",
+    "runner_api_protocol": "3",
+    "runner_wire_semantic": "2",
+    "snapshot_schema": "1"
+  },
+  "consumes": {
+    "attestation_digest": [
+      "kiwi-ci/execution-attestation-digest/v1"
+    ],
+    "compiled_job_schema": [
+      "1"
+    ],
+    "completion_result_hash": [
+      "1",
+      "2",
+      "3"
+    ],
+    "event_schema": [
+      "1"
+    ],
+    "evidence_root_digest": [
+      "kiwi-ci/execution-evidence-root/v1"
+    ],
+    "evidence_schema": [
+      "4",
+      "5",
+      "6"
+    ],
+    "execution_semantics": [
+      "kiwi.execution.v2"
+    ],
+    "observed_runtime_digest_v1": [
+      "kiwi-ci/observed-runtime/v1"
+    ],
+    "observed_runtime_digest_v2": [
+      "kiwi-ci/observed-runtime/v2"
+    ],
+    "pipeline_schema": [
+      "1"
+    ],
+    "runner_api_protocol": [
+      "3"
+    ],
+    "runner_wire_semantic": [
+      "2"
+    ],
+    "snapshot_schema": [
+      "1"
+    ]
+  },
+  "storage_schema": "1",
+  "minimum_reader": "1",
+  "minimum_writer": "1"
+}

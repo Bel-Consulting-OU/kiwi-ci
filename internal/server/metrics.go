@@ -317,7 +317,7 @@ func formatFloat(v float64) string {
 // classes for kiwi_http_requests_total. Raw IDs never leak into labels.
 func metricsPathClass(p string) string {
 	switch {
-	case p == "/readiness" || p == "/liveness" || p == "/metrics":
+	case p == "/readiness" || p == "/liveness" || p == "/metrics" || p == "/version":
 		return "health"
 	case strings.HasPrefix(p, "/hooks/"):
 		return "hooks"

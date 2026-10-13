@@ -18,8 +18,8 @@ func RenderContractTable() string {
 	sort.Strings(keys)
 	var b strings.Builder
 	b.WriteString("# Kiwi contract versions\n\n")
-	b.WriteString("Generated from `internal/version.ContractVersions` (the authoritative registry).\n")
-	b.WriteString("Do not hand-edit this file — run `KIWI_GEN=1 go test ./internal/version -run TestGenerateContractVersionsDoc`.\n\n")
+	b.WriteString("Generated from `internal/version.ContractVersions` as the contract-version table.\n")
+	b.WriteString("Do not hand-edit `docs/CONTRACTS.md` — run `KIWI_GEN=1 go test ./internal/version -run TestGenerateContractVersionsDoc`.\n\n")
 	b.WriteString("| Contract | Version / tag |\n|---|---|\n")
 	for _, k := range keys {
 		fmt.Fprintf(&b, "| `%s` | `%s` |\n", k, ContractVersions[k])

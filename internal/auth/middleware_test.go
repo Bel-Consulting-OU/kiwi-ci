@@ -170,6 +170,7 @@ func TestPublicRouteTable(t *testing.T) {
 		{http.MethodGet, "/api/v1/logout"},
 		{http.MethodGet, "/readiness"},
 		{http.MethodGet, "/liveness"},
+		{http.MethodGet, "/version"},
 		{http.MethodGet, "/.well-known/openid-configuration"},
 		{http.MethodGet, "/api/v1/oidc/jwks"},
 		{http.MethodPost, "/api/v1/jobs/j1/oidc"},

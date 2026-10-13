@@ -1234,6 +1234,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/logout", s.webLogout)
 	mux.HandleFunc("GET /readiness", s.readiness)
 	mux.HandleFunc("GET /liveness", s.liveness)
+	mux.HandleFunc("GET /version", s.versionInfo)
 	mux.HandleFunc("POST /hooks/github", s.githubWebhook)
 	mux.HandleFunc("POST /hooks/gitlab", s.gitlabWebhook)
 	mux.HandleFunc("POST /hooks/forgejo", s.forgejoWebhook)
@@ -1361,7 +1362,7 @@ func (s *Server) schemaMutationFence(next http.Handler) http.Handler {
 			return
 		}
 		switch r.URL.Path {
-		case "/liveness", "/readiness", "/metrics":
+		case "/liveness", "/readiness", "/metrics", "/version":
 			next.ServeHTTP(w, r)
 			return
 		}

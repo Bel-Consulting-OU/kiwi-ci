@@ -98,6 +98,16 @@ type VerificationObligation struct {
 	// RequiredAssurance is the assurance profile the outcome must claim.
 	// Opaque string defined by the verification contract.
 	RequiredAssurance string `json:"required_assurance"`
+	// VerifierProviderKind, when non-empty, names the VerifierProvider.Kind()
+	// that must discharge this obligation (see provider.go). Empty selects
+	// the service default EvidenceVerifier. A named kind is fail closed: the
+	// provider must be registered and its advertised capabilities must cover
+	// the obligation, or verification is refused before anything is stored.
+	// The field is optional on the wire (omitempty): a document without it
+	// decodes as "default verifier", and a decoder that does not know the
+	// field refuses a document that sets it rather than silently ignoring
+	// the routing demand.
+	VerifierProviderKind string `json:"verifier_provider_kind,omitempty"`
 	// Freshness is the expiry/freshness policy enforced at record time.
 	Freshness FreshnessPolicy `json:"freshness"`
 	// OpaqueCorrelationMetadata is free-form caller correlation state. It is

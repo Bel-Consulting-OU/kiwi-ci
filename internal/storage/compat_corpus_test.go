@@ -11,21 +11,21 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
-// N-1 compatibility corpus (testdata/compat/n-1). The files are PRODUCER
-// BYTES from the N-1 tree: built through a git worktree at the N-1 commit
-// and emitted by that tree's own internal/storage completion-receipt and
-// observed-runtime APIs (see MANIFEST.producer). This test consumes them
-// under HEAD and asserts two things:
+// N-2/N-1 compatibility corpora (testdata/compat/n-2, testdata/compat/n-1).
+// The files are PRODUCER BYTES from the named tree: built through a git
+// worktree at that commit and emitted by that tree's own internal/storage
+// completion-receipt and observed-runtime APIs (see MANIFEST.producer). The
+// tests consume them under HEAD and assert two things:
 //
-//  1. digest stability — every golden digest N-1 recorded is reproduced
-//     byte-for-byte by HEAD's digest functions, and every corpus file still
-//     hashes to the sha256 the MANIFEST froze;
+//  1. digest stability — every golden digest the producer recorded is
+//     reproduced byte-for-byte by HEAD's digest functions, and every corpus
+//     file still hashes to the sha256 the MANIFEST froze;
 //  2. replay — each frozen receipt (v1 legacy, v2 runtime-bound, v3
 //     runtime+Control) still resolves a retried completion through
 //     CompletionReceiptReplayMatches.
 //
-// The corpus is immutable. Regenerating it under a changed encoding makes
-// the pinned digests and MANIFEST hashes fail — that is the firewall.
+// The corpora are immutable. Regenerating them under a changed encoding
+// makes the pinned digests and MANIFEST hashes fail — that is the firewall.
 
 type compatManifest struct {
 	Producer struct {
@@ -68,16 +68,16 @@ type compatCorpus struct {
 	} `json:"golden"`
 }
 
-func compatDir(t *testing.T) string {
+func compatDir(t *testing.T, corpus string) string {
 	t.Helper()
-	return filepath.Join("..", "..", "testdata", "compat", "n-1")
+	return filepath.Join("..", "..", "testdata", "compat", corpus)
 }
 
-func compatRead(t *testing.T, name string) []byte {
+func compatRead(t *testing.T, corpus, name string) []byte {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join(compatDir(t), name))
+	b, err := os.ReadFile(filepath.Join(compatDir(t, corpus), name))
 	if err != nil {
-		t.Fatalf("read compat corpus %s: %v (the N-1 corpus must stay committed)", name, err)
+		t.Fatalf("read compat corpus %s/%s: %v (the %s corpus must stay committed)", corpus, name, err, corpus)
 	}
 	return b
 }
@@ -93,8 +93,21 @@ func compatSHA256(b []byte) string {
 // functions reproduce every N-1 golden digest byte-for-byte, and every
 // frozen receipt still replays.
 func TestCompatCorpusNMinusOneConsumedByHead(t *testing.T) {
+	runCompatCorpus(t, "n-1")
+}
+
+// TestCompatCorpusNMinusTwoConsumedByHead loads the frozen N-2
+// completion-receipt / observed-runtime corpus (producer commit recorded in
+// MANIFEST) and proves HEAD still consumes it on the same two axes:
+// digest stability and receipt replay.
+func TestCompatCorpusNMinusTwoConsumedByHead(t *testing.T) {
+	runCompatCorpus(t, "n-2")
+}
+
+func runCompatCorpus(t *testing.T, corpus string) {
+	t.Helper()
 	var man compatManifest
-	if err := json.Unmarshal(compatRead(t, "MANIFEST"), &man); err != nil {
+	if err := json.Unmarshal(compatRead(t, corpus, "MANIFEST"), &man); err != nil {
 		t.Fatalf("parse MANIFEST: %v", err)
 	}
 	if man.Producer.Commit == "" || man.Producer.Method == "" {
@@ -106,7 +119,7 @@ func TestCompatCorpusNMinusOneConsumedByHead(t *testing.T) {
 	// Digest stability of the corpus bytes themselves: every file must
 	// still hash to what the MANIFEST froze at emission time.
 	for name, want := range man.Files {
-		got := compatSHA256(compatRead(t, name))
+		got := compatSHA256(compatRead(t, corpus, name))
 		if got != want {
 			t.Fatalf("compat corpus %s sha256 = %s, MANIFEST = %s — corpus bytes changed", name, got, want)
 		}
@@ -119,14 +132,14 @@ func TestCompatCorpusNMinusOneConsumedByHead(t *testing.T) {
 	}
 
 	var fx compatCorpus
-	if err := json.Unmarshal(compatRead(t, "completion_receipt.json"), &fx); err != nil {
+	if err := json.Unmarshal(compatRead(t, corpus, "completion_receipt.json"), &fx); err != nil {
 		t.Fatalf("parse completion_receipt.json: %v", err)
 	}
 	var runtimeNoControl, runtimeWithControl model.ObservedRuntime
-	if err := json.Unmarshal(compatRead(t, "observed_runtime.json"), &runtimeNoControl); err != nil {
+	if err := json.Unmarshal(compatRead(t, corpus, "observed_runtime.json"), &runtimeNoControl); err != nil {
 		t.Fatalf("parse observed_runtime.json: %v", err)
 	}
-	if err := json.Unmarshal(compatRead(t, "observed_runtime_control.json"), &runtimeWithControl); err != nil {
+	if err := json.Unmarshal(compatRead(t, corpus, "observed_runtime_control.json"), &runtimeWithControl); err != nil {
 		t.Fatalf("parse observed_runtime_control.json: %v", err)
 	}
 	// The standalone observed-runtime files must be the same objects the
@@ -149,22 +162,22 @@ func TestCompatCorpusNMinusOneConsumedByHead(t *testing.T) {
 	errMsg := fx.Completion.Error
 	outputs := fx.Completion.Outputs
 
-	// Digest stability N-1 → HEAD: HEAD's functions must reproduce every
-	// golden digest the N-1 emitter recorded.
+	// Digest stability producer → HEAD: HEAD's functions must reproduce
+	// every golden digest the producer emitter recorded.
 	if got := CompletionResultDigestV1(status, errMsg, outputs); got != fx.Golden.CompletionResultV1 {
-		t.Fatalf("HEAD v1 digest = %s, N-1 golden = %s", got, fx.Golden.CompletionResultV1)
+		t.Fatalf("HEAD v1 digest = %s, %s golden = %s", got, corpus, fx.Golden.CompletionResultV1)
 	}
 	if got := CompletionResultDigestV2(status, errMsg, outputs, &runtimeNoControl); got != fx.Golden.CompletionResultV2 {
-		t.Fatalf("HEAD v2 digest = %s, N-1 golden = %s", got, fx.Golden.CompletionResultV2)
+		t.Fatalf("HEAD v2 digest = %s, %s golden = %s", got, corpus, fx.Golden.CompletionResultV2)
 	}
 	if got := CompletionResultDigestV3(status, errMsg, outputs, &runtimeWithControl); got != fx.Golden.CompletionResultV3 {
-		t.Fatalf("HEAD v3 digest = %s, N-1 golden = %s", got, fx.Golden.CompletionResultV3)
+		t.Fatalf("HEAD v3 digest = %s, %s golden = %s", got, corpus, fx.Golden.CompletionResultV3)
 	}
 	if got := ObservedRuntimeDigestV1(&runtimeNoControl); got != fx.Golden.ObservedRuntimeV1Digest {
-		t.Fatalf("HEAD observed-runtime/v1 digest = %s, N-1 golden = %s", got, fx.Golden.ObservedRuntimeV1Digest)
+		t.Fatalf("HEAD observed-runtime/v1 digest = %s, %s golden = %s", got, corpus, fx.Golden.ObservedRuntimeV1Digest)
 	}
 	if got := ObservedRuntimeDigest(&runtimeWithControl); got != fx.Golden.ObservedRuntimeV2Digest {
-		t.Fatalf("HEAD observed-runtime/v2 digest = %s, N-1 golden = %s", got, fx.Golden.ObservedRuntimeV2Digest)
+		t.Fatalf("HEAD observed-runtime/v2 digest = %s, %s golden = %s", got, corpus, fx.Golden.ObservedRuntimeV2Digest)
 	}
 	// The frozen v1/v2 observed-runtime encodings must also reproduce from
 	// the Control-bearing object (Control is excluded from v1; v2 binds it).
@@ -172,7 +185,7 @@ func TestCompatCorpusNMinusOneConsumedByHead(t *testing.T) {
 		t.Fatalf("HEAD v1 digest over the Control runtime = %s, want the no-Control golden %s", got, fx.Golden.ObservedRuntimeV1Digest)
 	}
 
-	// Replay: every frozen N-1 receipt must still resolve a retried
+	// Replay: every frozen producer receipt must still resolve a retried
 	// completion under HEAD's versioned matcher.
 	for _, ver := range []string{"v1", "v2", "v3"} {
 		recv, ok := fx.Receipts[ver]
@@ -214,14 +227,14 @@ func TestCompatCorpusNMinusOneConsumedByHead(t *testing.T) {
 		}
 	}
 
-	// Producer metadata must name the N-1 tree that wrote the bytes.
+	// Producer metadata must name the tree that wrote the bytes.
 	if fx.Producer.Commit != man.Producer.Commit {
 		t.Fatalf("receipt producer commit %s disagrees with MANIFEST %s", fx.Producer.Commit, man.Producer.Commit)
 	}
 	if fx.Producer.ObservedRuntimeV1Tag != ObservedRuntimeDigestV1Version {
-		t.Fatalf("N-1 observed-runtime/v1 tag = %q, HEAD = %q", fx.Producer.ObservedRuntimeV1Tag, ObservedRuntimeDigestV1Version)
+		t.Fatalf("%s observed-runtime/v1 tag = %q, HEAD = %q", corpus, fx.Producer.ObservedRuntimeV1Tag, ObservedRuntimeDigestV1Version)
 	}
 	if fx.Producer.ObservedRuntimeV2Tag != ObservedRuntimeDigestV2Version {
-		t.Fatalf("N-1 observed-runtime/v2 tag = %q, HEAD = %q", fx.Producer.ObservedRuntimeV2Tag, ObservedRuntimeDigestV2Version)
+		t.Fatalf("%s observed-runtime/v2 tag = %q, HEAD = %q", corpus, fx.Producer.ObservedRuntimeV2Tag, ObservedRuntimeDigestV2Version)
 	}
 }

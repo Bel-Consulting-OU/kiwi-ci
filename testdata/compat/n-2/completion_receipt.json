@@ -1,0 +1,103 @@
+{
+  "comment": "N-2 producer bytes for the completion-receipt / observed-runtime compatibility corpus. Every digest in `golden` is computed by N-2 code running inside the N-2 worktree; HEAD must reproduce them byte-for-byte (TestCompatCorpusNMinusTwoConsumedByHead).",
+  "completion": {
+    "error": "",
+    "observed_runtime": {
+      "os": "linux",
+      "arch": "amd64",
+      "runtime_name": "docker",
+      "runtime_version": "25.0.3",
+      "main_image": "alpine:3.20",
+      "main_image_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "service_images": {
+        "db": "postgres:16"
+      },
+      "service_image_digests": {
+        "db": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "components": {
+        "libfoo": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "captured_at": "2026-01-02T03:04:05Z"
+    },
+    "observed_runtime_control": {
+      "os": "linux",
+      "arch": "amd64",
+      "runtime_name": "docker",
+      "runtime_version": "25.0.3",
+      "main_image": "alpine:3.20",
+      "main_image_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "service_images": {
+        "db": "postgres:16"
+      },
+      "service_image_digests": {
+        "db": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "components": {
+        "libfoo": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "captured_at": "2026-01-02T03:04:05Z",
+      "control": {
+        "runtime": "docker",
+        "sandbox_started": true,
+        "network_enforced": "none",
+        "root_filesystem_read_only": true,
+        "workspace_quota_enforced": true
+      }
+    },
+    "outputs": {
+      "artifact": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "url": "https://example.invalid/dist/app"
+    },
+    "status": "success"
+  },
+  "golden": {
+    "completion_result_v1": "fed0dffe1dc5e52fd166181dc6fa2b2a7fbff6aa2a4cbdc4af80db4fad76bb81",
+    "completion_result_v2": "d59a8c99e366ac49dff7370bddefdef6ea4d81e05f49522e73eacd6745bee21b",
+    "completion_result_v3": "e1cb59e18f59b5201bc0ea437c0bc596f72838814b62502a0d248e76bad429d4",
+    "observed_runtime_v1_digest": "843e54d6abc51804f85e1e867362ce2a31cd79c6345e1993b193c477f54802b4",
+    "observed_runtime_v2_digest": "2e6ceb922e1586b11f0de80e545fa728308ddb2207cae034e69e6bf254b58dfb"
+  },
+  "producer": {
+    "commit": "753c1c3d0a0f16104d7e22fad888a37debdc47c0",
+    "current_completion_hash_version": 3,
+    "go_version": "go1.27.2",
+    "observed_runtime_v1_tag": "kiwi-ci/observed-runtime/v1",
+    "observed_runtime_v2_tag": "kiwi-ci/observed-runtime/v2"
+  },
+  "receipts": {
+    "v1": {
+      "hash_version": 1,
+      "receipt": {
+        "job_id": "compat-n2-job",
+        "generation": 3,
+        "runner_id": "compat-n2-runner",
+        "result_hash": "fed0dffe1dc5e52fd166181dc6fa2b2a7fbff6aa2a4cbdc4af80db4fad76bb81",
+        "result_hash_version": 1
+      },
+      "result_hash": "fed0dffe1dc5e52fd166181dc6fa2b2a7fbff6aa2a4cbdc4af80db4fad76bb81"
+    },
+    "v2": {
+      "hash_version": 2,
+      "receipt": {
+        "job_id": "compat-n2-job",
+        "generation": 3,
+        "runner_id": "compat-n2-runner",
+        "result_hash": "d59a8c99e366ac49dff7370bddefdef6ea4d81e05f49522e73eacd6745bee21b",
+        "result_hash_version": 2
+      },
+      "result_hash": "d59a8c99e366ac49dff7370bddefdef6ea4d81e05f49522e73eacd6745bee21b"
+    },
+    "v3": {
+      "hash_version": 3,
+      "receipt": {
+        "job_id": "compat-n2-job",
+        "generation": 3,
+        "runner_id": "compat-n2-runner",
+        "result_hash": "e1cb59e18f59b5201bc0ea437c0bc596f72838814b62502a0d248e76bad429d4",
+        "result_hash_version": 3
+      },
+      "result_hash": "e1cb59e18f59b5201bc0ea437c0bc596f72838814b62502a0d248e76bad429d4"
+    }
+  }
+}

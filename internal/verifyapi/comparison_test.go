@@ -44,7 +44,7 @@ func TestCompareCandidatesNeutralAndDeterministic(t *testing.T) {
 		t.Fatalf("order = %s, %s", cmp.Candidates[0].CandidateID, cmp.Candidates[1].CandidateID)
 	}
 	// Neutral by type shape: a comparison carries facts only. A consumer
-	// (Faktor or anyone) applies its own utility; nothing here ranks rows.
+	// (an evidence consumer or anyone) applies its own utility; nothing here ranks rows.
 	if len(cmp.Candidates) != 2 {
 		t.Fatalf("rows = %d", len(cmp.Candidates))
 	}

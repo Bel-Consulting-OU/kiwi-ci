@@ -1,7 +1,7 @@
 # Kiwi contract versions
 
-Generated from `internal/version.ContractVersions` (the authoritative registry).
-Do not hand-edit this file — run `KIWI_GEN=1 go test ./internal/version -run TestGenerateContractVersionsDoc`.
+Generated from `internal/version.ContractVersions` as the contract-version table.
+Do not hand-edit `docs/CONTRACTS.md` — run `KIWI_GEN=1 go test ./internal/version -run TestGenerateContractVersionsDoc`.
 
 | Contract | Version / tag |
 |---|---|

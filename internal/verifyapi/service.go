@@ -211,8 +211,14 @@ type Service struct {
 	// PostgresStore in production).
 	Store VerificationStore
 	// Verifier is the evidence acceptance boundary. It is the only way a
-	// VerifiedOutcome is minted.
+	// VerifiedOutcome is minted for obligations that name no provider kind.
 	Verifier EvidenceVerifier
+	// Providers is the optional external verifier SPI catalog (see
+	// provider.go). An obligation whose VerifierProviderKind is set is
+	// dispatched to the matching registered provider instead of Verifier;
+	// unknown kind or a capability mismatch is a refusal. Nil means no
+	// external providers — a named kind is then fail closed.
+	Providers *ProviderRegistry
 	// Authz mediates every method. Nil denies everything.
 	Authz Authorizer
 	// Clock reads wall time for service-side stamps. Nil selects time.Now.
@@ -318,6 +324,12 @@ func (s *Service) RecordClaim(ctx context.Context, p Principal, v VerificationOu
 //
 // The returned record is sealed; only sealed records discharge obligations.
 // Authorization runs against the STORED obligation's SubjectRef.
+//
+// Provider dispatch is fail closed: an obligation whose
+// VerifierProviderKind is set is routed to that registered provider
+// (refused when the kind is unknown or the provider's advertised
+// capabilities do not cover the required assurance). An obligation that
+// names no kind uses the default Verifier.
 func (s *Service) VerifyAndRecord(ctx context.Context, p Principal, v VerificationOutcome) (VerifiedOutcome, error) {
 	if err := v.Validate(); err != nil {
 		return VerifiedOutcome{}, err
@@ -329,9 +341,25 @@ func (s *Service) VerifyAndRecord(ctx context.Context, p Principal, v Verificati
 	if err := s.authorize(ctx, p, ActionProofVerify, ob.SubjectReference()); err != nil {
 		return DerivedVerifiedOutcome{}, err
 	}
+	// Choose the acceptance boundary: the default Verifier, or the
+	// obligation's named external provider.
+	verifier := s.Verifier
+	if ob.VerifierProviderKind != "" {
+		if s.Providers == nil {
+			return DerivedVerifiedOutcome{}, fmt.Errorf("%w: obligation names provider %q but no providers are registered", ErrNotFound, ob.VerifierProviderKind)
+		}
+		prov, perr := s.Providers.Provider(ob.VerifierProviderKind)
+		if perr != nil {
+			return DerivedVerifiedOutcome{}, perr
+		}
+		if err := providerServes(prov, ob); err != nil {
+			return DerivedVerifiedOutcome{}, err
+		}
+		verifier = prov
+	}
 	// The verifier derives every authority-bearing value from signed
 	// evidence; the submitted claim is a proposal only.
-	seal, err := s.Verifier.Verify(ctx, ob, v)
+	seal, err := verifier.Verify(ctx, ob, v)
 	if err != nil {
 		return DerivedVerifiedOutcome{}, err
 	}
