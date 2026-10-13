@@ -1,8 +1,10 @@
 package portableproof
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,12 +15,20 @@ import (
 
 // SignatureSchemaVersion is the portable-signature envelope schema. An
 // incompatible change to the signed payload or the envelope shape bumps it;
-// decoders refuse unknown versions rather than guessing.
-const SignatureSchemaVersion = 1
+// decoders refuse unknown versions rather than guessing. v2 domain-separates
+// the signing payload and binds the full envelope header (version, algorithm,
+// key id, signed_at) together with the proof bytes; v1 signed only the bare
+// proof bytes and no longer verifies.
+const SignatureSchemaVersion = 2
 
 // AlgorithmEd25519 is the only portable-signature algorithm. The name is
 // the exact wire token; a decoder that does not know it fails closed.
 const AlgorithmEd25519 = "Ed25519"
+
+// signatureDomain separates the portable-signature signing payload from any
+// other signed structure in the system. The domain string is frozen together
+// with the payload field list.
+const signatureDomain = "kiwi-ci/portable-signature/v2"
 
 // DiscoverySchemaVersion is the public-key discovery document schema.
 const DiscoverySchemaVersion = 1
@@ -35,6 +45,10 @@ var (
 	// ErrSchema is returned for an unknown envelope or discovery schema
 	// version.
 	ErrSchema = errors.New("portableproof: unsupported schema version")
+	// ErrUnsealed is returned when a signing entry point is handed a proof
+	// that has not been verified: the signer only ever signs sealed
+	// verifyapi.VerifiedProof values.
+	ErrUnsealed = errors.New("portableproof: proof is not verified")
 )
 
 // KeyStatus is the lifecycle state of a published verification key.
@@ -63,8 +77,11 @@ func (s KeyStatus) Valid() bool {
 
 // PortableSignature is the asymmetric signature envelope over one
 // VerificationProof. It names the schema, the algorithm and the key, and
-// carries the signature over the exact JSON encoding of the proof (see
-// SignedProof). The public half of KeyID is enough to verify.
+// carries the signature over the domain-separated canonical structure that
+// binds the envelope header (schema version, algorithm, key_id, signed_at)
+// AND the exact proof bytes (see signingPayload). The public half of KeyID
+// is enough to verify. signed_at is inside the signature: altering it after
+// signing breaks the signature.
 type PortableSignature struct {
 	// SchemaVersion is SignatureSchemaVersion.
 	SchemaVersion int `json:"schema_version"`
@@ -73,19 +90,20 @@ type PortableSignature struct {
 	// KeyID identifies the signing key in the discovery document.
 	KeyID string `json:"key_id"`
 	// SignedAt is when the signature was produced (operator clock; audit
-	// only — it is not freshness authority).
+	// only — it is not freshness authority). Bound by the signature.
 	SignedAt time.Time `json:"signed_at"`
 	// Signature is the base64 raw Ed25519 signature (64 bytes decoded).
 	Signature string `json:"signature"`
 }
 
 // SignedProof is the portable unit: the exact proof JSON bytes plus the
-// signature that covers those bytes. Proof is held as raw JSON on purpose —
-// the signature covers the bytes as transmitted, so any byte-level tamper
+// signature that covers those bytes together with the envelope header. Proof
+// is held as raw JSON on purpose — the signature covers the bytes as
+// transmitted inside the canonical signing payload, so any byte-level tamper
 // breaks the signature, and a consumer never re-encodes before checking.
 type SignedProof struct {
 	// Proof is the JSON encoding of verifyapi.VerificationProof. The
-	// signature covers these exact bytes.
+	// signature covers these exact bytes (inside signingPayload).
 	Proof json.RawMessage `json:"proof"`
 	// Signature is the asymmetric envelope over Proof.
 	Signature PortableSignature `json:"signature"`
@@ -147,30 +165,100 @@ func (s *Signer) KeyID() string {
 	return s.keyID
 }
 
-// SignProof encodes the proof to its canonical JSON bytes (encoding/json
-// emits struct fields in declaration order and sorts map keys, so the
-// encoding is byte-stable for a given Go value) and signs those exact
-// bytes. The returned envelope carries the same bytes.
-func (s *Signer) SignProof(proof verifyapi.VerificationProof, at time.Time) (SignedProof, error) {
+// signingPayload builds the domain-separated canonical structure the
+// Ed25519 signature covers. Frozen field order: envelope schema version,
+// algorithm, key id, signed_at (RFC3339Nano UTC) and the exact proof bytes.
+// Every field is length-prefixed so no value can bleed into its neighbor.
+// signed_at is part of the signed material: altering it after signing is a
+// signature failure, not a cosmetic edit.
+func signingPayload(schemaVersion int, algorithm, keyID string, signedAt time.Time, proof []byte) ([]byte, error) {
+	if schemaVersion <= 0 {
+		return nil, fmt.Errorf("%w: envelope schema version is required inside the signature", ErrSignature)
+	}
+	if algorithm == "" {
+		return nil, fmt.Errorf("%w: algorithm is required inside the signature", ErrSignature)
+	}
+	if keyID == "" {
+		return nil, fmt.Errorf("%w: key id is required inside the signature", ErrKey)
+	}
+	if signedAt.IsZero() {
+		return nil, fmt.Errorf("%w: signed_at is required inside the signature", ErrSignature)
+	}
+	if len(proof) == 0 {
+		return nil, fmt.Errorf("%w: envelope carries no proof bytes", ErrSignature)
+	}
+	var buf bytes.Buffer
+	buf.WriteString(signatureDomain)
+	buf.WriteByte(0)
+	write := func(b []byte) {
+		var lenBuf [8]byte
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(b)))
+		buf.Write(lenBuf[:])
+		buf.Write(b)
+	}
+	var verBuf [8]byte
+	binary.BigEndian.PutUint64(verBuf[:], uint64(schemaVersion))
+	write(verBuf[:])
+	write([]byte(algorithm))
+	write([]byte(keyID))
+	write([]byte(signedAt.UTC().Format(time.RFC3339Nano)))
+	write(proof)
+	return buf.Bytes(), nil
+}
+
+// signBytes is the internal raw-byte signer: it produces the base64 Ed25519
+// signature over an already-canonical payload. Public entry points build the
+// payload through signingPayload; nothing outside this package signs an
+// arbitrary byte string with the portable key.
+func (s *Signer) signBytes(payload []byte) (string, error) {
+	if s == nil || len(s.priv) != ed25519.PrivateKeySize {
+		return "", fmt.Errorf("%w: signer is not configured", ErrKey)
+	}
+	return base64.StdEncoding.EncodeToString(ed25519.Sign(s.priv, payload)), nil
+}
+
+// SignVerifiedProof seals a VERIFIED proof for portable transport. It is the
+// only signing entry point: an unsealed (or zero) verifyapi.VerifiedProof is
+// refused with ErrUnsealed — the portable layer never launders an unverified
+// document into a signed one.
+//
+// The proof is encoded to its canonical JSON bytes (encoding/json emits
+// struct fields in declaration order and sorts map keys, so the encoding is
+// byte-stable for a given Go value) and those exact bytes are bound into the
+// domain-separated signing payload together with the envelope version,
+// algorithm, key id and signed_at (see signingPayload). The returned
+// envelope carries the same proof bytes.
+func (s *Signer) SignVerifiedProof(proof verifyapi.VerifiedProof, at time.Time) (SignedProof, error) {
 	if s == nil || len(s.priv) != ed25519.PrivateKeySize {
 		return SignedProof{}, fmt.Errorf("%w: signer is not configured", ErrKey)
 	}
-	raw, err := json.Marshal(proof)
+	if !proof.Sealed() {
+		return SignedProof{}, fmt.Errorf("%w: SignVerifiedProof requires a verifier-produced VerifiedProof", ErrUnsealed)
+	}
+	raw, err := json.Marshal(proof.Document)
 	if err != nil {
 		return SignedProof{}, fmt.Errorf("%w: encode proof: %v", ErrSignature, err)
 	}
 	if at.IsZero() {
 		at = time.Now()
 	}
-	sig := ed25519.Sign(s.priv, raw)
+	at = at.UTC()
+	payload, err := signingPayload(SignatureSchemaVersion, AlgorithmEd25519, s.keyID, at, raw)
+	if err != nil {
+		return SignedProof{}, err
+	}
+	sig, err := s.signBytes(payload)
+	if err != nil {
+		return SignedProof{}, err
+	}
 	return SignedProof{
 		Proof: append(json.RawMessage(nil), raw...),
 		Signature: PortableSignature{
 			SchemaVersion: SignatureSchemaVersion,
 			Algorithm:     AlgorithmEd25519,
 			KeyID:         s.keyID,
-			SignedAt:      at.UTC(),
-			Signature:     base64.StdEncoding.EncodeToString(sig),
+			SignedAt:      at,
+			Signature:     sig,
 		},
 	}, nil
 }
@@ -178,7 +266,9 @@ func (s *Signer) SignProof(proof verifyapi.VerificationProof, at time.Time) (Sig
 // Verify checks the portable signature with a bare public key. It is the
 // consumer-side entry point: no secret, no store, no ambient authority —
 // only the envelope and the public key the consumer trusts. The proof bytes
-// are checked exactly as transmitted; any mutation is a refusal.
+// are checked exactly as transmitted inside the canonical signing payload;
+// any mutation (proof bytes, signed_at, key id, algorithm, schema version) is
+// a refusal.
 //
 // Verify does NOT evaluate the proof's internal HMAC acceptance record
 // (the consumer does not hold that secret) and does not interpret the
@@ -204,7 +294,11 @@ func Verify(signed SignedProof, keyID string, pub ed25519.PublicKey) error {
 	if err != nil {
 		return fmt.Errorf("%w: signature is not base64: %v", ErrSignature, err)
 	}
-	if !ed25519.Verify(pub, signed.Proof, raw) {
+	payload, err := signingPayload(signed.Signature.SchemaVersion, signed.Signature.Algorithm, signed.Signature.KeyID, signed.Signature.SignedAt, signed.Proof)
+	if err != nil {
+		return err
+	}
+	if !ed25519.Verify(pub, payload, raw) {
 		return fmt.Errorf("%w: signature does not verify under key %q", ErrSignature, keyID)
 	}
 	return nil

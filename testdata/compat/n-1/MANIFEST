@@ -1,5 +1,5 @@
 {
-  "comment": "SHA-256 manifest of the N-1 compatibility corpus. Every file is N-1 producer output (git worktree at the N-1 commit, emitted by N-1 storage APIs). Files are immutable: regenerating under changed encoding breaks TestCompatCorpusNMinusOneConsumedByHead. The producer records BOTH the git SHA and the sha256 of the producer product binary built from that commit (release-artifact corpus policy: a corpus is identified by its producer binary's exact bytes, not by a commit that can be rebuilt differently).",
+  "comment": "SHA-256 manifest of the N-1 compatibility corpus. Every file is N-1 producer output (git worktree at the N-1 commit, emitted by N-1 storage APIs). Files are immutable: regenerating under changed encoding breaks TestCompatCorpusNMinusOneConsumedByHead. The producer records BOTH the git SHA and the sha256 of the producer product binary built from that commit (hash-identified source-build corpus policy: a corpus is identified by its producer binary's exact bytes, not by a commit that can be rebuilt differently). This is a source build (`go build ./cmd/kiwi` of the producer tree), NOT an official released artifact.",
   "producer": {
     "commit": "fb8a366335ecb5137d994929b34aa41387ddd812",
     "binary_sha256": "2ce4554b797426eb78d5153fbe2ea3b2f399a63e96033ed505b62a2bda570bb3",

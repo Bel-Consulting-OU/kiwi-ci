@@ -334,7 +334,7 @@ func TestSysDFVerificationProductionPathIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	signed, err := portSigner.SignProof(proof, time.Now().UTC())
+	signed, err := portSigner.SignVerifiedProof(restored, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("portable sign: %v", err)
 	}
@@ -510,7 +510,8 @@ func TestSysDFVerificationProductionPathIntegration(t *testing.T) {
 		Evidence:       proof.Evidence,
 		Acceptance:     resealedRec,
 	})
-	if _, err := resealedProof.Verify(ring); err != nil {
+	resealedVerified, err := resealedProof.Verify(ring)
+	if err != nil {
 		t.Fatalf("resealed proof.Verify = %v", err)
 	}
 	// The pre-rotation proof still verifies: K1 remains in the keyring for
@@ -524,7 +525,7 @@ func TestSysDFVerificationProductionPathIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	signed2, err := portSigner2.SignProof(resealedProof, time.Now().UTC())
+	signed2, err := portSigner2.SignVerifiedProof(resealedVerified, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("portable sign under successor: %v", err)
 	}

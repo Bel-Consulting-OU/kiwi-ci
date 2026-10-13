@@ -44,8 +44,11 @@ type EffectiveVerificationDemand struct {
 	EvidenceMin EvidenceMinimum `json:"evidence_min"`
 	// Freshness is the freshness policy the demand enforces.
 	Freshness FreshnessPolicy `json:"freshness"`
-	// IssuedAt anchors the demand's freshness (the recipe's issued_at when
-	// bound, else the obligation's).
+	// IssuedAt anchors the freshness clock: ALWAYS the obligation's
+	// issuance time. A recipe is a reusable policy template — a recipe
+	// published six months ago must not make a newly issued obligation
+	// six months old. The recipe contributes the freshness RULE
+	// (MaxAgeSeconds / NotAfter), not the clock start.
 	IssuedAt time.Time `json:"issued_at"`
 }
 
@@ -71,7 +74,8 @@ func ResolveEffectiveDemand(o VerificationObligation, recipe *Recipe) (Effective
 			Assurance:     recipe.Assurance,
 			EvidenceMin:   recipe.EvidenceMin,
 			Freshness:     utcFreshnessPolicy(recipe.Freshness),
-			IssuedAt:      recipe.IssuedAt.UTC(),
+			// Freshness clock starts at the obligation, not the recipe.
+			IssuedAt: o.IssuedAt.UTC(),
 		}, nil
 	}
 	return EffectiveVerificationDemand{

@@ -353,6 +353,18 @@ func ProofSummaryFromBundle(p VerificationProof, out DerivedVerifiedOutcome, rec
 	if len(recipes) > 0 {
 		recipe = recipes[0]
 	}
+	if p.Obligation.RecipeDigest != "" {
+		if recipe == nil {
+			return ProofSummary{}, fmt.Errorf("%w: recipe-bound proof requires the resolved recipe for its summary", ErrBinding)
+		}
+		d, err := RecipeDigest(*recipe)
+		if err != nil {
+			return ProofSummary{}, err
+		}
+		if d != p.Obligation.RecipeDigest {
+			return ProofSummary{}, fmt.Errorf("%w: summary recipe %s does not match obligation recipe %s", ErrBinding, d, p.Obligation.RecipeDigest)
+		}
+	}
 	demand, err := ResolveEffectiveDemand(p.Obligation, recipe)
 	if err != nil {
 		return ProofSummary{}, err

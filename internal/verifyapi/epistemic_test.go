@@ -1,6 +1,10 @@
 package verifyapi
 
-import "testing"
+import (
+	"encoding/json"
+	"errors"
+	"testing"
+)
 
 // TestEpistemicLadderOrder pins the rung order and the FactSource mapping:
 // requested < configured < observed < attested < derived, and every existing
@@ -109,5 +113,38 @@ func TestEpistemicTaggedValues(t *testing.T) {
 	}
 	if !att.Known(EpistemicObserved) || att.Known(EpistemicDerived) {
 		t.Fatal("Known() must respect the ladder")
+	}
+}
+
+// TestEpistemicLevelJSONRoundTrip: the level serializes as its wire
+// spelling so a consumer reads "observed", not an opaque ordinal, and an
+// unknown spelling is refused rather than coerced onto a real rung.
+func TestEpistemicLevelJSONRoundTrip(t *testing.T) {
+	for _, lvl := range []EpistemicLevel{
+		EpistemicUnknown, EpistemicRequested, EpistemicConfigured,
+		EpistemicObserved, EpistemicAttested, EpistemicDerived,
+	} {
+		b, err := json.Marshal(lvl)
+		if err != nil {
+			t.Fatalf("Marshal(%s) = %v", lvl, err)
+		}
+		var back EpistemicLevel
+		if err := json.Unmarshal(b, &back); err != nil {
+			t.Fatalf("Unmarshal(%s) = %v", b, err)
+		}
+		if back != lvl {
+			t.Fatalf("round-trip %s -> %s", lvl, back)
+		}
+	}
+	b, err := json.Marshal(Observed(int64(7)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != `{"value":7,"level":"observed"}` {
+		t.Fatalf("Epistemic wire = %s", b)
+	}
+	var bad EpistemicLevel
+	if err := json.Unmarshal([]byte(`"nope"`), &bad); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("unknown level = %v, want ErrInvalid", err)
 	}
 }

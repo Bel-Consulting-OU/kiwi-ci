@@ -1,0 +1,35 @@
+name: release-gate
+
+# Mandatory production dogfood closure for release tags. This is the
+# "HEAD has passed the release-gate" proof — not merely that the target
+# exists. Break-glass bypass must be an explicit, audited incident (see
+# docs/releases.md § Release governance on `main`).
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  production-closure:
+    name: release-gate (production dogfood closure)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      - name: release-gate
+        run: |
+          export KIWI_REQUIRE_N_MINUS_ONE=1
+          make release-gate
+      - name: surface contracts
+        run: |
+          go run ./cmd/filemap --check
+          ./scripts/docs-lint.sh --source --baseline scripts/docs-lint-baseline.txt
+          ./scripts/docs-links-check.sh

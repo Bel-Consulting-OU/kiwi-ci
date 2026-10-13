@@ -21,6 +21,7 @@ func TestServiceSubmitObligationRecipeWeakerDemandRefused(t *testing.T) {
 	f := newServiceFixture(t)
 	reg := NewRecipeRegistry()
 	f.svc.Recipes = reg
+	f.store.WithRecipes(reg)
 	r := testRecipe(t)
 	// Align the recipe's checks/assurance with what the fixture can prove.
 	r.Requirements = []string{CheckJobStatusSuccess, CheckEvidenceRoot}
@@ -74,6 +75,7 @@ func TestServiceRecipeWithdrawalBlocksNewDemand(t *testing.T) {
 	f := newServiceFixture(t)
 	reg := NewRecipeRegistry()
 	f.svc.Recipes = reg
+	f.store.WithRecipes(reg)
 	r := testRecipe(t)
 	r.Requirements = []string{CheckJobStatusSuccess, CheckEvidenceRoot}
 	r.Assurance = "no_injected_credentials"
@@ -123,6 +125,7 @@ func TestServiceRecipeWithdrawalBlocksNewDemand(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.svc.Recipes = reg2
+	f.store.WithRecipes(reg2)
 	ob := f.obligation(t, "ob-withdrawn", "tenant-a")
 	ob.RecipeDigest = d2
 	if err := f.svc.SubmitObligation(context.Background(), f.tenantA, ob); !errors.Is(err, ErrBinding) {
@@ -135,6 +138,7 @@ func TestServiceRecipeWithdrawalBlocksNewDemand(t *testing.T) {
 func TestServiceSubmitObligationResolvesRecipeFromRegistry(t *testing.T) {
 	f := newServiceFixture(t)
 	f.svc.Recipes = NewRecipeRegistry()
+	f.store.WithRecipes(NewRecipeRegistry())
 	ob := f.obligation(t, "ob-unknown-recipe", "tenant-a")
 	ob.RecipeDigest = mustDigest(t, "no-such-recipe")
 	if err := f.svc.SubmitObligation(context.Background(), f.tenantA, ob); !errors.Is(err, ErrNotFound) {
@@ -143,6 +147,7 @@ func TestServiceSubmitObligationResolvesRecipeFromRegistry(t *testing.T) {
 
 	// No registry configured: fail closed.
 	f.svc.Recipes = nil
+	f.store.WithRecipes(nil)
 	if err := f.svc.SubmitObligation(context.Background(), f.tenantA, ob); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("no registry = %v, want ErrNotFound", err)
 	}
@@ -286,7 +291,7 @@ func TestEvidenceMinimumEnforcedOnDischarge(t *testing.T) {
 	// A no-window attestation under RequireAttestedWindow: freshness is
 	// UNKNOWN, so the attempt can never discharge as a pass (the derived
 	// outcome is downgraded and the floor refuses a pass regardless).
-	svc, err := NewService(NewMemoryStore(clock), &FuncEvidenceVerifier{
+	svc, err := NewService(NewMemoryStore(clock).WithRecipes(reg), &FuncEvidenceVerifier{
 		Identity: "min-verifier/v1",
 		Clock:    clock,
 		Resolve:  resolveWith(nil),
@@ -314,7 +319,7 @@ func TestEvidenceMinimumEnforcedOnDischarge(t *testing.T) {
 	// An OBSERVED (not attested) window under RequireAttestedWindow: the
 	// default freshness floor is cleared (so checks can yield pass), but
 	// the recipe floor demands an attested window and refuses the pass.
-	svcObs, err := NewService(NewMemoryStore(clock), &FuncEvidenceVerifier{
+	svcObs, err := NewService(NewMemoryStore(clock).WithRecipes(reg), &FuncEvidenceVerifier{
 		Identity: "min-verifier-obs/v1",
 		Clock:    clock,
 		Resolve: func(context.Context, string) (ResolvedAttestation, error) {
@@ -345,7 +350,7 @@ func TestEvidenceMinimumEnforcedOnDischarge(t *testing.T) {
 	}
 
 	// The same evidence with an attested window discharges as a pass.
-	svc2, err := NewService(NewMemoryStore(clock), &FuncEvidenceVerifier{
+	svc2, err := NewService(NewMemoryStore(clock).WithRecipes(reg), &FuncEvidenceVerifier{
 		Identity: "min-verifier-with-window/v1",
 		Clock:    clock,
 		Resolve:  resolveWith(trustedWindow()),
@@ -377,7 +382,7 @@ func TestEvidenceMinimumEnforcedOnDischarge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc3, err := NewService(NewMemoryStore(clock), &FuncEvidenceVerifier{
+	svc3, err := NewService(NewMemoryStore(clock).WithRecipes(reg2), &FuncEvidenceVerifier{
 		Identity: "min-verifier-2/v1",
 		Clock:    clock,
 		Resolve:  resolveWith(trustedWindow()),
@@ -411,7 +416,7 @@ func TestEvidenceMinimumEnforcedOnDischarge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc4, err := NewService(NewMemoryStore(clock), &FuncEvidenceVerifier{
+	svc4, err := NewService(NewMemoryStore(clock).WithRecipes(reg3), &FuncEvidenceVerifier{
 		Identity: "min-verifier-3/v1",
 		Clock:    clock,
 		Resolve:  resolveWith(trustedWindow()),
@@ -715,5 +720,125 @@ func TestAcceptRefusesRecipeBoundWithoutRecipe(t *testing.T) {
 	}
 	if _, err := AcceptWithRecipe(bound, sealed2, key, nil, &r, time.Now().UTC()); err != nil {
 		t.Fatalf("Accept of bound obligation with recipe: %v", err)
+	}
+}
+
+// TestLegacyRestoreRederivesWindowKinds: v1/v2 evidence encodings never bound
+// Window.Source or Kinds. A database writer must not be able to forge
+// attested-window authority onto a legacy row — restore re-derives both from
+// MAC-verified primitives.
+func mustAcceptRecord(t *testing.T, ob VerificationObligation, sealed DerivedVerifiedOutcome, key AcceptanceKey) AcceptanceRecord {
+	t.Helper()
+	rec, err := AcceptWithKeyring(ob, sealed, key, nil, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	return rec
+}
+
+func TestLegacyRestoreRederivesWindowKinds(t *testing.T) {
+	key := mustKey(t, "k1", "secret-1")
+	ob := baseObligation(t)
+	claim := baseOutcome(t, ob)
+	claim.ProvenanceRefs = []string{"att-1"}
+	claim.ExecutionIDs = []string{"exec-1"}
+	claim.EvidenceRoot = mustDigest(t, "root")
+	claim.CompletedChecks = ob.RequiredChecks
+	f := &FuncEvidenceVerifier{
+		Identity: "legacy-rederive/v1",
+		Resolve: func(context.Context, string) (ResolvedAttestation, error) {
+			return ResolvedAttestation{
+				ExecutionID:       "exec-1",
+				EvidenceRoot:      claim.EvidenceRoot,
+				AttestationDigest: mustDigest(t, "att"),
+				Status:            "success",
+				Checks:            passChecks("exec-1", CheckJobStatusSuccess, CheckEvidenceRoot),
+				// No Attested window: derived window source is Unknown.
+			}, nil
+		},
+	}
+	sealed, err := f.Verify(context.Background(), ob, claim)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	// Forge Window.Source=attested on the persisted evidence (as a DB
+	// writer would). The v2/v1 MAC does not cover Window.
+	forged := sealed.Evidence
+	forged.Window = ExecutionWindow{
+		StartedAt:   sealed.Outcome.StartedAt,
+		CompletedAt: sealed.Outcome.CompletedAt,
+		Source:      WindowSourceAttested,
+	}
+	persisted := PersistedVerified{
+		Obligation:     ob,
+		SubmittedClaim: sealed.SubmittedClaim,
+		Outcome:        sealed.Outcome,
+		Evidence:       forged,
+		Acceptance:     mustAcceptRecord(t, ob, sealed, key),
+	}
+	// Tamper the acceptance record's evidence digest so the MAC still
+	// verifies over the forged evidence (simulating a writer who also
+	// re-MACs — the MAC key is the trust root; without it the row fails).
+	// Instead: accept the sealed (honest) record, then swap only Evidence.
+	rec := mustAcceptRecord(t, ob, sealed, key)
+	persisted.Acceptance = rec
+	restored, err := RestoreVerifiedOutcome(persisted, key)
+	if err != nil {
+		// Digest mismatch is also a correct fail-closed outcome.
+		t.Logf("restore refused forged evidence: %v", err)
+		return
+	}
+	if restored.Evidence.Window.Source == WindowSourceAttested {
+		t.Fatal("legacy restore trusted a forged attested window source")
+	}
+}
+
+// TestPostSealMutationCannotUpgradeAuthority: a sealed DerivedVerifiedOutcome
+// is a Go struct — flipping Outcome.Result after the verifier sealed it must
+// not create an authoritative pass at Accept or RecordVerifiedOutcome.
+func TestPostSealMutationCannotUpgradeAuthority(t *testing.T) {
+	clock := func() time.Time { return time.Now().UTC() }
+	f := &FuncEvidenceVerifier{
+		Identity: "post-seal/v1",
+		Clock:    clock,
+		Resolve: func(context.Context, string) (ResolvedAttestation, error) {
+			return ResolvedAttestation{
+				ExecutionID:       "exec-1",
+				EvidenceRoot:      mustDigest(t, "root"),
+				AttestationDigest: mustDigest(t, "att"),
+				Status:            "failure", // derived result is fail
+				Facts:             &model.ExecutionFacts{},
+				Checks:            passChecks("exec-1", CheckJobStatusSuccess, CheckEvidenceRoot),
+				Attested:          trustedWindow(),
+			}, nil
+		},
+	}
+	ob := baseObligation(t)
+	claim := baseOutcome(t, ob)
+	claim.ProvenanceRefs = []string{"att-1"}
+	claim.ExecutionIDs = []string{"exec-1"}
+	claim.EvidenceRoot = mustDigest(t, "root")
+	claim.CompletedChecks = append([]string(nil), ob.RequiredChecks...)
+	claim.Outcome = OutcomePass // caller claims pass
+	sealed, err := f.Verify(context.Background(), ob, claim)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	if sealed.Outcome.Outcome == OutcomePass {
+		t.Fatal("verifier derived pass from a failed job status")
+	}
+	// Post-seal mutation: flip to pass.
+	mutated := sealed
+	mutated.Outcome.Outcome = OutcomePass
+	key := mustKey(t, "k1", "secret-1")
+	if _, err := AcceptWithKeyring(ob, mutated, key, nil, time.Now().UTC()); err == nil {
+		t.Fatal("Accept must refuse a post-seal mutation to pass")
+	}
+	reg := NewMemoryStore(clock)
+	if err := reg.SubmitObligation(context.Background(), ob); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.RecordVerifiedOutcome(context.Background(), mutated); err == nil {
+		t.Fatal("RecordVerifiedOutcome must refuse a post-seal mutation to pass")
 	}
 }

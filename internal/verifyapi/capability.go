@@ -2,6 +2,13 @@ package verifyapi
 
 import "fmt"
 
+// AnyCapability is the explicit universal advertiser on a capability axis.
+// An EMPTY capability list means the verifier does not cover that axis at all
+// (fail closed against any demand on it); a list containing AnyCapability is
+// how a verifier says "I cover every value on this axis". Absence is never
+// universal — only an explicit "*" is.
+const AnyCapability = "*"
+
 // VerifierCapability declares what one evidence verifier can actually check:
 // which claim kind and version it implements, which claim classes and
 // assurance levels it understands, which platforms it can attest over, and
@@ -16,15 +23,25 @@ import "fmt"
 type VerifierCapability struct {
 	// Kind names the verifier family (e.g. "execution-attestation").
 	Kind string `json:"kind"`
-	// Version is the capability schema version of that family.
+	// Version is the capability schema version of that family. The literal
+	// AnyCapability means the family covers every contract version on that
+	// axis.
 	Version string `json:"version"`
-	// ClaimClasses are the claim classes this verifier can verify.
+	// ClaimClasses are the claim classes this verifier can verify. Empty
+	// means it verifies no claim class (fail closed); the literal
+	// AnyCapability covers every class.
 	ClaimClasses []string `json:"claim_classes,omitempty"`
 	// AssuranceLevels are the assurance profiles this verifier can confirm.
+	// Empty means it confirms no profile (fail closed); the literal
+	// AnyCapability covers every profile.
 	AssuranceLevels []string `json:"assurance_levels,omitempty"`
-	// Platforms are the execution platforms this verifier covers.
+	// Platforms are the execution platforms this verifier covers. Empty
+	// means it covers no platform (fail closed); the literal AnyCapability
+	// covers every platform.
 	Platforms []string `json:"platforms,omitempty"`
 	// EvidenceTypes are the evidence encodings this verifier can resolve.
+	// Empty means it resolves no evidence type (fail closed); the literal
+	// AnyCapability covers every type.
 	EvidenceTypes []string `json:"evidence_types,omitempty"`
 }
 
@@ -73,22 +90,42 @@ func (q CapabilityQuery) matches(c VerifierCapability) bool {
 	if q.Kind != "" && c.Kind != q.Kind {
 		return false
 	}
-	if q.Version != "" && c.Version != q.Version {
+	if q.Version != "" && !versionCovers(c.Version, q.Version) {
 		return false
 	}
-	if q.ClaimClass != "" && !containsString(c.ClaimClasses, q.ClaimClass) {
+	if q.ClaimClass != "" && !capabilityCovers(c.ClaimClasses, q.ClaimClass) {
 		return false
 	}
-	if q.AssuranceLevel != "" && !containsString(c.AssuranceLevels, q.AssuranceLevel) {
+	if q.AssuranceLevel != "" && !capabilityCovers(c.AssuranceLevels, q.AssuranceLevel) {
 		return false
 	}
-	if q.Platform != "" && !containsString(c.Platforms, q.Platform) {
+	if q.Platform != "" && !capabilityCovers(c.Platforms, q.Platform) {
 		return false
 	}
-	if q.EvidenceType != "" && !containsString(c.EvidenceTypes, q.EvidenceType) {
+	if q.EvidenceType != "" && !capabilityCovers(c.EvidenceTypes, q.EvidenceType) {
 		return false
 	}
 	return true
+}
+
+// versionCovers reports whether a capability version satisfies a demanded
+// version: exact match, or the explicit AnyCapability wildcard.
+func versionCovers(have, want string) bool {
+	return have == want || have == AnyCapability
+}
+
+// capabilityCovers reports whether an advertised list covers a demanded
+// value. An empty list covers NOTHING (absence is unsupported, not
+// universal); a list containing AnyCapability covers everything. This is the
+// fail-closed rule: a verifier that never advertised a dimension must not
+// silently pass a demand on that axis.
+func capabilityCovers(list []string, want string) bool {
+	for _, v := range list {
+		if v == want || v == AnyCapability {
+			return true
+		}
+	}
+	return false
 }
 
 func containsString(list []string, want string) bool {

@@ -8,28 +8,45 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
-func testCandidateFact(t *testing.T, id string) CandidateFact {
+// testClaimCandidateFact builds a claim-authority row (never pass: a claim
+// is never projected into a plain pass) for the open comparison surface.
+func testClaimCandidateFact(t *testing.T, id string) CandidateFact {
 	t.Helper()
 	return CandidateFact{
 		CandidateID:       id,
 		CandidateDigest:   mustDigest(t, "cand-"+id),
 		VerificationID:    "ver-" + id,
-		Terminal:          TerminalPassed,
-		Outcome:           OutcomePass,
+		Terminal:          TerminalFailed,
+		Outcome:           OutcomeFail,
 		Assurance:         "uncontrolled",
-		Authority:         RowAuthorityVerified,
-		WallTimeNS:        5_000_000_000,
-		CPUTimeNS:         1_000_000_000,
-		PeakMemoryBytes:   64 << 20,
+		Authority:         RowAuthorityClaim,
+		WallTimeNS:        Observed(int64(5_000_000_000)),
+		CPUTimeNS:         Observed(int64(1_000_000_000)),
+		PeakMemoryBytes:   Observed(int64(64 << 20)),
+		IOBytes:           Observed(int64(1 << 20)),
+		CacheHits:         Observed(int64(10)),
+		CacheMisses:       Observed(int64(2)),
 		ArtifactSizeBytes: 1024,
 	}
 }
 
+// testForgedVerifiedCandidateFact builds a caller-forged row that claims
+// verified authority — the attack CompareCandidates must refuse.
+func testForgedVerifiedCandidateFact(t *testing.T, id string) CandidateFact {
+	t.Helper()
+	f := testClaimCandidateFact(t, id)
+	f.Terminal = TerminalPassed
+	f.Outcome = OutcomePass
+	f.Authority = RowAuthorityVerified
+	return f
+}
+
 func TestCompareCandidatesNeutralAndDeterministic(t *testing.T) {
-	a := testCandidateFact(t, "b")
-	b := testCandidateFact(t, "a")
-	b.Terminal = TerminalFailed
-	b.Outcome = OutcomeFail
+	// CompareCandidates is claim-only (a forged verified row is refused,
+	// see TestCompareCandidatesRefusesForgedVerifiedAuthority); the rows
+	// here are honest claims.
+	a := testClaimCandidateFact(t, "b")
+	b := testClaimCandidateFact(t, "a")
 	base := mustDigest(t, "snap")
 
 	cmp, err := CompareCandidates(base, []CandidateFact{a, b})
@@ -68,7 +85,7 @@ func TestCompareCandidatesNeutralAndDeterministic(t *testing.T) {
 }
 
 func TestCompareCandidatesRefuses(t *testing.T) {
-	ok := testCandidateFact(t, "a")
+	ok := testClaimCandidateFact(t, "a")
 	for name, mut := range map[string]func(*[]CandidateFact){
 		"empty": func(rows *[]CandidateFact) { *rows = nil },
 		"duplicate id": func(rows *[]CandidateFact) {
@@ -156,12 +173,24 @@ func TestFactFromOutcome(t *testing.T) {
 	if f.Terminal != TerminalPassed || f.Outcome != OutcomePass {
 		t.Fatalf("fact terminal/outcome = %s/%s", f.Terminal, f.Outcome)
 	}
-	// Attested wall time wins over the reported figure.
-	if f.WallTimeNS != 4_000_000_000 {
-		t.Fatalf("WallTimeNS = %d, want attested 4s", f.WallTimeNS)
+	// Attested wall time wins over derived/reported figures.
+	if f.WallTimeNS.Value != 4_000_000_000 || f.WallTimeNS.Level != EpistemicAttested {
+		t.Fatalf("WallTimeNS = %+v, want attested 4s", f.WallTimeNS)
 	}
-	if f.CPUTimeNS != 2_000_000_000 || f.PeakMemoryBytes != 1024 || f.ArtifactSizeBytes != 2048 {
-		t.Fatalf("facts = %+v", f)
+	// CPU and memory stay REPORTED on a verified row: Authority=verified
+	// describes how the row was minted, not the epistemic strength of
+	// every number on it.
+	if f.CPUTimeNS.Value != 2_000_000_000 || f.CPUTimeNS.Level != EpistemicObserved {
+		t.Fatalf("CPUTimeNS = %+v, want reported/observed 2s", f.CPUTimeNS)
+	}
+	if f.PeakMemoryBytes.Value != 1024 || f.PeakMemoryBytes.Level != EpistemicObserved {
+		t.Fatalf("PeakMemoryBytes = %+v, want reported/observed", f.PeakMemoryBytes)
+	}
+	if f.IOBytes.Level != EpistemicObserved || f.CacheHits.Level != EpistemicObserved || f.CacheMisses.Level != EpistemicObserved {
+		t.Fatalf("io/cache levels = %s/%s/%s, want observed", f.IOBytes.Level, f.CacheHits.Level, f.CacheMisses.Level)
+	}
+	if f.ArtifactSizeBytes != 2048 {
+		t.Fatalf("ArtifactSizeBytes = %d", f.ArtifactSizeBytes)
 	}
 	if err := f.Validate(); err != nil {
 		t.Fatal(err)
@@ -177,19 +206,36 @@ func TestFactFromOutcome(t *testing.T) {
 		t.Fatalf("missing-evidence fact = %s/%s", f2.Terminal, f2.Outcome)
 	}
 
-	// Reported wall time is used when no attested window exists.
-	claim := v
-	claim.Resources.Measured = &MeasuredResourceFacts{DurationNS: 9}
-	sealedClaim, err := sealDerivedOutcome(claim, claim, ev)
+	// Substrate-derived duration wins over the reported figure when no
+	// attested job window exists (derived > reported).
+	derivedOnly := v
+	derivedOnly.Resources.Measured = &MeasuredResourceFacts{DurationNS: 9}
+	sealedDerived, err := sealDerivedOutcome(derivedOnly, derivedOnly, ev)
 	if err != nil {
-		t.Fatalf("sealDerivedOutcome claim = %v", err)
+		t.Fatalf("sealDerivedOutcome derived = %v", err)
 	}
-	f3, err := FactFromOutcome("c1", sealedClaim, complete, 0)
+	f3, err := FactFromOutcome("c1", sealedDerived, complete, 0)
 	if err != nil {
-		t.Fatalf("FactFromOutcome claim = %v", err)
+		t.Fatalf("FactFromOutcome derived = %v", err)
 	}
-	if f3.WallTimeNS != 3_000_000_000 {
-		t.Fatalf("WallTimeNS = %d, want reported 3s", f3.WallTimeNS)
+	if f3.WallTimeNS.Value != 9 || f3.WallTimeNS.Level != EpistemicDerived {
+		t.Fatalf("WallTimeNS = %+v, want derived 9ns", f3.WallTimeNS)
+	}
+
+	// Reported wall time is used only when Measured carries neither an
+	// attested window nor a derived interval.
+	noMeasured := v
+	noMeasured.Resources.Measured = nil
+	sealedReported, err := sealDerivedOutcome(noMeasured, noMeasured, ev)
+	if err != nil {
+		t.Fatalf("sealDerivedOutcome reported = %v", err)
+	}
+	f3b, err := FactFromOutcome("c1", sealedReported, complete, 0)
+	if err != nil {
+		t.Fatalf("FactFromOutcome reported = %v", err)
+	}
+	if f3b.WallTimeNS.Value != 3_000_000_000 || f3b.WallTimeNS.Level != EpistemicObserved {
+		t.Fatalf("WallTimeNS = %+v, want reported/observed 3s", f3b.WallTimeNS)
 	}
 
 	failed := v
@@ -213,20 +259,26 @@ func TestFactFromOutcome(t *testing.T) {
 }
 
 func TestCandidateFactValidate(t *testing.T) {
-	base := testCandidateFact(t, "a")
+	base := testClaimCandidateFact(t, "a")
 	for name, mut := range map[string]func(*CandidateFact){
 		"no id":        func(c *CandidateFact) { c.CandidateID = "" },
 		"bad digest":   func(c *CandidateFact) { c.CandidateDigest = "x" },
 		"no ver":       func(c *CandidateFact) { c.VerificationID = "" },
 		"bad terminal": func(c *CandidateFact) { c.Terminal = "nope" },
 		"no assurance": func(c *CandidateFact) { c.Assurance = "" },
-		"neg wall":     func(c *CandidateFact) { c.WallTimeNS = -1 },
-		"neg cpu":      func(c *CandidateFact) { c.CPUTimeNS = -1 },
-		"neg mem":      func(c *CandidateFact) { c.PeakMemoryBytes = -1 },
-		"neg size":     func(c *CandidateFact) { c.ArtifactSizeBytes = -1 },
+		"neg wall":     func(c *CandidateFact) { c.WallTimeNS = Observed(int64(-1)) },
+		"neg cpu":      func(c *CandidateFact) { c.CPUTimeNS = Observed(int64(-1)) },
+		"neg mem":      func(c *CandidateFact) { c.PeakMemoryBytes = Observed(int64(-1)) },
+		"neg io":       func(c *CandidateFact) { c.IOBytes = Observed(int64(-1)) },
+		"neg hits":     func(c *CandidateFact) { c.CacheHits = Observed(int64(-1)) },
+		"neg misses":   func(c *CandidateFact) { c.CacheMisses = Observed(int64(-1)) },
+		"unknown wall level": func(c *CandidateFact) {
+			c.WallTimeNS = Epistemic[int64]{Value: 1, Level: EpistemicUnknown}
+		},
+		"neg size": func(c *CandidateFact) { c.ArtifactSizeBytes = -1 },
 		"outcome mismatch": func(c *CandidateFact) {
-			c.Terminal = TerminalFailed
-			// Outcome left as pass.
+			c.Terminal = TerminalEvidenceIncomplete
+			// Outcome left as fail.
 		},
 	} {
 		bad := base
@@ -270,7 +322,7 @@ func TestClaimComparisonNeverProjectsPass(t *testing.T) {
 	}
 	// A claim row stamped as pass-with-verified-authority is structurally
 	// impossible: CandidateFact.Validate refuses a claim row projecting pass.
-	bad := testCandidateFact(t, "c2")
+	bad := testForgedVerifiedCandidateFact(t, "c2")
 	bad.Authority = RowAuthorityClaim
 	if err := bad.Validate(); err == nil {
 		t.Fatal("claim row projecting pass must be refused")
@@ -281,5 +333,149 @@ func TestClaimComparisonNeverProjectsPass(t *testing.T) {
 	}
 	if cmp.Candidates[0].Authority != RowAuthorityClaim {
 		t.Fatalf("authority = %q", cmp.Candidates[0].Authority)
+	}
+}
+
+// TestCompareCandidatesRefusesForgedVerifiedAuthority: a caller-built
+// CandidateFact stamped Authority=verified is refused by the open
+// comparison surface. Verified rows require sealed input (FactFromOutcome
+// or CompareVerifiedCandidates).
+func TestCompareCandidatesRefusesForgedVerifiedAuthority(t *testing.T) {
+	forged := testForgedVerifiedCandidateFact(t, "a")
+	if forged.Authority != RowAuthorityVerified {
+		t.Fatal("forged row setup")
+	}
+	if _, err := CompareCandidates(mustDigest(t, "snap"), []CandidateFact{forged}); !errors.Is(err, ErrUnverified) {
+		t.Fatalf("forged verified row = %v, want ErrUnverified", err)
+	}
+	// The same row with claim authority is honest and is accepted.
+	honest := forged
+	honest.Authority = RowAuthorityClaim
+	honest.Terminal = TerminalFailed
+	honest.Outcome = OutcomeFail
+	if _, err := CompareCandidates(mustDigest(t, "snap"), []CandidateFact{honest}); err != nil {
+		t.Fatalf("claim row = %v", err)
+	}
+}
+
+// TestVerifiedRowReportsReportedCPUEpistemic: a verified row minted from a
+// sealed outcome shows reported CPU/memory at the observed rung — row
+// Authority=verified never promotes caller assertions to verified numbers.
+func TestVerifiedRowReportsReportedCPUEpistemic(t *testing.T) {
+	iv := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	v := VerificationOutcome{
+		VerificationID:   "ver-ep",
+		ObligationID:     "ob-ep",
+		CandidateDigest:  mustDigest(t, "candidate"),
+		SnapshotDigest:   mustDigest(t, "snapshot"),
+		ContractDigest:   mustDigest(t, "contract"),
+		Outcome:          OutcomePass,
+		AssuranceProfile: model.AssuranceUncontrolled.Name(),
+		CompletedChecks:  []string{CheckJobStatusSuccess},
+		ExecutionIDs:     []string{"exec-1"},
+		EvidenceRoot:     mustDigest(t, "evidence"),
+		Resources: ResourceFacts{
+			WallTimeNS:      3_000_000_000,
+			CPUTimeNS:       2_000_000_000,
+			PeakMemoryBytes: 4096,
+			IOBytes:         8192,
+			CacheHits:       7,
+			CacheMisses:     3,
+			RunnerClass:     "standard",
+		},
+		StartedAt:   iv,
+		CompletedAt: iv.Add(time.Minute),
+	}
+	ev := VerifiedEvidence{
+		ExecutionIDs:       []string{"exec-1"},
+		EvidenceRoot:       mustDigest(t, "evidence"),
+		AttestationDigests: []Digest{mustDigest(t, "att")},
+		JobStatus:          "success",
+		CompletedChecks:    []string{CheckJobStatusSuccess},
+		Assurance:          model.AssuranceUncontrolled,
+		VerifierIdentity:   "test-verifier/v1",
+		VerifiedAt:         iv.Add(time.Second),
+	}
+	sealed, err := sealDerivedOutcome(v, v, ev)
+	if err != nil {
+		t.Fatalf("sealDerivedOutcome = %v", err)
+	}
+	complete := EvidenceCompleteness{Required: 1, Present: 1, Verified: 1}
+	f, err := FactFromOutcome("c1", sealed, complete, 0)
+	if err != nil {
+		t.Fatalf("FactFromOutcome = %v", err)
+	}
+	if f.Authority != RowAuthorityVerified {
+		t.Fatalf("row Authority = %q, want verified (minted from sealed input)", f.Authority)
+	}
+	// Reported figures stay at the observed rung on a verified row.
+	for name, e := range map[string]Epistemic[int64]{
+		"cpu":    f.CPUTimeNS,
+		"mem":    f.PeakMemoryBytes,
+		"io":     f.IOBytes,
+		"hits":   f.CacheHits,
+		"misses": f.CacheMisses,
+		"wall":   f.WallTimeNS,
+	} {
+		if e.Level != EpistemicObserved {
+			t.Fatalf("%s level = %s, want observed (reported)", name, e.Level)
+		}
+		if e.Known(EpistemicAttested) || e.Known(EpistemicDerived) {
+			t.Fatalf("%s %+v must not be known at attested/derived", name, e)
+		}
+	}
+	if f.CPUTimeNS.Value != 2_000_000_000 || f.CacheHits.Value != 7 || f.CacheMisses.Value != 3 {
+		t.Fatalf("reported values lost: %+v", f.economic())
+	}
+
+	// The sealed verified comparison surface carries the same provenance.
+	src, err := VerifiedFromDerived("c1", sealed, 0)
+	if err != nil {
+		t.Fatalf("VerifiedFromDerived = %v", err)
+	}
+	cmp, err := CompareVerifiedCandidates(mustDigest(t, "snap"), []VerifiedCandidateSource{src}, nil)
+	if err != nil {
+		t.Fatalf("CompareVerifiedCandidates = %v", err)
+	}
+	row := cmp.Candidates[0]
+	if row.Authority != RowAuthorityVerified {
+		t.Fatalf("verified row Authority = %q", row.Authority)
+	}
+	if row.CPUTimeNS.Level != EpistemicObserved || row.CPUTimeNS.Value != 2_000_000_000 {
+		t.Fatalf("verified row CPUTimeNS = %+v, want reported/observed", row.CPUTimeNS)
+	}
+	if row.PeakMemoryBytes.Level != EpistemicObserved {
+		t.Fatalf("verified row PeakMemoryBytes level = %s", row.PeakMemoryBytes.Level)
+	}
+}
+
+// TestWallFactEpistemicLadder pins the wall-time source ladder: attested
+// job window > substrate-derived execution interval > reported figure.
+func TestWallFactEpistemicLadder(t *testing.T) {
+	attested := wallFact(ResourceFacts{
+		WallTimeNS: 1,
+		Measured:   &MeasuredResourceFacts{DurationNS: 2, WallTimeNS: 3},
+	})
+	if attested.Value != 3 || attested.Level != EpistemicAttested {
+		t.Fatalf("attested wall = %+v", attested)
+	}
+	derived := wallFact(ResourceFacts{
+		WallTimeNS: 1,
+		Measured:   &MeasuredResourceFacts{DurationNS: 2},
+	})
+	if derived.Value != 2 || derived.Level != EpistemicDerived {
+		t.Fatalf("derived wall = %+v", derived)
+	}
+	reported := wallFact(ResourceFacts{WallTimeNS: 1})
+	if reported.Value != 1 || reported.Level != EpistemicObserved {
+		t.Fatalf("reported wall = %+v", reported)
+	}
+	// Zero-valued measured entries do not outrank a reported figure.
+	fallback := wallFact(ResourceFacts{
+		WallTimeNS: 1,
+		Measured:   &MeasuredResourceFacts{},
+	})
+	if fallback.Value != 1 || fallback.Level != EpistemicObserved {
+		t.Fatalf("empty measured wall = %+v", fallback)
 	}
 }

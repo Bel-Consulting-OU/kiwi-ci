@@ -30,6 +30,10 @@ import (
 // signed evidence — the caller's submission is a proposal preserved on
 // SubmittedClaim). QueryOutcome returns authoritative records only — a raw
 // claim never satisfies it as a proven pass (ErrUnverified).
+//
+// Recipe-bound records are held to the recipe's EvidenceMinimum here, the
+// same floor PostgresStore applies through AcceptWithRecipe: an in-memory
+// write can never be the bypass around the recipe's evidence floor.
 type Registry struct {
 	mu          sync.RWMutex
 	clock       func() time.Time
@@ -42,6 +46,11 @@ type Registry struct {
 	verified     map[string]DerivedVerifiedOutcome
 	groups       map[string]SpeculativeGroup
 	capabilities map[string]VerifierCapability
+	// recipes resolves recipe-bound obligations so RecordVerifiedOutcome
+	// can enforce Recipe.EvidenceMinimum. Nil refuses every recipe-bound
+	// record (fail closed) — the same posture as PostgresStore without
+	// WithRecipes.
+	recipes *RecipeRegistry
 }
 
 // NewRegistry returns an empty registry reading wall time from the given
@@ -58,6 +67,17 @@ func NewRegistry(clock func() time.Time) *Registry {
 		groups:       make(map[string]SpeculativeGroup),
 		capabilities: make(map[string]VerifierCapability),
 	}
+}
+
+// SetRecipes installs the recipe registry used to resolve recipe-bound
+// obligations' evidence floors at record time. The registry is required for
+// any recipe-bound RecordVerifiedOutcome: without one the floor cannot be
+// applied and the write is refused, so an in-memory store can never diverge
+// from the Postgres acceptance boundary.
+func (r *Registry) SetRecipes(reg *RecipeRegistry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.recipes = reg
 }
 
 // SubmitObligation validates and stores a new obligation. Duplicate ids are
@@ -136,6 +156,12 @@ func (r *Registry) RecordOutcome(v VerificationOutcome) error {
 // pass. The derived Outcome inside is validated and bound exactly like a
 // claim (including the substrate-derived Measured facts).
 //
+// A recipe-bound obligation is held to its Recipe.EvidenceMinimum right here
+// — the same floor PostgresStore enforces through AcceptWithRecipe — so a
+// direct in-memory write cannot bypass the recipe's evidence floor. The
+// registry must hold a RecipeRegistry (SetRecipes) to resolve the recipe; a
+// recipe-bound write without one is refused, fail closed.
+//
 // Model A split: the caller's submission is kept AS-IS as the stored claim
 // (GetOutcome / OutcomesForObligation), and the derived Outcome is stored as
 // the authoritative record (QueryOutcome). A claim already stored under the
@@ -147,6 +173,15 @@ func (r *Registry) RecordVerifiedOutcome(v DerivedVerifiedOutcome) error {
 	if !v.Sealed() {
 		return fmt.Errorf("%w: RecordVerifiedOutcome requires a verifier-produced record", ErrUnverified)
 	}
+	// Re-seal: a sealed value is a Go struct — callers can mutate Outcome
+	// after the verifier sealed it and keep the unexported bit. Re-running
+	// the seal rules refuses any post-seal edit of result/checks/assurance
+	// that disagrees with the evidence.
+	rev, err := sealDerivedOutcome(v.SubmittedClaim, v.Outcome, v.Evidence)
+	if err != nil {
+		return fmt.Errorf("%w: sealed record failed re-validation: %v", ErrUnverified, err)
+	}
+	v = rev
 	out := v.Outcome
 	if err := out.Validate(); err != nil {
 		return err
@@ -162,6 +197,12 @@ func (r *Registry) RecordVerifiedOutcome(v DerivedVerifiedOutcome) error {
 	ob, ok := r.obligations[out.ObligationID]
 	if !ok {
 		return fmt.Errorf("%w: obligation %q", ErrNotFound, out.ObligationID)
+	}
+	// The recipe evidence floor is not only a service-path concern: a direct
+	// registry write must enforce it before the record becomes authority,
+	// matching PostgresStore.RecordVerifiedOutcome / AcceptWithRecipe.
+	if err := r.evidenceFloor(ob, v.Evidence); err != nil {
+		return err
 	}
 	if err := Bind(ob, out, r.clock()); err != nil {
 		return err
@@ -194,6 +235,29 @@ func (r *Registry) RecordVerifiedOutcome(v DerivedVerifiedOutcome) error {
 	seal := v
 	seal.Outcome = cloneOutcome(out)
 	r.verified[out.VerificationID] = cloneDerived(seal)
+	return nil
+}
+
+// evidenceFloor applies the bound recipe's EvidenceMinimum to verifier-derived
+// evidence. An obligation without a recipe has no floor. A recipe-bound
+// obligation whose recipe cannot be resolved (no registry configured, or the
+// digest is unknown) is refused — fail closed, exactly like PostgresStore
+// without WithRecipes. The check itself is Recipe.EvidenceMinimum.Check, the
+// same decision AcceptWithRecipe and RestoreVerifiedOutcome apply.
+func (r *Registry) evidenceFloor(ob VerificationObligation, e VerifiedEvidence) error {
+	if ob.RecipeDigest == "" {
+		return nil
+	}
+	if r.recipes == nil {
+		return fmt.Errorf("%w: obligation binds recipe %s but no recipe registry is configured", ErrNotFound, ob.RecipeDigest)
+	}
+	recipe, err := r.recipes.ByDigest(ob.RecipeDigest)
+	if err != nil {
+		return err
+	}
+	if err := recipe.EvidenceMin.Check(e); err != nil {
+		return fmt.Errorf("%w: record fails the recipe evidence floor: %v", ErrEvidence, err)
+	}
 	return nil
 }
 
@@ -528,6 +592,7 @@ func cloneCapability(c VerifierCapability) VerifierCapability {
 func cloneObligation(o VerificationObligation) VerificationObligation {
 	out := o
 	out.RequiredChecks = append([]string(nil), o.RequiredChecks...)
+	out.VerifierEvidenceTypes = append([]string(nil), o.VerifierEvidenceTypes...)
 	if o.SubjectRef != nil {
 		s := *o.SubjectRef
 		out.SubjectRef = &s

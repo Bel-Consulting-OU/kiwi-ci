@@ -354,13 +354,19 @@ Re-establish every canonical gate before the next release is cut.
 An unaudited bypass voids the release's supply-chain claims.
 
 
-## Release-artifact corpus policy
+## Compatibility corpus identity policy
 
 The compatibility corpora under `testdata/compat/` (`n-1/`, `n-2/`) are
-release-artifact corpora: frozen producer output that HEAD must keep
-consuming across upgrades (`internal/storage/compat_corpus_test.go`). Their
-identity is the producer's exact bytes, not only a git commit that can be
-rebuilt differently under another toolchain.
+frozen producer output that HEAD must keep consuming across upgrades
+(`internal/storage/compat_corpus_test.go`).
+
+**Honesty note: these manifests identify hash-pinned SOURCE BUILDS, not
+released artifacts.** Each corpus was emitted from a git worktree at the
+producer commit and a producer binary built with `go build ./cmd/kiwi` of
+that same tree. The `binary_sha256` pins those source-build bytes. None of
+the committed corpora is an official release binary, and no fixture may
+claim to come from "the N-1 release" unless it was actually produced from
+the released artifact and that artifact's SHA-256 is what the MANIFEST pins.
 
 Every corpus `MANIFEST` records both:
 
@@ -373,16 +379,19 @@ Every corpus `MANIFEST` records both:
 `TestCompatCorpusNMinusTwoConsumedByHead` refuse a corpus whose `MANIFEST`
 omits `binary_sha256` or carries a non-hex value. A commit alone is not a
 corpus identity: the same source can produce different binary bytes under a
-different `go` toolchain, and a fixture claimed to come from "the N-1
-release" must say which N-1 artifact bytes it was produced with.
+different `go` toolchain. The binary hash makes the fixture reproducible as
+bytes; it does not by itself make those bytes a release artifact.
 
 Policy for regenerating a corpus (rare — the files are immutable by
 contract, and regenerating under changed encoding is a breaking change that
 fails the consumer tests):
 
-1. Build the producer product binary from the producer commit (or, better,
-   use the actual released artifact for that version and pin its exact
-   bytes via `KIWI_N_MINUS_ONE_BIN` / `KIWI_N_MINUS_ONE_SHA256`).
+1. Build the producer product binary from the producer commit (`go build
+   ./cmd/kiwi` of the worktree) — the honest default, and what the
+   committed corpora record. Using an actual released artifact instead is
+   allowed but must be stated as such in `producer.method` and pinned via
+   its real release SHA-256 (`KIWI_N_MINUS_ONE_BIN` /
+   `KIWI_N_MINUS_ONE_SHA256`).
 2. Emit the corpus files from that tree's own storage APIs.
 3. Record `producer.commit`, `producer.binary_sha256` (the exact bytes
    hash of the producer binary), `producer.method` and `producer.go_version`
@@ -390,13 +399,15 @@ fails the consumer tests):
 4. Never rewrite an existing corpus in place. Add a new generation directory
    and teach HEAD to consume both.
 
-The release-artifact dogfood proofs (`make dogfood-release-artifacts`:
-N-1→N upgrade, G1→G2 self-build, packaged-artifact install) follow the same
-identity rule: the N-1 side is either a hash-pinned released binary
-(`KIWI_N_MINUS_ONE_BIN` + `KIWI_N_MINUS_ONE_SHA256`) or a worktree build
+The dogfood proofs named `make dogfood-release-artifacts` (N-1→N upgrade,
+G1→G2 self-build, packaged-artifact install) are a separate, stronger
+claim: there the N-1 side must be a hash-pinned released binary
+(`KIWI_N_MINUS_ONE_BIN` + `KIWI_N_MINUS_ONE_SHA256`), or a worktree build
 whose failure is fail-closed under `KIWI_REQUIRE_N_MINUS_ONE=1`. Automation
-that must certify "HEAD consumes the previous release" supplies the released
-artifact and its pinned SHA-256, never a locally rebuilt stand-in.
+that must certify "HEAD consumes the previous release" supplies the
+released artifact and its pinned SHA-256, never a locally rebuilt stand-in,
+and must not substitute the source-build compat corpora as if they were
+release artifacts.
 
 
 ## Dependency licenses

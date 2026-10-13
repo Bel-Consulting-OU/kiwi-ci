@@ -247,7 +247,9 @@ func TestServiceCapabilityMismatchRefuses(t *testing.T) {
 
 // TestProviderServesKindMismatch: providerServes itself refuses an
 // obligation addressed to a different kind than the provider being invoked
-// (defense in depth against a mis-routed call).
+// (defense in depth against a mis-routed call). Capability absence is fail
+// closed: a dimension the capability never advertised is unsupported, not
+// universal.
 func TestProviderServesKindMismatch(t *testing.T) {
 	p := &stubProvider{kind: externalScannerKind, caps: externalScannerCapability()}
 	ob := providerBaseObligation(t)
@@ -259,14 +261,23 @@ func TestProviderServesKindMismatch(t *testing.T) {
 	if err := providerServes(p, ob); err != nil {
 		t.Fatalf("matching kind refused: %v", err)
 	}
-	// A capability whose AssuranceLevels is empty is a universal advertiser
-	// on that dimension: no mismatch is raised.
+	// A capability whose AssuranceLevels is empty is NOT a universal
+	// advertiser: absence means unsupported on that axis. The demand's
+	// required assurance must be refused.
 	open := externalScannerCapability()
 	open.AssuranceLevels = nil
 	open.ClaimClasses = []string{"execution"}
 	p2 := &stubProvider{kind: externalScannerKind, caps: open}
-	if err := providerServes(p2, ob); err != nil {
-		t.Fatalf("open assurance set refused: %v", err)
+	if err := providerServes(p2, ob); !errors.Is(err, ErrBinding) {
+		t.Fatalf("empty assurance set = %v, want ErrBinding (absence is unsupported)", err)
+	}
+	// The explicit AnyCapability wildcard is how a capability says
+	// "universal on this axis".
+	universal := externalScannerCapability()
+	universal.AssuranceLevels = []string{AnyCapability}
+	p3 := &stubProvider{kind: externalScannerKind, caps: universal}
+	if err := providerServes(p3, ob); err != nil {
+		t.Fatalf("AnyCapability assurance refused: %v", err)
 	}
 }
 
@@ -386,10 +397,66 @@ func TestResolvedDemandCoversIsRealDispatchContract(t *testing.T) {
 		}
 	}
 
-	// Empty capability dimensions are universal advertisers (no constraint).
-	open := VerifierCapability{Kind: externalScannerKind, Version: "1", ClaimClasses: []string{"execution"}}
-	if err := open.Covers(full); err != nil {
-		t.Fatalf("open capability refused a dimension demand: %v", err)
+	// Capability absence is fail closed, NOT universal: a verifier that
+	// never advertised a dimension is unsupported on it and any demand on
+	// that axis is refused.
+	absent := VerifierCapability{Kind: externalScannerKind, Version: "1", ClaimClasses: []string{"execution"}}
+	if err := absent.Covers(full); err == nil {
+		t.Fatal("absent capability dimensions must refuse a demand, not pass as universal")
+	} else if !errors.Is(err, ErrBinding) {
+		t.Fatalf("absent dimension error = %v, want ErrBinding", err)
+	}
+	// Explicit AnyCapability wildcards are the universal advertisers.
+	universal := VerifierCapability{
+		Kind:            externalScannerKind,
+		Version:         AnyCapability,
+		ClaimClasses:    []string{AnyCapability},
+		AssuranceLevels: []string{AnyCapability},
+		Platforms:       []string{AnyCapability},
+		EvidenceTypes:   []string{AnyCapability},
+	}
+	if err := universal.Covers(full); err != nil {
+		t.Fatalf("explicit AnyCapability refused a dimension demand: %v", err)
+	}
+}
+
+// TestResolvedDemandPinsObligationFields: an obligation that carries the
+// dispatch pins (contract version, claim class, platform, evidence types)
+// resolves them into the demand; an obligation that carries none demands
+// nothing on those axes.
+func TestResolvedDemandPinsObligationFields(t *testing.T) {
+	ob := providerBaseObligation(t)
+	ob.VerifierProviderKind = externalScannerKind
+	ob.VerifierContractVersion = "1"
+	ob.VerifierClaimClass = "release"
+	ob.VerifierPlatform = "linux"
+	ob.VerifierEvidenceTypes = []string{"execution-attestation", "test-report"}
+	d := ResolveDemand(ob)
+	if d.ContractVersion != "1" || d.ClaimClass != "release" || d.Platform != "linux" || len(d.EvidenceTypes) != 2 {
+		t.Fatalf("ResolveDemand did not pin obligation fields: %+v", d)
+	}
+
+	// The pinned demand is enforced: a capability that covers none of those
+	// axes is refused even though the kind matches.
+	narrow := VerifierCapability{
+		Kind:            externalScannerKind,
+		Version:         "1",
+		AssuranceLevels: []string{AnyCapability},
+		EvidenceTypes:   []string{"execution-attestation"},
+	}
+	if err := narrow.Covers(d); err == nil {
+		t.Fatal("narrow capability must refuse the pinned claim class/platform demand")
+	}
+
+	// An obligation without the pins demands nothing on those axes.
+	bare := providerBaseObligation(t)
+	bare.VerifierProviderKind = externalScannerKind
+	bd := ResolveDemand(bare)
+	if bd.ContractVersion != "" || bd.ClaimClass != "" || bd.Platform != "" || len(bd.EvidenceTypes) != 0 {
+		t.Fatalf("unpinned obligation invented demand axes: %+v", bd)
+	}
+	if err := narrow.Covers(bd); err != nil {
+		t.Fatalf("unpinned demand refused by a matching capability: %v", err)
 	}
 }
 

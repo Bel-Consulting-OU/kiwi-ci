@@ -108,8 +108,8 @@ func (r *ProviderRegistry) Providers() []VerifierProvider {
 // ResolvedDemand is the dispatch contract an obligation resolves to before a
 // provider is admitted: which provider kind must discharge it, under which
 // contract version, for which claim class, on which platform, over which
-// evidence types, at which assurance. Empty dimensions mean "no demand on
-// that axis" and are vacuously covered. Admission requires
+// evidence types, at which assurance. Empty demand dimensions mean "no demand
+// on that axis" and are vacuously covered. Admission requires
 // provider.capabilities ⊇ demand (VerifierCapability.Covers); the same check
 // is re-run in the verifier path as defense in depth.
 type ResolvedDemand struct {
@@ -131,22 +131,32 @@ type ResolvedDemand struct {
 	Assurance string
 }
 
-// ResolveDemand resolves the dispatch demand of an obligation. The provider
-// kind and required assurance come from the obligation itself; the remaining
-// dimensions stay empty unless the caller pins them (ResolveDemandFull) —
-// an obligation carries no native claim-class/platform/evidence-type field,
-// so those axes are only demanded when explicitly resolved.
+// ResolveDemand resolves the dispatch demand of an obligation. Every axis
+// the obligation carries is pinned: the provider kind, contract version,
+// claim class, platform and evidence types come from the obligation's
+// Verifier* fields when set, and the required assurance always comes from
+// RequiredAssurance. An axis the obligation does not carry stays empty (no
+// demand on it); an axis it does carry is a hard requirement the provider's
+// capabilities must cover — absence in the capability set is unsupported,
+// not universal (see VerifierCapability.Covers).
 func ResolveDemand(obligation VerificationObligation) ResolvedDemand {
 	return ResolvedDemand{
-		ProviderKind: obligation.VerifierProviderKind,
-		Assurance:    obligation.RequiredAssurance,
+		ProviderKind:    obligation.VerifierProviderKind,
+		ContractVersion: obligation.VerifierContractVersion,
+		ClaimClass:      obligation.VerifierClaimClass,
+		Platform:        obligation.VerifierPlatform,
+		EvidenceTypes:   append([]string(nil), obligation.VerifierEvidenceTypes...),
+		Assurance:       obligation.RequiredAssurance,
 	}
 }
 
-// ResolveDemandFull pins every dimension of the dispatch demand, including
-// the axes an obligation does not carry natively.
+// ResolveDemandFull pins every dimension of the dispatch demand explicitly,
+// overriding whatever the obligation carries on the overridden axes.
 func ResolveDemandFull(obligation VerificationObligation, contractVersion, claimClass, platform string, evidenceTypes []string) ResolvedDemand {
-	d := ResolveDemand(obligation)
+	d := ResolvedDemand{
+		ProviderKind: obligation.VerifierProviderKind,
+		Assurance:    obligation.RequiredAssurance,
+	}
 	d.ContractVersion = contractVersion
 	d.ClaimClass = claimClass
 	d.Platform = platform
@@ -155,28 +165,31 @@ func ResolveDemandFull(obligation VerificationObligation, contractVersion, claim
 }
 
 // Covers reports whether the capability set is a superset of the demand
-// (provider.capabilities ⊇ demand). Empty capability dimensions are universal
-// advertisers on that axis (no constraint); a non-empty demand dimension must
-// appear in the corresponding capability list. Fail closed on every mismatch.
+// (provider.capabilities ⊇ demand). Empty DEMAND dimensions are vacuously
+// covered (no constraint on that axis). Empty CAPABILITY dimensions are NOT
+// universal advertisers: an axis the capability never advertised is
+// unsupported and any demand on it is refused. A verifier that means
+// "everything on this axis" must say so explicitly with the AnyCapability
+// wildcard ("*"). Fail closed on every mismatch.
 func (c VerifierCapability) Covers(d ResolvedDemand) error {
 	if d.ProviderKind != "" && c.Kind != d.ProviderKind {
 		return fmt.Errorf("%w: demand requires provider kind %q, capability is %q", ErrBinding, d.ProviderKind, c.Kind)
 	}
-	if d.ContractVersion != "" && c.Version != d.ContractVersion {
+	if d.ContractVersion != "" && !versionCovers(c.Version, d.ContractVersion) {
 		return fmt.Errorf("%w: demand requires contract version %q, capability is %q", ErrBinding, d.ContractVersion, c.Version)
 	}
-	if d.ClaimClass != "" && len(c.ClaimClasses) > 0 && !containsString(c.ClaimClasses, d.ClaimClass) {
+	if d.ClaimClass != "" && !capabilityCovers(c.ClaimClasses, d.ClaimClass) {
 		return fmt.Errorf("%w: capability %s/%s does not cover claim class %q (has %v)", ErrBinding, c.Kind, c.Version, d.ClaimClass, c.ClaimClasses)
 	}
-	if d.Platform != "" && len(c.Platforms) > 0 && !containsString(c.Platforms, d.Platform) {
+	if d.Platform != "" && !capabilityCovers(c.Platforms, d.Platform) {
 		return fmt.Errorf("%w: capability %s/%s does not cover platform %q (has %v)", ErrBinding, c.Kind, c.Version, d.Platform, c.Platforms)
 	}
 	for _, et := range d.EvidenceTypes {
-		if len(c.EvidenceTypes) > 0 && !containsString(c.EvidenceTypes, et) {
+		if !capabilityCovers(c.EvidenceTypes, et) {
 			return fmt.Errorf("%w: capability %s/%s does not cover evidence type %q (has %v)", ErrBinding, c.Kind, c.Version, et, c.EvidenceTypes)
 		}
 	}
-	if d.Assurance != "" && len(c.AssuranceLevels) > 0 && !containsString(c.AssuranceLevels, d.Assurance) {
+	if d.Assurance != "" && !capabilityCovers(c.AssuranceLevels, d.Assurance) {
 		return fmt.Errorf("%w: provider %q does not advertise assurance %q (has %v)", ErrBinding, c.Kind, d.Assurance, c.AssuranceLevels)
 	}
 	return nil

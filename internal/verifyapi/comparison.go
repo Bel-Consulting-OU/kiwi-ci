@@ -11,10 +11,14 @@ import (
 // so a consumer can decide for itself. It is deliberately NEUTRAL: no model
 // scores, no utility weights, no rankings, no winner. The row set carries
 // only facts the verification substrate already established (terminal state,
-// coarse outcome, assurance, wall/CPU/memory, artifact size). A scoring
-// layer (an evidence consumer or any other external controller) applies
-// its own utility on top of
-// these facts; this type never carries one.
+// coarse outcome, assurance, wall/CPU/memory/IO/cache, artifact size). A
+// scoring layer (an evidence consumer or any other external controller)
+// applies its own utility on top of these facts; this type never carries one.
+//
+// Epistemic provenance: every resource/economic fact is Epistemic-tagged at
+// its source level (reported → observed, measured → derived, attested →
+// attested). Row Authority describes how the ROW was minted; it does not
+// promote reported caller assertions to verified numbers.
 
 // RowAuthority marks how a comparison row became known. Every comparison
 // row carries one: "verified" rows derive from a sealed
@@ -31,6 +35,87 @@ const (
 	// It authorizes nothing and never projects to OutcomePass.
 	RowAuthorityClaim RowAuthority = "claim"
 )
+
+// economicFacts is the resource/economic fact set a comparison row exports.
+// Every quantity is Epistemic-tagged: a consumer can require a minimum rung
+// (e.g. attested) without re-deriving provenance per field. Authority=verified
+// on a row means the ROW was minted from sealed input — it does NOT promote
+// reported CPU/memory figures to verified numbers.
+type economicFacts struct {
+	WallTimeNS      Epistemic[int64]
+	CPUTimeNS       Epistemic[int64]
+	PeakMemoryBytes Epistemic[int64]
+	IOBytes         Epistemic[int64]
+	CacheHits       Epistemic[int64]
+	CacheMisses     Epistemic[int64]
+}
+
+// validate reports whether every exported economic fact carries a defined
+// epistemic level and a non-negative value. An unknown level is refused:
+// a new resource must be placed on the ladder deliberately (FactSourceOf /
+// EpistemicLevelOf) before it can appear on a comparison row.
+func (e economicFacts) validate() error {
+	for name, f := range map[string]Epistemic[int64]{
+		"wall_time_ns":      e.WallTimeNS,
+		"cpu_time_ns":       e.CPUTimeNS,
+		"peak_memory_bytes": e.PeakMemoryBytes,
+		"io_bytes":          e.IOBytes,
+		"cache_hits":        e.CacheHits,
+		"cache_misses":      e.CacheMisses,
+	} {
+		if f.Value < 0 {
+			return fmt.Errorf("%w: %s must be >= 0", ErrInvalid, name)
+		}
+		if !f.Level.Valid() {
+			return fmt.Errorf("%w: %s must carry a valid epistemic level", ErrInvalid, name)
+		}
+	}
+	return nil
+}
+
+// resourceLevel is the epistemic level of a named resource-fact source
+// (FactSourceOf → EpistemicLevelOf). An unmapped name yields EpistemicUnknown.
+func resourceLevel(name string) EpistemicLevel {
+	lvl, ok := EpistemicLevelOf(FactSourceOf(name))
+	if !ok {
+		return EpistemicUnknown
+	}
+	return lvl
+}
+
+// taggedResource tags v at the epistemic level of its named source.
+func taggedResource[T any](name string, v T) Epistemic[T] {
+	return Epistemic[T]{Value: v, Level: resourceLevel(name)}
+}
+
+// wallFact resolves wall time from the strongest ResourceFacts source and
+// tags it with that source's epistemic level: an attested job window
+// (measured.wall_time_ns) wins, a substrate-derived execution interval
+// (measured.duration_ns) is next, and the reported caller figure is last.
+func wallFact(res ResourceFacts) Epistemic[int64] {
+	if res.Measured != nil && res.Measured.WallTimeNS > 0 {
+		return taggedResource("measured.wall_time_ns", res.Measured.WallTimeNS)
+	}
+	if res.Measured != nil && res.Measured.DurationNS > 0 {
+		return taggedResource("measured.duration_ns", res.Measured.DurationNS)
+	}
+	return taggedResource("wall_time_ns", res.WallTimeNS)
+}
+
+// economicFromResources projects one execution's ResourceFacts onto the
+// comparison-row economic facts, each tagged at its source's epistemic level.
+// CPU, memory, I/O and cache counters stay reported (observed) until runners
+// emit attested measurements for them.
+func economicFromResources(res ResourceFacts) economicFacts {
+	return economicFacts{
+		WallTimeNS:      wallFact(res),
+		CPUTimeNS:       taggedResource("cpu_time_ns", res.CPUTimeNS),
+		PeakMemoryBytes: taggedResource("peak_memory_bytes", res.PeakMemoryBytes),
+		IOBytes:         taggedResource("io_bytes", res.IOBytes),
+		CacheHits:       taggedResource("cache_hits", res.CacheHits),
+		CacheMisses:     taggedResource("cache_misses", res.CacheMisses),
+	}
+}
 
 // CandidateFact is one comparable row of neutral verification facts about a
 // single candidate. Every field is a recorded fact, not a judgment.
@@ -53,14 +138,23 @@ type CandidateFact struct {
 	// records, "claim" for caller assertions. A claim row is never
 	// projected into a plain pass regardless of its claimed outcome.
 	Authority RowAuthority `json:"authority"`
-	// WallTimeNS is the wall-clock cost of the attempt in nanoseconds.
-	// Substrate-attested when the evidence carried a job window; otherwise
-	// the recorded reported figure.
-	WallTimeNS int64 `json:"wall_time_ns"`
-	// CPUTimeNS is the CPU cost in nanoseconds (reported fact).
-	CPUTimeNS int64 `json:"cpu_time_ns"`
-	// PeakMemoryBytes is the peak memory footprint (reported fact).
-	PeakMemoryBytes int64 `json:"peak_memory_bytes"`
+	// WallTimeNS is the wall-clock cost of the attempt in nanoseconds,
+	// tagged with how it became known: attested when the evidence carried
+	// a job window, derived from the substrate execution interval when
+	// that is the strongest source, otherwise the reported figure.
+	WallTimeNS Epistemic[int64] `json:"wall_time_ns"`
+	// CPUTimeNS is the CPU cost in nanoseconds. Reported until runners
+	// emit attested measurements (level: observed).
+	CPUTimeNS Epistemic[int64] `json:"cpu_time_ns"`
+	// PeakMemoryBytes is the peak memory footprint. Reported (level:
+	// observed) until runners emit attested measurements.
+	PeakMemoryBytes Epistemic[int64] `json:"peak_memory_bytes"`
+	// IOBytes is the I/O volume in bytes. Reported (level: observed).
+	IOBytes Epistemic[int64] `json:"io_bytes"`
+	// CacheHits is the cache-hit count. Reported (level: observed).
+	CacheHits Epistemic[int64] `json:"cache_hits"`
+	// CacheMisses is the cache-miss count. Reported (level: observed).
+	CacheMisses Epistemic[int64] `json:"cache_misses"`
 	// ArtifactSizeBytes is the size in bytes of the candidate artifact
 	// this attempt verified. Zero when the surface recorded none.
 	ArtifactSizeBytes int64 `json:"artifact_size_bytes"`
@@ -94,17 +188,26 @@ func (f CandidateFact) Validate() error {
 	if f.Authority == RowAuthorityClaim && f.Outcome == OutcomePass {
 		return fmt.Errorf("%w: a claim row is never projected into a plain pass", ErrInvalid)
 	}
-	for name, n := range map[string]int64{
-		"wall_time_ns":        f.WallTimeNS,
-		"cpu_time_ns":         f.CPUTimeNS,
-		"peak_memory_bytes":   f.PeakMemoryBytes,
-		"artifact_size_bytes": f.ArtifactSizeBytes,
-	} {
-		if n < 0 {
-			return fmt.Errorf("%w: %s must be >= 0", ErrInvalid, name)
-		}
+	if err := f.economic().validate(); err != nil {
+		return err
+	}
+	if f.ArtifactSizeBytes < 0 {
+		return fmt.Errorf("%w: artifact_size_bytes must be >= 0", ErrInvalid)
 	}
 	return nil
+}
+
+// economic returns the row's resource/economic facts as one bundle so
+// validation and consumers share a single view of provenance per fact.
+func (f CandidateFact) economic() economicFacts {
+	return economicFacts{
+		WallTimeNS:      f.WallTimeNS,
+		CPUTimeNS:       f.CPUTimeNS,
+		PeakMemoryBytes: f.PeakMemoryBytes,
+		IOBytes:         f.IOBytes,
+		CacheHits:       f.CacheHits,
+		CacheMisses:     f.CacheMisses,
+	}
 }
 
 // CandidateComparison is the lined-up neutral fact set of several
@@ -123,10 +226,17 @@ type CandidateComparison struct {
 	Candidates []CandidateFact `json:"candidates"`
 }
 
-// CompareCandidates assembles the neutral comparison from verified fact
-// rows. Rows are validated, de-duplicated by CandidateID (a second row for
-// one candidate is refused: pick the canonical attempt before comparing),
-// and sorted by CandidateID. No scoring of any kind is applied.
+// CompareCandidates assembles the neutral comparison from open caller rows.
+//
+// Deprecated: this surface used to accept Authority=verified rows that any
+// caller could forge. It now REFUSES every row stamped RowAuthorityVerified.
+// A verified row can only be minted from sealed input (FactFromOutcome or
+// CompareVerifiedCandidates). Prefer CompareClaims for claim-only sets and
+// CompareVerifiedCandidates for sealed verified sets.
+//
+// Rows are validated, de-duplicated by CandidateID (a second row for one
+// candidate is refused: pick the canonical attempt before comparing), and
+// sorted by CandidateID. No scoring of any kind is applied.
 func CompareCandidates(base Digest, rows []CandidateFact) (CandidateComparison, error) {
 	if len(rows) == 0 {
 		return CandidateComparison{}, fmt.Errorf("%w: comparison needs at least one candidate", ErrInvalid)
@@ -143,6 +253,9 @@ func CompareCandidates(base Digest, rows []CandidateFact) (CandidateComparison, 
 	}
 	seen := make(map[string]bool, len(rows))
 	for i, r := range rows {
+		if r.Authority == RowAuthorityVerified {
+			return CandidateComparison{}, fmt.Errorf("%w: candidates[%d] (%s): a caller-built row cannot claim verified authority; verified rows require sealed input (CompareVerifiedCandidates / FactFromOutcome)", ErrUnverified, i, r.CandidateID)
+		}
 		if err := r.Validate(); err != nil {
 			return CandidateComparison{}, fmt.Errorf("candidates[%d]: %w", i, err)
 		}
@@ -166,16 +279,19 @@ func CompareCandidates(base Digest, rows []CandidateFact) (CandidateComparison, 
 // unknown). The row is stamped RowAuthorityVerified only for sealed input:
 // an unsealed record is a bare claim and is refused (see CompareClaims for
 // the claim-only surface).
+//
+// Each resource/economic fact is Epistemic-tagged at its ResourceFacts
+// source level (reported → observed, measured → derived, attested job
+// window → attested). Row Authority=verified describes how the ROW was
+// minted (sealed input); it does not promote reported CPU/memory figures
+// to verified numbers.
 func FactFromOutcome(candidateID string, d DerivedVerifiedOutcome, c EvidenceCompleteness, artifactSizeBytes int64) (CandidateFact, error) {
 	if !d.Sealed() {
 		return CandidateFact{}, fmt.Errorf("%w: FactFromOutcome requires a sealed derived outcome, never a bare claim", ErrUnverified)
 	}
 	v := d.Outcome
 	status := StatusFromCompleteness(c, v.Outcome)
-	wall := v.Resources.WallTimeNS
-	if v.Resources.Measured != nil && v.Resources.Measured.WallTimeNS > 0 {
-		wall = v.Resources.Measured.WallTimeNS
-	}
+	ec := economicFromResources(v.Resources)
 	return CandidateFact{
 		CandidateID:       candidateID,
 		CandidateDigest:   v.CandidateDigest,
@@ -184,9 +300,12 @@ func FactFromOutcome(candidateID string, d DerivedVerifiedOutcome, c EvidenceCom
 		Outcome:           status.Coarse,
 		Assurance:         v.AssuranceProfile,
 		Authority:         RowAuthorityVerified,
-		WallTimeNS:        wall,
-		CPUTimeNS:         v.Resources.CPUTimeNS,
-		PeakMemoryBytes:   v.Resources.PeakMemoryBytes,
+		WallTimeNS:        ec.WallTimeNS,
+		CPUTimeNS:         ec.CPUTimeNS,
+		PeakMemoryBytes:   ec.PeakMemoryBytes,
+		IOBytes:           ec.IOBytes,
+		CacheHits:         ec.CacheHits,
+		CacheMisses:       ec.CacheMisses,
 		ArtifactSizeBytes: artifactSizeBytes,
 	}, nil
 }
@@ -253,20 +372,27 @@ func (s VerifiedCandidateSource) sealed(keyring *AcceptanceKeyring) (DerivedVeri
 	return DerivedVerifiedOutcome{}, fmt.Errorf("%w: verified candidate source is empty", ErrInvalid)
 }
 
-// VerifiedCandidateFact is one row of a verified-only comparison. Every field
-// is derived from a sealed record; Authority is always "verified".
+// VerifiedCandidateFact is one row of a verified-only comparison. Every
+// field is derived from a sealed record; Authority is always "verified"
+// (the row's mint), while each resource/economic fact carries its own
+// epistemic level: CPU/memory/I/O/cache stay reported (observed) until
+// runners emit attested measurements, and wall time is attested, derived,
+// or reported according to the strongest ResourceFacts source available.
 type VerifiedCandidateFact struct {
-	CandidateID       string        `json:"candidate_id"`
-	CandidateDigest   Digest        `json:"candidate_digest"`
-	VerificationID    string        `json:"verification_id"`
-	Terminal          TerminalState `json:"terminal"`
-	Outcome           Outcome       `json:"outcome"`
-	Assurance         string        `json:"assurance"`
-	Authority         RowAuthority  `json:"authority"`
-	WallTimeNS        int64         `json:"wall_time_ns"`
-	CPUTimeNS         int64         `json:"cpu_time_ns"`
-	PeakMemoryBytes   int64         `json:"peak_memory_bytes"`
-	ArtifactSizeBytes int64         `json:"artifact_size_bytes"`
+	CandidateID       string           `json:"candidate_id"`
+	CandidateDigest   Digest           `json:"candidate_digest"`
+	VerificationID    string           `json:"verification_id"`
+	Terminal          TerminalState    `json:"terminal"`
+	Outcome           Outcome          `json:"outcome"`
+	Assurance         string           `json:"assurance"`
+	Authority         RowAuthority     `json:"authority"`
+	WallTimeNS        Epistemic[int64] `json:"wall_time_ns"`
+	CPUTimeNS         Epistemic[int64] `json:"cpu_time_ns"`
+	PeakMemoryBytes   Epistemic[int64] `json:"peak_memory_bytes"`
+	IOBytes           Epistemic[int64] `json:"io_bytes"`
+	CacheHits         Epistemic[int64] `json:"cache_hits"`
+	CacheMisses       Epistemic[int64] `json:"cache_misses"`
+	ArtifactSizeBytes int64            `json:"artifact_size_bytes"`
 }
 
 // Validate reports structural soundness: identity present, valid terminal
@@ -293,17 +419,25 @@ func (f VerifiedCandidateFact) Validate() error {
 	if f.Authority != RowAuthorityVerified {
 		return fmt.Errorf("%w: verified fact authority must be %q", ErrInvalid, RowAuthorityVerified)
 	}
-	for name, n := range map[string]int64{
-		"wall_time_ns":        f.WallTimeNS,
-		"cpu_time_ns":         f.CPUTimeNS,
-		"peak_memory_bytes":   f.PeakMemoryBytes,
-		"artifact_size_bytes": f.ArtifactSizeBytes,
-	} {
-		if n < 0 {
-			return fmt.Errorf("%w: %s must be >= 0", ErrInvalid, name)
-		}
+	if err := f.economic().validate(); err != nil {
+		return err
+	}
+	if f.ArtifactSizeBytes < 0 {
+		return fmt.Errorf("%w: artifact_size_bytes must be >= 0", ErrInvalid)
 	}
 	return nil
+}
+
+// economic returns the row's resource/economic facts as one bundle.
+func (f VerifiedCandidateFact) economic() economicFacts {
+	return economicFacts{
+		WallTimeNS:      f.WallTimeNS,
+		CPUTimeNS:       f.CPUTimeNS,
+		PeakMemoryBytes: f.PeakMemoryBytes,
+		IOBytes:         f.IOBytes,
+		CacheHits:       f.CacheHits,
+		CacheMisses:     f.CacheMisses,
+	}
 }
 
 // VerifiedCandidateComparison is the lined-up fact set of several candidates
@@ -362,12 +496,11 @@ func CompareVerifiedCandidates(base Digest, sources []VerifiedCandidateSource, k
 // evidence-derived check set: a check conflict (P3g) is evidence_invalid,
 // a proven pass is TerminalPassed, a derived fail is TerminalFailed, and
 // anything else is evidence_incomplete. The row is never built from a claim.
+// Resource/economic facts are Epistemic-tagged at their ResourceFacts source
+// level; row Authority=verified does not promote reported figures to verified.
 func verifiedFactFromDerived(candidateID string, artifactSizeBytes int64, d DerivedVerifiedOutcome) VerifiedCandidateFact {
 	term, coarse := verifiedTerminal(d)
-	wall := d.Outcome.Resources.WallTimeNS
-	if d.Outcome.Resources.Measured != nil && d.Outcome.Resources.Measured.WallTimeNS > 0 {
-		wall = d.Outcome.Resources.Measured.WallTimeNS
-	}
+	ec := economicFromResources(d.Outcome.Resources)
 	return VerifiedCandidateFact{
 		CandidateID:       candidateID,
 		CandidateDigest:   d.Outcome.CandidateDigest,
@@ -376,9 +509,12 @@ func verifiedFactFromDerived(candidateID string, artifactSizeBytes int64, d Deri
 		Outcome:           coarse,
 		Assurance:         d.Outcome.AssuranceProfile,
 		Authority:         RowAuthorityVerified,
-		WallTimeNS:        wall,
-		CPUTimeNS:         d.Outcome.Resources.CPUTimeNS,
-		PeakMemoryBytes:   d.Outcome.Resources.PeakMemoryBytes,
+		WallTimeNS:        ec.WallTimeNS,
+		CPUTimeNS:         ec.CPUTimeNS,
+		PeakMemoryBytes:   ec.PeakMemoryBytes,
+		IOBytes:           ec.IOBytes,
+		CacheHits:         ec.CacheHits,
+		CacheMisses:       ec.CacheMisses,
 		ArtifactSizeBytes: artifactSizeBytes,
 	}
 }

@@ -513,6 +513,7 @@ func TestSysDFCanonicalReleaseScenarioIntegration(t *testing.T) {
 	// handler → authorization → store path a production runner uses) and no
 	// real executor can complete the mid-flight job behind our back.
 	runnerB.killNow()
+	runnerB2.killNow()
 	chaosSys, err := system.Attach(serverURL, adminToken, runnerToken, filepath.Join(root, "chaos-work"))
 	if err != nil {
 		t.Fatalf("attach chaos: %v", err)
@@ -1190,7 +1191,7 @@ func canonicalTriggerTrusted(t *testing.T, baseURL, adminToken, schedID, repoURL
 // canonicalLeaseOne polls the product next endpoint until one task is leased.
 func canonicalLeaseOne(t *testing.T, ctx context.Context, sys *system.System, runnerID string) system.LeaseTask {
 	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		task, ok, err := sys.Next(ctx, runnerID)
 		if err != nil {

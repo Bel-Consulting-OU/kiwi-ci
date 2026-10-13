@@ -11,9 +11,11 @@
 //
 // This package adds that second, asymmetric signature:
 //
-//   - the deployment's Ed25519 acceptance-signing identity produces a
-//     PortableSignature over the exact JSON encoding of the proof
-//     (SignatureSchemaVersion 1, algorithm "Ed25519");
+//   - the deployment's Ed25519 acceptance-signing identity signs only a
+//     sealed verifyapi.VerifiedProof (an unverified document is refused),
+//     over a domain-separated canonical structure that binds the envelope
+//     version, algorithm, key id, signed_at and the exact JSON encoding of
+//     the proof (SignatureSchemaVersion 2, algorithm "Ed25519");
 //   - a consumer holds ONLY the public key — typically discovered from a
 //     PublicKeyDiscovery document — and verifies the envelope with
 //     Verify / VerifyWithDiscovery;
@@ -30,5 +32,6 @@
 // an optional successor pointer, so a consumer can refuse a signature made
 // under a key the operator has since retired. Verification is fail closed:
 // unknown key id, revoked key, wrong algorithm, malformed signature and any
-// byte-level change to the proof are all refusals, never partial trust.
+// change to the signed material (proof bytes, signed_at, envelope header) are
+// all refusals, never partial trust.
 package portableproof

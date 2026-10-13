@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -21,10 +22,11 @@ func testDigest(t *testing.T, seed string) verifyapi.Digest {
 	return verifyapi.Digest(hex.EncodeToString(sum[:]))
 }
 
-// sealedProof builds a REAL sealed VerificationProof through the verifyapi
+// sealedProof builds a REAL sealed VerifiedProof through the verifyapi
 // acceptance path: obligation + claim + evidence-derived outcome + HMAC
-// acceptance record. The portable layer signs this proof; nothing is faked.
-func sealedProof(t *testing.T) (verifyapi.VerificationProof, *verifyapi.AcceptanceKeyring) {
+// acceptance record + proof.Verify. The portable layer signs this verified
+// proof; nothing is faked.
+func sealedProof(t *testing.T) (verifyapi.VerifiedProof, *verifyapi.AcceptanceKeyring) {
 	t.Helper()
 	at := time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC)
 	ob := verifyapi.VerificationObligation{
@@ -100,10 +102,11 @@ func sealedProof(t *testing.T) (verifyapi.VerificationProof, *verifyapi.Acceptan
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := proof.Verify(ring); err != nil {
+	verified, err := proof.Verify(ring)
+	if err != nil {
 		t.Fatalf("internal proof.Verify: %v", err)
 	}
-	return proof, ring
+	return verified, ring
 }
 
 func mustRing(t *testing.T, key verifyapi.AcceptanceKey) *verifyapi.AcceptanceKeyring {
@@ -119,14 +122,14 @@ func mustRing(t *testing.T, key verifyapi.AcceptanceKey) *verifyapi.AcceptanceKe
 // only the Ed25519 public key and the envelope verifies. The consumer
 // cannot forge — the private half never leaves the signer.
 func TestSignAndVerifyWithPublicKeyOnly(t *testing.T) {
-	proof, _ := sealedProof(t)
+	verified, _ := sealedProof(t)
 	signer, pub, err := portableproof.GenerateSigner("pk-1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	signed, err := signer.SignProof(proof, time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC))
+	signed, err := signer.SignVerifiedProof(verified, time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC))
 	if err != nil {
-		t.Fatalf("SignProof: %v", err)
+		t.Fatalf("SignVerifiedProof: %v", err)
 	}
 	if signed.Signature.Algorithm != portableproof.AlgorithmEd25519 {
 		t.Fatalf("algorithm = %q, want %s", signed.Signature.Algorithm, portableproof.AlgorithmEd25519)
@@ -141,12 +144,73 @@ func TestSignAndVerifyWithPublicKeyOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("VerifySignedProof = %v", err)
 	}
-	if got.Obligation.ObligationID != proof.Obligation.ObligationID || got.Outcome.VerificationID != proof.Outcome.VerificationID {
+	if got.Obligation.ObligationID != verified.Document.Obligation.ObligationID || got.Outcome.VerificationID != verified.Document.Outcome.VerificationID {
 		t.Fatalf("round-tripped proof identity mismatch: %+v", got)
 	}
 	// The internal HMAC layer is untouched by the portable signature.
-	if _, err := proof.Verify(mustRing(t, mustHMAC(t))); err != nil {
+	if _, err := verified.Document.Verify(mustRing(t, mustHMAC(t))); err != nil {
 		t.Fatalf("internal HMAC proof.Verify after portable sign = %v", err)
+	}
+}
+
+// TestSignUnsealedRefused: the signer only signs verifier-produced
+// VerifiedProof values. A raw VerificationProof document and an unsealed
+// zero VerifiedProof are both refused — the portable layer never launders
+// an unverified document into a signed one.
+func TestSignUnsealedRefused(t *testing.T) {
+	verified, _ := sealedProof(t)
+	signer, _, err := portableproof.GenerateSigner("pk-unsealed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Zero VerifiedProof: never verified, seal absent.
+	if _, err := signer.SignVerifiedProof(verifyapi.VerifiedProof{}, time.Time{}); !errors.Is(err, portableproof.ErrUnsealed) {
+		t.Fatalf("SignVerifiedProof(zero) = %v, want ErrUnsealed", err)
+	}
+	// A raw unverified VerificationProof document cannot be signed through
+	// the public API at all: wrapping it in VerifiedProof without
+	// VerificationProof.Verify leaves the seal unset.
+	raw := verifyapi.VerifiedProof{Document: verified.Document}
+	if raw.Sealed() {
+		t.Fatal("hand-built VerifiedProof must not be sealed")
+	}
+	if _, err := signer.SignVerifiedProof(raw, time.Time{}); !errors.Is(err, portableproof.ErrUnsealed) {
+		t.Fatalf("SignVerifiedProof(unsealed document) = %v, want ErrUnsealed", err)
+	}
+}
+
+// TestAlteringSignedAtBreaksSignature: signed_at is inside the signature.
+// Changing it after signing must fail verification — it is signed material,
+// not a cosmetic envelope field.
+func TestAlteringSignedAtBreaksSignature(t *testing.T) {
+	verified, _ := sealedProof(t)
+	signer, pub, err := portableproof.GenerateSigner("pk-signedat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	signed, err := signer.SignVerifiedProof(verified, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !signed.Signature.SignedAt.Equal(at) {
+		t.Fatalf("envelope signed_at = %v, want %v", signed.Signature.SignedAt, at)
+	}
+	// Alter the signed timestamp: the signature must no longer verify.
+	altered := signed
+	altered.Signature.SignedAt = at.Add(time.Hour)
+	if err := portableproof.Verify(altered, "pk-signedat", pub); err == nil {
+		t.Fatal("altering signed_at must break the signature")
+	}
+	// Zeroing signed_at is equally a refusal.
+	zeroed := signed
+	zeroed.Signature.SignedAt = time.Time{}
+	if err := portableproof.Verify(zeroed, "pk-signedat", pub); err == nil {
+		t.Fatal("zeroing signed_at must break the signature")
+	}
+	// The original still verifies.
+	if err := portableproof.Verify(signed, "pk-signedat", pub); err != nil {
+		t.Fatalf("original envelope after signed_at tamper attempts = %v", err)
 	}
 }
 
@@ -163,12 +227,12 @@ func mustHMAC(t *testing.T) *verifyapi.HMACAcceptanceKey {
 // breaks the portable signature. The consumer must not accept a mutated
 // proof even when the mutation is "just one field".
 func TestTamperedProofFails(t *testing.T) {
-	proof, _ := sealedProof(t)
+	verified, _ := sealedProof(t)
 	signer, pub, err := portableproof.GenerateSigner("pk-tamper")
 	if err != nil {
 		t.Fatal(err)
 	}
-	signed, err := signer.SignProof(proof, time.Time{})
+	signed, err := signer.SignVerifiedProof(verified, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,7 +270,7 @@ func TestTamperedProofFails(t *testing.T) {
 // TestWrongKeyFails: a signature made under key A must not verify under
 // key B, and a consumer holding only B cannot be convinced by A's envelope.
 func TestWrongKeyFails(t *testing.T) {
-	proof, _ := sealedProof(t)
+	verified, _ := sealedProof(t)
 	signerA, _, err := portableproof.GenerateSigner("pk-A")
 	if err != nil {
 		t.Fatal(err)
@@ -215,7 +279,7 @@ func TestWrongKeyFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	signed, err := signerA.SignProof(proof, time.Time{})
+	signed, err := signerA.SignVerifiedProof(verified, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +308,7 @@ func TestWrongKeyFails(t *testing.T) {
 // carries the rotation / revocation note, and verification follows the key
 // lifecycle (active ok, rotated ok for history, revoked refused).
 func TestDiscoveryRotationAndRevocation(t *testing.T) {
-	proof, _ := sealedProof(t)
+	verified, _ := sealedProof(t)
 	signer1, pub1, err := portableproof.GenerateSigner("pk-1")
 	if err != nil {
 		t.Fatal(err)
@@ -264,11 +328,11 @@ func TestDiscoveryRotationAndRevocation(t *testing.T) {
 	disc := portableproof.NewDiscovery(time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC))
 	disc.Keys = []portableproof.PublicKeyDoc{doc1, doc2}
 
-	signed1, err := signer1.SignProof(proof, time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC))
+	signed1, err := signer1.SignVerifiedProof(verified, time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
-	signed2, err := signer2.SignProof(proof, time.Date(2026, 2, 15, 0, 0, 0, 0, time.UTC))
+	signed2, err := signer2.SignVerifiedProof(verified, time.Date(2026, 2, 15, 0, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +370,7 @@ func TestDiscoveryRotationAndRevocation(t *testing.T) {
 		t.Fatalf("successor after predecessor revoke = %v", err)
 	}
 	// Unknown keys are refused.
-	unsigned, err := signer2.SignProof(proof, time.Time{})
+	unsigned, err := signer2.SignVerifiedProof(verified, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,12 +384,12 @@ func TestDiscoveryRotationAndRevocation(t *testing.T) {
 // byte-for-byte on the signed proof payload — the signature covers the
 // transmission, so transport encoding must not disturb it.
 func TestSignedProofRoundTripJSON(t *testing.T) {
-	proof, _ := sealedProof(t)
+	verified, _ := sealedProof(t)
 	signer, pub, err := portableproof.GenerateSigner("pk-rt")
 	if err != nil {
 		t.Fatal(err)
 	}
-	signed, err := signer.SignProof(proof, time.Time{})
+	signed, err := signer.SignVerifiedProof(verified, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}

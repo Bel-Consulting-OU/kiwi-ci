@@ -630,6 +630,17 @@ func acceptWithKeyringRecipe(obligation VerificationObligation, derived DerivedV
 	if err := Bind(bound, derived.Outcome, at); err != nil {
 		return AcceptanceRecord{}, fmt.Errorf("%w: sealed outcome does not bind the obligation: %v", ErrBinding, err)
 	}
+	// The recipe's evidence floor is enforced HERE, in the common acceptance
+	// boundary, before any acceptance record is minted: Service, Postgres and
+	// memory stores all reach this point, so their floor decisions cannot
+	// diverge. Store-level checks stay as defense in depth. Restore applies
+	// the same floor to the re-derived evidence (see restoreCurrent), so a
+	// record that could not meet the floor is neither minted nor restored.
+	if recipe != nil {
+		if err := recipe.EvidenceMin.Check(derived.Evidence); err != nil {
+			return AcceptanceRecord{}, fmt.Errorf("%w: record fails the recipe evidence floor: %v", ErrEvidence, err)
+		}
+	}
 	signer, err := asSigner(key, keyring)
 	if err != nil {
 		return AcceptanceRecord{}, err
@@ -787,7 +798,10 @@ func restoreV1(p PersistedVerified, rec AcceptanceRecord, verifier AcceptanceVer
 	}
 	// Completeness rules identical to first sealing: a truncated or edited
 	// row is refused instead of quietly losing the proven-pass bit.
-	return sealDerivedOutcome(p.SubmittedClaim, p.Outcome, p.Evidence)
+	// v1 encodings never bound Window/Kinds; re-derive both so a database
+	// writer cannot forge window authority on a legacy row.
+	evidence := rederiveEvidenceWindowKinds(p.Evidence, p.SubmittedClaim)
+	return sealDerivedOutcome(p.SubmittedClaim, p.Outcome, evidence)
 }
 
 // restoreV2 verifies a current acceptance record. The v2 MAC binds the
@@ -896,14 +910,10 @@ func restoreCurrent(p PersistedVerified, rec AcceptanceRecord, verifier Acceptan
 	if rec.Algorithm != key.Algorithm() {
 		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: acceptance algorithm %q does not match key algorithm %q", ErrAcceptance, rec.Algorithm, key.Algorithm())
 	}
-	// Recipe identity is not free at restore either: the supplied recipe
-	// must be exactly the one the obligation pins, or the recomputed demand
-	// would measure a different rule set than the record was accepted under.
-	if p.Obligation.RecipeDigest != "" && recipe == nil {
-		// Recipe-bound records must restore against the resolved recipe;
-		// without it the demand digest cannot be recomputed faithfully.
-		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: recipe-bound record requires the resolved recipe at restore time", ErrBinding)
-	}
+	// Integrity first: MAC over the acceptance record, then payload↔record
+	// digests. A tampered persisted object must report ErrAcceptance before
+	// any contextual recipe dependency — "the authenticated object changed"
+	// is the stronger, less ambiguous boundary.
 	bound := p.Obligation
 	if recipe != nil {
 		d, err := RecipeDigest(*recipe)
@@ -955,6 +965,12 @@ func restoreCurrent(p PersistedVerified, rec AcceptanceRecord, verifier Acceptan
 	}
 	if demandDig != rec.DemandDigest {
 		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: demand digest mismatch", ErrAcceptance)
+	}
+	if p.Obligation.RecipeDigest != "" && recipe == nil {
+		// Recipe-bound records must restore against the resolved recipe so
+		// the demand is the recipe's rule set, not a coincidentally-equal
+		// inline copy. Reached only after integrity passed.
+		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: recipe-bound record requires the resolved recipe at restore time", ErrBinding)
 	}
 	if rec.Subject != p.Obligation.Subject {
 		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: acceptance subject %q does not match obligation subject %q", ErrAcceptance, rec.Subject, p.Obligation.Subject)

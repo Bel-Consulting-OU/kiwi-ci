@@ -114,13 +114,15 @@ func runCompatCorpus(t *testing.T, corpus string) {
 	if man.Producer.Commit == "" || man.Producer.Method == "" {
 		t.Fatalf("MANIFEST producer is incomplete: %+v", man.Producer)
 	}
-	// Release-artifact corpus policy: the producer records the sha256 of
-	// the producer BINARY, not just the git SHA. A commit can be rebuilt
-	// under a different toolchain into different bytes; the corpus is
-	// identified by the exact producer artifact. (docs/releases.md,
-	// "Release-artifact corpus policy".)
+	// Hash-identified source-build corpus policy: the producer records the
+	// sha256 of the producer BINARY, not just the git SHA. A commit can be
+	// rebuilt under a different toolchain into different bytes; the corpus
+	// is identified by the exact producer artifact bytes. The committed
+	// corpora are source builds (`go build ./cmd/kiwi` of the producer
+	// tree), not official released artifacts. (docs/releases.md,
+	// "Compatibility corpus identity policy".)
 	if man.Producer.BinarySHA256 == "" {
-		t.Fatalf("MANIFEST producer is missing binary_sha256 (release-artifact corpus policy requires the producer binary hash, not just git SHA): %+v", man.Producer)
+		t.Fatalf("MANIFEST producer is missing binary_sha256 (corpus identity policy requires the producer binary hash, not just git SHA): %+v", man.Producer)
 	}
 	if len(man.Producer.BinarySHA256) != 64 {
 		t.Fatalf("MANIFEST producer binary_sha256 = %q, want 64 hex chars", man.Producer.BinarySHA256)

@@ -88,6 +88,14 @@ var _ VerificationStore = (*MemoryStore)(nil)
 // accessors). Callers should prefer the VerificationStore methods.
 func (m *MemoryStore) Registry() *Registry { return m.r }
 
+// WithRecipes installs the recipe registry used to resolve recipe-bound
+// records' evidence floors, mirroring PostgresStore.WithRecipes. A
+// recipe-bound RecordVerifiedOutcome without one is refused (fail closed).
+func (m *MemoryStore) WithRecipes(r *RecipeRegistry) *MemoryStore {
+	m.r.SetRecipes(r)
+	return m
+}
+
 // SubmitObligation records an obligation; ObligationID is the idempotency
 // key.
 func (m *MemoryStore) SubmitObligation(ctx context.Context, o VerificationObligation) error {

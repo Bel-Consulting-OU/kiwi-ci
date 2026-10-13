@@ -108,6 +108,24 @@ type VerificationObligation struct {
 	// field refuses a document that sets it rather than silently ignoring
 	// the routing demand.
 	VerifierProviderKind string `json:"verifier_provider_kind,omitempty"`
+	// VerifierContractVersion, when non-empty, pins the provider capability
+	// schema version required to discharge this obligation (see ResolvedDemand).
+	// Optional; empty means no demand on that axis.
+	VerifierContractVersion string `json:"verifier_contract_version,omitempty"`
+	// VerifierClaimClass, when non-empty, pins the claim class the
+	// discharging provider must cover. Optional; empty means no demand on
+	// that axis.
+	VerifierClaimClass string `json:"verifier_claim_class,omitempty"`
+	// VerifierPlatform, when non-empty, pins the execution platform the
+	// discharging provider must cover. Optional; empty means no demand on
+	// that axis.
+	VerifierPlatform string `json:"verifier_platform,omitempty"`
+	// VerifierEvidenceTypes, when non-empty, pins every evidence encoding
+	// the discharging provider must resolve. Optional; empty means no demand
+	// on that axis. Each entry is a hard requirement: a provider whose
+	// capability set does not list it (or the AnyCapability wildcard) is
+	// refused.
+	VerifierEvidenceTypes []string `json:"verifier_evidence_types,omitempty"`
 	// Freshness is the expiry/freshness policy enforced at record time.
 	Freshness FreshnessPolicy `json:"freshness"`
 	// OpaqueCorrelationMetadata is free-form caller correlation state. It is

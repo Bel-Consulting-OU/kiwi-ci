@@ -1,5 +1,10 @@
 package verifyapi
 
+import (
+	"encoding/json"
+	"fmt"
+)
+
 // Epistemic levels for key facts (P10).
 //
 // Every quantity a verification surface carries is known at some epistemic
@@ -126,4 +131,37 @@ func AttestedE[T any](v T) Epistemic[T] {
 // DerivedE tags v as substrate-derived.
 func DerivedE[T any](v T) Epistemic[T] {
 	return Epistemic[T]{Value: v, Level: EpistemicDerived}
+}
+
+// MarshalJSON renders the level as its wire spelling ("observed", …) so a
+// consumer sees the provenance rung, not an opaque ordinal.
+func (e EpistemicLevel) MarshalJSON() ([]byte, error) {
+	return json.Marshal(e.String())
+}
+
+// UnmarshalJSON accepts the wire spelling of a defined rung. An unknown
+// spelling is refused rather than coerced onto EpistemicUnknown, so a new
+// rung must be taught here deliberately.
+func (e *EpistemicLevel) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return err
+	}
+	switch s {
+	case "unknown":
+		*e = EpistemicUnknown
+	case "requested":
+		*e = EpistemicRequested
+	case "configured":
+		*e = EpistemicConfigured
+	case "observed":
+		*e = EpistemicObserved
+	case "attested":
+		*e = EpistemicAttested
+	case "derived":
+		*e = EpistemicDerived
+	default:
+		return fmt.Errorf("%w: epistemic level %q is not a defined rung", ErrInvalid, s)
+	}
+	return nil
 }
