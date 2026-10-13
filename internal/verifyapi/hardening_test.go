@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -35,6 +36,7 @@ func TestAcceptanceV2BindsSubmittedClaim(t *testing.T) {
 				EvidenceRoot:      mustDigest(t, "v2-root"),
 				AttestationDigest: mustDigest(t, "v2-att"),
 				Status:            "success",
+				Attested:          trustedWindow(),
 				Checks:            passChecks("exec-1", CheckJobStatusSuccess, CheckEvidenceRoot),
 			}, nil
 		},
@@ -54,8 +56,8 @@ func TestAcceptanceV2BindsSubmittedClaim(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Accept = %v", err)
 	}
-	if rec.AcceptanceVersion != AcceptanceVersionV2 {
-		t.Fatalf("AcceptanceVersion = %d, want %d (new records write v2)", rec.AcceptanceVersion, AcceptanceVersionV2)
+	if rec.AcceptanceVersion != AcceptanceVersionCurrent {
+		t.Fatalf("AcceptanceVersion = %d, want %d (new records write current)", rec.AcceptanceVersion, AcceptanceVersionCurrent)
 	}
 	if rec.SchemaVersion != SchemaVersion {
 		t.Fatalf("SchemaVersion = %d, want %d", rec.SchemaVersion, SchemaVersion)
@@ -157,6 +159,7 @@ func TestAcceptanceV1StillRestores(t *testing.T) {
 				EvidenceRoot:      mustDigest(t, "v1-root"),
 				AttestationDigest: mustDigest(t, "v1-att"),
 				Status:            "success",
+				Attested:          trustedWindow(),
 				Checks:            passChecks("exec-1", CheckJobStatusSuccess, CheckEvidenceRoot),
 			}, nil
 		},
@@ -237,6 +240,7 @@ func TestSealDerivedOutcomeRefusesClaimIdentityMismatch(t *testing.T) {
 				EvidenceRoot:      mustDigest(t, "id-root"),
 				AttestationDigest: mustDigest(t, "id-att"),
 				Status:            "success",
+				Attested:          trustedWindow(),
 				Checks:            passChecks("exec-1", "digest-match", "signature"),
 			}, nil
 		},
@@ -296,6 +300,7 @@ func sealedForAcceptance(t *testing.T) (VerificationObligation, DerivedVerifiedO
 				EvidenceRoot:      mustDigest(t, "kr-root"),
 				AttestationDigest: mustDigest(t, "kr-att"),
 				Status:            "success",
+				Attested:          trustedWindow(),
 				Checks:            passChecks("exec-1", CheckJobStatusSuccess, CheckEvidenceRoot),
 			}, nil
 		},
@@ -361,7 +366,7 @@ func TestKeyringRotateK2KeepsK1Verify(t *testing.T) {
 		t.Fatalf("Accept under K1 = %v", err)
 	}
 	persisted1 := PersistedVerified{
-		Obligation:     ob, SubmittedClaim: sealed.SubmittedClaim,
+		Obligation: ob, SubmittedClaim: sealed.SubmittedClaim,
 		Outcome: sealed.Outcome, Evidence: sealed.Evidence, Acceptance: rec1,
 	}
 
@@ -369,8 +374,8 @@ func TestKeyringRotateK2KeepsK1Verify(t *testing.T) {
 	if err := ring.Rotate(k2); err != nil {
 		t.Fatalf("Rotate = %v", err)
 	}
-	if ring.CurrentSigningKeyID != "K2" {
-		t.Fatalf("CurrentSigningKeyID = %q, want K2", ring.CurrentSigningKeyID)
+	if ring.CurrentSigningKeyID() != "K2" {
+		t.Fatalf("CurrentSigningKeyID = %q, want K2", ring.CurrentSigningKeyID())
 	}
 
 	// Old record still restores via its own KeyID.
@@ -391,7 +396,7 @@ func TestKeyringRotateK2KeepsK1Verify(t *testing.T) {
 		t.Fatalf("new record KeyID = %q, want K2", rec2.KeyID)
 	}
 	persisted2 := PersistedVerified{
-		Obligation:     ob, SubmittedClaim: sealed.SubmittedClaim,
+		Obligation: ob, SubmittedClaim: sealed.SubmittedClaim,
 		Outcome: sealed.Outcome, Evidence: sealed.Evidence, Acceptance: rec2,
 	}
 	restored2, err := RestoreVerifiedOutcomeWithKeyring(persisted2, nil, ring)
@@ -419,7 +424,7 @@ func TestKeyringResealThenRetireK1(t *testing.T) {
 		t.Fatalf("Accept = %v", err)
 	}
 	persisted := PersistedVerified{
-		Obligation:     ob, SubmittedClaim: sealed.SubmittedClaim,
+		Obligation: ob, SubmittedClaim: sealed.SubmittedClaim,
 		Outcome: sealed.Outcome, Evidence: sealed.Evidence, Acceptance: rec1,
 	}
 
@@ -438,7 +443,9 @@ func TestKeyringResealThenRetireK1(t *testing.T) {
 	} else if !errors.Is(err, ErrAcceptance) {
 		t.Fatalf("retired-key restore error = %v, want ErrAcceptance", err)
 	}
-	ring.VerifyKeys["K1"] = k1
+	if err := ring.Install(k1); err != nil {
+		t.Fatalf("Install K1 = %v", err)
+	}
 
 	// Reseal: verify under K1, re-sign under K2.
 	rec2, resealed, err := ring.ResealPersisted(persisted, time.Date(2026, 1, 4, 0, 0, 0, 0, time.UTC))
@@ -452,7 +459,7 @@ func TestKeyringResealThenRetireK1(t *testing.T) {
 		t.Fatal("resealed record must stay a proven pass")
 	}
 	persisted2 := PersistedVerified{
-		Obligation:     ob, SubmittedClaim: sealed.SubmittedClaim,
+		Obligation: ob, SubmittedClaim: sealed.SubmittedClaim,
 		Outcome: sealed.Outcome, Evidence: sealed.Evidence, Acceptance: rec2,
 	}
 
@@ -487,7 +494,7 @@ func TestKeyringUnknownAndTamperedKeyIDFailClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	persisted := PersistedVerified{
-		Obligation:     ob, SubmittedClaim: sealed.SubmittedClaim,
+		Obligation: ob, SubmittedClaim: sealed.SubmittedClaim,
 		Outcome: sealed.Outcome, Evidence: sealed.Evidence, Acceptance: rec,
 	}
 
@@ -506,7 +513,9 @@ func TestKeyringUnknownAndTamperedKeyIDFailClosed(t *testing.T) {
 	tampered := persisted
 	tampered.Acceptance = persisted.Acceptance
 	tampered.Acceptance.KeyID = "K2"
-	ring.VerifyKeys["K2"] = mustKey(t, "K2", "attacker-secret-32-bytes-long!!!")
+	if err := ring.Install(mustKey(t, "K2", "attacker-secret-32-bytes-long!!!")); err != nil {
+		t.Fatalf("Install K2 = %v", err)
+	}
 	if _, err := RestoreVerifiedOutcomeWithKeyring(tampered, nil, ring); err == nil {
 		t.Fatal("tampered key id must not restore")
 	}
@@ -530,6 +539,70 @@ func TestKeyringRetireRefusesCurrentSigningKey(t *testing.T) {
 	}
 	if err := ring.Retire("K1"); err == nil {
 		t.Fatal("retiring the current signing key must be refused")
+	}
+}
+
+// TestKeyringMapKeyMustMatchKeyID (P2b): a keyring entry whose map key
+// disagrees with the key's own KeyID is refused at construction — a
+// mislabeled entry would let a record's KeyID resolve to the wrong secret.
+func TestKeyringMapKeyMustMatchKeyID(t *testing.T) {
+	k2 := mustKey(t, "K2", "key-two-secret-32-bytes-long!!!!")
+	// keys["K1"] = key(K2): the map key and the key id disagree.
+	if _, err := NewAcceptanceKeyring("K1", map[string]AcceptanceKey{"K1": k2}); err == nil {
+		t.Fatal("map key K1 holding a key whose KeyID is K2 must fail construction")
+	} else if !errors.Is(err, ErrAcceptance) {
+		t.Fatalf("mismatched map key error = %v, want ErrAcceptance", err)
+	}
+	// Correct labeling still constructs.
+	k1 := mustKey(t, "K1", "key-one-secret-32-bytes-long!!!!")
+	if _, err := NewAcceptanceKeyring("K1", map[string]AcceptanceKey{"K1": k1, "K2": k2}); err != nil {
+		t.Fatalf("correctly labeled keyring refused: %v", err)
+	}
+}
+
+// TestKeyringConcurrentAccess (P2a): the keyring is race-safe under
+// concurrent readers and Rotate/Retire/Install writers. Run under -race.
+func TestKeyringConcurrentAccess(t *testing.T) {
+	k1 := mustKey(t, "K1", "key-one-secret-32-bytes-long!!!!")
+	k2 := mustKey(t, "K2", "key-two-secret-32-bytes-long!!!!")
+	k3 := mustKey(t, "K3", "key-three-secret-32-bytes-long!!")
+	ring, err := NewAcceptanceKeyring("K1", map[string]AcceptanceKey{"K1": k1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				_, _ = ring.SigningKey()
+				_, _ = ring.KeyByID("K1")
+				_, _ = ring.KeyByID("K2")
+				_ = ring.CurrentSigningKeyID()
+			}
+		}()
+	}
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 25; j++ {
+				switch id % 3 {
+				case 0:
+					_ = ring.Rotate(k2)
+				case 1:
+					_ = ring.Install(k3)
+				case 2:
+					_ = ring.Retire("K3")
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+	// The keyring must still be coherent after the storm.
+	if _, err := ring.SigningKey(); err != nil {
+		t.Fatalf("SigningKey after concurrent access = %v", err)
 	}
 }
 
@@ -620,6 +693,7 @@ func TestVerifiedCheckOutcomeRequiredForPass(t *testing.T) {
 						EvidenceRoot:      mustDigest(t, "vc-root"),
 						AttestationDigest: mustDigest(t, "vc-att"),
 						Status:            "success",
+						Attested:          trustedWindow(),
 						Checks: []VerifiedCheck{
 							{Name: CheckJobStatusSuccess, Outcome: CheckOutcomePass, EvidenceDigest: mustDigest(t, "vc-root"), ExecutionID: "exec-1"},
 							{Name: CheckEvidenceRoot, Outcome: CheckOutcomePass, EvidenceDigest: mustDigest(t, "vc-root"), ExecutionID: "exec-1"},
@@ -683,8 +757,8 @@ func TestProvenanceCheckOutcomeFromReportCases(t *testing.T) {
 	st, err := provenance.ExecutionAttestationStatement(provenance.ExecutionAttestationInput{
 		RunID: "run-1", JobID: "job-1", JobKey: "build[os=linux]", Generation: 7,
 		Status: "success", StartedAt: &start, FinishedAt: &finish,
-		RunnerIdentity: "runner-a",
-		CapsuleDigest:  strings.Repeat("a", 64),
+		RunnerIdentity:         "runner-a",
+		CapsuleDigest:          strings.Repeat("a", 64),
 		ExecutionCapsuleDigest: strings.Repeat("b", 64),
 		Artifacts: []provenance.ExecutionAttestationArtifact{
 			{Name: "bin", SHA256: strings.Repeat("1", 64), Size: 42, ProvenanceSHA256: strings.Repeat("2", 64)},
@@ -928,4 +1002,115 @@ func modelTestReport(tests, failures, errors int, aPassed, bPassed bool) model.T
 		Errors:   errors,
 		Cases:    cases,
 	}
+}
+
+// TestConflictingCheckEvidenceIsEvidenceInvalid (P3g): a same-name pass+fail
+// disagreement across attestations is a conflict (not first-wins); the check
+// is CheckOutcomeConflict and the attempt's terminal state is
+// evidence_invalid — never a plain pass.
+func TestConflictingCheckEvidenceIsEvidenceInvalid(t *testing.T) {
+	root := mustDigest(t, "conflict-root")
+	resolved := []ResolvedAttestation{
+		{
+			ExecutionID:       "exec-1",
+			EvidenceRoot:      root,
+			AttestationDigest: mustDigest(t, "conflict-att-1"),
+			Status:            "success",
+			Checks: []VerifiedCheck{
+				{Name: "suite-a", Outcome: CheckOutcomePass, EvidenceDigest: mustDigest(t, "suite-1"), ExecutionID: "exec-1"},
+			},
+		},
+		{
+			ExecutionID:       "exec-2",
+			EvidenceRoot:      root,
+			AttestationDigest: mustDigest(t, "conflict-att-2"),
+			Status:            "success",
+			Checks: []VerifiedCheck{
+				{Name: "suite-a", Outcome: CheckOutcomeFail, EvidenceDigest: mustDigest(t, "suite-2"), ExecutionID: "exec-2"},
+			},
+		},
+	}
+	checks := deriveVerifiedChecks(resolved, root)
+	var suite *VerifiedCheck
+	for i := range checks {
+		if checks[i].Name == "suite-a" {
+			suite = &checks[i]
+		}
+	}
+	if suite == nil {
+		t.Fatal("suite-a missing from derived checks")
+	}
+	if suite.Outcome != CheckOutcomeConflict {
+		t.Fatalf("suite-a outcome = %q, want conflict (not first-wins %q)", suite.Outcome, CheckOutcomePass)
+	}
+	if suite.Passed() {
+		t.Fatal("a conflicted check must never pass")
+	}
+	if !hasCheckConflicts(checks) {
+		t.Fatal("hasCheckConflicts must report the conflict")
+	}
+	// A conflicted evidence set is evidence_invalid, never a plain pass.
+	d := DerivedVerifiedOutcome{}
+	term, coarse := verifiedTerminal(d)
+	_ = term
+	_ = coarse
+	// Build the terminal from a derived shape carrying the conflict.
+	sealedShape := DerivedVerifiedOutcome{
+		Outcome:  VerificationOutcome{Outcome: OutcomePass},
+		Evidence: VerifiedEvidence{VerifiedChecks: checks},
+	}
+	// verifiedTerminal reads Evidence.VerifiedChecks via hasCheckConflicts;
+	// craft via the exported comparison path instead.
+	src, err := VerifiedFromDerived("c-conflict", mustSealWithChecks(t, checks), 0)
+	if err != nil {
+		t.Fatalf("VerifiedFromDerived = %v", err)
+	}
+	cmp, err := CompareVerifiedCandidates("", []VerifiedCandidateSource{src}, nil)
+	if err != nil {
+		t.Fatalf("CompareVerifiedCandidates = %v", err)
+	}
+	if cmp.Candidates[0].Terminal != TerminalEvidenceInvalid {
+		t.Fatalf("terminal = %q, want evidence_invalid", cmp.Candidates[0].Terminal)
+	}
+	if cmp.Candidates[0].Outcome != TerminalEvidenceInvalid.ProjectCoarse() {
+		t.Fatalf("coarse = %q", cmp.Candidates[0].Outcome)
+	}
+	_ = sealedShape
+}
+
+// mustSealWithChecks seals a minimal DerivedVerifiedOutcome carrying the
+// given derived check set (for comparison-path tests).
+func mustSealWithChecks(t *testing.T, checks []VerifiedCheck) DerivedVerifiedOutcome {
+	t.Helper()
+	iv := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	v := VerificationOutcome{
+		VerificationID:   "ver-conflict",
+		ObligationID:     "ob-conflict",
+		CandidateDigest:  mustDigest(t, "conflict-cand"),
+		SnapshotDigest:   mustDigest(t, "conflict-snap"),
+		ContractDigest:   mustDigest(t, "conflict-contract"),
+		Outcome:          OutcomePass,
+		AssuranceProfile: model.AssuranceUncontrolled.Name(),
+		CompletedChecks:  []string{CheckJobStatusSuccess},
+		ExecutionIDs:     []string{"exec-1"},
+		EvidenceRoot:     mustDigest(t, "conflict-root"),
+		Resources:        ResourceFacts{RunnerClass: "standard"},
+		StartedAt:        iv,
+		CompletedAt:      iv.Add(time.Second),
+	}
+	ev := VerifiedEvidence{
+		ExecutionIDs:       []string{"exec-1"},
+		EvidenceRoot:       mustDigest(t, "conflict-root"),
+		AttestationDigests: []Digest{mustDigest(t, "conflict-att")},
+		JobStatus:          "success",
+		CompletedChecks:    []string{CheckJobStatusSuccess},
+		VerifiedChecks:     checks,
+		VerifierIdentity:   "conflict-verifier/v1",
+		VerifiedAt:         iv,
+	}
+	sealed, err := sealDerivedOutcome(v, v, ev)
+	if err != nil {
+		t.Fatalf("sealDerivedOutcome = %v", err)
+	}
+	return sealed
 }

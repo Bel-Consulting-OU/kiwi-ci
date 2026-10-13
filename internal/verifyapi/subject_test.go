@@ -54,13 +54,13 @@ func TestSubjectRefValidateHierarchy(t *testing.T) {
 		}
 	}
 	invalid := map[string]SubjectRef{
-		"zero":               {},
-		"tenant-only":        {TenantID: "acme"},
-		"project-only":       {ProjectID: "payments"},
-		"repository-only":    {RepositoryID: "github.com/acme/service"},
-		"tenant/project":     {TenantID: "acme", ProjectID: "payments"},
-		"tenant/repository":  {TenantID: "acme", RepositoryID: "github.com/acme/service"},
-		"namespace/project":  {AuthorityNamespace: "github.com", ProjectID: "payments"},
+		"zero":              {},
+		"tenant-only":       {TenantID: "acme"},
+		"project-only":      {ProjectID: "payments"},
+		"repository-only":   {RepositoryID: "github.com/acme/service"},
+		"tenant/project":    {TenantID: "acme", ProjectID: "payments"},
+		"tenant/repository": {TenantID: "acme", RepositoryID: "github.com/acme/service"},
+		"namespace/project": {AuthorityNamespace: "github.com", ProjectID: "payments"},
 		"namespace/repository": {
 			AuthorityNamespace: "github.com", RepositoryID: "github.com/acme/service",
 		},
@@ -167,10 +167,10 @@ func TestObligationValidateRequiresHierarchy(t *testing.T) {
 		t.Fatalf("namespace-only digest = %v", err)
 	}
 	for name, bad := range map[string]SubjectRef{
-		"zero":               {},
-		"tenant-only":        {TenantID: "acme"},
-		"namespace/project":  {AuthorityNamespace: "github.com", ProjectID: "payments"},
-		"namespace/repo":     {AuthorityNamespace: "github.com", RepositoryID: "github.com/acme/service"},
+		"zero":              {},
+		"tenant-only":       {TenantID: "acme"},
+		"namespace/project": {AuthorityNamespace: "github.com", ProjectID: "payments"},
+		"namespace/repo":    {AuthorityNamespace: "github.com", RepositoryID: "github.com/acme/service"},
 		"namespace/tenant/repo": {
 			AuthorityNamespace: "github.com", TenantID: "acme", RepositoryID: "github.com/acme/service",
 		},
@@ -331,5 +331,74 @@ func TestCloneObligationCopiesSubjectRef(t *testing.T) {
 	}
 	if !c.SubjectReference().Equal(ref) {
 		t.Fatalf("clone subject = %v, want %v", c.SubjectReference(), ref)
+	}
+}
+
+// TestSpeculativeGroupSubjectRefBindsMembers (P2d): member obligations must
+// share the group subject or be validated descendants; the subject is bound
+// into group identity via CanonicalGroupDigest.
+func TestSpeculativeGroupSubjectRefBindsMembers(t *testing.T) {
+	groupSubject := SubjectRef{AuthorityNamespace: "github.com", TenantID: "acme", ProjectID: "payments"}
+	repo := groupSubject
+	repo.RepositoryID = "github.com/acme/service"
+	sibling := SubjectRef{AuthorityNamespace: "github.com", TenantID: "other", ProjectID: "payments"}
+
+	d1 := mustDigest(t, "cand-a")
+	group := SpeculativeGroup{
+		VerificationGroupID: "grp-subj",
+		BaseSnapshotDigest:  mustDigest(t, "base"),
+		SubjectRef:          &groupSubject,
+		CandidateDigests:    map[string]Digest{"a": d1},
+	}
+	if err := group.Validate(); err != nil {
+		t.Fatalf("Validate = %v", err)
+	}
+	out := VerificationOutcome{
+		Resources: ResourceFacts{
+			Speculative:         true,
+			VerificationGroupID: "grp-subj",
+			CandidateID:         "a",
+		},
+		CandidateDigest: d1,
+		SnapshotDigest:  mustDigest(t, "base"),
+	}
+
+	// Same subject joins.
+	obSame := VerificationObligation{ObligationID: "ob-same", SubjectRef: &groupSubject}
+	if err := BindGroup(group, &obSame, out); err != nil {
+		t.Fatalf("same subject refused: %v", err)
+	}
+	// Validated descendant joins.
+	obRepo := VerificationObligation{ObligationID: "ob-repo", SubjectRef: &repo}
+	if err := BindGroup(group, &obRepo, out); err != nil {
+		t.Fatalf("descendant refused: %v", err)
+	}
+	// Sibling tenant is not a descendant: refused.
+	obSib := VerificationObligation{ObligationID: "ob-sib", SubjectRef: &sibling}
+	if err := BindGroup(group, &obSib, out); err == nil {
+		t.Fatal("sibling tenant must be refused")
+	}
+	// Group identity binds the subject: the same candidate set under a
+	// different subject is a different group.
+	other := group
+	otherSubj := repo
+	other.SubjectRef = &otherSubj
+	dg1, err := CanonicalGroupDigest(group)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dg2, err := CanonicalGroupDigest(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dg1 == dg2 {
+		t.Fatal("CanonicalGroupDigest must separate subjects")
+	}
+	// Invalid group subject hierarchy is refused at Validate.
+	bad := group
+	badSubj := SubjectRef{TenantID: "acme"}
+	bad.SubjectRef = &badSubj
+	if err := bad.Validate(); err == nil {
+		t.Fatal("invalid group subject hierarchy must be refused")
 	}
 }

@@ -111,6 +111,46 @@ ranking. A scoring layer applies its own utility on top.
 `FactSource` values map onto the ladder (`EpistemicLevelOf`). New key facts
 can be tagged with `Epistemic[T]` so consumers require a minimum rung.
 
+## 8. Portable proof signatures (`internal/portableproof`)
+
+`VerificationProof.Verify` re-checks the bundle under the HMAC acceptance
+keyring — the durable store contract between the server and the store. A
+proof that leaves that boundary (archived with an artifact, shipped to an
+evidence consumer, audited by a third party) must verify without handing out
+the sealing secret. `internal/portableproof` adds that asymmetric layer;
+the HMAC record is retained untouched inside the proof.
+
+**Signature schema** (`portableproof.SignatureSchemaVersion` = 1):
+
+| Field | Meaning |
+| --- | --- |
+| `schema_version` | 1; unknown versions are refused |
+| `algorithm` | `Ed25519` (the only algorithm) |
+| `key_id` | discovery-document identity of the signing key |
+| `signed_at` | operator clock at signing (audit only, not freshness) |
+| `signature` | base64 raw Ed25519 signature over the exact proof JSON bytes |
+
+`SignedProof` carries the proof as raw JSON: the signature covers the bytes
+as transmitted, so any byte-level tamper is a refusal. Verification is
+public-key only (`Verify` / `VerifySignedProof` / `VerifyWithDiscovery`) —
+the consumer cannot forge, and the layer answers exactly one question: were
+these bytes signed by the holder of the private half of this key. It does
+not interpret the proof's claims and does not evaluate the HMAC record.
+
+**Public-key discovery document** (`PublicKeyDiscovery`, schema
+`DiscoverySchemaVersion` = 1) publishes each `PublicKeyDoc`: `key_id`,
+`algorithm`, base64 raw `public_key`, `status` (`active` / `rotated` /
+`revoked`), `created_at`, optional `superseded_by_key_id`, and an operator
+`note` — the rotation / revocation explanation a consumer reads without a
+second channel. `Rotate` moves the predecessor to `rotated` (historical
+signatures still verify) and activates the successor; `Revoke` refuses every
+signature under the key from that moment. Verification is fail closed:
+unknown key id, revoked key, wrong algorithm, malformed key and any mutation
+are refusals, never partial trust.
+
+The layer is product-neutral: it speaks about evidence consumers and
+external controllers, never about a specific consumer product.
+
 ## Related documents
 
 - [evidence-contract.md](evidence-contract.md) covers the signed evidence

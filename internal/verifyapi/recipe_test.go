@@ -173,17 +173,17 @@ func TestRecipeLiveAndBindRecipe(t *testing.T) {
 	if bound.Freshness.MaxAgeSeconds != 3600 {
 		t.Fatalf("bound freshness not inherited: %+v", bound.Freshness)
 	}
-	// Caller-set dimensions are preserved.
+	// Caller-set dimensions that disagree with the recipe are refused:
+	// the recipe owns the demand, so a weaker inline demand cannot ride
+	// along under a strong recipe digest.
 	pinned := ob
 	pinned.RequiredChecks = []string{"custom"}
 	pinned.RequiredAssurance = "attested-v1"
 	pinned.Freshness = FreshnessPolicy{MaxAgeSeconds: 60}
-	bound2, err := BindRecipe(pinned, r, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(bound2.RequiredChecks) != 1 || bound2.RequiredChecks[0] != "custom" {
-		t.Fatalf("caller checks overwritten: %+v", bound2.RequiredChecks)
+	if _, err := BindRecipe(pinned, r, now); err == nil {
+		t.Fatal("BindRecipe must refuse caller-set dimensions that disagree with the recipe")
+	} else if !errors.Is(err, ErrBinding) {
+		t.Fatalf("disagreeing dimensions error = %v, want ErrBinding", err)
 	}
 
 	// A withdrawn recipe cannot mint new demand.

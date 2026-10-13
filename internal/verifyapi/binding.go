@@ -301,13 +301,19 @@ func (r ResourceFacts) validate() error {
 }
 
 // Validate reports whether the speculative group is structurally sound: a
-// pinned shared base, and a non-empty candidate set with valid digests.
+// pinned shared base, a valid authority subject when one is set, and a
+// non-empty candidate set with valid digests.
 func (g SpeculativeGroup) Validate() error {
 	if g.VerificationGroupID == "" {
 		return fmt.Errorf("%w: verification_group_id is required", ErrInvalid)
 	}
 	if err := validateDigest("base_snapshot_digest", g.BaseSnapshotDigest); err != nil {
 		return err
+	}
+	if g.SubjectRef != nil && !g.SubjectRef.IsZero() {
+		if err := g.SubjectRef.ValidateHierarchy(); err != nil {
+			return fmt.Errorf("%w: speculative group subject: %v", ErrInvalid, err)
+		}
 	}
 	if len(g.CandidateDigests) == 0 {
 		return fmt.Errorf("%w: candidate_digests must be non-empty", ErrInvalid)
@@ -321,6 +327,29 @@ func (g SpeculativeGroup) Validate() error {
 		}
 	}
 	return nil
+}
+
+// SubjectReference returns the group's authority subject. A nil SubjectRef
+// yields the zero reference (legacy single-tenant shape).
+func (g SpeculativeGroup) SubjectReference() SubjectRef {
+	if g.SubjectRef == nil {
+		return SubjectRef{}
+	}
+	return *g.SubjectRef
+}
+
+// CanonicalGroupDigest commits the group's identity: the verification group
+// id, the shared base snapshot, the authority subject and the pinned
+// candidate set. The same candidate set under a different SubjectRef hashes
+// differently — the subject is bound into group identity (P2d), so the
+// groups are never interchangeable authority.
+func CanonicalGroupDigest(g SpeculativeGroup) (Digest, error) {
+	n := g
+	if n.SubjectRef != nil {
+		s := *n.SubjectRef
+		n.SubjectRef = &s
+	}
+	return canonicalDigest("speculative-group", n)
 }
 
 // Bind enforces the binding rule: the outcome is accepted for the obligation
@@ -378,11 +407,15 @@ func Bind(obligation VerificationObligation, outcome VerificationOutcome, now ti
 	return obligation.CheckFreshness(now, outcome.StartedAt, outcome.CompletedAt)
 }
 
-// BindGroup enforces speculative-group comparability: the outcome must be a
-// member of the named group, under the candidate id it claims, and must bind
-// to the group's shared base snapshot. Anything else is refused — a resource
-// comparison across different base states is meaningless.
-func BindGroup(group SpeculativeGroup, outcome VerificationOutcome) error {
+// BindGroup enforces speculative-group comparability and subject membership:
+// the outcome must be a member of the named group, under the candidate id it
+// claims, bound to the group's shared base snapshot. When obligation is
+// non-nil, its authority subject must also be the group's subject or a
+// validated descendant the group subject Includes (P2d). Pass nil only on
+// paths where membership was already enforced at record time (e.g. group
+// comparison reads). Anything else is refused — a resource comparison across
+// different base states or authority subjects is meaningless.
+func BindGroup(group SpeculativeGroup, obligation *VerificationObligation, outcome VerificationOutcome) error {
 	if err := group.Validate(); err != nil {
 		return err
 	}
@@ -402,6 +435,32 @@ func BindGroup(group SpeculativeGroup, outcome VerificationOutcome) error {
 	}
 	if outcome.SnapshotDigest != group.BaseSnapshotDigest {
 		return fmt.Errorf("%w: snapshot digest %s does not match group base %s", ErrGroupBinding, outcome.SnapshotDigest, group.BaseSnapshotDigest)
+	}
+	if obligation != nil {
+		return bindGroupSubject(group, *obligation)
+	}
+	return nil
+}
+
+// bindGroupSubject enforces the P2d subject rule: when the group pins an
+// authority subject, the member obligation's subject must be the group's
+// subject or a validated descendant the group subject Includes. A zero
+// group subject is the legacy shape and imposes no subject constraint
+// (the subject is bound into group identity only when the group pins one).
+func bindGroupSubject(group SpeculativeGroup, obligation VerificationObligation) error {
+	gs := group.SubjectReference()
+	if gs.IsZero() {
+		return nil
+	}
+	member := obligation.SubjectReference()
+	if member.Equal(gs) {
+		return nil
+	}
+	if err := member.ValidateHierarchy(); err != nil {
+		return fmt.Errorf("%w: member obligation %q subject is not a valid hierarchy: %v", ErrGroupBinding, obligation.ObligationID, err)
+	}
+	if !gs.Includes(member) {
+		return fmt.Errorf("%w: member obligation %q subject %s is not group subject %s or a descendant", ErrGroupBinding, obligation.ObligationID, member, gs)
 	}
 	return nil
 }

@@ -47,6 +47,10 @@ func newVerificationServer(t *testing.T) *Server {
 	clock := func() time.Time { return now }
 	st := verifyapi.NewMemoryStore(clock)
 	root := testDigest("evidence-root")
+	// Attested job window (after the obligations' issued_at, inside their
+	// max-age) so freshness is attested authority — never caller-typed.
+	attStart := time.Date(2026, 1, 2, 3, 4, 6, 0, time.UTC)
+	attFinish := time.Date(2026, 1, 2, 3, 4, 7, 0, time.UTC)
 	verifier := &verifyapi.FuncEvidenceVerifier{
 		Identity: "server-test-verifier/v1",
 		Clock:    clock,
@@ -57,6 +61,10 @@ func newVerificationServer(t *testing.T) *Server {
 				AttestationDigest: testDigest("att-digest"),
 				Status:            string(model.StatusSuccess),
 				Facts:             &model.ExecutionFacts{FilesystemIsolated: true},
+				Attested: &verifyapi.AttestedResourceFacts{
+					StartedAt:  attStart,
+					FinishedAt: attFinish,
+				},
 			}, nil
 		},
 	}

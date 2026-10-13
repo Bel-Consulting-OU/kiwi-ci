@@ -41,6 +41,16 @@ func passChecks(execID string, names ...string) []VerifiedCheck {
 	return out
 }
 
+// trustedWindow is the attested job window fixtures attach so the verifier's
+// freshness authority sees a non-unknown source and a sealed pass can stand.
+// The interval matches baseOutcome's execution window.
+func trustedWindow() *AttestedResourceFacts {
+	return &AttestedResourceFacts{
+		StartedAt:  time.Date(2026, 1, 2, 3, 4, 6, 0, time.UTC),
+		FinishedAt: time.Date(2026, 1, 2, 3, 4, 15, 0, time.UTC),
+	}
+}
+
 func baseObligation(t *testing.T) VerificationObligation {
 	t.Helper()
 	return VerificationObligation{
@@ -490,8 +500,14 @@ func TestSpeculativeGroupThreeCandidatesSharedBase(t *testing.T) {
 		if row.Resources != stats[wantOrder[i]] && !equalFacts(row.Resources, stats[wantOrder[i]]) {
 			t.Fatalf("row %s facts = %+v, want %+v", row.CandidateID, row.Resources, stats[wantOrder[i]])
 		}
-		if row.Outcome != OutcomePass {
-			t.Fatalf("row %s outcome = %v, want pass", row.CandidateID, row.Outcome)
+		// These are claim-only rows (RecordOutcome, never RecordVerifiedOutcome):
+		// a claim is never projected into a plain pass regardless of the
+		// claimed outcome.
+		if row.Authority != RowAuthorityClaim {
+			t.Fatalf("row %s authority = %q, want claim", row.CandidateID, row.Authority)
+		}
+		if row.Outcome != OutcomePartial {
+			t.Fatalf("row %s outcome = %v, want partial (claim never projects to pass)", row.CandidateID, row.Outcome)
 		}
 	}
 	if cmp.BaseSnapshotDigest != base {
@@ -727,7 +743,8 @@ func sameCandidateFacts(a, b CandidateFacts) bool {
 	if a.CandidateID != b.CandidateID ||
 		a.CandidateDigest != b.CandidateDigest ||
 		a.VerificationID != b.VerificationID ||
-		a.Outcome != b.Outcome {
+		a.Outcome != b.Outcome ||
+		a.Authority != b.Authority {
 		return false
 	}
 	ar, br := a.Resources, b.Resources

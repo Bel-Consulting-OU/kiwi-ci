@@ -58,12 +58,17 @@ const (
 	// pass/fail/error (empty suite, all skipped, or no resolvable report).
 	// Incomplete never satisfies an obligation requirement.
 	CheckOutcomeIncomplete CheckOutcome = "incomplete"
+	// CheckOutcomeConflict: the same-named check carries contradictory
+	// evidence-derived outcomes across attestations (e.g. one pass and one
+	// fail). The conflict is NOT resolved first-wins; the check is invalid
+	// and the attempt's terminal state is evidence_invalid (P3g).
+	CheckOutcomeConflict CheckOutcome = "conflict"
 )
 
 // Valid reports whether o is one of the closed check-outcome vocabulary values.
 func (o CheckOutcome) Valid() bool {
 	switch o {
-	case CheckOutcomePass, CheckOutcomeFail, CheckOutcomeError, CheckOutcomeIncomplete:
+	case CheckOutcomePass, CheckOutcomeFail, CheckOutcomeError, CheckOutcomeIncomplete, CheckOutcomeConflict:
 		return true
 	}
 	return false
@@ -92,7 +97,20 @@ type VerifiedCheck struct {
 }
 
 // Passed reports whether this check satisfies an obligation requirement.
+// A conflicted check never passes.
 func (c VerifiedCheck) Passed() bool { return c.Outcome == CheckOutcomePass }
+
+// hasCheckConflicts reports whether any check carries the conflict marker
+// (P3g): same-name evidence-derived outcomes that disagree across
+// attestations. A conflicted evidence set is invalid — never first-wins.
+func hasCheckConflicts(checks []VerifiedCheck) bool {
+	for _, c := range checks {
+		if c.Outcome == CheckOutcomeConflict {
+			return true
+		}
+	}
+	return false
+}
 
 // VerifiedEvidence is the cryptographically resolved evidence of one outcome.
 // Every field is produced by the verifier from signature-checked attestation
@@ -114,6 +132,17 @@ type VerifiedEvidence struct {
 	// case Measured.WallTimeNS stays unfilled rather than guessed. Filled
 	// exclusively from signature-checked attestation material.
 	Attested *AttestedResourceFacts `json:"attested,omitempty"`
+	// Window is the authoritative execution window derived from the
+	// resolved evidence, tagged with the source that established it. A
+	// caller-typed claim window is never a source: when the attestations
+	// carry no window the source is WindowSourceUnknown and freshness is
+	// UNKNOWN (never satisfied). See ExecutionWindow.
+	Window ExecutionWindow `json:"window"`
+	// Kinds lists the evidence kinds the verifier derived as present
+	// (EvidenceKindExecutionAttestation, EvidenceKindTestReport, …). It is
+	// computed from the resolved material, never caller-asserted, and is
+	// what Recipe.EvidenceMinimum.RequiredKinds is matched against.
+	Kinds []string `json:"kinds,omitempty"`
 	// JobStatus is the consensus signed job status derived from the
 	// attestations: "success" only when every attestation reports success,
 	// "failure" when any reports failure, otherwise "incomplete".
@@ -223,6 +252,12 @@ type ResolvedAttestation struct {
 	// window; the verifier then records no attested wall time instead of
 	// inventing one.
 	Attested *AttestedResourceFacts
+	// ObserverWindow is the observer-reported execution window the signed
+	// statement carries (a verified observer report), when it is not the
+	// job's own attested window. It is weaker authority than Attested:
+	// a freshness demand of RequireAttestedWindow is never satisfied by
+	// it alone. Nil when the statement carries no observer window.
+	ObserverWindow *AttestedResourceFacts
 	// Checks are the evidence-derived check results this attestation binds.
 	// Each entry carries a Name plus an Outcome derived from signed result
 	// material (test-report cases, explicit signed check results) — never a
@@ -331,7 +366,17 @@ func (f *FuncEvidenceVerifier) Verify(ctx context.Context, obligation Verificati
 	assurance := deriveAssurance(resolved)
 	observed := mergeObserved(resolved)
 	attested := mergeAttested(resolved)
-	start, end := deriveWindow(submittedClaim, attested)
+	observer := mergeObserver(resolved)
+	window := deriveWindow(submittedClaim, attested, observer)
+	kinds := deriveEvidenceKinds(resolved, verifiedChecks)
+	// Freshness authority: a caller-typed window is never a source, so an
+	// Unknown window leaves freshness UNKNOWN (NOT satisfied). A pass claim
+	// without a trusted execution window is downgraded — it can never
+	// discharge as a proven pass.
+	result := deriveResult(obligation, jobStatus, verifiedChecks, assurance)
+	if result == OutcomePass && !window.SatisfiesFreshness(MinWindowForRequireAttested(false)) {
+		result = OutcomePartial
+	}
 
 	derived := VerificationOutcome{
 		VerificationID:   submittedClaim.VerificationID,
@@ -339,7 +384,7 @@ func (f *FuncEvidenceVerifier) Verify(ctx context.Context, obligation Verificati
 		CandidateDigest:  obligation.ImmutableCandidateDigest,
 		SnapshotDigest:   obligation.SourceSnapshotDigest,
 		ContractDigest:   obligation.VerificationContractDigest,
-		Outcome:          deriveResult(obligation, jobStatus, verifiedChecks, assurance),
+		Outcome:          result,
 		AssuranceProfile: assurance.Name(),
 		CompletedChecks:  completed,
 		ExecutionIDs:     append([]string(nil), execIDs...),
@@ -364,8 +409,8 @@ func (f *FuncEvidenceVerifier) Verify(ctx context.Context, obligation Verificati
 			VerificationGroupID: submittedClaim.Resources.VerificationGroupID,
 			CandidateID:         submittedClaim.Resources.CandidateID,
 		},
-		StartedAt:      start,
-		CompletedAt:    end,
+		StartedAt:      window.StartedAt,
+		CompletedAt:    window.CompletedAt,
 		ProvenanceRefs: append([]string(nil), submittedClaim.ProvenanceRefs...),
 	}
 	derived.Resources.Measured = DeriveMeasuredFacts(derived, attested)
@@ -379,6 +424,8 @@ func (f *FuncEvidenceVerifier) Verify(ctx context.Context, obligation Verificati
 		EvidenceRoot:       root,
 		AttestationDigests: digests,
 		Attested:           attested,
+		Window:             window,
+		Kinds:              kinds,
 		JobStatus:          jobStatus,
 		CompletedChecks:    completed,
 		VerifiedChecks:     verifiedChecks,
@@ -387,6 +434,36 @@ func (f *FuncEvidenceVerifier) Verify(ctx context.Context, obligation Verificati
 		VerifierIdentity:   f.Identity,
 		VerifiedAt:         now(),
 	})
+}
+
+// deriveEvidenceKinds computes the verifier-derived evidence-kind set: a
+// resolved execution attestation is always "execution-attestation", and a
+// check whose verdict was derived from signed test-report material (its
+// EvidenceDigest is a suite digest, not the shared evidence root) is
+// "test-report". Never caller strings.
+func deriveEvidenceKinds(resolved []ResolvedAttestation, checks []VerifiedCheck) []string {
+	seen := map[string]bool{}
+	var kinds []string
+	add := func(k string) {
+		if !seen[k] {
+			seen[k] = true
+			kinds = append(kinds, k)
+		}
+	}
+	if len(resolved) > 0 {
+		add(EvidenceKindExecutionAttestation)
+	}
+	var root Digest
+	if len(resolved) > 0 {
+		root = resolved[0].EvidenceRoot
+	}
+	for _, c := range checks {
+		if c.EvidenceDigest != "" && c.EvidenceDigest != root {
+			add(EvidenceKindTestReport)
+			break
+		}
+	}
+	return kinds
 }
 
 // bindIdentity enforces the claim-addressing rule: the submission must answer
@@ -486,26 +563,65 @@ func deriveVerifiedChecks(resolved []ResolvedAttestation, root Digest) []Verifie
 			EvidenceDigest: root,
 		})
 	}
-	seen := map[string]bool{CheckJobStatusSuccess: true, CheckEvidenceRoot: true}
-	named := make([]VerifiedCheck, 0, len(resolved))
+	// Aggregate every attestation's result per name instead of first-wins
+	// (P3g): a same-name pass+fail (or pass+error) disagreement is a
+	// conflict and the check is evidence_invalid — never silently resolved
+	// to whichever attestation happened to arrive first. Structural names
+	// are already emitted above and are not re-derived here.
+	type agg struct {
+		pass, fail, error, incomplete bool
+		first                         VerifiedCheck
+	}
+	buckets := map[string]*agg{}
+	order := make([]string, 0, len(resolved))
 	for _, att := range resolved {
 		for _, c := range att.Checks {
-			if c.Name == "" || seen[c.Name] {
+			if c.Name == "" || c.Name == CheckJobStatusSuccess || c.Name == CheckEvidenceRoot {
 				continue
 			}
-			seen[c.Name] = true
-			// The resolver already derived the outcome from signed material;
-			// stamp the execution identity and (when absent) the attestation's
-			// evidence root as the evidence digest.
-			vc := c
-			if vc.ExecutionID == "" {
-				vc.ExecutionID = att.ExecutionID
+			a, ok := buckets[c.Name]
+			if !ok {
+				vc := c
+				if vc.ExecutionID == "" {
+					vc.ExecutionID = att.ExecutionID
+				}
+				if vc.EvidenceDigest == "" {
+					vc.EvidenceDigest = att.EvidenceRoot
+				}
+				a = &agg{first: vc}
+				buckets[c.Name] = a
+				order = append(order, c.Name)
 			}
-			if vc.EvidenceDigest == "" {
-				vc.EvidenceDigest = att.EvidenceRoot
+			switch c.Outcome {
+			case CheckOutcomePass:
+				a.pass = true
+			case CheckOutcomeFail:
+				a.fail = true
+			case CheckOutcomeError:
+				a.error = true
+			default:
+				a.incomplete = true
 			}
-			named = append(named, vc)
 		}
+	}
+	named := make([]VerifiedCheck, 0, len(order))
+	for _, name := range order {
+		a := buckets[name]
+		vc := a.first
+		switch {
+		case a.pass && a.fail, a.pass && a.error:
+			// Contradictory evidence for one name: conflict, not first-wins.
+			vc.Outcome = CheckOutcomeConflict
+		case a.pass:
+			vc.Outcome = CheckOutcomePass
+		case a.fail:
+			vc.Outcome = CheckOutcomeFail
+		case a.error:
+			vc.Outcome = CheckOutcomeError
+		default:
+			vc.Outcome = CheckOutcomeIncomplete
+		}
+		named = append(named, vc)
 	}
 	sort.SliceStable(named, func(i, j int) bool { return named[i].Name < named[j].Name })
 	return append(out, named...)
@@ -619,16 +735,6 @@ func deriveResult(obligation VerificationObligation, jobStatus string, checks []
 		return OutcomePartial
 	}
 	return OutcomePass
-}
-
-// deriveWindow picks the authoritative execution window: the attested job
-// window when the evidence carries one (so freshness cannot be satisfied by a
-// caller-typed interval), else the claim's proposed window.
-func deriveWindow(claim VerificationOutcome, attested *AttestedResourceFacts) (start, end time.Time) {
-	if attested != nil && !attested.StartedAt.IsZero() && !attested.FinishedAt.IsZero() {
-		return attested.StartedAt, attested.FinishedAt
-	}
-	return claim.StartedAt, claim.CompletedAt
 }
 
 // mergeAttested folds the attested job facts of every resolved attestation

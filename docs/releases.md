@@ -354,6 +354,51 @@ Re-establish every canonical gate before the next release is cut.
 An unaudited bypass voids the release's supply-chain claims.
 
 
+## Release-artifact corpus policy
+
+The compatibility corpora under `testdata/compat/` (`n-1/`, `n-2/`) are
+release-artifact corpora: frozen producer output that HEAD must keep
+consuming across upgrades (`internal/storage/compat_corpus_test.go`). Their
+identity is the producer's exact bytes, not only a git commit that can be
+rebuilt differently under another toolchain.
+
+Every corpus `MANIFEST` records both:
+
+| Field | Meaning |
+| --- | --- |
+| `producer.commit` | full 40-char git SHA of the producer tree |
+| `producer.binary_sha256` | SHA-256 of the producer product binary (`go build ./cmd/kiwi`) of that exact tree, hash-pinned at corpus-freeze time |
+
+`TestCompatCorpusNMinusOneConsumedByHead` and
+`TestCompatCorpusNMinusTwoConsumedByHead` refuse a corpus whose `MANIFEST`
+omits `binary_sha256` or carries a non-hex value. A commit alone is not a
+corpus identity: the same source can produce different binary bytes under a
+different `go` toolchain, and a fixture claimed to come from "the N-1
+release" must say which N-1 artifact bytes it was produced with.
+
+Policy for regenerating a corpus (rare — the files are immutable by
+contract, and regenerating under changed encoding is a breaking change that
+fails the consumer tests):
+
+1. Build the producer product binary from the producer commit (or, better,
+   use the actual released artifact for that version and pin its exact
+   bytes via `KIWI_N_MINUS_ONE_BIN` / `KIWI_N_MINUS_ONE_SHA256`).
+2. Emit the corpus files from that tree's own storage APIs.
+3. Record `producer.commit`, `producer.binary_sha256` (the exact bytes
+   hash of the producer binary), `producer.method` and `producer.go_version`
+   in the `MANIFEST`, and the per-file SHA-256 map.
+4. Never rewrite an existing corpus in place. Add a new generation directory
+   and teach HEAD to consume both.
+
+The release-artifact dogfood proofs (`make dogfood-release-artifacts`:
+N-1→N upgrade, G1→G2 self-build, packaged-artifact install) follow the same
+identity rule: the N-1 side is either a hash-pinned released binary
+(`KIWI_N_MINUS_ONE_BIN` + `KIWI_N_MINUS_ONE_SHA256`) or a worktree build
+whose failure is fail-closed under `KIWI_REQUIRE_N_MINUS_ONE=1`. Automation
+that must certify "HEAD consumes the previous release" supplies the released
+artifact and its pinned SHA-256, never a locally rebuilt stand-in.
+
+
 ## Dependency licenses
 
 Third-party licensing is gated by `scripts/license-check.sh`

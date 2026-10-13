@@ -26,7 +26,12 @@ jobs:
         with:
           go-version-file: go.mod
       - name: gofmt
-        run: test -z "$(gofmt -l .)"
+        run: |
+          files="$(gofmt -l .)"
+          if [ -n "$files" ]; then
+            printf 'Files requiring gofmt:\n%s\n' "$files"
+            exit 1
+          fi
       - name: vet
         run: go vet ./...
       - name: surface checks
@@ -64,7 +69,7 @@ jobs:
         with:
           go-version-file: go.mod
       - name: race-sensitive packages
-        run: go test -race -count=1 -timeout=40m ./internal/server/ ./internal/storage/ ./internal/runner/ ./internal/app/
+        run: go test -race -count=1 -timeout=40m ./internal/server/ ./internal/storage/ ./internal/runner/ ./internal/app/ ./internal/verifyapi/
 
   fuzz-smoke:
     name: fuzz smoke

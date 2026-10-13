@@ -4,6 +4,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
 func testCandidateFact(t *testing.T, id string) CandidateFact {
@@ -15,6 +17,7 @@ func testCandidateFact(t *testing.T, id string) CandidateFact {
 		Terminal:          TerminalPassed,
 		Outcome:           OutcomePass,
 		Assurance:         "uncontrolled",
+		Authority:         RowAuthorityVerified,
 		WallTimeNS:        5_000_000_000,
 		CPUTimeNS:         1_000_000_000,
 		PeakMemoryBytes:   64 << 20,
@@ -109,6 +112,7 @@ func TestCompareCandidatesRefuses(t *testing.T) {
 }
 
 func TestFactFromOutcome(t *testing.T) {
+	iv := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	v := VerificationOutcome{
 		VerificationID:   "ver-1",
 		ObligationID:     "ob-1",
@@ -116,19 +120,39 @@ func TestFactFromOutcome(t *testing.T) {
 		SnapshotDigest:   mustDigest(t, "snapshot"),
 		ContractDigest:   mustDigest(t, "contract"),
 		Outcome:          OutcomePass,
-		AssuranceProfile: "uncontrolled",
+		AssuranceProfile: model.AssuranceUncontrolled.Name(),
+		CompletedChecks:  []string{CheckJobStatusSuccess},
+		ExecutionIDs:     []string{"exec-1"},
 		EvidenceRoot:     mustDigest(t, "evidence"),
 		Resources: ResourceFacts{
 			WallTimeNS:      3_000_000_000,
 			CPUTimeNS:       2_000_000_000,
 			PeakMemoryBytes: 1024,
+			RunnerClass:     "standard",
 			Measured:        &MeasuredResourceFacts{DurationNS: 9, WallTimeNS: 4_000_000_000},
 		},
-		StartedAt:   time.Now().Add(-time.Minute),
-		CompletedAt: time.Now(),
+		StartedAt:   iv,
+		CompletedAt: iv.Add(time.Minute),
+	}
+	ev := VerifiedEvidence{
+		ExecutionIDs:       []string{"exec-1"},
+		EvidenceRoot:       mustDigest(t, "evidence"),
+		AttestationDigests: []Digest{mustDigest(t, "att")},
+		JobStatus:          "success",
+		CompletedChecks:    []string{CheckJobStatusSuccess},
+		Assurance:          model.AssuranceUncontrolled,
+		VerifierIdentity:   "test-verifier/v1",
+		VerifiedAt:         iv.Add(time.Second),
+	}
+	sealed, err := sealDerivedOutcome(v, v, ev)
+	if err != nil {
+		t.Fatalf("sealDerivedOutcome = %v", err)
 	}
 	complete := EvidenceCompleteness{Required: 1, Present: 1, Verified: 1}
-	f := FactFromOutcome("c1", v, complete, 2048)
+	f, err := FactFromOutcome("c1", sealed, complete, 2048)
+	if err != nil {
+		t.Fatalf("FactFromOutcome = %v", err)
+	}
 	if f.Terminal != TerminalPassed || f.Outcome != OutcomePass {
 		t.Fatalf("fact terminal/outcome = %s/%s", f.Terminal, f.Outcome)
 	}
@@ -145,7 +169,10 @@ func TestFactFromOutcome(t *testing.T) {
 
 	// A claimed pass with missing evidence never becomes TerminalPassed.
 	missing := EvidenceCompleteness{Required: 2, Present: 1, Verified: 1, Missing: 1}
-	f2 := FactFromOutcome("c1", v, missing, 0)
+	f2, err := FactFromOutcome("c1", sealed, missing, 0)
+	if err != nil {
+		t.Fatalf("FactFromOutcome missing = %v", err)
+	}
 	if f2.Terminal != TerminalEvidenceIncomplete || f2.Outcome != OutcomePartial {
 		t.Fatalf("missing-evidence fact = %s/%s", f2.Terminal, f2.Outcome)
 	}
@@ -153,16 +180,35 @@ func TestFactFromOutcome(t *testing.T) {
 	// Reported wall time is used when no attested window exists.
 	claim := v
 	claim.Resources.Measured = &MeasuredResourceFacts{DurationNS: 9}
-	f3 := FactFromOutcome("c1", claim, complete, 0)
+	sealedClaim, err := sealDerivedOutcome(claim, claim, ev)
+	if err != nil {
+		t.Fatalf("sealDerivedOutcome claim = %v", err)
+	}
+	f3, err := FactFromOutcome("c1", sealedClaim, complete, 0)
+	if err != nil {
+		t.Fatalf("FactFromOutcome claim = %v", err)
+	}
 	if f3.WallTimeNS != 3_000_000_000 {
 		t.Fatalf("WallTimeNS = %d, want reported 3s", f3.WallTimeNS)
 	}
 
 	failed := v
 	failed.Outcome = OutcomeFail
-	f4 := FactFromOutcome("c1", failed, complete, 0)
+	sealedFailed, err := sealDerivedOutcome(failed, failed, ev)
+	if err != nil {
+		t.Fatalf("sealDerivedOutcome failed = %v", err)
+	}
+	f4, err := FactFromOutcome("c1", sealedFailed, complete, 0)
+	if err != nil {
+		t.Fatalf("FactFromOutcome failed = %v", err)
+	}
 	if f4.Terminal != TerminalFailed || f4.Outcome != OutcomeFail {
 		t.Fatalf("failed fact = %s/%s", f4.Terminal, f4.Outcome)
+	}
+
+	// A bare (unsealed) claim is refused: it can never mint RowAuthorityVerified.
+	if _, err := FactFromOutcome("c1", DerivedVerifiedOutcome{Outcome: v, Evidence: ev}, complete, 0); !errors.Is(err, ErrUnverified) {
+		t.Fatalf("unsealed FactFromOutcome = %v, want ErrUnverified", err)
 	}
 }
 
@@ -188,5 +234,52 @@ func TestCandidateFactValidate(t *testing.T) {
 		if err := bad.Validate(); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("%s: err = %v, want ErrInvalid", name, err)
 		}
+	}
+}
+
+// TestCompareVerifiedCandidatesRefusesClaims (P2c): the verified comparison
+// accepts only sealed DerivedVerifiedOutcome values or re-verified proofs —
+// never a raw claim.
+func TestCompareVerifiedCandidatesRefusesClaims(t *testing.T) {
+	// Unsealed (zero) record is a claim, not proof.
+	if _, err := VerifiedFromDerived("c1", DerivedVerifiedOutcome{}, 0); err == nil {
+		t.Fatal("unsealed record must be refused by VerifiedFromDerived")
+	} else if !errors.Is(err, ErrUnverified) {
+		t.Fatalf("unsealed error = %v, want ErrUnverified", err)
+	}
+	if _, err := CompareVerifiedCandidates("", nil, nil); err == nil {
+		t.Fatal("empty comparison must be refused")
+	}
+}
+
+// TestClaimComparisonNeverProjectsPass (P2c): a claimed pass stays a claim
+// and never projects to OutcomePass.
+func TestClaimComparisonNeverProjectsPass(t *testing.T) {
+	row := ClaimFact{
+		CandidateID:      "c1",
+		CandidateDigest:  mustDigest(t, "c1"),
+		ClaimedOutcome:   OutcomePass,
+		ClaimedAssurance: "uncontrolled",
+		Authority:        RowAuthorityClaim,
+	}
+	if err := row.Validate(); err != nil {
+		t.Fatalf("Validate = %v", err)
+	}
+	if got := row.AuthoritativeOutcome(); got != OutcomePartial {
+		t.Fatalf("AuthoritativeOutcome = %q, want partial (claim is never a plain pass)", got)
+	}
+	// A claim row stamped as pass-with-verified-authority is structurally
+	// impossible: CandidateFact.Validate refuses a claim row projecting pass.
+	bad := testCandidateFact(t, "c2")
+	bad.Authority = RowAuthorityClaim
+	if err := bad.Validate(); err == nil {
+		t.Fatal("claim row projecting pass must be refused")
+	}
+	cmp, err := CompareClaims(mustDigest(t, "base"), []ClaimFact{row})
+	if err != nil {
+		t.Fatalf("CompareClaims = %v", err)
+	}
+	if cmp.Candidates[0].Authority != RowAuthorityClaim {
+		t.Fatalf("authority = %q", cmp.Candidates[0].Authority)
 	}
 }

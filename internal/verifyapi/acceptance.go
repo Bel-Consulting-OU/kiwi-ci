@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -47,9 +49,20 @@ import (
 // pre-existing rows keep restoring; no new record is written at this version.
 const AcceptanceVersion = 1
 
-// AcceptanceVersionV2 is the current acceptance-record schema version. Any
-// change to the v2 canonical MAC input must bump it (and the domain).
+// AcceptanceVersionV2 is the v2 acceptance-record schema version. Retained
+// so pre-existing rows keep restoring; no new record is written at this
+// version.
 const AcceptanceVersionV2 = 2
+
+// AcceptanceVersionV3 is the current acceptance-record schema version. It
+// binds the resolved verification demand (DemandDigest) and includes the
+// recipe digest in the frozen obligation encoding. Any change to the v3
+// canonical MAC input must bump it (and the domain).
+const AcceptanceVersionV3 = 3
+
+// AcceptanceVersionCurrent is the version new acceptance records are written
+// at.
+const AcceptanceVersionCurrent = AcceptanceVersionV3
 
 // AcceptanceAlgorithmHMACSHA256 is the MAC algorithm of HMACAcceptanceKey.
 const AcceptanceAlgorithmHMACSHA256 = "HMAC-SHA256"
@@ -60,6 +73,10 @@ const acceptanceDomain = "kiwi-ci/verify-acceptance/v1"
 // acceptanceDomainV2 is the v2 acceptance MAC domain. The domain string is
 // frozen together with the v2 field list.
 const acceptanceDomainV2 = "kiwi-ci/verification-acceptance/v2"
+
+// acceptanceDomainV3 is the v3 acceptance MAC domain. The domain string is
+// frozen together with the v3 field list.
+const acceptanceDomainV3 = "kiwi-ci/verification-acceptance/v3"
 
 // AcceptanceRecord is the durable integrity record of one accepted
 // verification. It binds the exact bundle that was sealed, under a MAC or
@@ -86,6 +103,12 @@ type AcceptanceRecord struct {
 	// VerifiedEvidenceDigest commits the canonical encoding of the resolved
 	// evidence.
 	VerifiedEvidenceDigest Digest `json:"verified_evidence_digest"`
+	// DemandDigest commits the canonical resolved verification demand
+	// (EffectiveVerificationDemand) the record was accepted under — the
+	// recipe-owned rules when a recipe is bound, else the obligation's
+	// inline rules. v3 only. A discharge is pinned to the exact rules it
+	// was measured against.
+	DemandDigest Digest `json:"demand_digest,omitempty"`
 	// Subject is the obligation's subject identity (v2 only).
 	Subject string `json:"subject,omitempty"`
 	// SubjectRef is the obligation's authority subject (v2 only).
@@ -116,24 +139,43 @@ type AcceptanceKey interface {
 	Verify(payload []byte, mac string) bool
 }
 
-// AcceptanceKeyring is the rotation-aware acceptance trust root.
+// keyringState is an immutable snapshot of the acceptance trust root. Once
+// published through AcceptanceKeyring.state it is never mutated; every
+// structural change (Rotate / Retire / Install) builds a fresh snapshot and
+// swaps the pointer, so concurrent readers always observe a consistent view
+// without locks.
+type keyringState struct {
+	currentID  string
+	verifyKeys map[string]AcceptanceKey
+}
+
+// AcceptanceKeyring is the rotation-aware acceptance trust root. It is safe
+// for concurrent use: the trust root is an immutable snapshot held behind an
+// atomic pointer, and Rotate/Retire/Install swap in a new snapshot. The
+// mutators are serialized by a mutex so concurrent Rotate/Retire/Install
+// cannot lose an update (read-modify-write on the verify-key map).
 //
-// CurrentSigningKeyID names the key new records are sealed under.
-// VerifyKeys holds every key that may still verify a persisted record, keyed
-// by KeyID. Rotation is: install the new key, move CurrentSigningKeyID to it,
-// keep the old key in VerifyKeys until every record that references it has
-// been resealed, then retire the old key. A record whose KeyID is absent from
-// VerifyKeys fails closed — an unknown or tampered key id can never restore.
+// The current signing key id names the key new records are sealed under.
+// The verify-key set holds every key that may still verify a persisted
+// record, keyed by KeyID. Rotation is: install the new key, move the current
+// signing key id to it, keep the old key in the verify set until every record
+// that references it has been resealed, then retire the old key. A record
+// whose KeyID is absent from the verify set fails closed — an unknown or
+// tampered key id can never restore. Rotate and Install refuse to overwrite
+// a different key that already occupies the same KeyID.
 type AcceptanceKeyring struct {
-	// CurrentSigningKeyID is the key new acceptance records are signed with.
-	CurrentSigningKeyID string
-	// VerifyKeys maps key id → key for every key that may still verify.
-	VerifyKeys map[string]AcceptanceKey
+	// mu serializes Retire/Rotate/Install so their read-modify-write of
+	// the verify-key map is atomic with respect to each other. Readers use
+	// the atomic pointer and take no lock.
+	mu    sync.Mutex
+	state atomic.Pointer[keyringState]
 }
 
 // NewAcceptanceKeyring builds a keyring. currentID must name a key present in
-// keys. The map is copied so later mutation of the caller's map cannot
-// silently extend the trust root.
+// keys, and every map key must equal the key's own KeyID() — a mislabeled
+// entry would let a record's KeyID resolve to the wrong secret. The map is
+// copied so later mutation of the caller's map cannot silently extend the
+// trust root.
 func NewAcceptanceKeyring(currentID string, keys map[string]AcceptanceKey) (*AcceptanceKeyring, error) {
 	if currentID == "" {
 		return nil, fmt.Errorf("%w: keyring current signing key id is required", ErrAcceptance)
@@ -146,12 +188,17 @@ func NewAcceptanceKeyring(currentID string, keys map[string]AcceptanceKey) (*Acc
 		if id == "" || k == nil {
 			return nil, fmt.Errorf("%w: keyring entry with empty id or nil key", ErrAcceptance)
 		}
+		if k.KeyID() != id {
+			return nil, fmt.Errorf("%w: keyring map key %q does not match key id %q", ErrAcceptance, id, k.KeyID())
+		}
 		copied[id] = k
 	}
 	if _, ok := copied[currentID]; !ok {
 		return nil, fmt.Errorf("%w: keyring current signing key %q is not in the key set", ErrAcceptance, currentID)
 	}
-	return &AcceptanceKeyring{CurrentSigningKeyID: currentID, VerifyKeys: copied}, nil
+	r := &AcceptanceKeyring{}
+	r.state.Store(&keyringState{currentID: currentID, verifyKeys: copied})
+	return r, nil
 }
 
 // NewSingleKeyring wraps one key as a keyring that both signs and verifies
@@ -163,14 +210,33 @@ func NewSingleKeyring(key AcceptanceKey) (*AcceptanceKeyring, error) {
 	return NewAcceptanceKeyring(key.KeyID(), map[string]AcceptanceKey{key.KeyID(): key})
 }
 
+// snapshot returns the current immutable trust-root snapshot.
+func (r *AcceptanceKeyring) snapshot() *keyringState {
+	if r == nil {
+		return nil
+	}
+	return r.state.Load()
+}
+
+// CurrentSigningKeyID returns the key id new acceptance records are signed
+// with.
+func (r *AcceptanceKeyring) CurrentSigningKeyID() string {
+	s := r.snapshot()
+	if s == nil {
+		return ""
+	}
+	return s.currentID
+}
+
 // SigningKey returns the key new records are signed with.
 func (r *AcceptanceKeyring) SigningKey() (AcceptanceKey, error) {
-	if r == nil {
+	s := r.snapshot()
+	if s == nil {
 		return nil, fmt.Errorf("%w: acceptance keyring is nil", ErrAcceptance)
 	}
-	k, ok := r.VerifyKeys[r.CurrentSigningKeyID]
+	k, ok := s.verifyKeys[s.currentID]
 	if !ok || k == nil {
-		return nil, fmt.Errorf("%w: keyring has no current signing key %q", ErrAcceptance, r.CurrentSigningKeyID)
+		return nil, fmt.Errorf("%w: keyring has no current signing key %q", ErrAcceptance, s.currentID)
 	}
 	return k, nil
 }
@@ -178,17 +244,48 @@ func (r *AcceptanceKeyring) SigningKey() (AcceptanceKey, error) {
 // KeyByID returns the verification key for id. Unknown ids are a hard
 // refusal (fail closed) — never a fallback to some other key.
 func (r *AcceptanceKeyring) KeyByID(id string) (AcceptanceKey, error) {
-	if r == nil {
+	s := r.snapshot()
+	if s == nil {
 		return nil, fmt.Errorf("%w: acceptance keyring is nil", ErrAcceptance)
 	}
 	if id == "" {
 		return nil, fmt.Errorf("%w: acceptance record has no key id", ErrAcceptance)
 	}
-	k, ok := r.VerifyKeys[id]
+	k, ok := s.verifyKeys[id]
 	if !ok || k == nil {
 		return nil, fmt.Errorf("%w: acceptance key %q is not in the keyring", ErrAcceptance, id)
 	}
 	return k, nil
+}
+
+// sameAcceptanceKey reports whether a and b are the same signing key. Two
+// keys that MAC a fixed probe identically (same secret, same algorithm) are
+// interchangeable; a different secret under the same KeyID is a distinct key
+// and must never silently overwrite it. The probe-MAC comparison is total
+// (no interface equality) so uncomparable key implementations are safe.
+func sameAcceptanceKey(a, b AcceptanceKey) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	if a.KeyID() != b.KeyID() || a.Algorithm() != b.Algorithm() {
+		return false
+	}
+	probe := []byte("kiwi-ci/acceptance-keyring-same-key/v1")
+	ma, errA := a.Sign(probe)
+	mb, errB := b.Sign(probe)
+	return errA == nil && errB == nil && ma != "" && ma == mb
+}
+
+// ensureKeySlot reports whether key may occupy key's KeyID in the map: the
+// slot must be empty or already hold the same key. Overwriting a different
+// key under one KeyID is refused (a tampered or swapped secret would then
+// verify records the original key sealed).
+func ensureKeySlot(keys map[string]AcceptanceKey, key AcceptanceKey) error {
+	id := key.KeyID()
+	if existing, ok := keys[id]; ok && !sameAcceptanceKey(existing, key) {
+		return fmt.Errorf("%w: refusing to overwrite key %q with a different key under the same id", ErrAcceptance, id)
+	}
+	return nil
 }
 
 // Retire removes a verification key. It refuses to remove the current
@@ -199,20 +296,33 @@ func (r *AcceptanceKeyring) Retire(keyID string) error {
 	if r == nil {
 		return fmt.Errorf("%w: acceptance keyring is nil", ErrAcceptance)
 	}
-	if keyID == r.CurrentSigningKeyID {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s := r.state.Load()
+	if s == nil {
+		return fmt.Errorf("%w: acceptance keyring is nil", ErrAcceptance)
+	}
+	if keyID == s.currentID {
 		return fmt.Errorf("%w: refusing to retire the current signing key %q", ErrAcceptance, keyID)
 	}
-	if _, ok := r.VerifyKeys[keyID]; !ok {
+	if _, ok := s.verifyKeys[keyID]; !ok {
 		return fmt.Errorf("%w: acceptance key %q is not in the keyring", ErrAcceptance, keyID)
 	}
-	delete(r.VerifyKeys, keyID)
+	next := make(map[string]AcceptanceKey, len(s.verifyKeys)-1)
+	for id, k := range s.verifyKeys {
+		if id != keyID {
+			next[id] = k
+		}
+	}
+	r.state.Store(&keyringState{currentID: s.currentID, verifyKeys: next})
 	return nil
 }
 
 // Rotate installs newKey as the current signing key while keeping the
 // previous key available for verification. This is the "rotate K2 keep K1
 // verify" step: after Rotate, new records are sealed under K2 and existing
-// K1 records still restore.
+// K1 records still restore. A different key that already occupies newKey's
+// KeyID is refused rather than overwritten.
 func (r *AcceptanceKeyring) Rotate(newKey AcceptanceKey) error {
 	if r == nil {
 		return fmt.Errorf("%w: acceptance keyring is nil", ErrAcceptance)
@@ -223,11 +333,54 @@ func (r *AcceptanceKeyring) Rotate(newKey AcceptanceKey) error {
 	if newKey.KeyID() == "" {
 		return fmt.Errorf("%w: acceptance key id is required", ErrAcceptance)
 	}
-	if r.VerifyKeys == nil {
-		r.VerifyKeys = make(map[string]AcceptanceKey, 2)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s := r.state.Load()
+	if s == nil {
+		return fmt.Errorf("%w: acceptance keyring is nil", ErrAcceptance)
 	}
-	r.VerifyKeys[newKey.KeyID()] = newKey
-	r.CurrentSigningKeyID = newKey.KeyID()
+	next := make(map[string]AcceptanceKey, len(s.verifyKeys)+1)
+	for id, k := range s.verifyKeys {
+		next[id] = k
+	}
+	if err := ensureKeySlot(next, newKey); err != nil {
+		return err
+	}
+	next[newKey.KeyID()] = newKey
+	r.state.Store(&keyringState{currentID: newKey.KeyID(), verifyKeys: next})
+	return nil
+}
+
+// Install adds a verification key without changing the current signing key.
+// It is the migration helper for putting a retired key back (e.g. to finish a
+// reseal that was interrupted); it never demotes the current signing key. A
+// different key that already occupies the same KeyID is refused rather than
+// overwritten.
+func (r *AcceptanceKeyring) Install(key AcceptanceKey) error {
+	if r == nil {
+		return fmt.Errorf("%w: acceptance keyring is nil", ErrAcceptance)
+	}
+	if key == nil {
+		return fmt.Errorf("%w: acceptance key is required", ErrAcceptance)
+	}
+	if key.KeyID() == "" {
+		return fmt.Errorf("%w: acceptance key id is required", ErrAcceptance)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s := r.state.Load()
+	if s == nil {
+		return fmt.Errorf("%w: acceptance keyring is nil", ErrAcceptance)
+	}
+	next := make(map[string]AcceptanceKey, len(s.verifyKeys)+1)
+	for id, k := range s.verifyKeys {
+		next[id] = k
+	}
+	if err := ensureKeySlot(next, key); err != nil {
+		return err
+	}
+	next[key.KeyID()] = key
+	r.state.Store(&keyringState{currentID: s.currentID, verifyKeys: next})
 	return nil
 }
 
@@ -237,11 +390,18 @@ func (r *AcceptanceKeyring) Rotate(newKey AcceptanceKey) error {
 // AcceptanceRecord must be persisted in place of the old one; only then may
 // K1 be retired.
 func (r *AcceptanceKeyring) ResealPersisted(p PersistedVerified, at time.Time) (AcceptanceRecord, DerivedVerifiedOutcome, error) {
-	sealed, err := RestoreVerifiedOutcomeWithKeyring(p, nil, r)
+	return r.ResealPersistedWithRecipe(p, nil, at)
+}
+
+// ResealPersistedWithRecipe is the recipe-aware reseal. Recipe-bound records
+// must pass the resolved recipe so the recomputed demand digest matches the
+// original accept.
+func (r *AcceptanceKeyring) ResealPersistedWithRecipe(p PersistedVerified, recipe *Recipe, at time.Time) (AcceptanceRecord, DerivedVerifiedOutcome, error) {
+	sealed, err := RestoreVerifiedOutcomeWithRecipe(p, nil, r, recipe)
 	if err != nil {
 		return AcceptanceRecord{}, DerivedVerifiedOutcome{}, err
 	}
-	rec, err := AcceptWithKeyring(p.Obligation, sealed, nil, r, at)
+	rec, err := AcceptWithRecipe(p.Obligation, sealed, nil, r, recipe, at)
 	if err != nil {
 		return AcceptanceRecord{}, DerivedVerifiedOutcome{}, err
 	}
@@ -386,18 +546,48 @@ func asVerifier(k AcceptanceKey, r *AcceptanceKeyring) (AcceptanceVerifier, erro
 // time. An unsealed record is refused — acceptance never mints first
 // authority.
 //
-// New records are always written at AcceptanceVersionV2 under the signer's
-// current key. Pass an *AcceptanceKeyring to sign with the rotated key, or a
-// bare AcceptanceKey for single-key deployments.
+// New records are always written at AcceptanceVersionCurrent under the
+// signer's current key. Pass an *AcceptanceKeyring to sign with the rotated
+// key, or a bare AcceptanceKey for single-key deployments.
 func Accept(obligation VerificationObligation, derived DerivedVerifiedOutcome, key AcceptanceKey, at time.Time) (AcceptanceRecord, error) {
 	return AcceptWithKeyring(obligation, derived, key, nil, at)
 }
 
 // AcceptWithKeyring is the keyring-aware accept. Exactly one of key / keyring
-// must be non-nil.
+// must be non-nil. When the obligation pins a RecipeDigest the caller must
+// supply the resolved *Recipe (AcceptOptions.Recipe): the demand digest is
+// then the recipe's rule set, and the obligation's inline fields must already
+// match it (BindRecipe). Accepting a recipe-bound obligation without a
+// resolved recipe is refused — otherwise a caller could mint a valid MAC
+// over weaker inline rules while advertising a strong recipe label.
 func AcceptWithKeyring(obligation VerificationObligation, derived DerivedVerifiedOutcome, key AcceptanceKey, keyring *AcceptanceKeyring, at time.Time) (AcceptanceRecord, error) {
+	return acceptWithKeyringRecipe(obligation, derived, key, keyring, nil, at)
+}
+
+// AcceptWithRecipe is the recipe-aware accept: required whenever
+// obligation.RecipeDigest is set. The recipe is resolved once at submit and
+// passed here so the demand digest is the recipe's canonical rule set.
+func AcceptWithRecipe(obligation VerificationObligation, derived DerivedVerifiedOutcome, key AcceptanceKey, keyring *AcceptanceKeyring, recipe *Recipe, at time.Time) (AcceptanceRecord, error) {
+	return acceptWithKeyringRecipe(obligation, derived, key, keyring, recipe, at)
+}
+
+func acceptWithKeyringRecipe(obligation VerificationObligation, derived DerivedVerifiedOutcome, key AcceptanceKey, keyring *AcceptanceKeyring, recipe *Recipe, at time.Time) (AcceptanceRecord, error) {
 	if !derived.Sealed() {
 		return AcceptanceRecord{}, fmt.Errorf("%w: Accept requires a verifier-produced record", ErrUnverified)
+	}
+	// The derived outcome must actually discharge THIS obligation: candidate,
+	// snapshot, contract, required checks and assurance. A sealed outcome
+	// from another obligation must never ride along under this record.
+	if err := Bind(obligation, derived.Outcome, at); err != nil {
+		return AcceptanceRecord{}, fmt.Errorf("%w: sealed outcome does not bind the obligation: %v", ErrBinding, err)
+	}
+	if obligation.RecipeDigest != "" && recipe == nil {
+		return AcceptanceRecord{}, fmt.Errorf("%w: recipe-bound obligation requires the resolved recipe at accept time", ErrBinding)
+	}
+	if recipe != nil {
+		if _, err := BindRecipe(obligation, *recipe, at); err != nil {
+			return AcceptanceRecord{}, fmt.Errorf("%w: obligation does not match its recipe: %v", ErrBinding, err)
+		}
 	}
 	signer, err := asSigner(key, keyring)
 	if err != nil {
@@ -410,7 +600,7 @@ func AcceptWithKeyring(obligation VerificationObligation, derived DerivedVerifie
 	if err != nil {
 		return AcceptanceRecord{}, err
 	}
-	obDig, err := obligationDigestV2(obligation)
+	obDig, err := obligationDigestV3(obligation)
 	if err != nil {
 		return AcceptanceRecord{}, err
 	}
@@ -426,13 +616,21 @@ func AcceptWithKeyring(obligation VerificationObligation, derived DerivedVerifie
 	if err != nil {
 		return AcceptanceRecord{}, err
 	}
+	// Bind the canonical resolved demand: the recipe's rules when a recipe
+	// is pinned, else the obligation's inline rules. This is the rule set
+	// the discharge was measured against.
+	demandDig, err := EffectiveVerificationDemandDigest(obligation, recipe)
+	if err != nil {
+		return AcceptanceRecord{}, err
+	}
 	rec := AcceptanceRecord{
-		AcceptanceVersion:      AcceptanceVersionV2,
+		AcceptanceVersion:      AcceptanceVersionCurrent,
 		SchemaVersion:          SchemaVersion,
 		ObligationDigest:       obDig,
 		SubmittedClaimDigest:   claimDig,
 		OutcomeDigest:          outDig,
 		VerifiedEvidenceDigest: evDig,
+		DemandDigest:           demandDig,
 		Subject:                obligation.Subject,
 		Algorithm:              sk.Algorithm(),
 		VerifiedAt:             at.UTC(),
@@ -473,6 +671,14 @@ func RestoreVerifiedOutcome(p PersistedVerified, key AcceptanceKey) (DerivedVeri
 // RestoreVerifiedOutcomeWithKeyring is the keyring-aware restore. Exactly one
 // of key / keyring must be non-nil.
 func RestoreVerifiedOutcomeWithKeyring(p PersistedVerified, key AcceptanceKey, keyring *AcceptanceKeyring) (DerivedVerifiedOutcome, error) {
+	return RestoreVerifiedOutcomeWithRecipe(p, key, keyring, nil)
+}
+
+// RestoreVerifiedOutcomeWithRecipe restores a record and, for v3
+// recipe-bound records, recomputes the demand digest from the resolved
+// recipe. A recipe-bound record restored without its recipe is refused
+// rather than silently matching a weaker inline demand.
+func RestoreVerifiedOutcomeWithRecipe(p PersistedVerified, key AcceptanceKey, keyring *AcceptanceKeyring, recipe *Recipe) (DerivedVerifiedOutcome, error) {
 	verifier, err := asVerifier(key, keyring)
 	if err != nil {
 		return DerivedVerifiedOutcome{}, err
@@ -483,6 +689,8 @@ func RestoreVerifiedOutcomeWithKeyring(p PersistedVerified, key AcceptanceKey, k
 		return restoreV1(p, rec, verifier)
 	case AcceptanceVersionV2:
 		return restoreV2(p, rec, verifier)
+	case AcceptanceVersionV3:
+		return restoreV3(p, rec, verifier, recipe)
 	default:
 		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: unsupported acceptance version %d", ErrAcceptance, rec.AcceptanceVersion)
 	}
@@ -609,6 +817,93 @@ func restoreV2(p PersistedVerified, rec AcceptanceRecord, verifier AcceptanceVer
 	return sealDerivedOutcome(p.SubmittedClaim, p.Outcome, p.Evidence)
 }
 
+// restoreV3 verifies a current acceptance record. The v3 MAC binds the
+// resolved verification demand digest (DemandDigest) in addition to the v2
+// field set, so a database writer who swaps the demanded rules (or the
+// recipe identity) breaks the MAC.
+func restoreV3(p PersistedVerified, rec AcceptanceRecord, verifier AcceptanceVerifier, recipe *Recipe) (DerivedVerifiedOutcome, error) {
+	if rec.MAC == "" {
+		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: acceptance record is unsigned", ErrAcceptance)
+	}
+	if rec.KeyID == "" || rec.Algorithm == "" {
+		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: acceptance record is missing key id or algorithm", ErrAcceptance)
+	}
+	if rec.SchemaVersion != SchemaVersion {
+		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: unsupported schema version %d (want %d)", ErrAcceptance, rec.SchemaVersion, SchemaVersion)
+	}
+	key, err := verifier.KeyByID(rec.KeyID)
+	if err != nil {
+		return DerivedVerifiedOutcome{}, err
+	}
+	if rec.Algorithm != key.Algorithm() {
+		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: acceptance algorithm %q does not match key algorithm %q", ErrAcceptance, rec.Algorithm, key.Algorithm())
+	}
+	obDig, err := obligationDigestV3(p.Obligation)
+	if err != nil {
+		return DerivedVerifiedOutcome{}, err
+	}
+	if obDig != rec.ObligationDigest {
+		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: obligation digest mismatch", ErrAcceptance)
+	}
+	claimDig, err := submittedClaimDigest(p.SubmittedClaim)
+	if err != nil {
+		return DerivedVerifiedOutcome{}, err
+	}
+	if claimDig != rec.SubmittedClaimDigest {
+		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: submitted claim digest mismatch", ErrAcceptance)
+	}
+	outDig, err := outcomeDigestV2(p.Outcome)
+	if err != nil {
+		return DerivedVerifiedOutcome{}, err
+	}
+	if outDig != rec.OutcomeDigest {
+		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: outcome digest mismatch", ErrAcceptance)
+	}
+	evDig, err := evidenceDigestV2(p.Evidence)
+	if err != nil {
+		return DerivedVerifiedOutcome{}, err
+	}
+	if evDig != rec.VerifiedEvidenceDigest {
+		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: evidence digest mismatch", ErrAcceptance)
+	}
+	if p.Obligation.RecipeDigest != "" && recipe == nil {
+		// Recipe-bound records must restore against the resolved recipe;
+		// without it the demand digest cannot be recomputed faithfully.
+		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: recipe-bound record requires the resolved recipe at restore time", ErrBinding)
+	}
+	if recipe != nil {
+		if err := recipe.EvidenceMin.Check(p.Evidence); err != nil {
+			return DerivedVerifiedOutcome{}, fmt.Errorf("%w: restored record fails the recipe evidence floor: %v", ErrUnverified, err)
+		}
+	}
+	demandDig, err := EffectiveVerificationDemandDigest(p.Obligation, recipe)
+	if err != nil {
+		return DerivedVerifiedOutcome{}, err
+	}
+	if demandDig != rec.DemandDigest {
+		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: demand digest mismatch", ErrAcceptance)
+	}
+	if rec.Subject != p.Obligation.Subject {
+		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: acceptance subject %q does not match obligation subject %q", ErrAcceptance, rec.Subject, p.Obligation.Subject)
+	}
+	if !subjectRefsEqual(rec.SubjectRef, p.Obligation.SubjectRef) {
+		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: acceptance subject_ref does not match obligation subject_ref", ErrAcceptance)
+	}
+	payload, err := acceptancePayload(rec)
+	if err != nil {
+		return DerivedVerifiedOutcome{}, err
+	}
+	if !key.Verify(payload, rec.MAC) {
+		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: acceptance MAC verification failed", ErrAcceptance)
+	}
+	// Re-apply the obligation-binding rule at restore so a MAC-valid pair
+	// of (other-obligation outcome, this obligation) cannot restore.
+	if err := Bind(p.Obligation, p.Outcome, rec.VerifiedAt); err != nil {
+		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: restored outcome does not bind the obligation: %v", ErrBinding, err)
+	}
+	return sealDerivedOutcome(p.SubmittedClaim, p.Outcome, p.Evidence)
+}
+
 func subjectRefsEqual(a, b *SubjectRef) bool {
 	if a == nil && b == nil {
 		return true
@@ -623,15 +918,18 @@ func subjectRefsEqual(a, b *SubjectRef) bool {
 	return a.Equal(*b)
 }
 
-// acceptancePayload is the canonical MAC input. v2 uses the FROZEN
-// length-prefixed encoding (see frozen.go); v1 keeps its original
-// newline-joined form so legacy MACs keep verifying.
+// acceptancePayload is the canonical MAC input. v3 uses the FROZEN
+// length-prefixed encoding (see frozen.go) including the demand digest; v2
+// keeps its original frozen form so legacy MACs keep verifying; v1 keeps its
+// original newline-joined form.
 func acceptancePayload(rec AcceptanceRecord) ([]byte, error) {
 	switch rec.AcceptanceVersion {
 	case AcceptanceVersion:
 		return acceptancePayloadV1(rec)
 	case AcceptanceVersionV2:
 		return acceptancePayloadV2(rec)
+	case AcceptanceVersionV3:
+		return acceptancePayloadV3(rec)
 	default:
 		return nil, fmt.Errorf("%w: unsupported acceptance version %d", ErrAcceptance, rec.AcceptanceVersion)
 	}
@@ -702,6 +1000,45 @@ func acceptancePayloadV2(rec AcceptanceRecord) ([]byte, error) {
 	return f.buf, nil
 }
 
+// acceptancePayloadV3 is the FROZEN v3 MAC input: the v2 field list plus the
+// resolved-demand digest. Domain-separated, length-prefixed, fixed order.
+func acceptancePayloadV3(rec AcceptanceRecord) ([]byte, error) {
+	if err := validateDigest("obligation_digest", rec.ObligationDigest); err != nil {
+		return nil, err
+	}
+	if err := validateDigest("submitted_claim_digest", rec.SubmittedClaimDigest); err != nil {
+		return nil, err
+	}
+	if err := validateDigest("outcome_digest", rec.OutcomeDigest); err != nil {
+		return nil, err
+	}
+	if err := validateDigest("verified_evidence_digest", rec.VerifiedEvidenceDigest); err != nil {
+		return nil, err
+	}
+	if err := validateDigest("demand_digest", rec.DemandDigest); err != nil {
+		return nil, err
+	}
+	if rec.Algorithm == "" || rec.KeyID == "" {
+		return nil, fmt.Errorf("%w: acceptance algorithm and key id are required", ErrAcceptance)
+	}
+	if rec.VerifiedAt.IsZero() {
+		return nil, fmt.Errorf("%w: acceptance verified_at is required", ErrAcceptance)
+	}
+	f := frozenDomain(acceptanceDomainV3)
+	f.int64(int64(rec.SchemaVersion))
+	f.str(string(rec.ObligationDigest))
+	f.str(string(rec.SubmittedClaimDigest))
+	f.str(string(rec.OutcomeDigest))
+	f.str(string(rec.VerifiedEvidenceDigest))
+	f.str(string(rec.DemandDigest))
+	f.str(rec.Subject)
+	encodeSubjectRefFrozen(f, rec.SubjectRef)
+	f.str(rec.Algorithm)
+	f.time(rec.VerifiedAt)
+	f.str(rec.KeyID)
+	return f.buf, nil
+}
+
 // obligationDigest commits the canonical encoding of an obligation (v1
 // rule, retained for legacy restore).
 func obligationDigest(o VerificationObligation) (Digest, error) {
@@ -723,6 +1060,12 @@ func evidenceDigest(e VerifiedEvidence) (Digest, error) {
 // obligationDigestV2 commits the FROZEN encoding of an obligation.
 func obligationDigestV2(o VerificationObligation) (Digest, error) {
 	return encodeObligationFrozen(normalizeObligation(o)).frozenHash("obligation")
+}
+
+// obligationDigestV3 commits the FROZEN v3 encoding of an obligation
+// (including the recipe digest).
+func obligationDigestV3(o VerificationObligation) (Digest, error) {
+	return encodeObligationFrozenV3(normalizeObligation(o)).frozenHash("obligation")
 }
 
 // outcomeDigestV2 commits the FROZEN encoding of a derived outcome.
@@ -762,6 +1105,12 @@ func canonicalDigest(label string, v any) (Digest, error) {
 func normalizeObligation(o VerificationObligation) VerificationObligation {
 	n := o
 	n.IssuedAt = n.IssuedAt.UTC()
+	// A zero SubjectRef is the same "no subject" shape as nil: canonicalize
+	// it away so the frozen encoding (and any JSON round-trip) cannot tell
+	// them apart.
+	if n.SubjectRef != nil && n.SubjectRef.IsZero() {
+		n.SubjectRef = nil
+	}
 	if n.Freshness.NotBefore != nil {
 		t := n.Freshness.NotBefore.UTC()
 		n.Freshness.NotBefore = &t

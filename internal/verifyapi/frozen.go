@@ -138,7 +138,9 @@ func (f *frozenBuffer) frozenHash(label string) (Digest, error) {
 // bumping AcceptanceVersionV2 and the acceptance domain.
 
 // encodeObligationFrozen is the v2 canonical encoding of a verification
-// obligation.
+// obligation. Retained verbatim so legacy v2 acceptance records keep
+// restoring; new records use encodeObligationFrozenV3 (which also pins the
+// recipe digest).
 func encodeObligationFrozen(o VerificationObligation) *frozenBuffer {
 	f := frozenDomain("obligation/v2")
 	f.str(o.ObligationID)
@@ -157,9 +159,34 @@ func encodeObligationFrozen(o VerificationObligation) *frozenBuffer {
 	return f
 }
 
+// encodeObligationFrozenV3 is the v3 canonical encoding of a verification
+// obligation: the v2 field list plus the recipe digest, so two obligations
+// that differ only in RecipeDigest never share an acceptance digest.
+func encodeObligationFrozenV3(o VerificationObligation) *frozenBuffer {
+	f := frozenDomain("obligation/v3")
+	f.str(o.ObligationID)
+	f.str(o.Subject)
+	encodeSubjectRefFrozen(f, o.SubjectRef)
+	f.str(string(o.ImmutableCandidateDigest))
+	f.str(string(o.SourceSnapshotDigest))
+	f.str(string(o.VerificationContractDigest))
+	f.str(string(o.RecipeDigest))
+	f.strings(o.RequiredChecks)
+	f.str(o.RequiredAssurance)
+	f.timePtr(o.Freshness.NotBefore)
+	f.int64(o.Freshness.MaxAgeSeconds)
+	f.timePtr(o.Freshness.NotAfter)
+	f.sortedMap(o.OpaqueCorrelationMetadata)
+	f.time(o.IssuedAt)
+	return f
+}
+
 // encodeSubjectRefFrozen appends the (possibly absent) authority subject.
+// Nil and the zero SubjectRef are the same "no subject" shape and encode
+// identically (one empty field), so a digest or MAC never depends on
+// whether the caller wrote &SubjectRef{} or nil.
 func encodeSubjectRefFrozen(f *frozenBuffer, s *SubjectRef) {
-	if s == nil {
+	if s == nil || s.IsZero() {
 		f.str("")
 		return
 	}
@@ -209,18 +236,18 @@ func encodeResourcesFrozen(f *frozenBuffer, r ResourceFacts) {
 	f.str(r.VerificationGroupID)
 	f.str(r.CandidateID)
 	// Measured is substrate-filled at record time and is deliberately NOT
-	// part of the frozen identity: it never participates in a digest.
-	if r.Measured == nil {
-		f.str("")
-		return
-	}
-	f.int64(r.Measured.DurationNS)
-	f.int64(r.Measured.WallTimeNS)
+	// part of the frozen identity: it never participates in a digest
+	// (the same rule submittedClaimDigest and verifystore.ClaimContentDigest
+	// apply).
 }
 
-// encodeEvidenceFrozen is the v2 canonical encoding of resolved evidence.
+// encodeEvidenceFrozen is the v3 canonical encoding of resolved evidence.
+// v3 binds Window.Source and Kinds in addition to the v2 field set: both are
+// authority-bearing (freshness floor and EvidenceMinimum.RequiredKinds) and
+// must ride the MAC so a database writer cannot forge window authority or
+// evidence kinds. v2 records restore via encodeEvidenceFrozenV2.
 func encodeEvidenceFrozen(e VerifiedEvidence) *frozenBuffer {
-	f := frozenDomain("evidence/v2")
+	f := frozenDomain("evidence/v3")
 	f.strings(e.ExecutionIDs)
 	f.str(string(e.EvidenceRoot))
 	f.digests(e.AttestationDigests)
@@ -231,6 +258,11 @@ func encodeEvidenceFrozen(e VerifiedEvidence) *frozenBuffer {
 		f.time(e.Attested.StartedAt)
 		f.time(e.Attested.FinishedAt)
 	}
+	// Window source is the freshness authority; bind it explicitly.
+	f.str("window-source:" + string(e.Window.Source))
+	f.time(e.Window.StartedAt)
+	f.time(e.Window.CompletedAt)
+	f.strings(e.Kinds)
 	f.str(e.JobStatus)
 	f.strings(e.CompletedChecks)
 	encodeChecksFrozen(f, e.VerifiedChecks)
@@ -264,4 +296,48 @@ func encodeChecksFrozen(f *frozenBuffer, checks []VerifiedCheck) {
 // encodeAssuranceFrozen appends the derived assurance profile.
 func encodeAssuranceFrozen(f *frozenBuffer, a model.ExecutionAssurance) {
 	f.str(a.Name())
+}
+
+// encodeEvidenceMinFrozen appends the evidence-floor block in frozen order.
+func encodeEvidenceMinFrozen(f *frozenBuffer, m EvidenceMinimum) {
+	f.int64(int64(m.MinAttestations))
+	f.strings(m.RequiredKinds)
+	f.bool(m.RequireAttestedWindow)
+}
+
+// encodeFreshnessFrozen appends a freshness policy in frozen order.
+func encodeFreshnessFrozen(f *frozenBuffer, p FreshnessPolicy) {
+	f.timePtr(p.NotBefore)
+	f.int64(p.MaxAgeSeconds)
+	f.timePtr(p.NotAfter)
+}
+
+// encodeRecipeFrozen is the canonical encoding of one recipe version
+// (WithdrawnAt excluded: withdrawal is a liveness fact, not identity).
+// Requirement and kind lists must already be sorted by the caller.
+func encodeRecipeFrozen(r Recipe) *frozenBuffer {
+	f := frozenDomain(recipeDomain)
+	f.int64(int64(r.SchemaVersion))
+	f.str(r.Name)
+	f.int64(int64(r.Version))
+	f.strings(r.Requirements)
+	f.str(r.Assurance)
+	encodeEvidenceMinFrozen(f, r.EvidenceMin)
+	encodeFreshnessFrozen(f, r.Freshness)
+	f.time(r.IssuedAt)
+	return f
+}
+
+// encodeDemandFrozen is the canonical encoding of one resolved verification
+// demand. Requirement and kind lists must already be sorted by the caller.
+func encodeDemandFrozen(d EffectiveVerificationDemand) *frozenBuffer {
+	f := frozenDomain(demandDomain)
+	f.int64(int64(d.SchemaVersion))
+	f.str(string(d.RecipeDigest))
+	f.strings(d.Requirements)
+	f.str(d.Assurance)
+	encodeEvidenceMinFrozen(f, d.EvidenceMin)
+	encodeFreshnessFrozen(f, d.Freshness)
+	f.time(d.IssuedAt)
+	return f
 }

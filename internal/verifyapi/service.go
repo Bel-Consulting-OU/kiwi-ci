@@ -219,6 +219,12 @@ type Service struct {
 	// unknown kind or a capability mismatch is a refusal. Nil means no
 	// external providers — a named kind is then fail closed.
 	Providers *ProviderRegistry
+	// Recipes is the published verification-recipe registry. An obligation
+	// that carries a RecipeDigest is resolved against it at submit time
+	// (unknown or withdrawn recipes are refused) and its Recipe.EvidenceMinimum
+	// is enforced on the authoritative discharge path. Nil means no recipes
+	// — a recipe-bound obligation is then fail closed (ErrNotFound).
+	Recipes *RecipeRegistry
 	// Authz mediates every method. Nil denies everything.
 	Authz Authorizer
 	// Clock reads wall time for service-side stamps. Nil selects time.Now.
@@ -284,14 +290,38 @@ func (s *Service) subjectOf(ctx context.Context, obligationID string) (Verificat
 // The caller must be authorized for THAT subject: the obligation names its
 // own authority, so a tenant can never submit into a sibling's scope.
 // ObligationID is the store idempotency key (identical resubmit is a no-op).
+//
+// Recipe binding (P1a): an obligation that carries a RecipeDigest is resolved
+// against the RecipeRegistry. The recipe must exist and be live (a withdrawn
+// recipe cannot mint new demand), and the obligation's recipe-owned fields
+// (checks, assurance, freshness) must not disagree with the recipe — a
+// weaker inline demand under a strong recipe digest is refused. Empty fields
+// are filled from the recipe. The stored obligation is the bound copy.
 func (s *Service) SubmitObligation(ctx context.Context, p Principal, o VerificationObligation) error {
 	if err := o.Validate(); err != nil {
 		return err
 	}
-	if err := s.authorize(ctx, p, ActionObligationCreate, o.SubjectReference()); err != nil {
+	bound := o
+	if o.RecipeDigest != "" {
+		if s.Recipes == nil {
+			return fmt.Errorf("%w: obligation binds recipe %s but no recipe registry is configured", ErrNotFound, o.RecipeDigest)
+		}
+		r, err := s.Recipes.ByDigest(o.RecipeDigest)
+		if err != nil {
+			return err
+		}
+		if !r.Live(s.now()) {
+			return fmt.Errorf("%w: recipe %s@%d is withdrawn and cannot mint new demand", ErrBinding, r.Name, r.Version)
+		}
+		bound, err = BindRecipe(o, r, s.now())
+		if err != nil {
+			return err
+		}
+	}
+	if err := s.authorize(ctx, p, ActionObligationCreate, bound.SubjectReference()); err != nil {
 		return err
 	}
-	return s.Store.SubmitObligation(ctx, o)
+	return s.Store.SubmitObligation(ctx, bound)
 }
 
 // RecordClaim records a submitted outcome as a CLAIM. The claim is bound
@@ -344,6 +374,7 @@ func (s *Service) VerifyAndRecord(ctx context.Context, p Principal, v Verificati
 	// Choose the acceptance boundary: the default Verifier, or the
 	// obligation's named external provider.
 	verifier := s.Verifier
+	var namedProvider VerifierProvider
 	if ob.VerifierProviderKind != "" {
 		if s.Providers == nil {
 			return DerivedVerifiedOutcome{}, fmt.Errorf("%w: obligation names provider %q but no providers are registered", ErrNotFound, ob.VerifierProviderKind)
@@ -355,6 +386,7 @@ func (s *Service) VerifyAndRecord(ctx context.Context, p Principal, v Verificati
 		if err := providerServes(prov, ob); err != nil {
 			return DerivedVerifiedOutcome{}, err
 		}
+		namedProvider = prov
 		verifier = prov
 	}
 	// The verifier derives every authority-bearing value from signed
@@ -368,10 +400,46 @@ func (s *Service) VerifyAndRecord(ctx context.Context, p Principal, v Verificati
 		// record is refused here rather than stored as authority.
 		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: verifier returned an unsealed record", ErrUnverified)
 	}
+	// Re-check the provider's capabilities against the resolved demand after
+	// verification (P2e): admission at routing time is not the last word.
+	if namedProvider != nil {
+		if err := recheckProviderDemand(namedProvider, ob, seal); err != nil {
+			return DerivedVerifiedOutcome{}, err
+		}
+	}
+	// Recipe.EvidenceMinimum is enforced on the authoritative discharge
+	// path (P1a): a pass claim whose evidence does not meet the recipe's
+	// floor (attestation count, required kinds, attested window) is
+	// refused — the recipe binds the semantics of a discharge.
+	if err := s.enforceEvidenceMinimum(ob, seal); err != nil {
+		return DerivedVerifiedOutcome{}, err
+	}
 	if err := s.Store.RecordVerifiedOutcome(ctx, seal); err != nil {
 		return DerivedVerifiedOutcome{}, err
 	}
 	return seal, nil
+}
+
+// enforceEvidenceMinimum checks a sealed record against the bound recipe's
+// evidence floor. An obligation without a recipe has no floor to enforce.
+// Fail closed: a discharged pass that does not meet the floor is refused
+// before anything is stored as authoritative.
+func (s *Service) enforceEvidenceMinimum(ob VerificationObligation, seal DerivedVerifiedOutcome) error {
+	if ob.RecipeDigest == "" {
+		return nil
+	}
+	if s.Recipes == nil {
+		return fmt.Errorf("%w: obligation binds recipe %s but no recipe registry is configured", ErrNotFound, ob.RecipeDigest)
+	}
+	r, err := s.Recipes.ByDigest(ob.RecipeDigest)
+	if err != nil {
+		return err
+	}
+	if seal.Outcome.Outcome != OutcomePass {
+		// The floor gates a pass claim; a fail/partial records as-is.
+		return nil
+	}
+	return r.EvidenceMin.Check(seal.Evidence)
 }
 
 // QueryOutcome returns the sealed authoritative record for a verification

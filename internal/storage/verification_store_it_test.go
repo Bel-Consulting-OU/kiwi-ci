@@ -333,6 +333,12 @@ func verificationITSeal(t *testing.T, ob verifyapi.VerificationObligation, v ver
 				EvidenceRoot:      root,
 				AttestationDigest: verificationITDigest(t, "att-"+string(root[:8])),
 				Status:            "success",
+				// The signed job window is the freshness authority (P1b):
+				// without it a derived pass is downgraded to partial.
+				Attested: &verifyapi.AttestedResourceFacts{
+					StartedAt:  v.StartedAt,
+					FinishedAt: v.CompletedAt,
+				},
 				Checks: []verifyapi.VerifiedCheck{
 					{Name: "digest-match", Outcome: verifyapi.CheckOutcomePass, EvidenceDigest: root, ExecutionID: v.ExecutionIDs[0]},
 					{Name: "signature", Outcome: verifyapi.CheckOutcomePass, EvidenceDigest: root, ExecutionID: v.ExecutionIDs[0]},

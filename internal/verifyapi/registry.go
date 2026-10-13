@@ -115,7 +115,7 @@ func (r *Registry) RecordOutcome(v VerificationOutcome) error {
 		if !ok {
 			return fmt.Errorf("%w: group %q", ErrGroupBinding, v.Resources.VerificationGroupID)
 		}
-		if err := BindGroup(g, v); err != nil {
+		if err := BindGroup(g, &ob, v); err != nil {
 			return err
 		}
 	}
@@ -171,7 +171,7 @@ func (r *Registry) RecordVerifiedOutcome(v DerivedVerifiedOutcome) error {
 		if !ok {
 			return fmt.Errorf("%w: group %q", ErrGroupBinding, out.Resources.VerificationGroupID)
 		}
-		if err := BindGroup(g, out); err != nil {
+		if err := BindGroup(g, &ob, out); err != nil {
 			return err
 		}
 	}
@@ -371,28 +371,41 @@ func (r *Registry) Group(id string) (SpeculativeGroup, error) {
 	return cloneGroup(g), nil
 }
 
+// groupAttempt is one recorded outcome of a speculative-group candidate,
+// tagged with whether it carries a sealed derived record.
+type groupAttempt struct {
+	outcome  VerificationOutcome
+	verified bool
+}
+
 // betterAttempt reports whether a is the canonical attempt over b when both
-// answer the same candidate in a speculative group. The rule is a total order
-// over distinct outcomes (verification ids are unique), so map iteration order
-// cannot change the winner: latest completed_at wins; ties break by ascending
-// verification_id.
-func betterAttempt(a, b VerificationOutcome) bool {
-	if !a.CompletedAt.Equal(b.CompletedAt) {
-		return a.CompletedAt.After(b.CompletedAt)
+// answer the same candidate in a speculative group. A verified attempt
+// always outranks a claim (authority first); within the same authority the
+// rule is a total order over distinct outcomes (verification ids are unique),
+// so map iteration order cannot change the winner: latest completed_at wins;
+// ties break by ascending verification_id.
+func betterAttempt(a, b groupAttempt) bool {
+	if a.verified != b.verified {
+		return a.verified
 	}
-	return a.VerificationID < b.VerificationID
+	if !a.outcome.CompletedAt.Equal(b.outcome.CompletedAt) {
+		return a.outcome.CompletedAt.After(b.outcome.CompletedAt)
+	}
+	return a.outcome.VerificationID < b.outcome.VerificationID
 }
 
 // CompareGroup lines up the resource facts of every recorded outcome in a
 // speculative group into comparable rows ordered by candidate id. When a
 // candidate has several recorded outcomes, exactly one canonical attempt is
-// selected deterministically: the outcome with the latest completed_at wins,
-// ties broken by ascending verification_id. Two CompareGroup calls over the
-// same stored records therefore always return identical rows and the same
-// winner. Outcomes whose base snapshot does not match the group (which
-// BindGroup prevents from being recorded) can never appear; the check is
-// repeated at comparison time so a caller that reads across surfaces still
-// gets fail-closed behavior.
+// selected deterministically: a verified attempt always outranks a claim,
+// then the outcome with the latest completed_at wins, ties broken by
+// ascending verification_id. Two CompareGroup calls over the same stored
+// records therefore always return identical rows and the same winner. Rows
+// carry the attempt's Authority; a claim row is never projected into a plain
+// pass (claimed pass → partial). Outcomes whose base snapshot does not match
+// the group (which BindGroup prevents from being recorded) can never appear;
+// the check is repeated at comparison time so a caller that reads across
+// surfaces still gets fail-closed behavior.
 func (r *Registry) CompareGroup(groupID string) (GroupComparison, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -400,7 +413,7 @@ func (r *Registry) CompareGroup(groupID string) (GroupComparison, error) {
 	if !ok {
 		return GroupComparison{}, fmt.Errorf("%w: group %q", ErrNotFound, groupID)
 	}
-	byCandidate := make(map[string]VerificationOutcome)
+	byCandidate := make(map[string]groupAttempt)
 	for _, v := range r.outcomes {
 		rf := v.Resources
 		if !rf.Speculative || rf.VerificationGroupID != groupID {
@@ -409,15 +422,17 @@ func (r *Registry) CompareGroup(groupID string) (GroupComparison, error) {
 		// Prefer the DERIVED authoritative outcome when one exists: its
 		// Measured facts are substrate-filled from evidence. The claim is
 		// the fallback for claim-only members.
+		attempt := groupAttempt{outcome: v, verified: false}
 		if seal, ok := r.verified[v.VerificationID]; ok {
-			v = seal.Outcome
+			attempt.outcome = seal.Outcome
+			attempt.verified = true
 		}
-		if err := BindGroup(g, v); err != nil {
+		if err := BindGroup(g, nil, attempt.outcome); err != nil {
 			return GroupComparison{}, err
 		}
 		prev, exists := byCandidate[rf.CandidateID]
-		if !exists || betterAttempt(v, prev) {
-			byCandidate[rf.CandidateID] = v
+		if !exists || betterAttempt(attempt, prev) {
+			byCandidate[rf.CandidateID] = attempt
 		}
 	}
 	ids := make([]string, 0, len(g.CandidateDigests))
@@ -431,10 +446,16 @@ func (r *Registry) CompareGroup(groupID string) (GroupComparison, error) {
 			CandidateID:     id,
 			CandidateDigest: g.CandidateDigests[id],
 		}
-		if v, ok := byCandidate[id]; ok {
-			row.VerificationID = v.VerificationID
-			row.Outcome = v.Outcome
-			row.Resources = cloneResources(v.Resources)
+		if att, ok := byCandidate[id]; ok {
+			row.VerificationID = att.outcome.VerificationID
+			row.Resources = cloneResources(att.outcome.Resources)
+			if att.verified {
+				row.Authority = RowAuthorityVerified
+				row.Outcome = att.outcome.Outcome
+			} else {
+				row.Authority = RowAuthorityClaim
+				row.Outcome = claimAuthoritativeOutcome(att.outcome.Outcome)
+			}
 		}
 		rows = append(rows, row)
 	}
@@ -444,6 +465,16 @@ func (r *Registry) CompareGroup(groupID string) (GroupComparison, error) {
 		SchemaVersion:       SchemaVersion,
 		Candidates:          rows,
 	}, nil
+}
+
+// claimAuthoritativeOutcome projects a caller claim onto the outcome a
+// consumer may treat as the row's standing: a claim never projects to a
+// plain pass, regardless of the claimed outcome (claimed pass → partial).
+func claimAuthoritativeOutcome(claimed Outcome) Outcome {
+	if claimed == OutcomePass {
+		return OutcomePartial
+	}
+	return claimed
 }
 
 // RegisterCapability validates and stores a verifier capability row.
@@ -543,6 +574,7 @@ func cloneDerived(v DerivedVerifiedOutcome) DerivedVerifiedOutcome {
 	out.Evidence.AttestationDigests = append([]Digest(nil), v.Evidence.AttestationDigests...)
 	out.Evidence.CompletedChecks = append([]string(nil), v.Evidence.CompletedChecks...)
 	out.Evidence.VerifiedChecks = append([]VerifiedCheck(nil), v.Evidence.VerifiedChecks...)
+	out.Evidence.Kinds = append([]string(nil), v.Evidence.Kinds...)
 	if v.Evidence.Attested != nil {
 		a := *v.Evidence.Attested
 		out.Evidence.Attested = &a
@@ -556,6 +588,10 @@ func cloneDerived(v DerivedVerifiedOutcome) DerivedVerifiedOutcome {
 
 func cloneGroup(g SpeculativeGroup) SpeculativeGroup {
 	out := g
+	if g.SubjectRef != nil {
+		s := *g.SubjectRef
+		out.SubjectRef = &s
+	}
 	if g.CandidateDigests != nil {
 		out.CandidateDigests = make(map[string]Digest, len(g.CandidateDigests))
 		for k, v := range g.CandidateDigests {

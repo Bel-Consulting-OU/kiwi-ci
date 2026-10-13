@@ -32,19 +32,46 @@ func TestEpistemicLadderOrder(t *testing.T) {
 	}
 }
 
+// TestEpistemicUnknownIsValidP3f: EpistemicUnknown is the zero value and is
+// invalid — it is never treated as EpistemicRequested, and AtLeast is fail
+// closed on it from either side.
+func TestEpistemicUnknownIsValidP3f(t *testing.T) {
+	if EpistemicUnknown.Valid() {
+		t.Fatal("EpistemicUnknown must be invalid")
+	}
+	if EpistemicUnknown.String() != "unknown" {
+		t.Fatalf("EpistemicUnknown.String() = %q, want unknown", EpistemicUnknown.String())
+	}
+	var zero EpistemicLevel
+	if zero != EpistemicUnknown {
+		t.Fatalf("zero value = %s, want EpistemicUnknown", zero)
+	}
+	if EpistemicUnknown.AtLeast(EpistemicRequested) || EpistemicRequested.AtLeast(EpistemicUnknown) {
+		t.Fatal("AtLeast must be fail-closed across the unknown boundary")
+	}
+	if (&Epistemic[int]{Value: 1, Level: EpistemicUnknown}).Known(EpistemicRequested) {
+		t.Fatal("an unknown-level value is never Known at any rung")
+	}
+}
+
 func TestEpistemicLevelOfFactSource(t *testing.T) {
-	cases := map[FactSource]EpistemicLevel{
-		FactSourceReported: EpistemicObserved,
-		FactSourceAttested: EpistemicAttested,
-		FactSourceDerived:  EpistemicDerived,
-		FactSource("nope"): EpistemicRequested,
+	cases := map[FactSource]struct {
+		level EpistemicLevel
+		ok    bool
+	}{
+		FactSourceReported: {EpistemicObserved, true},
+		FactSourceAttested: {EpistemicAttested, true},
+		FactSourceDerived:  {EpistemicDerived, true},
+		FactSource("nope"): {EpistemicUnknown, false},
+		FactSource(""):     {EpistemicUnknown, false},
 	}
 	for src, want := range cases {
-		if got := EpistemicLevelOf(src); got != want {
-			t.Fatalf("EpistemicLevelOf(%q) = %s, want %s", src, got, want)
+		got, ok := EpistemicLevelOf(src)
+		if got != want.level || ok != want.ok {
+			t.Fatalf("EpistemicLevelOf(%q) = (%s, %v), want (%s, %v)", src, got, ok, want.level, want.ok)
 		}
 	}
-	// Every documented resource-fact name maps onto a defined level.
+	// Every documented resource-fact name maps onto a defined, valid level.
 	for _, name := range []string{
 		"measured.duration_ns", "measured.wall_time_ns",
 		"cpu_time_ns", "wall_time_ns", "peak_memory_bytes",
@@ -52,8 +79,9 @@ func TestEpistemicLevelOfFactSource(t *testing.T) {
 		if src := FactSourceOf(name); src == "" {
 			t.Fatalf("FactSourceOf(%q) is empty", name)
 		}
-		if !EpistemicLevelOf(FactSourceOf(name)).Valid() {
-			t.Fatalf("fact %q maps to an invalid level", name)
+		lvl, ok := EpistemicLevelOf(FactSourceOf(name))
+		if !ok || !lvl.Valid() {
+			t.Fatalf("fact %q maps to an invalid level (%s, ok=%v)", name, lvl, ok)
 		}
 	}
 }

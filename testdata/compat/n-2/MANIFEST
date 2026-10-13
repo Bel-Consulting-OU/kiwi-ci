@@ -1,13 +1,14 @@
 {
-  "comment": "SHA-256 manifest of the N-2 compatibility corpus. Every file is N-2 producer output (git worktree at the N-2 commit, emitted by N-2 storage APIs). Files are immutable: regenerating under changed encoding breaks TestCompatCorpusNMinusTwoConsumedByHead.",
+  "comment": "SHA-256 manifest of the N-2 compatibility corpus. Every file is N-2 producer output (git worktree at the N-2 commit, emitted by N-2 storage APIs). Files are immutable: regenerating under changed encoding breaks TestCompatCorpusNMinusTwoConsumedByHead. The producer records BOTH the git SHA and the sha256 of the producer product binary built from that commit (release-artifact corpus policy: a corpus is identified by its producer binary's exact bytes, not by a commit that can be rebuilt differently).",
+  "producer": {
+    "commit": "753c1c3d0a0f16104d7e22fad888a37debdc47c0",
+    "binary_sha256": "14bc6a14dca187f8c210820aeec8a2d274c2a92eae54fa857e13576cc0fe5ed1",
+    "method": "git worktree add --detach 753c1c3d0a0f16104d7e22fad888a37debdc47c0; go run ./compatemit (calls internal/storage completion-receipt + observed-runtime APIs of the N-2 tree); producer binary is `go build ./cmd/kiwi` of the same tree, hash-pinned here as binary_sha256",
+    "go_version": "go1.27.2"
+  },
   "files": {
     "completion_receipt.json": "7f0230b37a3672660b1ea43c059f8dc3bb19c97f1e740a940a5f994410f31838",
     "observed_runtime.json": "3facd05c8f1053bf39a12dfefe6f6091a1421aff77a954b4f15a9667df6c7d4b",
     "observed_runtime_control.json": "63a522278fdf0d39ecb890badae8dfefc58838ce322442d2ca9c023be85ec948"
-  },
-  "producer": {
-    "commit": "753c1c3d0a0f16104d7e22fad888a37debdc47c0",
-    "method": "git worktree add --detach 753c1c3d0a0f16104d7e22fad888a37debdc47c0; go run ./compatemit (calls internal/storage completion-receipt + observed-runtime APIs of the N-2 tree)",
-    "go_version": "go1.27.2"
   }
 }

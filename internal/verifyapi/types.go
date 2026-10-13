@@ -315,6 +315,13 @@ type SpeculativeGroup struct {
 	// must name as its SnapshotDigest. A member bound to a different base is
 	// not comparable and is refused.
 	BaseSnapshotDigest Digest `json:"base_snapshot_digest"`
+	// SubjectRef is the authority subject every member obligation must
+	// share: the same ref, or a validated descendant the group subject
+	// Includes. It participates in group identity (see CanonicalGroupDigest)
+	// so the same candidate set under a different subject is a different
+	// group and is never interchangeable authority. Nil (or zero) means the
+	// group carries no authority subject — the legacy single-tenant shape.
+	SubjectRef *SubjectRef `json:"subject_ref,omitempty"`
 	// CandidateDigests pins the candidate set of the group, keyed by
 	// candidate id. Only these candidates may join the group.
 	CandidateDigests map[string]Digest `json:"candidate_digests"`
@@ -323,20 +330,25 @@ type SpeculativeGroup struct {
 // CandidateFacts is one comparable row of a speculative-group comparison:
 // the candidate identity and the resource facts of its canonical outcome
 // attempt. When a candidate has several recorded attempts, CompareGroup
-// selects one deterministically (latest completed_at, ties broken by
-// ascending verification_id); the row carries that attempt and only it.
+// selects one deterministically (a verified attempt always outranks a claim;
+// among the same authority, latest completed_at, ties broken by ascending
+// verification_id); the row carries that attempt and only it. Authority
+// marks how the row became known. A claim row is never projected into a
+// plain pass regardless of its claimed outcome (claimed pass → partial).
+// The zero Authority (empty string) means no recorded attempt.
 type CandidateFacts struct {
 	CandidateID     string        `json:"candidate_id"`
 	CandidateDigest Digest        `json:"candidate_digest"`
 	VerificationID  string        `json:"verification_id"`
 	Outcome         Outcome       `json:"outcome"`
+	Authority       RowAuthority  `json:"authority,omitempty"`
 	Resources       ResourceFacts `json:"resources"`
 }
 
 // GroupComparison is the lined-up resource facts of every recorded outcome in
 // a speculative group. Rows are ordered by candidate id so the wire shape is
 // deterministic; within each candidate the canonical attempt is selected by
-// the rule documented on CompareGroup.
+// the rule documented on CandidateFacts / CompareGroup.
 type GroupComparison struct {
 	VerificationGroupID string           `json:"verification_group_id"`
 	BaseSnapshotDigest  Digest           `json:"base_snapshot_digest"`

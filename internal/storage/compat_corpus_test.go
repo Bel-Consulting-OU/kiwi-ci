@@ -29,9 +29,10 @@ import (
 
 type compatManifest struct {
 	Producer struct {
-		Commit    string `json:"commit"`
-		Method    string `json:"method"`
-		GoVersion string `json:"go_version"`
+		Commit       string `json:"commit"`
+		BinarySHA256 string `json:"binary_sha256"`
+		Method       string `json:"method"`
+		GoVersion    string `json:"go_version"`
 	} `json:"producer"`
 	Files map[string]string `json:"files"`
 }
@@ -112,6 +113,20 @@ func runCompatCorpus(t *testing.T, corpus string) {
 	}
 	if man.Producer.Commit == "" || man.Producer.Method == "" {
 		t.Fatalf("MANIFEST producer is incomplete: %+v", man.Producer)
+	}
+	// Release-artifact corpus policy: the producer records the sha256 of
+	// the producer BINARY, not just the git SHA. A commit can be rebuilt
+	// under a different toolchain into different bytes; the corpus is
+	// identified by the exact producer artifact. (docs/releases.md,
+	// "Release-artifact corpus policy".)
+	if man.Producer.BinarySHA256 == "" {
+		t.Fatalf("MANIFEST producer is missing binary_sha256 (release-artifact corpus policy requires the producer binary hash, not just git SHA): %+v", man.Producer)
+	}
+	if len(man.Producer.BinarySHA256) != 64 {
+		t.Fatalf("MANIFEST producer binary_sha256 = %q, want 64 hex chars", man.Producer.BinarySHA256)
+	}
+	if _, err := hex.DecodeString(man.Producer.BinarySHA256); err != nil {
+		t.Fatalf("MANIFEST producer binary_sha256 = %q is not hex: %v", man.Producer.BinarySHA256, err)
 	}
 	if len(man.Files) == 0 {
 		t.Fatal("MANIFEST lists no files")

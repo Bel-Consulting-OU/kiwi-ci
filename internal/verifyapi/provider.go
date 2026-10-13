@@ -105,19 +105,95 @@ func (r *ProviderRegistry) Providers() []VerifierProvider {
 	return out
 }
 
+// ResolvedDemand is the dispatch contract an obligation resolves to before a
+// provider is admitted: which provider kind must discharge it, under which
+// contract version, for which claim class, on which platform, over which
+// evidence types, at which assurance. Empty dimensions mean "no demand on
+// that axis" and are vacuously covered. Admission requires
+// provider.capabilities ⊇ demand (VerifierCapability.Covers); the same check
+// is re-run in the verifier path as defense in depth.
+type ResolvedDemand struct {
+	// ProviderKind names the VerifierProvider.Kind() that must discharge
+	// the obligation. Empty means the service default verifier.
+	ProviderKind string
+	// ContractVersion, when set, demands a specific capability schema
+	// version of that provider family.
+	ContractVersion string
+	// ClaimClass, when set, demands one claim class the provider can verify.
+	ClaimClass string
+	// Platform, when set, demands one execution platform the provider covers.
+	Platform string
+	// EvidenceTypes, when non-empty, demands every listed evidence encoding
+	// the provider can resolve.
+	EvidenceTypes []string
+	// Assurance, when set, demands the assurance profile the provider can
+	// confirm.
+	Assurance string
+}
+
+// ResolveDemand resolves the dispatch demand of an obligation. The provider
+// kind and required assurance come from the obligation itself; the remaining
+// dimensions stay empty unless the caller pins them (ResolveDemandFull) —
+// an obligation carries no native claim-class/platform/evidence-type field,
+// so those axes are only demanded when explicitly resolved.
+func ResolveDemand(obligation VerificationObligation) ResolvedDemand {
+	return ResolvedDemand{
+		ProviderKind: obligation.VerifierProviderKind,
+		Assurance:    obligation.RequiredAssurance,
+	}
+}
+
+// ResolveDemandFull pins every dimension of the dispatch demand, including
+// the axes an obligation does not carry natively.
+func ResolveDemandFull(obligation VerificationObligation, contractVersion, claimClass, platform string, evidenceTypes []string) ResolvedDemand {
+	d := ResolveDemand(obligation)
+	d.ContractVersion = contractVersion
+	d.ClaimClass = claimClass
+	d.Platform = platform
+	d.EvidenceTypes = append([]string(nil), evidenceTypes...)
+	return d
+}
+
+// Covers reports whether the capability set is a superset of the demand
+// (provider.capabilities ⊇ demand). Empty capability dimensions are universal
+// advertisers on that axis (no constraint); a non-empty demand dimension must
+// appear in the corresponding capability list. Fail closed on every mismatch.
+func (c VerifierCapability) Covers(d ResolvedDemand) error {
+	if d.ProviderKind != "" && c.Kind != d.ProviderKind {
+		return fmt.Errorf("%w: demand requires provider kind %q, capability is %q", ErrBinding, d.ProviderKind, c.Kind)
+	}
+	if d.ContractVersion != "" && c.Version != d.ContractVersion {
+		return fmt.Errorf("%w: demand requires contract version %q, capability is %q", ErrBinding, d.ContractVersion, c.Version)
+	}
+	if d.ClaimClass != "" && len(c.ClaimClasses) > 0 && !containsString(c.ClaimClasses, d.ClaimClass) {
+		return fmt.Errorf("%w: capability %s/%s does not cover claim class %q (has %v)", ErrBinding, c.Kind, c.Version, d.ClaimClass, c.ClaimClasses)
+	}
+	if d.Platform != "" && len(c.Platforms) > 0 && !containsString(c.Platforms, d.Platform) {
+		return fmt.Errorf("%w: capability %s/%s does not cover platform %q (has %v)", ErrBinding, c.Kind, c.Version, d.Platform, c.Platforms)
+	}
+	for _, et := range d.EvidenceTypes {
+		if len(c.EvidenceTypes) > 0 && !containsString(c.EvidenceTypes, et) {
+			return fmt.Errorf("%w: capability %s/%s does not cover evidence type %q (has %v)", ErrBinding, c.Kind, c.Version, et, c.EvidenceTypes)
+		}
+	}
+	if d.Assurance != "" && len(c.AssuranceLevels) > 0 && !containsString(c.AssuranceLevels, d.Assurance) {
+		return fmt.Errorf("%w: provider %q does not advertise assurance %q (has %v)", ErrBinding, c.Kind, d.Assurance, c.AssuranceLevels)
+	}
+	return nil
+}
+
 // providerServes reports whether p's advertised capabilities cover the
-// obligation, and that the obligation is addressed to p's kind. Fail closed:
+// obligation's resolved demand, and that the obligation is addressed to p's
+// kind. Fail closed:
 //
 //   - a kind mismatch is a routing error (the caller named a different
 //     provider than the one it is about to invoke);
-//   - a required assurance the provider does not advertise is a capability
+//   - any demand dimension the provider does not advertise is a capability
 //     mismatch and is refused even when the kind matches.
 //
-// ClaimClasses / Platforms / EvidenceTypes are discovery dimensions for
-// callers choosing a provider; the acceptance boundary stays the provider's
-// own Verify. Assurance is the one dimension the substrate itself refuses
-// on: an obligation that demands an assurance profile the provider never
-// advertised must not be discharged by it.
+// This is the admission gate. Service.VerifyAndRecord re-checks the same
+// demand after the provider's Verify returns (defense in depth against a
+// provider that registered one capability set and verified outside it).
 func providerServes(p VerifierProvider, obligation VerificationObligation) error {
 	if p == nil {
 		return fmt.Errorf("%w: provider is required", ErrInvalid)
@@ -130,17 +206,23 @@ func providerServes(p VerifierProvider, obligation VerificationObligation) error
 	if caps.Kind != kind {
 		return fmt.Errorf("%w: provider %q advertises capability kind %q", ErrInvalid, kind, caps.Kind)
 	}
-	if len(caps.AssuranceLevels) > 0 {
-		ok := false
-		for _, level := range caps.AssuranceLevels {
-			if level == obligation.RequiredAssurance {
-				ok = true
-				break
-			}
-		}
-		if !ok {
-			return fmt.Errorf("%w: provider %q does not advertise assurance %q (has %v)", ErrBinding, kind, obligation.RequiredAssurance, caps.AssuranceLevels)
-		}
+	return caps.Covers(ResolveDemand(obligation))
+}
+
+// recheckProviderDemand re-runs the capability-coverage check against the
+// demand after verification. It is the verifier-side re-check: the provider's
+// advertised capabilities must still cover the obligation's resolved demand
+// once Verify returns, so a registration-time fit cannot be silently drifted
+// away from. A sealed result that claims pass under an assurance the demand
+// does not name is also refused.
+func recheckProviderDemand(p VerifierProvider, obligation VerificationObligation, derived DerivedVerifiedOutcome) error {
+	if err := providerServes(p, obligation); err != nil {
+		return err
+	}
+	demand := ResolveDemand(obligation)
+	if demand.Assurance != "" && derived.Sealed() && derived.Outcome.Outcome == OutcomePass &&
+		derived.Outcome.AssuranceProfile != demand.Assurance {
+		return fmt.Errorf("%w: derived pass assurance %q does not meet demand %q", ErrBinding, derived.Outcome.AssuranceProfile, demand.Assurance)
 	}
 	return nil
 }

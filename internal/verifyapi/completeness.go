@@ -167,12 +167,15 @@ func (c EvidenceCompleteness) Complete() bool {
 // OutcomeStatus is the richer outcome view: the rich terminal state, the
 // reason it is not a proven pass (when it is not), and the evidence
 // completeness counters behind that judgment. Coarse is the projection for
-// consumers still on the pass/fail/partial vocabulary.
+// consumers still on the pass/fail/partial vocabulary. MissingItems names
+// the required evidence items that are absent (e.g.
+// "attested_execution_window" when freshness is UNKNOWN).
 type OutcomeStatus struct {
-	Terminal TerminalState        `json:"terminal"`
-	Reason   UnverifiedReason     `json:"reason,omitempty"`
-	Evidence EvidenceCompleteness `json:"evidence"`
-	Coarse   Outcome              `json:"coarse"`
+	Terminal     TerminalState        `json:"terminal"`
+	Reason       UnverifiedReason     `json:"reason,omitempty"`
+	Evidence     EvidenceCompleteness `json:"evidence"`
+	Coarse       Outcome              `json:"coarse"`
+	MissingItems []string             `json:"missing_items,omitempty"`
 }
 
 // ProvenPass reports whether this status is a proven pass (the single
@@ -242,4 +245,25 @@ func (s OutcomeStatus) String() string {
 		return string(s.Terminal)
 	}
 	return fmt.Sprintf("%s: %s", s.Terminal, s.Reason)
+}
+
+// StatusFromEvidence derives the OutcomeStatus of one attempt from its
+// evidence completeness, the coarse verdict the verifier derived, and the
+// authority of the execution window. A window that does not clear the
+// freshness floor leaves freshness UNKNOWN: the attempt is
+// evidence_incomplete with missing=attested_execution_window and is NOT a
+// proven pass — a caller-typed interval can never discharge freshness.
+func StatusFromEvidence(c EvidenceCompleteness, derived Outcome, w ExecutionWindow, min WindowSource) OutcomeStatus {
+	if !w.SatisfiesFreshness(min) {
+		return OutcomeStatus{
+			Terminal: TerminalEvidenceIncomplete,
+			Reason:   ReasonMissingRequiredEvidence,
+			Evidence: c,
+			Coarse:   TerminalEvidenceIncomplete.ProjectCoarse(),
+			MissingItems: []string{
+				MissingAttestedExecutionWindow,
+			},
+		}
+	}
+	return StatusFromCompleteness(c, derived)
 }

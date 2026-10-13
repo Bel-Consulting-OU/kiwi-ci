@@ -283,6 +283,13 @@ func TestSysDFCanonicalReleaseScenarioIntegration(t *testing.T) {
 	t.Logf("canonical STAGE 2 ok: run=%s hold=%s probe=%s artifact=%s sha256=%s",
 		trustedRunID, holdJob.ID, probeJob.ID, artProbe.Name, artProbe.SHA256)
 
+	// Retire the stage-2 runners before the untrusted arm: those runners use
+	// a real git checkout and would race the quota-gate runner for the
+	// untrusted job (placement labels are not a scheduling filter yet).
+	// Fresh runners are spawned before stage 5 failover.
+	runnerA.killNow()
+	runnerB.killNow()
+
 	// ====================================================================
 	// STAGE 3 — untrusted / high-assurance controls
 	// ====================================================================
@@ -304,7 +311,7 @@ func TestSysDFCanonicalReleaseScenarioIntegration(t *testing.T) {
 	// A container-labeled in-process runner claims the untrusted job. The
 	// hard-quota gate runs before any container backend or checkout, so this
 	// arm never needs Docker to prove the fail-closed default.
-	if err := ctrlSys.StartRunner("canon-quota-gate", []string{"container"}); err != nil {
+	if err := ctrlSys.StartRunner("canon-quota-gate", []string{"container", "quota-gate"}); err != nil {
 		t.Fatalf("start quota-gate runner: %v", err)
 	}
 	qStatus, err := ctrlSys.WaitJobTerminal(ctx, untrustedRunID, "build")
@@ -412,9 +419,40 @@ func TestSysDFCanonicalReleaseScenarioIntegration(t *testing.T) {
 	// ====================================================================
 	// STAGE 5 — process kill / failover + retry
 	// ====================================================================
+	// Respawn the stage-2 runners (retired during the untrusted arm so they
+	// could not race the quota-gate runner). Names are new so the registry
+	// lookup cannot pick up the dead stage-2 identities.
+	runnerA2 := spawnRunner(t, headBin, serverURL, runnerToken, "canon-runner-a2", workA, filepath.Join(root, "id-a2"))
+	runnerB2 := spawnRunner(t, headBin, serverURL, runnerToken, "canon-runner-b2b", workB, filepath.Join(root, "id-b2b"))
+	_ = runnerB2
+	var live []struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	var idA2, idB2 string
+	waitFor(t, "respawned runners registered", 30*time.Second, func() bool {
+		live = nil
+		if apiGet(t, serverURL, adminToken, "/api/v1/runners", &live) != 200 {
+			return false
+		}
+		idA2, idB2 = "", ""
+		for _, r := range live {
+			switch r.Name {
+			case "canon-runner-a2":
+				idA2 = r.ID
+			case "canon-runner-b2b":
+				idB2 = r.ID
+			}
+		}
+		return idA2 != "" && idB2 != ""
+	})
+	if idA2 == "" || idB2 == "" {
+		t.Fatalf("respawned runner identities: A=%q B=%q (all %+v)", idA2, idB2, live)
+	}
 	// 5a. Runner failover: hard-kill runner A; fresh work must land on
 	// runner B (leases are not stranded to a dead process).
-	runnerA.killNow()
+	runnerA2.killNow()
+	idA = idA2
 	failoverRunID := canonicalTriggerTrusted(t, serverURL, adminToken, "canon-sched-failover", repoURL, canonicalQuickPipeline)
 	var failoverJob canonJob
 	waitFor(t, "failover job claimed by a live runner", 90*time.Second, func() bool {
@@ -761,11 +799,11 @@ func TestSysDFCanonicalReleaseScenarioIntegration(t *testing.T) {
 	// Packaged binary serves the full history chain (N-1 origin + trusted
 	// probe + restored job B) and their evidence still verifies.
 	type histRef struct {
-		name           string
-		run            string
-		jobID          string
+		name            string
+		run             string
+		jobID           string
 		leaseGeneration int64
-		env            []byte
+		env             []byte
 	}
 	histIDs := []histRef{
 		{"n1-origin", n1RunID, n1Job.ID, n1Job.LeaseGeneration, n1Env},
@@ -896,6 +934,8 @@ jobs:
     runtime: container
     image: alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
     network: none
+    placement:
+      labels: [quota-gate]
     steps:
       - run: echo canonical-untrusted
 `

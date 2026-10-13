@@ -339,3 +339,82 @@ func TestProviderDispatchClockSmoke(t *testing.T) {
 		t.Fatalf("provider calls = %d, want 1", prov.calls)
 	}
 }
+
+// TestResolvedDemandCoversIsRealDispatchContract (P2e): the demand is the
+// provider kind, contract version, claim class, platform, evidence types and
+// assurance; admission requires provider.capabilities ⊇ demand.
+func TestResolvedDemandCoversIsRealDispatchContract(t *testing.T) {
+	ob := providerBaseObligation(t)
+	ob.VerifierProviderKind = externalScannerKind
+	ob.RequiredAssurance = "no_injected_credentials"
+	d := ResolveDemand(ob)
+	if d.ProviderKind != externalScannerKind || d.Assurance != "no_injected_credentials" {
+		t.Fatalf("ResolveDemand = %+v", d)
+	}
+	full := ResolveDemandFull(ob, "1", "execution", "linux", []string{"execution-attestation", "test-report"})
+	if full.ContractVersion != "1" || full.ClaimClass != "execution" || full.Platform != "linux" || len(full.EvidenceTypes) != 2 {
+		t.Fatalf("ResolveDemandFull = %+v", full)
+	}
+
+	caps := VerifierCapability{
+		Kind:            externalScannerKind,
+		Version:         "1",
+		ClaimClasses:    []string{"execution", "release"},
+		AssuranceLevels: []string{"no_injected_credentials", "sealed_pinned_no_network"},
+		Platforms:       []string{"linux", "darwin"},
+		EvidenceTypes:   []string{"execution-attestation", "test-report"},
+	}
+	if err := caps.Covers(full); err != nil {
+		t.Fatalf("superset capability refused demand: %v", err)
+	}
+
+	// Each missing dimension is a refusal.
+	cases := map[string]ResolvedDemand{
+		"kind":       {ProviderKind: "other"},
+		"version":    {ProviderKind: externalScannerKind, ContractVersion: "2"},
+		"claim":      {ProviderKind: externalScannerKind, ClaimClass: "billing"},
+		"platform":   {ProviderKind: externalScannerKind, Platform: "plan9"},
+		"evidence":   {ProviderKind: externalScannerKind, EvidenceTypes: []string{"telemetry"}},
+		"assurance":  {ProviderKind: externalScannerKind, Assurance: "angelic"},
+		"evidence-2": {ProviderKind: externalScannerKind, EvidenceTypes: []string{"execution-attestation", "telemetry"}},
+	}
+	for name, dem := range cases {
+		if err := caps.Covers(dem); err == nil {
+			t.Fatalf("Covers(%s) succeeded, want refusal", name)
+		} else if !errors.Is(err, ErrBinding) {
+			t.Fatalf("Covers(%s) error = %v, want ErrBinding", name, err)
+		}
+	}
+
+	// Empty capability dimensions are universal advertisers (no constraint).
+	open := VerifierCapability{Kind: externalScannerKind, Version: "1", ClaimClasses: []string{"execution"}}
+	if err := open.Covers(full); err != nil {
+		t.Fatalf("open capability refused a dimension demand: %v", err)
+	}
+}
+
+// TestProviderRecheckAfterVerify (P2e): the demand is re-checked in the
+// verifier path after Verify returns, so admission is not the last word.
+func TestProviderRecheckAfterVerify(t *testing.T) {
+	p := &stubProvider{kind: externalScannerKind, caps: externalScannerCapability()}
+	ob := providerBaseObligation(t)
+	ob.VerifierProviderKind = externalScannerKind
+	// Capabilities cover the demand at admission.
+	if err := providerServes(p, ob); err != nil {
+		t.Fatalf("providerServes = %v", err)
+	}
+	// A sealed pass under a different assurance than the demand is refused.
+	// Build the sealed shape via the package seal path is heavy; recheck the
+	// demand contract directly against a mismatched profile.
+	demand := ResolveDemand(ob)
+	if demand.Assurance == "" {
+		t.Fatal("demand assurance is empty")
+	}
+	// Simulate a drifted capability: Covers now refuses.
+	narrow := p
+	narrow.caps = externalScannerCapability()
+	narrow.caps.AssuranceLevels = []string{"sealed_pinned_no_network"}
+	if err := recheckProviderDemand(narrow, ob, DerivedVerifiedOutcome{}); err == nil {
+		t.Fatal("recheck must refuse a provider whose capabilities no longer cover the demand")
+	}
+}

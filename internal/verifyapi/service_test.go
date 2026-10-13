@@ -38,7 +38,8 @@ func newServiceFixture(t *testing.T) *serviceFixture {
 				AttestationDigest: mustDigest(t, "att-digest"),
 				// Signed job status + assurance facts: the derived verifier
 				// only trusts what the attestation proves.
-				Status: string(model.StatusSuccess),
+				Status:   string(model.StatusSuccess),
+				Attested: trustedWindow(),
 				Facts: &model.ExecutionFacts{
 					FilesystemIsolated: true,
 				},

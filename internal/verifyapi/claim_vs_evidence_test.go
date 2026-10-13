@@ -32,6 +32,7 @@ func claimEvidenceVerifier(t *testing.T, root Digest, refToExec map[string]strin
 				EvidenceRoot:      root,
 				AttestationDigest: mustDigest(t, "att-"+ref),
 				Status:            "success",
+				Attested:          trustedWindow(),
 				Checks:            passChecks(exec, "digest-match", "signature"),
 			}, nil
 		},

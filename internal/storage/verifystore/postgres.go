@@ -38,7 +38,10 @@ import (
 // by storage.PostgresStore.Migrate; this package only owns the read/write
 // contract.
 type PostgresStore struct {
-	pool *pgxpool.Pool
+	// recipes resolves recipe-bound obligations at accept/restore time so
+	// the demand digest is the recipe's rule set (never weaker inline rules).
+	recipes *verifyapi.RecipeRegistry
+	pool    *pgxpool.Pool
 	// now reads the store clock for freshness binding at record time.
 	// Production leaves it nil (time.Now); tests may override it.
 	now func() time.Time
@@ -75,6 +78,14 @@ func (s *PostgresStore) WithAcceptanceKey(key verifyapi.AcceptanceKey) *Postgres
 // records are sealed under the keyring's current signing key; persisted
 // records verify under the key id they were sealed with. Required before any
 // verified write or read.
+// WithRecipes installs the recipe registry used to resolve recipe-bound
+// obligations at accept and restore. Required before persisting or loading
+// any record whose obligation pins a RecipeDigest.
+func (s *PostgresStore) WithRecipes(r *verifyapi.RecipeRegistry) *PostgresStore {
+	s.recipes = r
+	return s
+}
+
 func (s *PostgresStore) WithAcceptanceKeyring(ring *verifyapi.AcceptanceKeyring) *PostgresStore {
 	s.acceptanceKeyring = ring
 	return s
@@ -297,7 +308,7 @@ func (s *PostgresStore) idempotentConflict(ctx context.Context, query, id, wantD
 // rules as the in-process registry; Measured resource facts are filled at
 // record time. A claim is never authoritative.
 func (s *PostgresStore) RecordOutcome(ctx context.Context, v verifyapi.VerificationOutcome) error {
-	return s.recordOutcomeTx(ctx, v, v, nil)
+	return s.recordOutcomeTx(ctx, v, v, nil, nil)
 }
 
 // RecordVerifiedOutcome records a verifier-produced VerifiedOutcome as the
@@ -323,22 +334,34 @@ func (s *PostgresStore) RecordVerifiedOutcome(ctx context.Context, v verifyapi.V
 	if err != nil {
 		return err
 	}
-	rec, err := verifyapi.AcceptWithKeyring(ob, v, nil, s.acceptanceKeyring, s.verifyNow())
+	var recipe *verifyapi.Recipe
+	if ob.RecipeDigest != "" {
+		if s.recipes == nil {
+			return fmt.Errorf("%w: store has no recipe registry; cannot accept a recipe-bound record", verifyapi.ErrBinding)
+		}
+		r, err := s.recipes.ByDigest(ob.RecipeDigest)
+		if err != nil {
+			return err
+		}
+		recipe = &r
+	}
+	rec, err := verifyapi.AcceptWithRecipe(ob, v, nil, s.acceptanceKeyring, recipe, s.verifyNow())
 	if err != nil {
 		return err
 	}
-	payload := verifiedPayload{Outcome: v.Outcome, Evidence: v.Evidence, Acceptance: rec}
-	return s.recordOutcomeTx(ctx, v.SubmittedClaim, v.Outcome, &payload)
+	payload := verifiedPayload{Outcome: v.Outcome, Evidence: v.Evidence}
+	return s.recordOutcomeTx(ctx, v.SubmittedClaim, v.Outcome, &payload, &rec)
 }
 
 // verifiedPayload is the evidence-column shape of a verified row: the
 // derived authoritative outcome plus the resolved evidence behind it. The
-// submitted claim lives in the claim column (Model A keeps the two distinct);
-// the acceptance record lives in its own column.
+// submitted claim lives in the claim column (Model A keeps the two distinct).
+// The acceptance record is NOT embedded here: its column is the single
+// source of truth for the integrity record (and the idempotency predicate
+// reads it from there).
 type verifiedPayload struct {
-	Outcome    verifyapi.VerificationOutcome `json:"outcome"`
-	Evidence   verifyapi.VerifiedEvidence    `json:"evidence"`
-	Acceptance verifyapi.AcceptanceRecord    `json:"acceptance,omitempty"`
+	Outcome  verifyapi.VerificationOutcome `json:"outcome"`
+	Evidence verifyapi.VerifiedEvidence    `json:"evidence"`
 }
 
 // recordOutcomeTx writes one outcome row (claim-only when payload is nil,
@@ -346,8 +369,9 @@ type verifiedPayload struct {
 // optional group are bound first, then the insert/upgrade is decided by the
 // content digest so retries never fork the durable record. claim is the
 // SUBMITTED claim (the idempotency identity); bound is the outcome Bind
-// checks (the derived outcome on a verified write).
-func (s *PostgresStore) recordOutcomeTx(ctx context.Context, claim, bound verifyapi.VerificationOutcome, payload *verifiedPayload) error {
+// checks (the derived outcome on a verified write). acceptance is the
+// integrity record of a verified write and lives only in its own column.
+func (s *PostgresStore) recordOutcomeTx(ctx context.Context, claim, bound verifyapi.VerificationOutcome, payload *verifiedPayload, acceptance *verifyapi.AcceptanceRecord) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -390,7 +414,7 @@ func (s *PostgresStore) recordOutcomeTx(ctx context.Context, claim, bound verify
 		if err != nil {
 			return err
 		}
-		if err := verifyapi.BindGroup(g, bound); err != nil {
+		if err := verifyapi.BindGroup(g, &ob, bound); err != nil {
 			return err
 		}
 	}
@@ -417,7 +441,10 @@ func (s *PostgresStore) recordOutcomeTx(ctx context.Context, claim, bound verify
 		if err != nil {
 			return err
 		}
-		acceptanceJSON, err = canonicalJSON(payload.Acceptance)
+		if acceptance == nil {
+			return fmt.Errorf("%w: verified write requires an acceptance record", verifyapi.ErrAcceptance)
+		}
+		acceptanceJSON, err = canonicalJSON(*acceptance)
 		if err != nil {
 			return err
 		}
@@ -433,7 +460,11 @@ func (s *PostgresStore) recordOutcomeTx(ctx context.Context, claim, bound verify
 
 	// Insert, or upgrade an equivalent claim/row. The DO UPDATE predicate
 	// is the idempotency gate: it only fires when the content digest
-	// matches, and a verified write never downgrades is_verified.
+	// matches, a verified write never downgrades is_verified, and a verified
+	// write never overwrites an already-verified row whose acceptance
+	// identity (OutcomeDigest + VerifiedEvidenceDigest) differs — that is a
+	// different derivation under the same claim and is refused with
+	// ErrExists rather than silently replacing the sealed record.
 	var written string
 	if payload != nil {
 		err = tx.QueryRow(ctx, `
@@ -457,10 +488,18 @@ func (s *PostgresStore) recordOutcomeTx(ctx context.Context, claim, bound verify
 				repository_id = EXCLUDED.repository_id,
 				verified_at = COALESCE(verification_outcomes.verified_at, now())
 			WHERE verification_outcomes.content_digest = EXCLUDED.content_digest
+				AND (
+					verification_outcomes.is_verified = FALSE
+					OR (
+						verification_outcomes.acceptance->>'outcome_digest' = $15
+						AND verification_outcomes.acceptance->>'verified_evidence_digest' = $16
+					)
+				)
 			RETURNING verification_id`,
 			claim.VerificationID, claim.ObligationID, digest, claimJSON, evidenceJSON, acceptanceJSON,
 			idx.GroupID, idx.CandidateID, idx.StartedAt, idx.CompletedAt,
-			sc.AuthorityNamespace, sc.TenantID, sc.ProjectID, sc.RepositoryID).Scan(&written)
+			sc.AuthorityNamespace, sc.TenantID, sc.ProjectID, sc.RepositoryID,
+			string(acceptance.OutcomeDigest), string(acceptance.VerifiedEvidenceDigest)).Scan(&written)
 	} else {
 		err = tx.QueryRow(ctx, `
 			INSERT INTO verification_outcomes (
@@ -496,22 +535,39 @@ func (s *PostgresStore) recordOutcomeTx(ctx context.Context, claim, bound verify
 	}
 
 	// Conflict path: the row exists with this verification id. Identical
-	// content is the already-accepted submission (a verified row answering
-	// a claim retry, or a replay of a verified write whose DO UPDATE was
-	// skipped because it was already verified).
+	// claim content is the already-accepted submission (a verified row
+	// answering a claim retry). A verified write against an already-verified
+	// row must also agree on the acceptance identity — a different
+	// OutcomeDigest / VerifiedEvidenceDigest under the same claim is a
+	// different derivation and is refused with ErrExists.
 	var gotDigest string
-	err = tx.QueryRow(ctx, `SELECT content_digest FROM verification_outcomes WHERE verification_id = $1`,
-		claim.VerificationID).Scan(&gotDigest)
+	var gotVerified bool
+	var gotAcceptance []byte
+	err = tx.QueryRow(ctx,
+		`SELECT content_digest, is_verified, acceptance FROM verification_outcomes WHERE verification_id = $1`,
+		claim.VerificationID).Scan(&gotDigest, &gotVerified, &gotAcceptance)
 	if err != nil {
 		return fmt.Errorf("verifystore: read outcome %q after conflict: %w", claim.VerificationID, err)
 	}
-	if gotDigest == digest {
-		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("verifystore: commit record outcome %q: %w", claim.VerificationID, err)
-		}
-		return nil
+	if gotDigest != digest {
+		return fmt.Errorf("%w: outcome %q", verifyapi.ErrExists, claim.VerificationID)
 	}
-	return fmt.Errorf("%w: outcome %q", verifyapi.ErrExists, claim.VerificationID)
+	if gotVerified && payload != nil {
+		var gotAcc verifyapi.AcceptanceRecord
+		if len(gotAcceptance) > 0 {
+			if err := json.Unmarshal(gotAcceptance, &gotAcc); err != nil {
+				return fmt.Errorf("verifystore: decode acceptance %q after conflict: %w", claim.VerificationID, err)
+			}
+		}
+		if gotAcc.OutcomeDigest != acceptance.OutcomeDigest ||
+			gotAcc.VerifiedEvidenceDigest != acceptance.VerifiedEvidenceDigest {
+			return fmt.Errorf("%w: outcome %q", verifyapi.ErrExists, claim.VerificationID)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("verifystore: commit record outcome %q: %w", claim.VerificationID, err)
+	}
+	return nil
 }
 
 // loadGroupTx fetches a speculative group inside an open transaction.
@@ -638,13 +694,24 @@ func (s *PostgresStore) QueryOutcome(ctx context.Context, id string) (verifyapi.
 	// integrity check (verifyapi.RestoreVerifiedOutcome). The keyring
 	// resolves the record's KeyID so a record sealed under a rotated-out
 	// key still verifies while that key remains in the keyring.
-	return verifyapi.RestoreVerifiedOutcomeWithKeyring(verifyapi.PersistedVerified{
+	var recipe *verifyapi.Recipe
+	if ob.RecipeDigest != "" {
+		if s.recipes == nil {
+			return verifyapi.DerivedVerifiedOutcome{}, fmt.Errorf("%w: store has no recipe registry; cannot restore a recipe-bound record", verifyapi.ErrBinding)
+		}
+		r, err := s.recipes.ByDigest(ob.RecipeDigest)
+		if err != nil {
+			return verifyapi.DerivedVerifiedOutcome{}, err
+		}
+		recipe = &r
+	}
+	return verifyapi.RestoreVerifiedOutcomeWithRecipe(verifyapi.PersistedVerified{
 		Obligation:     ob,
 		SubmittedClaim: submitted,
 		Outcome:        payload.Outcome,
 		Evidence:       payload.Evidence,
 		Acceptance:     acceptance,
-	}, nil, s.acceptanceKeyring)
+	}, nil, s.acceptanceKeyring, recipe)
 }
 
 // OutcomesForObligation lists every recorded outcome answering the
@@ -730,18 +797,42 @@ func (s *PostgresStore) GetGroup(ctx context.Context, id string) (verifyapi.Spec
 	return g, nil
 }
 
+// groupAttempt is one recorded outcome of a speculative-group candidate,
+// tagged with whether the row carries a sealed derived record.
+type groupAttempt struct {
+	outcome  verifyapi.VerificationOutcome
+	verified bool
+}
+
 // betterAttempt is the canonical-attempt order documented on
-// verifyapi.CompareGroup: latest completed_at wins, ties break by ascending
-// verification id.
-func betterAttempt(a, b verifyapi.VerificationOutcome) bool {
-	if !a.CompletedAt.Equal(b.CompletedAt) {
-		return a.CompletedAt.After(b.CompletedAt)
+// verifyapi.CompareGroup: a verified attempt always outranks a claim, then
+// latest completed_at wins, ties break by ascending verification id.
+func betterAttempt(a, b groupAttempt) bool {
+	if a.verified != b.verified {
+		return a.verified
 	}
-	return a.VerificationID < b.VerificationID
+	if !a.outcome.CompletedAt.Equal(b.outcome.CompletedAt) {
+		return a.outcome.CompletedAt.After(b.outcome.CompletedAt)
+	}
+	return a.outcome.VerificationID < b.outcome.VerificationID
+}
+
+// claimAuthoritativeOutcome projects a caller claim onto the outcome a
+// consumer may treat as the row's standing: a claim never projects to a
+// plain pass (claimed pass → partial).
+func claimAuthoritativeOutcome(claimed verifyapi.Outcome) verifyapi.Outcome {
+	if claimed == verifyapi.OutcomePass {
+		return verifyapi.OutcomePartial
+	}
+	return claimed
 }
 
 // CompareGroup lines up the resource facts of a speculative group. Rows are
-// ordered by candidate id; one canonical attempt per candidate.
+// ordered by candidate id; one canonical attempt per candidate (verified
+// outranks claim, then latest completed_at). When a row is verified, the
+// DERIVED outcome from the evidence payload is used — never the claim's
+// self-reported Outcome. Claim rows carry Authority "claim" and are never
+// projected into a plain pass.
 func (s *PostgresStore) CompareGroup(ctx context.Context, groupID string) (verifyapi.GroupComparison, error) {
 	if err := ctx.Err(); err != nil {
 		return verifyapi.GroupComparison{}, err
@@ -751,7 +842,7 @@ func (s *PostgresStore) CompareGroup(ctx context.Context, groupID string) (verif
 		return verifyapi.GroupComparison{}, err
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT claim FROM verification_outcomes
+		SELECT claim, evidence, is_verified FROM verification_outcomes
 		WHERE group_id = $1
 		ORDER BY verification_id`,
 		groupID)
@@ -759,24 +850,40 @@ func (s *PostgresStore) CompareGroup(ctx context.Context, groupID string) (verif
 		return verifyapi.GroupComparison{}, fmt.Errorf("verifystore: compare group %q: %w", groupID, err)
 	}
 	defer rows.Close()
-	byCandidate := map[string]verifyapi.VerificationOutcome{}
+	byCandidate := map[string]groupAttempt{}
 	for rows.Next() {
-		var raw []byte
-		if err := rows.Scan(&raw); err != nil {
+		var claimRaw, evidenceRaw []byte
+		var isVerified bool
+		if err := rows.Scan(&claimRaw, &evidenceRaw, &isVerified); err != nil {
 			return verifyapi.GroupComparison{}, fmt.Errorf("verifystore: scan group outcome %q: %w", groupID, err)
 		}
-		var v verifyapi.VerificationOutcome
-		if err := json.Unmarshal(raw, &v); err != nil {
+		var claim verifyapi.VerificationOutcome
+		if err := json.Unmarshal(claimRaw, &claim); err != nil {
 			return verifyapi.GroupComparison{}, fmt.Errorf("verifystore: decode group outcome %q: %w", groupID, err)
+		}
+		attempt := groupAttempt{outcome: claim, verified: false}
+		if isVerified {
+			// Read the DERIVED outcome from the evidence payload; a
+			// verified row whose payload is missing or undecodable fails
+			// closed rather than falling back to the claim's Outcome.
+			if len(evidenceRaw) == 0 {
+				return verifyapi.GroupComparison{}, fmt.Errorf("verifystore: group outcome %q is verified but has no evidence payload", claim.VerificationID)
+			}
+			var payload verifiedPayload
+			if err := json.Unmarshal(evidenceRaw, &payload); err != nil {
+				return verifyapi.GroupComparison{}, fmt.Errorf("verifystore: decode group evidence %q: %w", groupID, err)
+			}
+			attempt.outcome = payload.Outcome
+			attempt.verified = true
 		}
 		// Fail closed on rows that are not comparable to this group
 		// (BindGroup is the single comparability rule).
-		if err := verifyapi.BindGroup(g, v); err != nil {
+		if err := verifyapi.BindGroup(g, nil, attempt.outcome); err != nil {
 			return verifyapi.GroupComparison{}, err
 		}
-		prev, exists := byCandidate[v.Resources.CandidateID]
-		if !exists || betterAttempt(v, prev) {
-			byCandidate[v.Resources.CandidateID] = v
+		prev, exists := byCandidate[attempt.outcome.Resources.CandidateID]
+		if !exists || betterAttempt(attempt, prev) {
+			byCandidate[attempt.outcome.Resources.CandidateID] = attempt
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -794,10 +901,16 @@ func (s *PostgresStore) CompareGroup(ctx context.Context, groupID string) (verif
 			CandidateID:     id,
 			CandidateDigest: g.CandidateDigests[id],
 		}
-		if v, ok := byCandidate[id]; ok {
-			row.VerificationID = v.VerificationID
-			row.Outcome = v.Outcome
-			row.Resources = v.Resources
+		if att, ok := byCandidate[id]; ok {
+			row.VerificationID = att.outcome.VerificationID
+			row.Resources = att.outcome.Resources
+			if att.verified {
+				row.Authority = verifyapi.RowAuthorityVerified
+				row.Outcome = att.outcome.Outcome
+			} else {
+				row.Authority = verifyapi.RowAuthorityClaim
+				row.Outcome = claimAuthoritativeOutcome(att.outcome.Outcome)
+			}
 		}
 		candidates = append(candidates, row)
 	}

@@ -180,6 +180,7 @@ func bareResolvedAttestation(t *testing.T, execID string, root Digest) ResolvedA
 		EvidenceRoot:      root,
 		AttestationDigest: mustDigest(t, "bare-att-digest"),
 		Status:            "success",
+		Attested:          trustedWindow(),
 		Checks:            passChecks(execID, "digest-match", "signature"),
 	}
 }
@@ -661,6 +662,7 @@ func TestFuncEvidenceVerifierSealRules(t *testing.T) {
 		EvidenceRoot:      mustDigest(t, "resolved-root"),
 		AttestationDigest: mustDigest(t, "att-digest"),
 		Status:            "success",
+		Attested:          trustedWindow(),
 		Checks:            passChecks("exec-1", "digest-match", "signature"),
 	}
 	f := &FuncEvidenceVerifier{
@@ -714,6 +716,7 @@ func TestRestoreVerifiedOutcomeRoundTrip(t *testing.T) {
 				EvidenceRoot:      mustDigest(t, "resolved-root"),
 				AttestationDigest: mustDigest(t, "att-digest"),
 				Status:            string(model.StatusSuccess),
+				Attested:          trustedWindow(),
 				Facts:             &model.ExecutionFacts{FilesystemIsolated: true},
 			}, nil
 		},
@@ -987,6 +990,7 @@ func TestAdversarialCallerPassMissingEvidenceChecksIsNotProvenPass(t *testing.T)
 				EvidenceRoot:      mustDigest(t, "adv-root"),
 				AttestationDigest: mustDigest(t, "adv-att"),
 				Status:            "success",
+				Attested:          trustedWindow(),
 			}, nil
 		},
 	}

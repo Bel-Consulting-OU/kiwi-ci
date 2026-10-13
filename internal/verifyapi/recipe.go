@@ -1,9 +1,6 @@
 package verifyapi
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -58,6 +55,43 @@ func (m EvidenceMinimum) Validate() error {
 			return fmt.Errorf("%w: evidence minimum required_kinds contains duplicate %q", ErrInvalid, k)
 		}
 		seen[k] = true
+	}
+	return nil
+}
+
+// Evidence kind vocabulary (P1a). Kinds name the classes of evidence a
+// recipe may demand; VerifiedEvidence.Kinds is the verifier-derived set of
+// kinds actually present.
+const (
+	// EvidenceKindExecutionAttestation: at least one cryptographically
+	// resolved execution attestation.
+	EvidenceKindExecutionAttestation = "execution-attestation"
+	// EvidenceKindTestReport: at least one check derived from a signed
+	// test report.
+	EvidenceKindTestReport = "test-report"
+)
+
+// Check enforces this evidence floor against verifier-derived evidence. It
+// is applied on the authoritative discharge path only: a pass claim whose
+// evidence does not meet the floor is refused. RequireAttestedWindow demands
+// an attested (not observer, not caller-typed) execution window.
+func (m EvidenceMinimum) Check(e VerifiedEvidence) error {
+	if m.MinAttestations > 0 && len(e.AttestationDigests) < m.MinAttestations {
+		return fmt.Errorf("%w: evidence minimum requires %d attestations, got %d", ErrEvidence, m.MinAttestations, len(e.AttestationDigests))
+	}
+	if len(m.RequiredKinds) > 0 {
+		present := make(map[string]bool, len(e.Kinds))
+		for _, k := range e.Kinds {
+			present[k] = true
+		}
+		for _, need := range m.RequiredKinds {
+			if !present[need] {
+				return fmt.Errorf("%w: evidence minimum requires kind %q, which is absent", ErrEvidence, need)
+			}
+		}
+	}
+	if m.RequireAttestedWindow && !e.Window.SatisfiesFreshness(WindowSourceAttested) {
+		return errWindowAuthority(WindowSourceAttested, e.Window.Source)
 	}
 	return nil
 }
@@ -168,12 +202,12 @@ func (r Recipe) Normalize() Recipe {
 }
 
 // RecipeDigest is the stable content digest of one recipe version. It is a
-// lowercase hex SHA-256 over a domain-separated canonical encoding of the
-// recipe with requirement and kind lists sorted, timestamps UTC-normalized,
-// and WithdrawnAt excluded (withdrawal is a liveness fact, not recipe
-// identity: a withdrawn recipe keeps the digest its proofs cite). Equal
-// recipes therefore digest equal across processes and storage round trips;
-// any rule change is a different digest.
+// lowercase hex SHA-256 over the FROZEN domain-separated canonical encoding
+// of the recipe (see encodeRecipeFrozen) with requirement and kind lists
+// sorted, timestamps UTC-normalized, and WithdrawnAt excluded (withdrawal is
+// a liveness fact, not recipe identity: a withdrawn recipe keeps the digest
+// its proofs cite). Equal recipes therefore digest equal across processes and
+// storage round trips; any rule change is a different digest.
 func RecipeDigest(r Recipe) (Digest, error) {
 	n := r.Normalize()
 	if err := n.Validate(); err != nil {
@@ -185,12 +219,7 @@ func RecipeDigest(r Recipe) (Digest, error) {
 	n.WithdrawnAt = nil
 	sort.Strings(n.Requirements)
 	sort.Strings(n.EvidenceMin.RequiredKinds)
-	raw, err := json.Marshal(n)
-	if err != nil {
-		return "", fmt.Errorf("%w: encode recipe for digest: %v", ErrInvalid, err)
-	}
-	sum := sha256.Sum256(append([]byte(recipeDomain+"\n"), raw...))
-	return Digest(hex.EncodeToString(sum[:])), nil
+	return encodeRecipeFrozen(n).frozenHash("recipe")
 }
 
 // MustRecipeDigest is RecipeDigest for values already known to validate; it
@@ -205,10 +234,14 @@ func MustRecipeDigest(r Recipe) Digest {
 
 // BindRecipe returns a copy of o pinned to recipe: RecipeDigest is set to
 // the recipe's stable digest, and the obligation's requirement, assurance
-// and freshness dimensions are replaced by the recipe's when the obligation
-// left them at the recipe's values or empty. The obligation id and subject
-// stay the caller's. A recipe that is not live at bind time is refused so a
-// withdrawn recipe cannot mint new demand.
+// and freshness dimensions are set to the recipe's. Recipe-owned fields are
+// NOT independently definable: an obligation that already carries different
+// checks, assurance or freshness disagrees with the recipe and is refused
+// (ErrBinding) — the recipe binds the semantics, so a weaker inline demand
+// can never ride along under a strong recipe digest. Empty fields are filled
+// from the recipe. The obligation id and subject stay the caller's. A recipe
+// that is not live at bind time is refused so a withdrawn recipe cannot mint
+// new demand.
 func BindRecipe(o VerificationObligation, r Recipe, now time.Time) (VerificationObligation, error) {
 	if err := r.Validate(); err != nil {
 		return VerificationObligation{}, err
@@ -221,17 +254,74 @@ func BindRecipe(o VerificationObligation, r Recipe, now time.Time) (Verification
 		return VerificationObligation{}, err
 	}
 	out := o
+	if out.RecipeDigest != "" && out.RecipeDigest != d {
+		return VerificationObligation{}, fmt.Errorf("%w: obligation recipe digest %s disagrees with supplied recipe %s@%d (%s)",
+			ErrBinding, out.RecipeDigest, r.Name, r.Version, d)
+	}
 	out.RecipeDigest = d
 	if len(out.RequiredChecks) == 0 {
+		out.RequiredChecks = append([]string(nil), r.Requirements...)
+	} else if !stringSetsEqual(out.RequiredChecks, r.Requirements) {
+		return VerificationObligation{}, fmt.Errorf("%w: obligation checks %v disagree with recipe %s@%d requirements %v",
+			ErrBinding, out.RequiredChecks, r.Name, r.Version, r.Requirements)
+	} else {
 		out.RequiredChecks = append([]string(nil), r.Requirements...)
 	}
 	if out.RequiredAssurance == "" {
 		out.RequiredAssurance = r.Assurance
+	} else if out.RequiredAssurance != r.Assurance {
+		return VerificationObligation{}, fmt.Errorf("%w: obligation assurance %q disagrees with recipe %s@%d assurance %q",
+			ErrBinding, out.RequiredAssurance, r.Name, r.Version, r.Assurance)
 	}
 	if out.Freshness == (FreshnessPolicy{}) {
 		out.Freshness = r.Freshness
+	} else if !freshnessEqual(out.Freshness, r.Freshness) {
+		return VerificationObligation{}, fmt.Errorf("%w: obligation freshness %+v disagrees with recipe %s@%d freshness %+v",
+			ErrBinding, out.Freshness, r.Name, r.Version, r.Freshness)
+	} else {
+		out.Freshness = utcFreshnessPolicy(r.Freshness)
 	}
 	return out, nil
+}
+
+// stringSetsEqual reports whether two check lists hold the same identities
+// (order-insensitive; duplicates already rejected by Validate).
+func stringSetsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := make(map[string]int, len(a))
+	for _, s := range a {
+		seen[s]++
+	}
+	for _, s := range b {
+		seen[s]--
+		if seen[s] < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// freshnessEqual reports whether two freshness policies constrain the same
+// dimensions to the same instants (pointer times compared by value).
+func freshnessEqual(a, b FreshnessPolicy) bool {
+	if a.MaxAgeSeconds != b.MaxAgeSeconds {
+		return false
+	}
+	if (a.NotBefore == nil) != (b.NotBefore == nil) {
+		return false
+	}
+	if a.NotBefore != nil && !a.NotBefore.Equal(*b.NotBefore) {
+		return false
+	}
+	if (a.NotAfter == nil) != (b.NotAfter == nil) {
+		return false
+	}
+	if a.NotAfter != nil && !a.NotAfter.Equal(*b.NotAfter) {
+		return false
+	}
+	return true
 }
 
 // RecipeRegistry holds published recipe versions keyed by digest. Recipes
