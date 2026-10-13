@@ -352,6 +352,13 @@ func (s *Service) RecordClaim(ctx context.Context, p Principal, v VerificationOu
 // the store's transactional RecordVerifiedOutcome (PostgresStore commits the
 // claim upgrade and the verified row in one transaction).
 //
+// After the verifier returns, the Service INDEPENDENTLY re-binds the result
+// to this request (P0c): the returned SubmittedClaim must be the supplied
+// submission, the returned identity must equal the authorized obligation,
+// the outcome must bind it, and the sealed content must still be valid. A
+// hostile provider returning another obligation's sealed record is refused
+// here — the provider is never trusted to address its own output.
+//
 // The returned record is sealed; only sealed records discharge obligations.
 // Authorization runs against the STORED obligation's SubjectRef.
 //
@@ -400,6 +407,14 @@ func (s *Service) VerifyAndRecord(ctx context.Context, p Principal, v Verificati
 		// record is refused here rather than stored as authority.
 		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: verifier returned an unsealed record", ErrUnverified)
 	}
+	// P0c: independently re-bind the verifier's return value to THIS
+	// request before anything is stored. A provider is not trusted to
+	// address its own output — a hostile provider returning a sealed
+	// tenant-B record for a tenant-A obligation is refused here, not at
+	// query time.
+	if err := rebindVerifierOutput(ob, v, seal, s.now()); err != nil {
+		return DerivedVerifiedOutcome{}, err
+	}
 	// Re-check the provider's capabilities against the resolved demand after
 	// verification (P2e): admission at routing time is not the last word.
 	if namedProvider != nil {
@@ -423,7 +438,9 @@ func (s *Service) VerifyAndRecord(ctx context.Context, p Principal, v Verificati
 // enforceEvidenceMinimum checks a sealed record against the bound recipe's
 // evidence floor. An obligation without a recipe has no floor to enforce.
 // Fail closed: a discharged pass that does not meet the floor is refused
-// before anything is stored as authoritative.
+// before anything is stored as authoritative. Pass-only (P2i): the floor is
+// what a recipe demands before any pass can be claimed — a fail/partial
+// records as-is.
 func (s *Service) enforceEvidenceMinimum(ob VerificationObligation, seal DerivedVerifiedOutcome) error {
 	if ob.RecipeDigest == "" {
 		return nil
@@ -435,11 +452,90 @@ func (s *Service) enforceEvidenceMinimum(ob VerificationObligation, seal Derived
 	if err != nil {
 		return err
 	}
-	if seal.Outcome.Outcome != OutcomePass {
+	if seal.outcome.Outcome != OutcomePass {
 		// The floor gates a pass claim; a fail/partial records as-is.
 		return nil
 	}
-	return r.EvidenceMin.Check(seal.Evidence)
+	return r.EvidenceMin.Check(seal.evidence)
+}
+
+// rebindVerifierOutput is the Service's independent re-binding gate over a
+// verifier/provider return value (P0c). The verifier is not trusted to
+// address its own output: before anything is stored the Service asserts
+//
+//   - the returned SubmittedClaim is the supplied submission (the proposal
+//     the caller actually made — a swapped claim is a different request);
+//   - the returned outcome and claim identity (obligation, candidate,
+//     snapshot, contract) equal the authorized obligation — a sealed
+//     record minted for another obligation (e.g. tenant-B proof returned
+//     for a tenant-A request) is refused;
+//   - the returned outcome binds that obligation under the full Bind rule
+//     (checks, assurance, freshness) at the service clock;
+//   - the sealed content is still internally valid (structural validation
+//     plus the seal invariants: claim↔derived identity and evidence
+//     consistency).
+//
+// Every failure is a refusal (ErrBinding / ErrUnverified / ErrInvalid):
+// nothing is recorded and no outcome is disclosed.
+func rebindVerifierOutput(obligation VerificationObligation, submitted VerificationOutcome, seal DerivedVerifiedOutcome, now time.Time) error {
+	if !seal.Sealed() {
+		return fmt.Errorf("%w: verifier returned an unsealed record", ErrUnverified)
+	}
+	// (1) The returned SubmittedClaim must be the supplied submission.
+	wantClaim, err := submittedClaimDigest(submitted)
+	if err != nil {
+		return err
+	}
+	gotClaim, err := submittedClaimDigest(seal.submittedClaim)
+	if err != nil {
+		return err
+	}
+	if wantClaim != gotClaim {
+		return fmt.Errorf("%w: verifier returned a different submitted claim than the supplied submission", ErrBinding)
+	}
+	// (2) The supplied submission itself must address the authorized
+	// obligation — otherwise the rebind would be comparing against a
+	// mis-addressed request.
+	if submitted.ObligationID != obligation.ObligationID {
+		return fmt.Errorf("%w: submission names obligation %q, authorized %q", ErrBinding, submitted.ObligationID, obligation.ObligationID)
+	}
+	if submitted.CandidateDigest != obligation.ImmutableCandidateDigest {
+		return fmt.Errorf("%w: submission candidate digest %s does not match obligation %s", ErrBinding, submitted.CandidateDigest, obligation.ImmutableCandidateDigest)
+	}
+	if submitted.SnapshotDigest != obligation.SourceSnapshotDigest {
+		return fmt.Errorf("%w: submission snapshot digest %s does not match obligation %s", ErrBinding, submitted.SnapshotDigest, obligation.SourceSnapshotDigest)
+	}
+	if submitted.ContractDigest != obligation.VerificationContractDigest {
+		return fmt.Errorf("%w: submission contract digest %s does not match obligation %s", ErrBinding, submitted.ContractDigest, obligation.VerificationContractDigest)
+	}
+	// (3) The returned outcome identity must equal the authorized obligation.
+	if seal.outcome.ObligationID != obligation.ObligationID {
+		return fmt.Errorf("%w: verifier returned obligation %q, authorized %q", ErrBinding, seal.outcome.ObligationID, obligation.ObligationID)
+	}
+	if seal.outcome.CandidateDigest != obligation.ImmutableCandidateDigest {
+		return fmt.Errorf("%w: verifier returned candidate digest %s, authorized %s", ErrBinding, seal.outcome.CandidateDigest, obligation.ImmutableCandidateDigest)
+	}
+	if seal.outcome.SnapshotDigest != obligation.SourceSnapshotDigest {
+		return fmt.Errorf("%w: verifier returned snapshot digest %s, authorized %s", ErrBinding, seal.outcome.SnapshotDigest, obligation.SourceSnapshotDigest)
+	}
+	if seal.outcome.ContractDigest != obligation.VerificationContractDigest {
+		return fmt.Errorf("%w: verifier returned contract digest %s, authorized %s", ErrBinding, seal.outcome.ContractDigest, obligation.VerificationContractDigest)
+	}
+	// (4) The outcome must bind the obligation under the full rule
+	// (required checks, assurance, freshness at the service clock).
+	if err := Bind(obligation, seal.outcome, now); err != nil {
+		return fmt.Errorf("%w: verifier output does not bind the obligation: %v", ErrBinding, err)
+	}
+	// (5) The sealed content must still be internally valid: structural
+	// validation plus the seal invariants (claim↔derived identity, evidence
+	// consistency) re-applied over the returned record.
+	if err := seal.outcome.Validate(); err != nil {
+		return err
+	}
+	if _, err := sealDerivedOutcome(seal.submittedClaim, seal.outcome, seal.evidence); err != nil {
+		return fmt.Errorf("%w: verifier returned inconsistent sealed content: %v", ErrUnverified, err)
+	}
+	return nil
 }
 
 // QueryOutcome returns the sealed authoritative record for a verification
@@ -453,7 +549,7 @@ func (s *Service) QueryOutcome(ctx context.Context, p Principal, id string) (Der
 	if err != nil {
 		return DerivedVerifiedOutcome{}, err
 	}
-	ob, err := s.subjectOf(ctx, vo.Outcome.ObligationID)
+	ob, err := s.subjectOf(ctx, vo.outcome.ObligationID)
 	if err != nil {
 		return DerivedVerifiedOutcome{}, err
 	}

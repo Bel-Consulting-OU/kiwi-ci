@@ -70,9 +70,9 @@ func TestAcceptanceV2BindsSubmittedClaim(t *testing.T) {
 	}
 	persisted := PersistedVerified{
 		Obligation:     ob,
-		SubmittedClaim: sealed.SubmittedClaim,
-		Outcome:        sealed.Outcome,
-		Evidence:       sealed.Evidence,
+		SubmittedClaim: sealed.SubmittedClaim(),
+		Outcome:        sealed.Outcome(),
+		Evidence:       sealed.Evidence(),
 		Acceptance:     rec,
 	}
 	if _, err := RestoreVerifiedOutcome(persisted, key); err != nil {
@@ -177,11 +177,11 @@ func TestAcceptanceV1StillRestores(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	outDig, err := outcomeDigest(sealed.Outcome)
+	outDig, err := outcomeDigest(sealed.Outcome())
 	if err != nil {
 		t.Fatal(err)
 	}
-	evDig, err := evidenceDigest(sealed.Evidence)
+	evDig, err := evidenceDigest(sealed.Evidence())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,9 +206,9 @@ func TestAcceptanceV1StillRestores(t *testing.T) {
 
 	persisted := PersistedVerified{
 		Obligation:     ob,
-		SubmittedClaim: sealed.SubmittedClaim,
-		Outcome:        sealed.Outcome,
-		Evidence:       sealed.Evidence,
+		SubmittedClaim: sealed.SubmittedClaim(),
+		Outcome:        sealed.Outcome(),
+		Evidence:       sealed.Evidence(),
 		Acceptance:     rec,
 	}
 	restored, err := RestoreVerifiedOutcome(persisted, key)
@@ -261,9 +261,9 @@ func TestSealDerivedOutcomeRefusesClaimIdentityMismatch(t *testing.T) {
 		{"contract digest", func(c *VerificationOutcome) { c.ContractDigest = mustDigest(t, "other-contract") }},
 	}
 	for _, tc := range mismatches {
-		claim := sealed.SubmittedClaim
+		claim := sealed.SubmittedClaim()
 		tc.mut(&claim)
-		if _, err := sealDerivedOutcome(claim, sealed.Outcome, sealed.Evidence); err == nil {
+		if _, err := sealDerivedOutcome(claim, sealed.Outcome(), sealed.Evidence()); err == nil {
 			t.Fatalf("seal with mismatched %s must fail", tc.name)
 		} else if !errors.Is(err, ErrUnverified) {
 			t.Fatalf("mismatched %s error = %v, want ErrUnverified", tc.name, err)
@@ -330,9 +330,9 @@ func TestKeyringWriteK1ThenRestart(t *testing.T) {
 	}
 	persisted := PersistedVerified{
 		Obligation:     ob,
-		SubmittedClaim: sealed.SubmittedClaim,
-		Outcome:        sealed.Outcome,
-		Evidence:       sealed.Evidence,
+		SubmittedClaim: sealed.SubmittedClaim(),
+		Outcome:        sealed.Outcome(),
+		Evidence:       sealed.Evidence(),
 		Acceptance:     rec,
 	}
 	// "Restart": build a fresh keyring from the same key material.
@@ -366,8 +366,8 @@ func TestKeyringRotateK2KeepsK1Verify(t *testing.T) {
 		t.Fatalf("Accept under K1 = %v", err)
 	}
 	persisted1 := PersistedVerified{
-		Obligation: ob, SubmittedClaim: sealed.SubmittedClaim,
-		Outcome: sealed.Outcome, Evidence: sealed.Evidence, Acceptance: rec1,
+		Obligation: ob, SubmittedClaim: sealed.SubmittedClaim(),
+		Outcome: sealed.Outcome(), Evidence: sealed.Evidence(), Acceptance: rec1,
 	}
 
 	// Rotate to K2; K1 stays in VerifyKeys.
@@ -396,8 +396,8 @@ func TestKeyringRotateK2KeepsK1Verify(t *testing.T) {
 		t.Fatalf("new record KeyID = %q, want K2", rec2.KeyID)
 	}
 	persisted2 := PersistedVerified{
-		Obligation: ob, SubmittedClaim: sealed.SubmittedClaim,
-		Outcome: sealed.Outcome, Evidence: sealed.Evidence, Acceptance: rec2,
+		Obligation: ob, SubmittedClaim: sealed.SubmittedClaim(),
+		Outcome: sealed.Outcome(), Evidence: sealed.Evidence(), Acceptance: rec2,
 	}
 	restored2, err := RestoreVerifiedOutcomeWithKeyring(persisted2, nil, ring)
 	if err != nil {
@@ -424,8 +424,8 @@ func TestKeyringResealThenRetireK1(t *testing.T) {
 		t.Fatalf("Accept = %v", err)
 	}
 	persisted := PersistedVerified{
-		Obligation: ob, SubmittedClaim: sealed.SubmittedClaim,
-		Outcome: sealed.Outcome, Evidence: sealed.Evidence, Acceptance: rec1,
+		Obligation: ob, SubmittedClaim: sealed.SubmittedClaim(),
+		Outcome: sealed.Outcome(), Evidence: sealed.Evidence(), Acceptance: rec1,
 	}
 
 	// Rotate to K2.
@@ -459,8 +459,8 @@ func TestKeyringResealThenRetireK1(t *testing.T) {
 		t.Fatal("resealed record must stay a proven pass")
 	}
 	persisted2 := PersistedVerified{
-		Obligation: ob, SubmittedClaim: sealed.SubmittedClaim,
-		Outcome: sealed.Outcome, Evidence: sealed.Evidence, Acceptance: rec2,
+		Obligation: ob, SubmittedClaim: sealed.SubmittedClaim(),
+		Outcome: sealed.Outcome(), Evidence: sealed.Evidence(), Acceptance: rec2,
 	}
 
 	// Now K1 may be retired: the migrated record verifies under K2 alone.
@@ -494,8 +494,8 @@ func TestKeyringUnknownAndTamperedKeyIDFailClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	persisted := PersistedVerified{
-		Obligation: ob, SubmittedClaim: sealed.SubmittedClaim,
-		Outcome: sealed.Outcome, Evidence: sealed.Evidence, Acceptance: rec,
+		Obligation: ob, SubmittedClaim: sealed.SubmittedClaim(),
+		Outcome: sealed.Outcome(), Evidence: sealed.Evidence(), Acceptance: rec,
 	}
 
 	// Unknown key id.
@@ -706,12 +706,12 @@ func TestVerifiedCheckOutcomeRequiredForPass(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Verify = %v", err)
 			}
-			if vo.Outcome.Outcome != tc.want {
-				t.Fatalf("derived outcome = %q, want %q", vo.Outcome.Outcome, tc.want)
+			if vo.Outcome().Outcome != tc.want {
+				t.Fatalf("derived outcome = %q, want %q", vo.Outcome().Outcome, tc.want)
 			}
 			// CompletedChecks only lists checks whose outcome is pass.
 			hasSuiteA := false
-			for _, c := range vo.Outcome.CompletedChecks {
+			for _, c := range vo.Outcome().CompletedChecks {
 				if c == "suite-a" {
 					hasSuiteA = true
 				}
@@ -813,10 +813,10 @@ func TestProvenanceCheckOutcomeFromReportCases(t *testing.T) {
 	}
 	// Required checks are digest-match + signature: digest-match is now a
 	// FAIL, so the obligation cannot be satisfied.
-	if vo.Outcome.Outcome != OutcomePartial {
-		t.Fatalf("derived outcome = %q, want partial (digest-match failed)", vo.Outcome.Outcome)
+	if vo.Outcome().Outcome != OutcomePartial {
+		t.Fatalf("derived outcome = %q, want partial (digest-match failed)", vo.Outcome().Outcome)
 	}
-	for _, c := range vo.Evidence.VerifiedChecks {
+	for _, c := range vo.Evidence().VerifiedChecks {
 		if c.Name == "digest-match" && c.Outcome != CheckOutcomeFail {
 			t.Fatalf("digest-match outcome = %q, want fail (derived from failing cases)", c.Outcome)
 		}
@@ -845,7 +845,7 @@ func TestProvenanceMissingReportIsIncomplete(t *testing.T) {
 	if vo.ProvenPass() {
 		t.Fatal("missing reports must not produce a proven pass")
 	}
-	for _, c := range vo.Evidence.VerifiedChecks {
+	for _, c := range vo.Evidence().VerifiedChecks {
 		if c.Name == "digest-match" || c.Name == "signature" {
 			if c.Outcome != CheckOutcomeIncomplete {
 				t.Fatalf("%s outcome = %q, want incomplete", c.Name, c.Outcome)
@@ -933,9 +933,9 @@ func TestVerificationProofVerifyWithoutRegistry(t *testing.T) {
 	}
 	proof := NewVerificationProof(PersistedVerified{
 		Obligation:     ob,
-		SubmittedClaim: sealed.SubmittedClaim,
-		Outcome:        sealed.Outcome,
-		Evidence:       sealed.Evidence,
+		SubmittedClaim: sealed.SubmittedClaim(),
+		Outcome:        sealed.Outcome(),
+		Evidence:       sealed.Evidence(),
 		Acceptance:     rec,
 	})
 	// Verify with no registry, no store — just the keyring.
@@ -1056,8 +1056,8 @@ func TestConflictingCheckEvidenceIsEvidenceInvalid(t *testing.T) {
 	_ = coarse
 	// Build the terminal from a derived shape carrying the conflict.
 	sealedShape := DerivedVerifiedOutcome{
-		Outcome:  VerificationOutcome{Outcome: OutcomePass},
-		Evidence: VerifiedEvidence{VerifiedChecks: checks},
+		outcome:  VerificationOutcome{Outcome: OutcomePass},
+		evidence: VerifiedEvidence{VerifiedChecks: checks},
 	}
 	// verifiedTerminal reads Evidence.VerifiedChecks via hasCheckConflicts;
 	// craft via the exported comparison path instead.
@@ -1065,7 +1065,7 @@ func TestConflictingCheckEvidenceIsEvidenceInvalid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("VerifiedFromDerived = %v", err)
 	}
-	cmp, err := CompareVerifiedCandidates("", []VerifiedCandidateSource{src}, nil)
+	cmp, err := CompareVerifiedCandidates(mustDigest(t, "conflict-snap"), []VerifiedCandidateSource{src}, nil)
 	if err != nil {
 		t.Fatalf("CompareVerifiedCandidates = %v", err)
 	}
@@ -1083,6 +1083,7 @@ func TestConflictingCheckEvidenceIsEvidenceInvalid(t *testing.T) {
 func mustSealWithChecks(t *testing.T, checks []VerifiedCheck) DerivedVerifiedOutcome {
 	t.Helper()
 	iv := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	completed := completedCheckNames(checks)
 	v := VerificationOutcome{
 		VerificationID:   "ver-conflict",
 		ObligationID:     "ob-conflict",
@@ -1091,7 +1092,7 @@ func mustSealWithChecks(t *testing.T, checks []VerifiedCheck) DerivedVerifiedOut
 		ContractDigest:   mustDigest(t, "conflict-contract"),
 		Outcome:          OutcomePass,
 		AssuranceProfile: model.AssuranceUncontrolled.Name(),
-		CompletedChecks:  []string{CheckJobStatusSuccess},
+		CompletedChecks:  completed,
 		ExecutionIDs:     []string{"exec-1"},
 		EvidenceRoot:     mustDigest(t, "conflict-root"),
 		Resources:        ResourceFacts{RunnerClass: "standard"},
@@ -1103,7 +1104,7 @@ func mustSealWithChecks(t *testing.T, checks []VerifiedCheck) DerivedVerifiedOut
 		EvidenceRoot:       mustDigest(t, "conflict-root"),
 		AttestationDigests: []Digest{mustDigest(t, "conflict-att")},
 		JobStatus:          "success",
-		CompletedChecks:    []string{CheckJobStatusSuccess},
+		CompletedChecks:    completed,
 		VerifiedChecks:     checks,
 		VerifierIdentity:   "conflict-verifier/v1",
 		VerifiedAt:         iv,

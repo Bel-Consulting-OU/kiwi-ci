@@ -21,8 +21,15 @@ import (
 const EffectiveVerificationDemandSchemaVersion = 1
 
 // demandDomain separates demand digests from every other digest in the
-// package.
+// package. This is the v1 domain: the pre-provider-axes field set, retained
+// so AcceptanceVersionV3/V4 records keep restoring.
 const demandDomain = "kiwi-ci/verify-demand/v1"
+
+// demandDomainV2 is the v2 demand domain. v2 additionally binds the
+// verifier provider constraints (kind, contract version, claim class,
+// platform, evidence types); the domain bump keeps a v1 demand digest from
+// ever colliding with a v2 one.
+const demandDomainV2 = "kiwi-ci/verify-demand/v2"
 
 // EffectiveVerificationDemand is the canonical resolved verification demand
 // one discharge is measured against. When the obligation binds a recipe, the
@@ -50,6 +57,25 @@ type EffectiveVerificationDemand struct {
 	// six months old. The recipe contributes the freshness RULE
 	// (MaxAgeSeconds / NotAfter), not the clock start.
 	IssuedAt time.Time `json:"issued_at"`
+	// VerifierProviderKind, when non-empty, names the VerifierProvider.Kind()
+	// that must discharge this demand. Empty selects the service default
+	// EvidenceVerifier. P1d: these five provider axes ride the demand (and
+	// therefore DemandDigest) so an acceptance MAC pins WHICH verifier must
+	// discharge the obligation, not just what it must prove.
+	VerifierProviderKind string `json:"verifier_provider_kind,omitempty"`
+	// VerifierContractVersion, when non-empty, pins the provider capability
+	// schema version required to discharge this demand.
+	VerifierContractVersion string `json:"verifier_contract_version,omitempty"`
+	// VerifierClaimClass, when non-empty, pins the claim class the
+	// discharging provider must cover.
+	VerifierClaimClass string `json:"verifier_claim_class,omitempty"`
+	// VerifierPlatform, when non-empty, pins the execution platform the
+	// discharging provider must cover.
+	VerifierPlatform string `json:"verifier_platform,omitempty"`
+	// VerifierEvidenceTypes, when non-empty, pins every evidence encoding
+	// the discharging provider must resolve. Each entry is a hard
+	// requirement (see VerifierCapability.Covers).
+	VerifierEvidenceTypes []string `json:"verifier_evidence_types,omitempty"`
 }
 
 // ResolveEffectiveDemand derives the effective demand of one obligation. A
@@ -59,6 +85,16 @@ type EffectiveVerificationDemand struct {
 // (when set) pins the recipe identity. An unbound obligation's inline rules
 // are the demand.
 func ResolveEffectiveDemand(o VerificationObligation, recipe *Recipe) (EffectiveVerificationDemand, error) {
+	// Provider constraints are obligation-owned (a recipe is a reusable
+	// rule template and carries no provider axes): both resolution paths
+	// pin them from the obligation so DemandDigest binds WHO must verify.
+	providerAxes := EffectiveVerificationDemand{
+		VerifierProviderKind:    o.VerifierProviderKind,
+		VerifierContractVersion: o.VerifierContractVersion,
+		VerifierClaimClass:      o.VerifierClaimClass,
+		VerifierPlatform:        o.VerifierPlatform,
+		VerifierEvidenceTypes:   append([]string(nil), o.VerifierEvidenceTypes...),
+	}
 	if recipe != nil {
 		if err := recipe.Validate(); err != nil {
 			return EffectiveVerificationDemand{}, err
@@ -76,6 +112,12 @@ func ResolveEffectiveDemand(o VerificationObligation, recipe *Recipe) (Effective
 			Freshness:     utcFreshnessPolicy(recipe.Freshness),
 			// Freshness clock starts at the obligation, not the recipe.
 			IssuedAt: o.IssuedAt.UTC(),
+
+			VerifierProviderKind:    providerAxes.VerifierProviderKind,
+			VerifierContractVersion: providerAxes.VerifierContractVersion,
+			VerifierClaimClass:      providerAxes.VerifierClaimClass,
+			VerifierPlatform:        providerAxes.VerifierPlatform,
+			VerifierEvidenceTypes:   providerAxes.VerifierEvidenceTypes,
 		}, nil
 	}
 	return EffectiveVerificationDemand{
@@ -85,6 +127,12 @@ func ResolveEffectiveDemand(o VerificationObligation, recipe *Recipe) (Effective
 		Assurance:     o.RequiredAssurance,
 		Freshness:     utcFreshnessPolicy(o.Freshness),
 		IssuedAt:      o.IssuedAt.UTC(),
+
+		VerifierProviderKind:    providerAxes.VerifierProviderKind,
+		VerifierContractVersion: providerAxes.VerifierContractVersion,
+		VerifierClaimClass:      providerAxes.VerifierClaimClass,
+		VerifierPlatform:        providerAxes.VerifierPlatform,
+		VerifierEvidenceTypes:   providerAxes.VerifierEvidenceTypes,
 	}, nil
 }
 
@@ -117,6 +165,16 @@ func (d EffectiveVerificationDemand) Validate() error {
 	if err := d.EvidenceMin.Validate(); err != nil {
 		return err
 	}
+	seenET := make(map[string]bool, len(d.VerifierEvidenceTypes))
+	for i, et := range d.VerifierEvidenceTypes {
+		if et == "" {
+			return fmt.Errorf("%w: demand verifier_evidence_types[%d] is empty", ErrInvalid, i)
+		}
+		if seenET[et] {
+			return fmt.Errorf("%w: demand verifier_evidence_types contains duplicate %q", ErrInvalid, et)
+		}
+		seenET[et] = true
+	}
 	if d.IssuedAt.IsZero() {
 		return fmt.Errorf("%w: demand issued_at is required", ErrInvalid)
 	}
@@ -128,11 +186,31 @@ func (d EffectiveVerificationDemand) Validate() error {
 
 // CanonicalDigest is the stable content digest of the resolved demand: a
 // lowercase hex SHA-256 over the FROZEN domain-separated canonical encoding
-// (see encodeDemandFrozen) with the requirement and kind lists sorted and
-// timestamps UTC-normalized. Two demands digest equal exactly when they
-// demand the same rules — this is the value acceptance records and proofs
-// bind as DemandDigest.
+// (see encodeDemandFrozenV2) with the requirement, kind and evidence-type
+// lists sorted and timestamps UTC-normalized. Two demands digest equal
+// exactly when they demand the same rules from the same verifier family —
+// this is the value acceptance records and proofs bind as DemandDigest.
 func (d EffectiveVerificationDemand) CanonicalDigest() (Digest, error) {
+	n := d
+	if err := n.Validate(); err != nil {
+		return "", err
+	}
+	n.Requirements = append([]string(nil), n.Requirements...)
+	n.EvidenceMin.RequiredKinds = append([]string(nil), n.EvidenceMin.RequiredKinds...)
+	n.VerifierEvidenceTypes = append([]string(nil), n.VerifierEvidenceTypes...)
+	sort.Strings(n.Requirements)
+	sort.Strings(n.EvidenceMin.RequiredKinds)
+	sort.Strings(n.VerifierEvidenceTypes)
+	n.Freshness = utcFreshnessPolicy(n.Freshness)
+	n.IssuedAt = n.IssuedAt.UTC()
+	return encodeDemandFrozenV2(n).frozenHash("demand")
+}
+
+// canonicalDigestV1 is the pre-provider-fields demand digest (the v1 frozen
+// field set under the v1 demand domain). Retained verbatim so historical
+// AcceptanceVersionV3/V4 acceptance records keep restoring: their DemandDigest
+// was minted before the provider axes existed and must keep hashing equal.
+func (d EffectiveVerificationDemand) canonicalDigestV1() (Digest, error) {
 	n := d
 	if err := n.Validate(); err != nil {
 		return "", err
@@ -156,4 +234,15 @@ func EffectiveVerificationDemandDigest(o VerificationObligation, recipe *Recipe)
 		return "", err
 	}
 	return d.CanonicalDigest()
+}
+
+// effectiveVerificationDemandDigestV1 is the historical demand digest rule
+// (v1 frozen field set), used only when restoring AcceptanceVersionV3/V4
+// records whose DemandDigest predates the provider axes.
+func effectiveVerificationDemandDigestV1(o VerificationObligation, recipe *Recipe) (Digest, error) {
+	d, err := ResolveEffectiveDemand(o, recipe)
+	if err != nil {
+		return "", err
+	}
+	return d.canonicalDigestV1()
 }

@@ -197,44 +197,44 @@ func (w *epistemicWorld) assertSealedInvariants(rec DerivedVerifiedOutcome) {
 	w.t.Helper()
 	// (1) No verified without evidence.
 	if !rec.Sealed() {
-		w.t.Fatalf("accepted record %q is not sealed", rec.Outcome.VerificationID)
+		w.t.Fatalf("accepted record %q is not sealed", rec.Outcome().VerificationID)
 	}
-	if rec.Evidence.EvidenceRoot == "" {
-		w.t.Fatalf("accepted record %q has no evidence root", rec.Outcome.VerificationID)
+	if rec.Evidence().EvidenceRoot == "" {
+		w.t.Fatalf("accepted record %q has no evidence root", rec.Outcome().VerificationID)
 	}
-	if len(rec.Evidence.AttestationDigests) == 0 {
-		w.t.Fatalf("accepted record %q has no attestation digests", rec.Outcome.VerificationID)
+	if len(rec.Evidence().AttestationDigests) == 0 {
+		w.t.Fatalf("accepted record %q has no attestation digests", rec.Outcome().VerificationID)
 	}
-	if rec.Evidence.VerifiedAt.IsZero() {
-		w.t.Fatalf("accepted record %q has no verification timestamp", rec.Outcome.VerificationID)
+	if rec.Evidence().VerifiedAt.IsZero() {
+		w.t.Fatalf("accepted record %q has no verification timestamp", rec.Outcome().VerificationID)
 	}
-	if rec.Outcome.EvidenceRoot != rec.Evidence.EvidenceRoot {
+	if rec.Outcome().EvidenceRoot != rec.Evidence().EvidenceRoot {
 		w.t.Fatalf("accepted record %q outcome root %s disagrees with evidence root %s",
-			rec.Outcome.VerificationID, rec.Outcome.EvidenceRoot, rec.Evidence.EvidenceRoot)
+			rec.Outcome().VerificationID, rec.Outcome().EvidenceRoot, rec.Evidence().EvidenceRoot)
 	}
 	// A raw claim is never a proven pass.
-	if !rec.ProvenPass() && rec.Outcome.Outcome == OutcomePass {
-		w.t.Fatalf("record %q claims pass but ProvenPass() is false", rec.Outcome.VerificationID)
+	if !rec.ProvenPass() && rec.Outcome().Outcome == OutcomePass {
+		w.t.Fatalf("record %q claims pass but ProvenPass() is false", rec.Outcome().VerificationID)
 	}
 
 	// (2) No accepted record with mismatched subject / binding.
-	ob, ok := w.obligations[rec.Outcome.ObligationID]
+	ob, ok := w.obligations[rec.Outcome().ObligationID]
 	if !ok {
-		w.t.Fatalf("accepted record %q names unknown obligation %q", rec.Outcome.VerificationID, rec.Outcome.ObligationID)
+		w.t.Fatalf("accepted record %q names unknown obligation %q", rec.Outcome().VerificationID, rec.Outcome().ObligationID)
 	}
 	wantSubj := w.subjectOf[ob.ObligationID]
 	if ob.SubjectRef == nil || *ob.SubjectRef != wantSubj {
 		w.t.Fatalf("obligation %q subject drifted: %+v want %+v", ob.ObligationID, ob.SubjectRef, wantSubj)
 	}
-	if rec.Outcome.CandidateDigest != ob.ImmutableCandidateDigest ||
-		rec.Outcome.SnapshotDigest != ob.SourceSnapshotDigest ||
-		rec.Outcome.ContractDigest != ob.VerificationContractDigest {
+	if rec.Outcome().CandidateDigest != ob.ImmutableCandidateDigest ||
+		rec.Outcome().SnapshotDigest != ob.SourceSnapshotDigest ||
+		rec.Outcome().ContractDigest != ob.VerificationContractDigest {
 		w.t.Fatalf("accepted record %q binding digests do not match obligation %q (subject %v)",
-			rec.Outcome.VerificationID, ob.ObligationID, wantSubj)
+			rec.Outcome().VerificationID, ob.ObligationID, wantSubj)
 	}
-	if rec.Outcome.ObligationID != rec.SubmittedClaim.ObligationID {
+	if rec.Outcome().ObligationID != rec.SubmittedClaim().ObligationID {
 		w.t.Fatalf("record %q derived obligation %q disagrees with claim %q",
-			rec.Outcome.VerificationID, rec.Outcome.ObligationID, rec.SubmittedClaim.ObligationID)
+			rec.Outcome().VerificationID, rec.Outcome().ObligationID, rec.SubmittedClaim().ObligationID)
 	}
 	// Every record is attributable to exactly one subject: the obligation's
 	// SubjectRef. A claim that answers a different subject's obligation is
@@ -247,11 +247,11 @@ func (w *epistemicWorld) assertSealedInvariants(rec DerivedVerifiedOutcome) {
 			// Different subject: the record must not bind to the other
 			// obligation's content either (that would make the two
 			// interchangeable authority).
-			if rec.Outcome.CandidateDigest == otherOb.ImmutableCandidateDigest &&
-				rec.Outcome.SnapshotDigest == otherOb.SourceSnapshotDigest &&
-				rec.Outcome.ContractDigest == otherOb.VerificationContractDigest {
+			if rec.Outcome().CandidateDigest == otherOb.ImmutableCandidateDigest &&
+				rec.Outcome().SnapshotDigest == otherOb.SourceSnapshotDigest &&
+				rec.Outcome().ContractDigest == otherOb.VerificationContractDigest {
 				w.t.Fatalf("record %q binds content shared with differently-subjected obligation %q (%v vs %v)",
-					rec.Outcome.VerificationID, otherID, wantSubj, *otherOb.SubjectRef)
+					rec.Outcome().VerificationID, otherID, wantSubj, *otherOb.SubjectRef)
 			}
 		}
 	}
@@ -259,32 +259,32 @@ func (w *epistemicWorld) assertSealedInvariants(rec DerivedVerifiedOutcome) {
 	// (3) No stronger claim than attested controls.
 	// Find the attested facts this record's evidence proved.
 	var facts *model.ExecutionFacts
-	for _, ref := range rec.SubmittedClaim.ProvenanceRefs {
+	for _, ref := range rec.SubmittedClaim().ProvenanceRefs {
 		if f, ok := w.factsByRef[ref]; ok {
 			facts = f
 			break
 		}
 	}
 	ceiling := assuranceName(facts)
-	if rec.Outcome.AssuranceProfile != ceiling {
+	if rec.Outcome().AssuranceProfile != ceiling {
 		w.t.Fatalf("record %q derived assurance %q, attested controls prove %q (claim proposed %q)",
-			rec.Outcome.VerificationID, rec.Outcome.AssuranceProfile, ceiling, rec.SubmittedClaim.AssuranceProfile)
+			rec.Outcome().VerificationID, rec.Outcome().AssuranceProfile, ceiling, rec.SubmittedClaim().AssuranceProfile)
 	}
 	// The derived outcome must not copy the claim's inflated check list.
 	passNames := make(map[string]bool)
-	for _, c := range rec.Evidence.VerifiedChecks {
+	for _, c := range rec.Evidence().VerifiedChecks {
 		if c.Outcome == CheckOutcomePass {
 			passNames[c.Name] = true
 		}
 	}
-	for _, name := range rec.Outcome.CompletedChecks {
+	for _, name := range rec.Outcome().CompletedChecks {
 		if !passNames[name] {
-			w.t.Fatalf("record %q derived CompletedChecks contains %q which the evidence did not pass", rec.Outcome.VerificationID, name)
+			w.t.Fatalf("record %q derived CompletedChecks contains %q which the evidence did not pass", rec.Outcome().VerificationID, name)
 		}
 	}
 	// The claim's inflated extras must never appear as derived authority.
-	if containsString(rec.Outcome.CompletedChecks, "never-attested-check") {
-		w.t.Fatalf("record %q laundered the claim's never-attested-check into authority", rec.Outcome.VerificationID)
+	if containsString(rec.Outcome().CompletedChecks, "never-attested-check") {
+		w.t.Fatalf("record %q laundered the claim's never-attested-check into authority", rec.Outcome().VerificationID)
 	}
 }
 
@@ -345,7 +345,7 @@ func TestEpistemicHistoryProperties(t *testing.T) {
 						}
 						continue
 					}
-					w.verified[seal.Outcome.VerificationID] = seal
+					w.verified[seal.Outcome().VerificationID] = seal
 					w.assertSealedInvariants(seal)
 				case 4:
 					// Tampered claim against a real obligation: the digests
@@ -435,13 +435,13 @@ func TestEpistemicClaimNeverUpgradesAuthority(t *testing.T) {
 		return
 	}
 	if seal.ProvenPass() {
-		t.Fatalf("sealed record is a proven pass despite unproven demanded assurance: %+v", seal.Outcome)
+		t.Fatalf("sealed record is a proven pass despite unproven demanded assurance: %+v", seal.Outcome())
 	}
-	if seal.Outcome.AssuranceProfile == "sealed_pinned_no_network" {
-		t.Fatalf("derived assurance %q copied the claim's lie", seal.Outcome.AssuranceProfile)
+	if seal.Outcome().AssuranceProfile == "sealed_pinned_no_network" {
+		t.Fatalf("derived assurance %q copied the claim's lie", seal.Outcome().AssuranceProfile)
 	}
-	if want := assuranceName(w.factsByRef[ref]); seal.Outcome.AssuranceProfile != want {
-		t.Fatalf("derived assurance %q, attested controls prove %q", seal.Outcome.AssuranceProfile, want)
+	if want := assuranceName(w.factsByRef[ref]); seal.Outcome().AssuranceProfile != want {
+		t.Fatalf("derived assurance %q, attested controls prove %q", seal.Outcome().AssuranceProfile, want)
 	}
 	w.assertSealedInvariants(seal)
 }

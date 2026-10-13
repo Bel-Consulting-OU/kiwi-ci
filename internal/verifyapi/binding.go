@@ -102,6 +102,26 @@ func (o VerificationObligation) Validate() error {
 	if o.RequiredAssurance == "" {
 		return fmt.Errorf("%w: required_assurance is required", ErrInvalid)
 	}
+	// Provider constraints without a provider kind are unaddressable demand:
+	// an auxiliary axis (contract version, claim class, platform, evidence
+	// types) only means something for a named VerifierProviderKind. Without
+	// one the field would be a silent no-op (or worse, an unenforced
+	// constraint), so it is refused at construction (P1e).
+	if o.VerifierProviderKind == "" {
+		if o.VerifierContractVersion != "" || o.VerifierClaimClass != "" || o.VerifierPlatform != "" || len(o.VerifierEvidenceTypes) > 0 {
+			return fmt.Errorf("%w: verifier provider constraints (contract version, claim class, platform, evidence types) require verifier_provider_kind", ErrInvalid)
+		}
+	}
+	seenET := make(map[string]bool, len(o.VerifierEvidenceTypes))
+	for i, et := range o.VerifierEvidenceTypes {
+		if et == "" {
+			return fmt.Errorf("%w: verifier_evidence_types[%d] is empty", ErrInvalid, i)
+		}
+		if seenET[et] {
+			return fmt.Errorf("%w: verifier_evidence_types contains duplicate %q", ErrInvalid, et)
+		}
+		seenET[et] = true
+	}
 	if err := o.Freshness.validate(o.IssuedAt); err != nil {
 		return err
 	}

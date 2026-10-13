@@ -155,12 +155,12 @@ func TestServiceDispatchesToNamedProvider(t *testing.T) {
 	// The default fixture verifier must NOT have been the acceptance path:
 	// the sealed identity is the provider's delegate, and the record is
 	// queryable as authoritative.
-	rec, err := f.svc.QueryOutcome(ctx, f.tenantA, seal.Outcome.VerificationID)
+	rec, err := f.svc.QueryOutcome(ctx, f.tenantA, seal.Outcome().VerificationID)
 	if err != nil {
 		t.Fatalf("QueryOutcome: %v", err)
 	}
-	if rec.Outcome.VerificationID != seal.Outcome.VerificationID {
-		t.Fatalf("queried %q, sealed %q", rec.Outcome.VerificationID, seal.Outcome.VerificationID)
+	if rec.Outcome().VerificationID != seal.Outcome().VerificationID {
+		t.Fatalf("queried %q, sealed %q", rec.Outcome().VerificationID, seal.Outcome().VerificationID)
 	}
 }
 

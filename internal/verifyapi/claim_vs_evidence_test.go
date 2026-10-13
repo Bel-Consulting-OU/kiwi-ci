@@ -191,17 +191,12 @@ func TestModelAClaimEvidenceIDUpgradesAreNotConflicts(t *testing.T) {
 		claim.ProvenanceRefs = []string{"att-1", "att-1"}
 		claim.ExecutionIDs = []string{"exec-1"}
 
-		st, err := runClaimUpgrade(t, ob, claim, claimEvidenceVerifier(t, root, map[string]string{"att-1": "exec-1"}))
-		if err != nil {
-			t.Fatalf("upgrade with the same evidence twice = %v, want success", err)
-		}
-		assertClaimAndEvidenceIDs(t, st, claim.VerificationID, []string{"exec-1"}, []string{"exec-1"})
-		vo, qerr := st.QueryOutcome(context.Background(), claim.VerificationID)
-		if qerr != nil {
-			t.Fatalf("QueryOutcome = %v", qerr)
-		}
-		if len(vo.Evidence.AttestationDigests) != 2 {
-			t.Fatalf("attestation digests = %v, want one digest per ref (2)", vo.Evidence.AttestationDigests)
+		// P1f: two references to the same signed statement are one piece of
+		// evidence, never two — duplicate attestation digests are refused
+		// during verification rather than counted twice.
+		_, err := runClaimUpgrade(t, ob, claim, claimEvidenceVerifier(t, root, map[string]string{"att-1": "exec-1"}))
+		if err == nil {
+			t.Fatal("duplicate attestation digest must be refused during verification")
 		}
 	})
 }
@@ -249,8 +244,8 @@ func TestModelAVerifiedRecordWithDerivedClaimIDsStillUpgrades(t *testing.T) {
 	if !got.ProvenPass() {
 		t.Fatal("want proven pass")
 	}
-	if len(got.Evidence.ExecutionIDs) != 2 {
-		t.Fatalf("evidence exec ids = %v, want both", got.Evidence.ExecutionIDs)
+	if len(got.Evidence().ExecutionIDs) != 2 {
+		t.Fatalf("evidence exec ids = %v, want both", got.Evidence().ExecutionIDs)
 	}
 }
 
@@ -306,13 +301,13 @@ func assertClaimAndEvidenceIDs(t *testing.T, st *MemoryStore, id string, wantCla
 	if err != nil {
 		t.Fatalf("QueryOutcome = %v", err)
 	}
-	if !equalStringSlices(vo.SubmittedClaim.ExecutionIDs, wantClaim) {
-		t.Fatalf("submitted claim exec ids = %v, want %v (proposal preserved)", vo.SubmittedClaim.ExecutionIDs, wantClaim)
+	if !equalStringSlices(vo.SubmittedClaim().ExecutionIDs, wantClaim) {
+		t.Fatalf("submitted claim exec ids = %v, want %v (proposal preserved)", vo.SubmittedClaim().ExecutionIDs, wantClaim)
 	}
-	if !equalStringSlices(vo.Evidence.ExecutionIDs, wantEvidence) {
-		t.Fatalf("evidence exec ids = %v, want %v", vo.Evidence.ExecutionIDs, wantEvidence)
+	if !equalStringSlices(vo.Evidence().ExecutionIDs, wantEvidence) {
+		t.Fatalf("evidence exec ids = %v, want %v", vo.Evidence().ExecutionIDs, wantEvidence)
 	}
-	if !equalStringSlices(vo.Outcome.ExecutionIDs, wantEvidence) {
-		t.Fatalf("derived outcome exec ids = %v, want %v (derived is authority)", vo.Outcome.ExecutionIDs, wantEvidence)
+	if !equalStringSlices(vo.Outcome().ExecutionIDs, wantEvidence) {
+		t.Fatalf("derived outcome exec ids = %v, want %v (derived is authority)", vo.Outcome().ExecutionIDs, wantEvidence)
 	}
 }

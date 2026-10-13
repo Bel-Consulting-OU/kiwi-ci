@@ -266,16 +266,16 @@ func TestSysDFVerificationProductionPathIntegration(t *testing.T) {
 	}
 	if !derived.ProvenPass() {
 		t.Fatalf("derived outcome is not a proven pass: outcome=%s checks=%+v assurance=%s",
-			derived.Outcome.Outcome, derived.Evidence.VerifiedChecks, derived.Evidence.Assurance.Name())
+			derived.Outcome().Outcome, derived.Evidence().VerifiedChecks, derived.Evidence().Assurance.Name())
 	}
-	if derived.Evidence.JobStatus != string(model.StatusSuccess) {
-		t.Fatalf("derived job status = %q, want success", derived.Evidence.JobStatus)
+	if derived.Evidence().JobStatus != string(model.StatusSuccess) {
+		t.Fatalf("derived job status = %q, want success", derived.Evidence().JobStatus)
 	}
-	if derived.Evidence.EvidenceRoot != candidateDigest {
-		t.Fatalf("derived evidence root = %s, want %s", derived.Evidence.EvidenceRoot, candidateDigest)
+	if derived.Evidence().EvidenceRoot != candidateDigest {
+		t.Fatalf("derived evidence root = %s, want %s", derived.Evidence().EvidenceRoot, candidateDigest)
 	}
 	t.Logf("verify-path STAGE 3 ok: sealed proven pass ver=%s checks=%v assurance=%s",
-		derived.Outcome.VerificationID, derived.Evidence.CompletedChecks, derived.Evidence.Assurance.Name())
+		derived.Outcome().VerificationID, derived.Evidence().CompletedChecks, derived.Evidence().Assurance.Name())
 
 	// ====================================================================
 	// STAGE 4 — acceptance-sign + persist to PostgreSQL (verifystore)
@@ -602,9 +602,9 @@ func fetchVerificationProof(t *testing.T, dsn string, store *verifystore.Postgre
 	}
 	return verifyapi.NewVerificationProof(verifyapi.PersistedVerified{
 		Obligation:     ob,
-		SubmittedClaim: restored.SubmittedClaim,
-		Outcome:        restored.Outcome,
-		Evidence:       restored.Evidence,
+		SubmittedClaim: restored.SubmittedClaim(),
+		Outcome:        restored.Outcome(),
+		Evidence:       restored.Evidence(),
 		Acceptance:     acceptance,
 	})
 }

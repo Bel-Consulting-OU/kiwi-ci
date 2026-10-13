@@ -235,7 +235,7 @@ func (s *Signer) SignVerifiedProof(proof verifyapi.VerifiedProof, at time.Time) 
 	if !proof.Sealed() {
 		return SignedProof{}, fmt.Errorf("%w: SignVerifiedProof requires a verifier-produced VerifiedProof", ErrUnsealed)
 	}
-	raw, err := json.Marshal(proof.Document)
+	raw, err := json.Marshal(proof.Document())
 	if err != nil {
 		return SignedProof{}, fmt.Errorf("%w: encode proof: %v", ErrSignature, err)
 	}

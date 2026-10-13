@@ -181,6 +181,36 @@ func encodeObligationFrozenV3(o VerificationObligation) *frozenBuffer {
 	return f
 }
 
+// encodeObligationFrozenV5 is the v5 canonical encoding of a verification
+// obligation: the v3 field list plus the verifier provider constraints
+// (kind, contract version, claim class, platform, evidence types), so two
+// obligations that differ only in WHICH provider must discharge them never
+// share an acceptance obligation digest. Field order is FROZEN; v3 restore
+// keeps using encodeObligationFrozenV3, which does not bind these axes.
+func encodeObligationFrozenV5(o VerificationObligation) *frozenBuffer {
+	f := frozenDomain("obligation/v5")
+	f.str(o.ObligationID)
+	f.str(o.Subject)
+	encodeSubjectRefFrozen(f, o.SubjectRef)
+	f.str(string(o.ImmutableCandidateDigest))
+	f.str(string(o.SourceSnapshotDigest))
+	f.str(string(o.VerificationContractDigest))
+	f.str(string(o.RecipeDigest))
+	f.strings(o.RequiredChecks)
+	f.str(o.RequiredAssurance)
+	f.timePtr(o.Freshness.NotBefore)
+	f.int64(o.Freshness.MaxAgeSeconds)
+	f.timePtr(o.Freshness.NotAfter)
+	f.sortedMap(o.OpaqueCorrelationMetadata)
+	f.time(o.IssuedAt)
+	f.str(o.VerifierProviderKind)
+	f.str(o.VerifierContractVersion)
+	f.str(o.VerifierClaimClass)
+	f.str(o.VerifierPlatform)
+	f.strings(o.VerifierEvidenceTypes)
+	return f
+}
+
 // encodeSubjectRefFrozen appends the (possibly absent) authority subject.
 // Nil and the zero SubjectRef are the same "no subject" shape and encode
 // identically (one empty field), so a digest or MAC never depends on
@@ -366,8 +396,11 @@ func encodeRecipeFrozen(r Recipe) *frozenBuffer {
 	return f
 }
 
-// encodeDemandFrozen is the canonical encoding of one resolved verification
-// demand. Requirement and kind lists must already be sorted by the caller.
+// encodeDemandFrozen is the v1 canonical encoding of one resolved
+// verification demand. Retained verbatim so historical
+// AcceptanceVersionV3/V4 records keep restoring (their DemandDigest was
+// minted with this field set); new records use encodeDemandFrozenV2.
+// Requirement and kind lists must already be sorted by the caller.
 func encodeDemandFrozen(d EffectiveVerificationDemand) *frozenBuffer {
 	f := frozenDomain(demandDomain)
 	f.int64(int64(d.SchemaVersion))
@@ -377,5 +410,28 @@ func encodeDemandFrozen(d EffectiveVerificationDemand) *frozenBuffer {
 	encodeEvidenceMinFrozen(f, d.EvidenceMin)
 	encodeFreshnessFrozen(f, d.Freshness)
 	f.time(d.IssuedAt)
+	return f
+}
+
+// encodeDemandFrozenV2 is the v2 canonical encoding of one resolved
+// verification demand: the v1 field list plus the verifier provider
+// constraints, so two demands that differ only in WHICH provider must
+// discharge them never share a demand digest. Requirement, kind and
+// evidence-type lists must already be sorted by the caller. Field order is
+// FROZEN — do not reorder without bumping the demand domain.
+func encodeDemandFrozenV2(d EffectiveVerificationDemand) *frozenBuffer {
+	f := frozenDomain(demandDomainV2)
+	f.int64(int64(d.SchemaVersion))
+	f.str(string(d.RecipeDigest))
+	f.strings(d.Requirements)
+	f.str(d.Assurance)
+	encodeEvidenceMinFrozen(f, d.EvidenceMin)
+	encodeFreshnessFrozen(f, d.Freshness)
+	f.time(d.IssuedAt)
+	f.str(d.VerifierProviderKind)
+	f.str(d.VerifierContractVersion)
+	f.str(d.VerifierClaimClass)
+	f.str(d.VerifierPlatform)
+	f.strings(d.VerifierEvidenceTypes)
 	return f
 }

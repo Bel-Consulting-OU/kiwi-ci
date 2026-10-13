@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -29,7 +30,8 @@ const recipeDomain = "kiwi-ci/verify-recipe/v1"
 // be claimed. Counts are minimums; empty kind lists mean "no kind constraint".
 type EvidenceMinimum struct {
 	// MinAttestations is the minimum number of distinct verified
-	// attestations required. Zero means "no count floor" (discouraged:
+	// attestations required. Two references to the same signed statement
+	// are one attestation (P1f). Zero means "no count floor" (discouraged:
 	// recipes should name one).
 	MinAttestations int `json:"min_attestations,omitempty"`
 	// RequiredKinds lists evidence kinds that must appear (for example
@@ -75,9 +77,18 @@ const (
 // is applied on the authoritative discharge path only: a pass claim whose
 // evidence does not meet the floor is refused. RequireAttestedWindow demands
 // an attested (not observer, not caller-typed) execution window.
+//
+// MinAttestations counts DISTINCT attestation digests (P1f): two references
+// to the same signed statement are one piece of evidence, never two.
 func (m EvidenceMinimum) Check(e VerifiedEvidence) error {
-	if m.MinAttestations > 0 && len(e.AttestationDigests) < m.MinAttestations {
-		return fmt.Errorf("%w: evidence minimum requires %d attestations, got %d", ErrEvidence, m.MinAttestations, len(e.AttestationDigests))
+	if m.MinAttestations > 0 {
+		distinct := make(map[Digest]bool, len(e.AttestationDigests))
+		for _, d := range e.AttestationDigests {
+			distinct[d] = true
+		}
+		if len(distinct) < m.MinAttestations {
+			return fmt.Errorf("%w: evidence minimum requires %d distinct attestations, got %d", ErrEvidence, m.MinAttestations, len(distinct))
+		}
 	}
 	if len(m.RequiredKinds) > 0 {
 		present := make(map[string]bool, len(e.Kinds))
@@ -128,6 +139,11 @@ type Recipe struct {
 	// the recipe stay historically valid, but a PolicyEvaluation run after
 	// the withdrawal refuses them (see proof.go). Zero means live.
 	WithdrawnAt *time.Time `json:"withdrawn_at,omitempty"`
+	// WithdrawalReason is the audit note recorded with a withdrawal
+	// (RecipeRegistry.Withdraw / a re-publish that carries a WithdrawnAt).
+	// Like WithdrawnAt it is a liveness fact and is excluded from recipe
+	// identity (RecipeDigest).
+	WithdrawalReason string `json:"withdrawal_reason,omitempty"`
 }
 
 // Validate reports whether the recipe is structurally sound and internally
@@ -204,10 +220,11 @@ func (r Recipe) Normalize() Recipe {
 // RecipeDigest is the stable content digest of one recipe version. It is a
 // lowercase hex SHA-256 over the FROZEN domain-separated canonical encoding
 // of the recipe (see encodeRecipeFrozen) with requirement and kind lists
-// sorted, timestamps UTC-normalized, and WithdrawnAt excluded (withdrawal is
-// a liveness fact, not recipe identity: a withdrawn recipe keeps the digest
-// its proofs cite). Equal recipes therefore digest equal across processes and
-// storage round trips; any rule change is a different digest.
+// sorted, timestamps UTC-normalized, and the withdrawal facts
+// (WithdrawnAt / WithdrawalReason) excluded (withdrawal is a liveness fact,
+// not recipe identity: a withdrawn recipe keeps the digest its proofs cite).
+// Equal recipes therefore digest equal across processes and storage round
+// trips; any rule change is a different digest.
 func RecipeDigest(r Recipe) (Digest, error) {
 	n := r.Normalize()
 	if err := n.Validate(); err != nil {
@@ -217,6 +234,7 @@ func RecipeDigest(r Recipe) (Digest, error) {
 	// proofs cite) and sorts the unordered lists so caller order is not
 	// identity.
 	n.WithdrawnAt = nil
+	n.WithdrawalReason = ""
 	sort.Strings(n.Requirements)
 	sort.Strings(n.EvidenceMin.RequiredKinds)
 	return encodeRecipeFrozen(n).frozenHash("recipe")
@@ -339,10 +357,14 @@ func freshnessEqual(a, b FreshnessPolicy) bool {
 	return true
 }
 
-// RecipeRegistry holds published recipe versions keyed by digest. Recipes
-// are immutable: Register is idempotent on an identical digest and refuses
-// any different content under the same (name, version) with ErrExists.
+// RecipeRegistry holds published recipe versions keyed by digest. It is
+// safe for concurrent use. Recipes are immutable in CONTENT: Publish is
+// idempotent on an identical digest and refuses any different content under
+// the same (name, version) with ErrExists. Liveness (withdrawal) is the one
+// mutable fact and is applied explicitly — a re-publish that carries a
+// WithdrawnAt must never silently keep the old live state (P1h).
 type RecipeRegistry struct {
+	mu       sync.RWMutex
 	byDigest map[string]Recipe
 	byName   map[string]map[int]Digest
 }
@@ -355,10 +377,14 @@ func NewRecipeRegistry() *RecipeRegistry {
 	}
 }
 
-// Register publishes a recipe version. The recipe must validate. Registering
-// the identical recipe again is a no-op success; the same (name, version)
-// with different content is ErrExists (a published version is immutable).
-func (reg *RecipeRegistry) Register(r Recipe) (Digest, error) {
+// Publish publishes a recipe version. The recipe must validate. Publishing
+// the identical recipe again is a no-op success with one exception: when the
+// incoming copy carries a WithdrawnAt the stored recipe is WITHDRAWN rather
+// than left live — re-registering a withdrawn shape must not silently keep
+// the old live state. A stored withdrawal is sticky: a later publish of the
+// live shape does not resurrect it. The same (name, version) with different
+// content is ErrExists (a published version is immutable).
+func (reg *RecipeRegistry) Publish(r Recipe) (Digest, error) {
 	if reg == nil {
 		return "", fmt.Errorf("%w: nil recipe registry", ErrInvalid)
 	}
@@ -369,8 +395,19 @@ func (reg *RecipeRegistry) Register(r Recipe) (Digest, error) {
 	if err != nil {
 		return "", err
 	}
-	stored := reg.byDigest[string(d)]
-	if stored.Name != "" {
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	if stored, ok := reg.byDigest[string(d)]; ok {
+		if r.WithdrawnAt != nil {
+			// Liveness from the re-publish wins over a still-live stored
+			// copy. A stored withdrawal is earlier authority and is kept.
+			if stored.WithdrawnAt == nil {
+				t := r.WithdrawnAt.UTC()
+				stored.WithdrawnAt = &t
+				stored.WithdrawalReason = r.WithdrawalReason
+				reg.byDigest[string(d)] = stored
+			}
+		}
 		return d, nil
 	}
 	versions, ok := reg.byName[r.Name]
@@ -386,11 +423,57 @@ func (reg *RecipeRegistry) Register(r Recipe) (Digest, error) {
 	return d, nil
 }
 
+// Register is the historical spelling of Publish (kept so older call sites
+// and tests keep compiling); it applies exactly the Publish rules.
+func (reg *RecipeRegistry) Register(r Recipe) (Digest, error) {
+	return reg.Publish(r)
+}
+
+// Withdraw marks a published recipe version as withdrawn at the given
+// instant, with an audit reason. Withdrawal is a liveness fact, not identity:
+// the recipe keeps the digest its proofs cite, historical restores stay
+// liveness-free, and only NEW demand is refused. The instant must not
+// precede the recipe's IssuedAt. Withdrawing an already-withdrawn recipe at
+// the SAME instant is an idempotent no-op (the reason is refreshed); any
+// other re-withdraw is refused so the withdrawal history cannot be rewritten.
+func (reg *RecipeRegistry) Withdraw(d Digest, at time.Time, reason string) error {
+	if reg == nil {
+		return fmt.Errorf("%w: nil recipe registry", ErrInvalid)
+	}
+	if at.IsZero() {
+		return fmt.Errorf("%w: withdrawal time is required", ErrInvalid)
+	}
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	stored, ok := reg.byDigest[string(d)]
+	if !ok {
+		return fmt.Errorf("%w: recipe %s", ErrNotFound, d)
+	}
+	at = at.UTC()
+	if at.Before(stored.IssuedAt.UTC()) {
+		return fmt.Errorf("%w: withdrawal at %s precedes recipe issued_at %s", ErrInvalid, at.Format(time.RFC3339), stored.IssuedAt.UTC().Format(time.RFC3339))
+	}
+	if stored.WithdrawnAt != nil {
+		if stored.WithdrawnAt.Equal(at) {
+			stored.WithdrawalReason = reason
+			reg.byDigest[string(d)] = stored
+			return nil
+		}
+		return fmt.Errorf("%w: recipe %s already withdrawn at %s", ErrExists, d, stored.WithdrawnAt.UTC().Format(time.RFC3339))
+	}
+	stored.WithdrawnAt = &at
+	stored.WithdrawalReason = reason
+	reg.byDigest[string(d)] = stored
+	return nil
+}
+
 // ByDigest fetches a published recipe by its stable digest.
 func (reg *RecipeRegistry) ByDigest(d Digest) (Recipe, error) {
 	if reg == nil {
 		return Recipe{}, fmt.Errorf("%w: nil recipe registry", ErrNotFound)
 	}
+	reg.mu.RLock()
+	defer reg.mu.RUnlock()
 	r, ok := reg.byDigest[string(d)]
 	if !ok {
 		return Recipe{}, fmt.Errorf("%w: recipe %s", ErrNotFound, d)
@@ -403,7 +486,9 @@ func (reg *RecipeRegistry) ByNameVersion(name string, version int) (Recipe, erro
 	if reg == nil {
 		return Recipe{}, fmt.Errorf("%w: nil recipe registry", ErrNotFound)
 	}
+	reg.mu.RLock()
 	d, ok := reg.byName[name][version]
+	reg.mu.RUnlock()
 	if !ok {
 		return Recipe{}, fmt.Errorf("%w: recipe %s@%d", ErrNotFound, name, version)
 	}

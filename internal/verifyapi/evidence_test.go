@@ -213,7 +213,7 @@ func TestRawPassWithFakeEvidenceRootIsNotAuthoritative(t *testing.T) {
 	}
 
 	// The zero (unsealed) VerifiedOutcome is not server-created authority.
-	if err := reg.RecordVerifiedOutcome(VerifiedOutcome{Outcome: v}); !errors.Is(err, ErrUnverified) {
+	if err := reg.RecordVerifiedOutcome(VerifiedOutcome{outcome: v}); !errors.Is(err, ErrUnverified) {
 		t.Fatalf("RecordVerifiedOutcome unsealed = %v, want ErrUnverified", err)
 	}
 
@@ -253,19 +253,19 @@ func TestVerifiedOutcomeWithRealProvenanceFixtureIsAuthoritative(t *testing.T) {
 		t.Fatal("verified outcome is not sealed")
 	}
 	if !vo.ProvenPass() {
-		t.Fatalf("ProvenPass = false, want true (outcome %q)", vo.Outcome.Outcome)
+		t.Fatalf("ProvenPass = false, want true (outcome %q)", vo.Outcome().Outcome)
 	}
-	if vo.Evidence.VerifierIdentity != "verifyapi-test-verifier/v1" {
-		t.Fatalf("verifier identity = %q", vo.Evidence.VerifierIdentity)
+	if vo.Evidence().VerifierIdentity != "verifyapi-test-verifier/v1" {
+		t.Fatalf("verifier identity = %q", vo.Evidence().VerifierIdentity)
 	}
-	if vo.Evidence.EvidenceRoot != fx.evidenceRoot {
-		t.Fatalf("resolved evidence root = %s, want %s", vo.Evidence.EvidenceRoot, fx.evidenceRoot)
+	if vo.Evidence().EvidenceRoot != fx.evidenceRoot {
+		t.Fatalf("resolved evidence root = %s, want %s", vo.Evidence().EvidenceRoot, fx.evidenceRoot)
 	}
-	if len(vo.Evidence.AttestationDigests) != 1 || vo.Evidence.AttestationDigests[0] == "" {
-		t.Fatalf("attestation digests = %v, want one real digest", vo.Evidence.AttestationDigests)
+	if len(vo.Evidence().AttestationDigests) != 1 || vo.Evidence().AttestationDigests[0] == "" {
+		t.Fatalf("attestation digests = %v, want one real digest", vo.Evidence().AttestationDigests)
 	}
-	if len(vo.Evidence.ExecutionIDs) != 1 || vo.Evidence.ExecutionIDs[0] != fx.attemptID {
-		t.Fatalf("resolved execution ids = %v, want [%s]", vo.Evidence.ExecutionIDs, fx.attemptID)
+	if len(vo.Evidence().ExecutionIDs) != 1 || vo.Evidence().ExecutionIDs[0] != fx.attemptID {
+		t.Fatalf("resolved execution ids = %v, want [%s]", vo.Evidence().ExecutionIDs, fx.attemptID)
 	}
 
 	if err := reg.RecordVerifiedOutcome(vo); err != nil {
@@ -278,7 +278,7 @@ func TestVerifiedOutcomeWithRealProvenanceFixtureIsAuthoritative(t *testing.T) {
 	if !got.ProvenPass() {
 		t.Fatal("QueryOutcome did not return a proven pass")
 	}
-	if got.Evidence.AttestationDigests[0] != vo.Evidence.AttestationDigests[0] {
+	if got.Evidence().AttestationDigests[0] != vo.Evidence().AttestationDigests[0] {
 		t.Fatal("stored attestation digest drifted")
 	}
 }
@@ -308,14 +308,14 @@ func TestRecordVerifiedOutcomeFillsAttestedWallTime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Verify real provenance fixture = %v", err)
 	}
-	if vo.Evidence.Attested == nil {
+	if vo.Evidence().Attested == nil {
 		t.Fatal("verified evidence has no attested facts; the fixture carries a job window")
 	}
 	// The fixture attestation binds a 90s job window (started_at →
 	// finished_at) — that is the number that must surface, not the caller's.
 	const wantWallNS = int64(90 * time.Second)
-	if vo.Evidence.Attested.WallTimeNS() != wantWallNS {
-		t.Fatalf("attested wall time = %d, want %d", vo.Evidence.Attested.WallTimeNS(), wantWallNS)
+	if vo.Evidence().Attested.WallTimeNS() != wantWallNS {
+		t.Fatalf("attested wall time = %d, want %d", vo.Evidence().Attested.WallTimeNS(), wantWallNS)
 	}
 
 	if err := reg.RecordVerifiedOutcome(vo); err != nil {
@@ -325,7 +325,7 @@ func TestRecordVerifiedOutcomeFillsAttestedWallTime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("QueryOutcome = %v", err)
 	}
-	m := got.Outcome.Resources.Measured
+	m := got.Outcome().Resources.Measured
 	if m == nil {
 		t.Fatal("Measured is nil after verified record")
 	}
@@ -367,10 +367,10 @@ func TestMeasuredWallTimeUnfilledWithoutAttestedWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Verify = %v", err)
 	}
-	if vo.Evidence.Attested != nil {
-		t.Fatalf("Attested = %+v, want nil when the attestation carries no window", vo.Evidence.Attested)
+	if vo.Evidence().Attested != nil {
+		t.Fatalf("Attested = %+v, want nil when the attestation carries no window", vo.Evidence().Attested)
 	}
-	if m := DeriveMeasuredFacts(vo.Outcome, vo.Evidence.Attested); m.WallTimeNS != 0 {
+	if m := DeriveMeasuredFacts(vo.Outcome(), vo.Evidence().Attested); m.WallTimeNS != 0 {
 		t.Fatalf("Measured.WallTimeNS = %d, want 0 without attested facts", m.WallTimeNS)
 	}
 }
@@ -490,8 +490,8 @@ func TestVerifiedOutcomeWithContractAttestationV6Fixture(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Verify attestation_v6 fixture = %v", err)
 	}
-	if vo.Evidence.EvidenceRoot != root {
-		t.Fatalf("resolved root = %s, want fixture %s", vo.Evidence.EvidenceRoot, root)
+	if vo.Evidence().EvidenceRoot != root {
+		t.Fatalf("resolved root = %s, want fixture %s", vo.Evidence().EvidenceRoot, root)
 	}
 	if err := reg.RecordVerifiedOutcome(vo); err != nil {
 		t.Fatalf("RecordVerifiedOutcome = %v", err)
@@ -524,17 +524,17 @@ func TestEvidenceVerifierDerivesRootOverFakeClaimedRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Verify fake root = %v (Model A keeps the proposal and derives truth)", err)
 	}
-	if vo.Outcome.EvidenceRoot != fx.evidenceRoot {
-		t.Fatalf("derived evidence root = %s, want resolved %s", vo.Outcome.EvidenceRoot, fx.evidenceRoot)
+	if vo.Outcome().EvidenceRoot != fx.evidenceRoot {
+		t.Fatalf("derived evidence root = %s, want resolved %s", vo.Outcome().EvidenceRoot, fx.evidenceRoot)
 	}
-	if vo.SubmittedClaim.EvidenceRoot != mustDigest(t, "totally-fake-root") {
+	if vo.SubmittedClaim().EvidenceRoot != mustDigest(t, "totally-fake-root") {
 		t.Fatal("submitted claim must keep the proposed (fake) root for audit")
 	}
-	if vo.Outcome.AssuranceProfile == "sealed_pinned_no_network" {
+	if vo.Outcome().AssuranceProfile == "sealed_pinned_no_network" {
 		t.Fatal("derived assurance must not echo the caller's inflated profile")
 	}
-	if vo.Outcome.AssuranceProfile != model.AssuranceKiwiMediatedAuthority.Name() {
-		t.Fatalf("derived assurance = %q, want %q", vo.Outcome.AssuranceProfile, model.AssuranceKiwiMediatedAuthority.Name())
+	if vo.Outcome().AssuranceProfile != model.AssuranceKiwiMediatedAuthority.Name() {
+		t.Fatalf("derived assurance = %q, want %q", vo.Outcome().AssuranceProfile, model.AssuranceKiwiMediatedAuthority.Name())
 	}
 	if !vo.ProvenPass() {
 		t.Fatal("derived record over real evidence and covered checks must be a proven pass")
@@ -558,11 +558,11 @@ func TestEvidenceVerifierDerivesExecIDsOverForgedClaim(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Verify forged execution id = %v (Model A keeps the proposal and derives truth)", err)
 	}
-	if len(vo.Outcome.ExecutionIDs) != 1 || vo.Outcome.ExecutionIDs[0] != fx.attemptID {
-		t.Fatalf("derived execution ids = %v, want [%s]", vo.Outcome.ExecutionIDs, fx.attemptID)
+	if len(vo.Outcome().ExecutionIDs) != 1 || vo.Outcome().ExecutionIDs[0] != fx.attemptID {
+		t.Fatalf("derived execution ids = %v, want [%s]", vo.Outcome().ExecutionIDs, fx.attemptID)
 	}
-	if !equalStringSlices(vo.SubmittedClaim.ExecutionIDs, []string{fx.attemptID, "forged-exec"}) {
-		t.Fatalf("submitted claim ids = %v, want the proposal preserved", vo.SubmittedClaim.ExecutionIDs)
+	if !equalStringSlices(vo.SubmittedClaim().ExecutionIDs, []string{fx.attemptID, "forged-exec"}) {
+		t.Fatalf("submitted claim ids = %v, want the proposal preserved", vo.SubmittedClaim().ExecutionIDs)
 	}
 }
 
@@ -726,7 +726,7 @@ func TestRestoreVerifiedOutcomeRoundTrip(t *testing.T) {
 		t.Fatalf("Verify = %v", err)
 	}
 	if !sealed.Sealed() || !sealed.ProvenPass() {
-		t.Fatalf("want sealed proven pass before restore (outcome %q)", sealed.Outcome.Outcome)
+		t.Fatalf("want sealed proven pass before restore (outcome %q)", sealed.Outcome().Outcome)
 	}
 
 	key, err := NewHMACAcceptanceKey("acc-restore", []byte("restore-test-secret-32-bytes!"))
@@ -739,9 +739,9 @@ func TestRestoreVerifiedOutcomeRoundTrip(t *testing.T) {
 	}
 	persisted := PersistedVerified{
 		Obligation:     ob,
-		SubmittedClaim: sealed.SubmittedClaim,
-		Outcome:        sealed.Outcome,
-		Evidence:       sealed.Evidence,
+		SubmittedClaim: sealed.SubmittedClaim(),
+		Outcome:        sealed.Outcome(),
+		Evidence:       sealed.Evidence(),
 		Acceptance:     rec,
 	}
 	restored, err := RestoreVerifiedOutcome(persisted, key)
@@ -751,8 +751,8 @@ func TestRestoreVerifiedOutcomeRoundTrip(t *testing.T) {
 	if !restored.Sealed() || !restored.ProvenPass() {
 		t.Fatal("restored record must stay sealed and proven")
 	}
-	if restored.Evidence.VerifierIdentity != sealed.Evidence.VerifierIdentity {
-		t.Fatalf("restored verifier identity = %q, want %q", restored.Evidence.VerifierIdentity, sealed.Evidence.VerifierIdentity)
+	if restored.Evidence().VerifierIdentity != sealed.Evidence().VerifierIdentity {
+		t.Fatalf("restored verifier identity = %q, want %q", restored.Evidence().VerifierIdentity, sealed.Evidence().VerifierIdentity)
 	}
 
 	// Tampered / truncated evidence must not restore as authoritative.
@@ -882,17 +882,17 @@ func TestAdversarialCallerPassHighWithFailedJobIsNotProvenPass(t *testing.T) {
 	if vo.ProvenPass() {
 		t.Fatal("ProvenPass = true, want false: the signed job status is failure")
 	}
-	if vo.Outcome.Outcome != OutcomeFail {
-		t.Fatalf("derived result = %q, want fail (signed job status is failure)", vo.Outcome.Outcome)
+	if vo.Outcome().Outcome != OutcomeFail {
+		t.Fatalf("derived result = %q, want fail (signed job status is failure)", vo.Outcome().Outcome)
 	}
-	if vo.SubmittedClaim.Outcome != OutcomePass || vo.SubmittedClaim.AssuranceProfile != "sealed_pinned_no_network" {
+	if vo.SubmittedClaim().Outcome != OutcomePass || vo.SubmittedClaim().AssuranceProfile != "sealed_pinned_no_network" {
 		t.Fatal("the caller's pass/high proposal must be preserved on SubmittedClaim")
 	}
-	if vo.Outcome.AssuranceProfile == "sealed_pinned_no_network" {
+	if vo.Outcome().AssuranceProfile == "sealed_pinned_no_network" {
 		t.Fatal("derived assurance must not echo the caller's inflated profile")
 	}
-	if vo.Evidence.JobStatus != "failure" {
-		t.Fatalf("derived job status = %q, want failure", vo.Evidence.JobStatus)
+	if vo.Evidence().JobStatus != "failure" {
+		t.Fatalf("derived job status = %q, want failure", vo.Evidence().JobStatus)
 	}
 
 	// Even if a caller tries to persist it, the record is not a proven pass.
@@ -938,20 +938,20 @@ func TestAdversarialCallerPassWithUnboundChecksIsNotProvenPass(t *testing.T) {
 	if vo.ProvenPass() {
 		t.Fatal("ProvenPass = true, want false: required checks are not bound by signed result evidence")
 	}
-	if vo.Outcome.Outcome != OutcomePartial {
-		t.Fatalf("derived result = %q, want partial (checks missing)", vo.Outcome.Outcome)
+	if vo.Outcome().Outcome != OutcomePartial {
+		t.Fatalf("derived result = %q, want partial (checks missing)", vo.Outcome().Outcome)
 	}
 	// Derived CompletedChecks contain only what the signatures bind.
-	for _, c := range vo.Outcome.CompletedChecks {
+	for _, c := range vo.Outcome().CompletedChecks {
 		if c == "digest-match" || c == "signature" {
-			t.Fatalf("derived completed checks %v must not contain caller-only names", vo.Outcome.CompletedChecks)
+			t.Fatalf("derived completed checks %v must not contain caller-only names", vo.Outcome().CompletedChecks)
 		}
 	}
-	if !equalStringSlices(vo.SubmittedClaim.CompletedChecks, []string{"digest-match", "signature"}) {
+	if !equalStringSlices(vo.SubmittedClaim().CompletedChecks, []string{"digest-match", "signature"}) {
 		t.Fatal("the caller's check-name proposal must be preserved on SubmittedClaim")
 	}
 	hasStructural := false
-	for _, c := range vo.Outcome.CompletedChecks {
+	for _, c := range vo.Outcome().CompletedChecks {
 		if c == CheckJobStatusSuccess || c == CheckEvidenceRoot {
 			hasStructural = true
 		}
@@ -960,9 +960,9 @@ func TestAdversarialCallerPassWithUnboundChecksIsNotProvenPass(t *testing.T) {
 		}
 	}
 	if !hasStructural {
-		t.Fatalf("derived completed checks %v must contain the bound structural/named checks", vo.Outcome.CompletedChecks)
+		t.Fatalf("derived completed checks %v must contain the bound structural/named checks", vo.Outcome().CompletedChecks)
 	}
-	if vo.Outcome.AssuranceProfile == "sealed_pinned_no_network" {
+	if vo.Outcome().AssuranceProfile == "sealed_pinned_no_network" {
 		t.Fatal("derived assurance must not echo the caller's inflated profile")
 	}
 }
@@ -1001,13 +1001,75 @@ func TestAdversarialCallerPassMissingEvidenceChecksIsNotProvenPass(t *testing.T)
 	if vo.ProvenPass() {
 		t.Fatal("ProvenPass = true, want false: named required checks are unbound")
 	}
-	if vo.Outcome.Outcome != OutcomePartial {
-		t.Fatalf("derived result = %q, want partial", vo.Outcome.Outcome)
+	if vo.Outcome().Outcome != OutcomePartial {
+		t.Fatalf("derived result = %q, want partial", vo.Outcome().Outcome)
 	}
-	if !equalStringSlices(vo.Outcome.CompletedChecks, []string{CheckJobStatusSuccess, CheckEvidenceRoot}) {
-		t.Fatalf("derived completed checks = %v, want only the bound structural pair", vo.Outcome.CompletedChecks)
+	if !equalStringSlices(vo.Outcome().CompletedChecks, []string{CheckJobStatusSuccess, CheckEvidenceRoot}) {
+		t.Fatalf("derived completed checks = %v, want only the bound structural pair", vo.Outcome().CompletedChecks)
 	}
-	if !equalStringSlices(vo.SubmittedClaim.CompletedChecks, []string{"digest-match", "signature", "extra-claim"}) {
+	if !equalStringSlices(vo.SubmittedClaim().CompletedChecks, []string{"digest-match", "signature", "extra-claim"}) {
 		t.Fatal("the caller's check-name proposal must be preserved on SubmittedClaim")
+	}
+}
+
+// TestDerivedVerifiedOutcomeWireShape pins the persisted JSON contract of a
+// DerivedVerifiedOutcome: the wire names are unchanged (submitted_claim /
+// outcome / evidence) and unmarshal never restores the seal — a decoded
+// value is data, and only RestoreVerifiedOutcome mints authority again.
+func TestDerivedVerifiedOutcomeWireShape(t *testing.T) {
+	ob := baseObligation(t)
+	v := baseOutcome(t, ob)
+	v.EvidenceRoot = mustDigest(t, "wire-root")
+	v.ProvenanceRefs = []string{"att-1"}
+	v.ExecutionIDs = []string{"exec-1"}
+	f := &FuncEvidenceVerifier{
+		Identity: "wire-verifier/v1",
+		Resolve: func(context.Context, string) (ResolvedAttestation, error) {
+			return ResolvedAttestation{
+				ExecutionID:       "exec-1",
+				EvidenceRoot:      mustDigest(t, "wire-root"),
+				AttestationDigest: mustDigest(t, "wire-att"),
+				Status:            "success",
+				Attested:          trustedWindow(),
+				Checks:            passChecks("exec-1", CheckJobStatusSuccess, CheckEvidenceRoot),
+			}, nil
+		},
+	}
+	sealed, err := f.Verify(context.Background(), ob, v)
+	if err != nil {
+		t.Fatalf("Verify = %v", err)
+	}
+	raw, err := json.Marshal(sealed)
+	if err != nil {
+		t.Fatalf("MarshalJSON = %v", err)
+	}
+	var shape map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &shape); err != nil {
+		t.Fatalf("decode shape = %v", err)
+	}
+	for _, name := range []string{"submitted_claim", "outcome", "evidence"} {
+		if _, ok := shape[name]; !ok {
+			t.Fatalf("wire shape missing %q: %s", name, raw)
+		}
+	}
+	var back DerivedVerifiedOutcome
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("UnmarshalJSON = %v", err)
+	}
+	if back.Sealed() {
+		t.Fatal("json.Unmarshal must never restore the seal")
+	}
+	if back.ProvenPass() {
+		t.Fatal("a decoded value must never be a proven pass")
+	}
+	// Content round-trips: the accessors see the same authority values.
+	if back.Outcome().VerificationID != sealed.Outcome().VerificationID {
+		t.Fatalf("round-trip verification id = %q, want %q", back.Outcome().VerificationID, sealed.Outcome().VerificationID)
+	}
+	if back.Outcome().Outcome != sealed.Outcome().Outcome {
+		t.Fatalf("round-trip result = %q, want %q", back.Outcome().Outcome, sealed.Outcome().Outcome)
+	}
+	if back.Evidence().EvidenceRoot != mustDigest(t, "wire-root") {
+		t.Fatalf("round-trip evidence root = %s", back.Evidence().EvidenceRoot)
 	}
 }

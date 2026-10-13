@@ -141,8 +141,8 @@ func (m *MemoryStore) RecordVerifiedOutcome(ctx context.Context, v DerivedVerifi
 	defer m.mu.Unlock()
 	err := m.r.RecordVerifiedOutcome(v)
 	if errors.Is(err, ErrExists) {
-		existing, gerr := m.r.QueryOutcome(v.Outcome.VerificationID)
-		if gerr == nil && claimEquivalent(existing.Outcome, v.Outcome) {
+		existing, gerr := m.r.QueryOutcome(v.outcome.VerificationID)
+		if gerr == nil && claimEquivalent(existing.outcome, v.outcome) {
 			return nil
 		}
 	}

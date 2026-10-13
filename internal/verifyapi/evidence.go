@@ -2,6 +2,7 @@ package verifyapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -173,25 +174,29 @@ type VerifiedEvidence struct {
 // DerivedVerifiedOutcome is the server-created authoritative record of one
 // verification (Model A of the acceptance boundary): the caller's submission
 // is preserved verbatim as a PROPOSAL for audit, and every authority-bearing
-// value on Outcome is DERIVED from cryptographically resolved evidence —
-// never copied from the proposal. Only a DerivedVerifiedOutcome may be stored
-// as authoritative (see Registry.RecordVerifiedOutcome). The zero value is
-// not verified — the seal is set exclusively by EvidenceVerifier
-// implementations in this package, so a caller cannot fabricate authority
-// outside the process boundary.
+// value on the derived outcome is DERIVED from cryptographically resolved
+// evidence — never copied from the proposal. Only a DerivedVerifiedOutcome
+// may be stored as authoritative (see Registry.RecordVerifiedOutcome).
+//
+// It is a capability, not a mutable DTO: every field is unexported and the
+// accessors return deep copies, so no holder of a sealed record can rewrite
+// the result, checks or evidence after the verifier sealed it. The zero
+// value is not verified — the seal is set exclusively by sealDerivedOutcome
+// inside this package, so a caller cannot fabricate authority outside the
+// process boundary.
 type DerivedVerifiedOutcome struct {
-	// SubmittedClaim is the caller's proposal, preserved for audit. It
+	// submittedClaim is the caller's proposal, preserved for audit. It
 	// authorizes nothing: when its Result, AssuranceProfile, CompletedChecks,
 	// ExecutionIDs or EvidenceRoot disagree with the derived values, the
 	// derived values win and the claim stays here as the submission record.
-	SubmittedClaim VerificationOutcome `json:"submitted_claim"`
-	// Outcome is the DERIVED authoritative outcome: Result, CompletedChecks,
+	submittedClaim VerificationOutcome
+	// outcome is the DERIVED authoritative outcome: Result, CompletedChecks,
 	// AssuranceProfile, ExecutionIDs and EvidenceRoot all come from the
 	// signed evidence (see VerifiedEvidence), and the execution window and
 	// Measured resource facts follow the attested job window when one exists.
-	Outcome VerificationOutcome `json:"outcome"`
-	// Evidence is the cryptographically resolved evidence backing Outcome.
-	Evidence VerifiedEvidence `json:"evidence"`
+	outcome VerificationOutcome
+	// evidence is the cryptographically resolved evidence backing outcome.
+	evidence VerifiedEvidence
 
 	// sealed is the server-creation seal. It is intentionally unexported:
 	// values constructed outside a verifier of this package are never sealed
@@ -223,7 +228,62 @@ func (v DerivedVerifiedOutcome) Sealed() bool { return v.sealed }
 // the signed job status is success and every obligation check is bound by
 // signed result evidence, a caller-claimed pass can never satisfy it alone.
 func (v DerivedVerifiedOutcome) ProvenPass() bool {
-	return v.sealed && v.Outcome.Outcome == OutcomePass
+	return v.sealed && v.outcome.Outcome == OutcomePass
+}
+
+// SubmittedClaim returns a deep copy of the caller's proposal. The copy is
+// detached from the record: mutating it can never rewrite the sealed claim.
+func (v DerivedVerifiedOutcome) SubmittedClaim() VerificationOutcome {
+	return cloneOutcome(v.submittedClaim)
+}
+
+// Outcome returns a deep copy of the DERIVED authoritative outcome. The copy
+// is detached from the record: flipping Result (or any other field) on it
+// cannot upgrade authority — the sealed record is untouched.
+func (v DerivedVerifiedOutcome) Outcome() VerificationOutcome {
+	return cloneOutcome(v.outcome)
+}
+
+// Evidence returns a deep copy of the resolved evidence backing the outcome.
+// The copy is detached from the record.
+func (v DerivedVerifiedOutcome) Evidence() VerifiedEvidence {
+	return cloneEvidence(v.evidence)
+}
+
+// derivedWire is the wire projection of a DerivedVerifiedOutcome. It keeps
+// the persisted JSON shape identical to the pre-capability struct
+// (submitted_claim / outcome / evidence); the seal is process-local and is
+// deliberately never serialized.
+type derivedWire struct {
+	SubmittedClaim VerificationOutcome `json:"submitted_claim"`
+	Outcome        VerificationOutcome `json:"outcome"`
+	Evidence       VerifiedEvidence    `json:"evidence"`
+}
+
+// MarshalJSON renders the record under its historical wire names. The seal
+// is not part of the encoding: a decoded value is never authority (restore
+// goes through the acceptance integrity path, which re-seals).
+func (v DerivedVerifiedOutcome) MarshalJSON() ([]byte, error) {
+	return json.Marshal(derivedWire{
+		SubmittedClaim: v.submittedClaim,
+		Outcome:        v.outcome,
+		Evidence:       v.evidence,
+	})
+}
+
+// UnmarshalJSON decodes the historical wire shape into the private fields.
+// The seal stays false: deserialization can never mint authority, only
+// RestoreVerifiedOutcome can.
+func (v *DerivedVerifiedOutcome) UnmarshalJSON(data []byte) error {
+	var w derivedWire
+	if err := json.Unmarshal(data, &w); err != nil {
+		return err
+	}
+	v.submittedClaim = w.SubmittedClaim
+	v.outcome = w.Outcome
+	v.evidence = w.Evidence
+	v.sealed = false
+	return nil
 }
 
 // ResolvedAttestation is one cryptographically resolved execution
@@ -348,10 +408,18 @@ func (f *FuncEvidenceVerifier) Verify(ctx context.Context, obligation Verificati
 	execIDs := make([]string, 0, len(resolved))
 	digests := make([]Digest, 0, len(resolved))
 	seenExec := make(map[string]bool, len(resolved))
+	seenAtt := make(map[Digest]bool, len(resolved))
 	for _, att := range resolved {
 		if att.EvidenceRoot != root {
 			return DerivedVerifiedOutcome{}, fmt.Errorf("%w: attestations disagree on evidence root (%s vs %s)", ErrEvidence, root, att.EvidenceRoot)
 		}
+		// Two references to the same signed statement are one piece of
+		// evidence, never two (P1f): duplicate attestation digests are
+		// refused during verification rather than counted twice.
+		if seenAtt[att.AttestationDigest] {
+			return DerivedVerifiedOutcome{}, fmt.Errorf("%w: duplicate attestation digest %s (two references to one statement count once)", ErrEvidence, att.AttestationDigest)
+		}
+		seenAtt[att.AttestationDigest] = true
 		if !seenExec[att.ExecutionID] {
 			seenExec[att.ExecutionID] = true
 			execIDs = append(execIDs, att.ExecutionID)
@@ -903,17 +971,92 @@ func sealDerivedOutcome(submitted, derived VerificationOutcome, evidence Verifie
 	if !equalStringSlices(derived.ExecutionIDs, evidence.ExecutionIDs) {
 		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: derived execution ids %v disagree with resolved %v", ErrUnverified, derived.ExecutionIDs, evidence.ExecutionIDs)
 	}
-	if !equalStringSlices(derived.CompletedChecks, evidence.CompletedChecks) {
+	// Derivation completeness: result, checks and assurance are RE-DERIVED
+	// from the evidence primitives (JobStatus, VerifiedChecks, Assurance)
+	// and the stored projections must equal that derivation. Comparing the
+	// two projections to each other is not enough — they could be rewritten
+	// in concert. This is defense in depth on top of the struct's
+	// immutability.
+	//
+	// VerifiedChecks is the authoritative check set (see the type doc): when
+	// it is present, both completed-check projections are pinned to the
+	// passing names in it. Legacy evidence that predates the per-check set
+	// falls back to requiring the two projections to agree with each other.
+	if len(evidence.VerifiedChecks) > 0 {
+		reChecks := completedCheckNames(evidence.VerifiedChecks)
+		if !equalStringSlices(derived.CompletedChecks, reChecks) {
+			return DerivedVerifiedOutcome{}, fmt.Errorf("%w: derived completed checks %v disagree with the evidence-derived %v", ErrUnverified, derived.CompletedChecks, reChecks)
+		}
+		if !equalStringSlices(evidence.CompletedChecks, reChecks) {
+			return DerivedVerifiedOutcome{}, fmt.Errorf("%w: evidence completed checks %v disagree with the evidence-derived %v", ErrUnverified, evidence.CompletedChecks, reChecks)
+		}
+	} else if !equalStringSlices(derived.CompletedChecks, evidence.CompletedChecks) {
 		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: derived completed checks %v disagree with evidence %v", ErrUnverified, derived.CompletedChecks, evidence.CompletedChecks)
 	}
-	if derived.AssuranceProfile != evidence.Assurance.Name() {
-		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: derived assurance %q disagrees with evidence %q", ErrUnverified, derived.AssuranceProfile, evidence.Assurance.Name())
+	reAssurance := evidence.Assurance.Name()
+	if derived.AssuranceProfile != reAssurance {
+		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: derived assurance %q disagrees with evidence-derived %q", ErrUnverified, derived.AssuranceProfile, reAssurance)
+	}
+	if err := checkResultAgainstPrimitives(derived.Outcome, evidence); err != nil {
+		return DerivedVerifiedOutcome{}, err
+	}
+	// The structural job-status check is derived from the consensus job
+	// status (see deriveVerifiedChecks): when both are present they must
+	// agree, or the check set and the status primitive contradict each other.
+	for _, c := range evidence.VerifiedChecks {
+		if c.Name != CheckJobStatusSuccess {
+			continue
+		}
+		switch evidence.JobStatus {
+		case string(model.StatusSuccess):
+			if c.Outcome != CheckOutcomePass {
+				return DerivedVerifiedOutcome{}, fmt.Errorf("%w: job status %q requires the %s check to pass, got %q", ErrUnverified, evidence.JobStatus, CheckJobStatusSuccess, c.Outcome)
+			}
+		case string(model.StatusFailure):
+			if c.Outcome != CheckOutcomeFail {
+				return DerivedVerifiedOutcome{}, fmt.Errorf("%w: job status %q requires the %s check to fail, got %q", ErrUnverified, evidence.JobStatus, CheckJobStatusSuccess, c.Outcome)
+			}
+		default:
+			if c.Outcome == CheckOutcomePass {
+				return DerivedVerifiedOutcome{}, fmt.Errorf("%w: job status %q cannot prove the %s check passed", ErrUnverified, evidence.JobStatus, CheckJobStatusSuccess)
+			}
+		}
+		break
 	}
 	out := DerivedVerifiedOutcome{
-		SubmittedClaim: submitted,
-		Outcome:        derived,
-		Evidence:       evidence,
+		submittedClaim: cloneOutcome(submitted),
+		outcome:        cloneOutcome(derived),
+		evidence:       cloneEvidence(evidence),
 		sealed:         true,
 	}
 	return out, nil
+}
+
+// checkResultAgainstPrimitives pins the derived result to what the signed
+// job status and check set prove (see deriveResult for the obligation-aware
+// derivation this must stay consistent with):
+//
+//   - a failure job status proves fail and nothing else;
+//   - anything short of unanimous success can never prove pass;
+//   - a success job status never derives fail (pass or partial only — the
+//     obligation's required checks/assurance and freshness decide which).
+//
+// A failed job can therefore never be sealed as a pass even when the
+// derived outcome and the evidence summary were rewritten together.
+func checkResultAgainstPrimitives(result Outcome, evidence VerifiedEvidence) error {
+	switch evidence.JobStatus {
+	case string(model.StatusFailure):
+		if result != OutcomeFail {
+			return fmt.Errorf("%w: job status %q proves a fail result, derived %q", ErrUnverified, evidence.JobStatus, result)
+		}
+	case string(model.StatusSuccess):
+		if result == OutcomeFail {
+			return fmt.Errorf("%w: job status %q cannot prove a fail result, derived %q", ErrUnverified, evidence.JobStatus, result)
+		}
+	default:
+		if result != OutcomePartial {
+			return fmt.Errorf("%w: job status %q proves only a partial result, derived %q", ErrUnverified, evidence.JobStatus, result)
+		}
+	}
+	return nil
 }

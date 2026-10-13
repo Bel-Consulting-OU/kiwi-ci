@@ -233,9 +233,9 @@ func recheckProviderDemand(p VerifierProvider, obligation VerificationObligation
 		return err
 	}
 	demand := ResolveDemand(obligation)
-	if demand.Assurance != "" && derived.Sealed() && derived.Outcome.Outcome == OutcomePass &&
-		derived.Outcome.AssuranceProfile != demand.Assurance {
-		return fmt.Errorf("%w: derived pass assurance %q does not meet demand %q", ErrBinding, derived.Outcome.AssuranceProfile, demand.Assurance)
+	if demand.Assurance != "" && derived.Sealed() && derived.outcome.Outcome == OutcomePass &&
+		derived.outcome.AssuranceProfile != demand.Assurance {
+		return fmt.Errorf("%w: derived pass assurance %q does not meet demand %q", ErrBinding, derived.outcome.AssuranceProfile, demand.Assurance)
 	}
 	return nil
 }

@@ -204,9 +204,9 @@ func TestAcceptBindsEffectiveVerificationDemandDigest(t *testing.T) {
 	}
 	persisted := PersistedVerified{
 		Obligation:     ob,
-		SubmittedClaim: sealed.SubmittedClaim,
-		Outcome:        sealed.Outcome,
-		Evidence:       sealed.Evidence,
+		SubmittedClaim: sealed.SubmittedClaim(),
+		Outcome:        sealed.Outcome(),
+		Evidence:       sealed.Evidence(),
 		Acceptance:     rec,
 	}
 	if _, err := RestoreVerifiedOutcome(persisted, key); err != nil {
@@ -312,8 +312,8 @@ func TestEvidenceMinimumEnforcedOnDischarge(t *testing.T) {
 		if !errors.Is(err, ErrFreshness) && !errors.Is(err, ErrEvidence) {
 			t.Fatalf("discharge without attested window = %v, want refusal or a non-pass", err)
 		}
-	} else if seal.ProvenPass() || seal.Outcome.Outcome == OutcomePass {
-		t.Fatalf("discharge without attested window must not produce a pass (outcome=%q)", seal.Outcome.Outcome)
+	} else if seal.ProvenPass() || seal.Outcome().Outcome == OutcomePass {
+		t.Fatalf("discharge without attested window must not produce a pass (outcome=%q)", seal.Outcome().Outcome)
 	}
 
 	// An OBSERVED (not attested) window under RequireAttestedWindow: the
@@ -475,23 +475,23 @@ func TestCallerTypedWindowNeverSatisfiesFreshness(t *testing.T) {
 	}
 
 	// The derived window is Unknown — the claim's times are not a source.
-	if vo.Evidence.Window.Source != WindowSourceUnknown {
-		t.Fatalf("window source = %q, want %q", vo.Evidence.Window.Source, WindowSourceUnknown)
+	if vo.Evidence().Window.Source != WindowSourceUnknown {
+		t.Fatalf("window source = %q, want %q", vo.Evidence().Window.Source, WindowSourceUnknown)
 	}
 	// Unknown never satisfies freshness at ANY minimum authority.
 	for _, min := range []WindowSource{WindowSourceUnknown, WindowSourceVerifiedObserver, WindowSourceAttested} {
-		if vo.Evidence.Window.SatisfiesFreshness(min) {
+		if vo.Evidence().Window.SatisfiesFreshness(min) {
 			t.Fatalf("Unknown window must not satisfy freshness at min=%q", min)
 		}
-		if EvaluateFreshness(vo.Evidence.Window, ob.Freshness, ob.IssuedAt, ob.IssuedAt.Add(30*time.Second), min) != FreshnessUnknown {
+		if EvaluateFreshness(vo.Evidence().Window, ob.Freshness, ob.IssuedAt, ob.IssuedAt.Add(30*time.Second), min) != FreshnessUnknown {
 			t.Fatalf("EvaluateFreshness at min=%q = %v, want unknown", min,
-				EvaluateFreshness(vo.Evidence.Window, ob.Freshness, ob.IssuedAt, ob.IssuedAt.Add(30*time.Second), min))
+				EvaluateFreshness(vo.Evidence().Window, ob.Freshness, ob.IssuedAt, ob.IssuedAt.Add(30*time.Second), min))
 		}
 	}
 
 	// The sealed record is NOT a proven pass: freshness is unsatisfied.
-	if vo.Outcome.Outcome != OutcomePartial {
-		t.Fatalf("derived outcome = %q, want partial (freshness unknown)", vo.Outcome.Outcome)
+	if vo.Outcome().Outcome != OutcomePartial {
+		t.Fatalf("derived outcome = %q, want partial (freshness unknown)", vo.Outcome().Outcome)
 	}
 	if vo.ProvenPass() {
 		t.Fatal("caller-typed window must never produce a proven pass")
@@ -503,7 +503,7 @@ func TestCallerTypedWindowNeverSatisfiesFreshness(t *testing.T) {
 		[]string{"digest-match", "signature"},
 		[]string{"digest-match", "signature"},
 	)
-	status := StatusFromEvidence(c, vo.Outcome.Outcome, vo.Evidence.Window, MinWindowForRequireAttested(false))
+	status := StatusFromEvidence(c, vo.Outcome().Outcome, vo.Evidence().Window, MinWindowForRequireAttested(false))
 	if status.Terminal != TerminalEvidenceIncomplete {
 		t.Fatalf("terminal = %q, want %q", status.Terminal, TerminalEvidenceIncomplete)
 	}
@@ -532,10 +532,10 @@ func TestCallerTypedWindowNeverSatisfiesFreshness(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Verify attested = %v", err)
 	}
-	if vo2.Evidence.Window.Source != WindowSourceAttested {
-		t.Fatalf("window source = %q, want %q", vo2.Evidence.Window.Source, WindowSourceAttested)
+	if vo2.Evidence().Window.Source != WindowSourceAttested {
+		t.Fatalf("window source = %q, want %q", vo2.Evidence().Window.Source, WindowSourceAttested)
 	}
-	if !vo2.Evidence.Window.SatisfiesFreshness(MinWindowForRequireAttested(false)) {
+	if !vo2.Evidence().Window.SatisfiesFreshness(MinWindowForRequireAttested(false)) {
 		t.Fatal("attested window must satisfy freshness")
 	}
 	if !vo2.ProvenPass() {
@@ -614,13 +614,13 @@ func TestVerifiedObserverWindowIsWeakerThanAttested(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Verify = %v", err)
 	}
-	if vo.Evidence.Window.Source != WindowSourceVerifiedObserver {
-		t.Fatalf("window source = %q, want %q", vo.Evidence.Window.Source, WindowSourceVerifiedObserver)
+	if vo.Evidence().Window.Source != WindowSourceVerifiedObserver {
+		t.Fatalf("window source = %q, want %q", vo.Evidence().Window.Source, WindowSourceVerifiedObserver)
 	}
-	if !vo.Evidence.Window.SatisfiesFreshness(WindowSourceVerifiedObserver) {
+	if !vo.Evidence().Window.SatisfiesFreshness(WindowSourceVerifiedObserver) {
 		t.Fatal("observer window must satisfy a non-attested floor")
 	}
-	if vo.Evidence.Window.SatisfiesFreshness(WindowSourceAttested) {
+	if vo.Evidence().Window.SatisfiesFreshness(WindowSourceAttested) {
 		t.Fatal("observer window must NOT satisfy a RequireAttestedWindow floor")
 	}
 	// Under the default floor an observer window can still discharge.
@@ -629,7 +629,7 @@ func TestVerifiedObserverWindowIsWeakerThanAttested(t *testing.T) {
 	}
 	// The recipe floor raises the bar to attested.
 	min := MinWindowForRequireAttested(true)
-	status := StatusFromEvidence(EvidenceCompleteness{Required: 1, Present: 1, Verified: 1}, vo.Outcome.Outcome, vo.Evidence.Window, min)
+	status := StatusFromEvidence(EvidenceCompleteness{Required: 1, Present: 1, Verified: 1}, vo.Outcome().Outcome, vo.Evidence().Window, min)
 	if status.Terminal != TerminalEvidenceIncomplete {
 		t.Fatalf("terminal under RequireAttestedWindow = %q, want evidence_incomplete", status.Terminal)
 	}
@@ -763,16 +763,16 @@ func TestLegacyRestoreRederivesWindowKinds(t *testing.T) {
 	}
 	// Forge Window.Source=attested on the persisted evidence (as a DB
 	// writer would). The v2/v1 MAC does not cover Window.
-	forged := sealed.Evidence
+	forged := sealed.Evidence()
 	forged.Window = ExecutionWindow{
-		StartedAt:   sealed.Outcome.StartedAt,
-		CompletedAt: sealed.Outcome.CompletedAt,
+		StartedAt:   sealed.Outcome().StartedAt,
+		CompletedAt: sealed.Outcome().CompletedAt,
 		Source:      WindowSourceAttested,
 	}
 	persisted := PersistedVerified{
 		Obligation:     ob,
-		SubmittedClaim: sealed.SubmittedClaim,
-		Outcome:        sealed.Outcome,
+		SubmittedClaim: sealed.SubmittedClaim(),
+		Outcome:        sealed.Outcome(),
 		Evidence:       forged,
 		Acceptance:     mustAcceptRecord(t, ob, sealed, key),
 	}
@@ -788,7 +788,7 @@ func TestLegacyRestoreRederivesWindowKinds(t *testing.T) {
 		t.Logf("restore refused forged evidence: %v", err)
 		return
 	}
-	if restored.Evidence.Window.Source == WindowSourceAttested {
+	if restored.Evidence().Window.Source == WindowSourceAttested {
 		t.Fatal("legacy restore trusted a forged attested window source")
 	}
 }
@@ -824,21 +824,58 @@ func TestPostSealMutationCannotUpgradeAuthority(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seal: %v", err)
 	}
-	if sealed.Outcome.Outcome == OutcomePass {
+	if sealed.Outcome().Outcome == OutcomePass {
 		t.Fatal("verifier derived pass from a failed job status")
 	}
-	// Post-seal mutation: flip to pass.
+	// Immutability: the accessors return deep copies, so rewriting the
+	// returned outcome cannot upgrade the sealed record.
+	copyOut := sealed.Outcome()
+	copyOut.Outcome = OutcomePass
+	if sealed.Outcome().Outcome != OutcomeFail {
+		t.Fatal("mutating an Outcome() copy must not upgrade the sealed record")
+	}
+	if sealed.ProvenPass() {
+		t.Fatal("sealed record must not become a proven pass via copy mutation")
+	}
+
+	// Coordinated attack on the internals: flip the derived result to pass
+	// AND rewrite the evidence projections to agree (the pre-P0 hole —
+	// sealDerivedOutcome only compared the two mutable projections). The
+	// seal re-derives result/checks/assurance from the evidence primitives
+	// (JobStatus, VerifiedChecks, Assurance), so the failed job status still
+	// proves fail and the forgery is refused.
 	mutated := sealed
-	mutated.Outcome.Outcome = OutcomePass
+	mutated.outcome.Outcome = OutcomePass
+	mutated.outcome.CompletedChecks = append([]string(nil), ob.RequiredChecks...)
+	mutated.evidence.CompletedChecks = append([]string(nil), ob.RequiredChecks...)
 	key := mustKey(t, "k1", "secret-1")
 	if _, err := AcceptWithKeyring(ob, mutated, key, nil, time.Now().UTC()); err == nil {
-		t.Fatal("Accept must refuse a post-seal mutation to pass")
+		t.Fatal("Accept must refuse a coordinated post-seal mutation to pass")
+	} else if !errors.Is(err, ErrUnverified) {
+		t.Fatalf("Accept error = %v, want ErrUnverified", err)
 	}
 	reg := NewMemoryStore(clock)
 	if err := reg.SubmitObligation(context.Background(), ob); err != nil {
 		t.Fatal(err)
 	}
 	if err := reg.RecordVerifiedOutcome(context.Background(), mutated); err == nil {
-		t.Fatal("RecordVerifiedOutcome must refuse a post-seal mutation to pass")
+		t.Fatal("RecordVerifiedOutcome must refuse a coordinated post-seal mutation to pass")
+	} else if !errors.Is(err, ErrUnverified) {
+		t.Fatalf("RecordVerifiedOutcome error = %v, want ErrUnverified", err)
+	}
+
+	// A subtler forgery: flip the consensus job status to success and the
+	// result to pass while leaving the derived check set untouched. The
+	// projections then agree with each other, but the structural
+	// job-status-success check is still fail — the primitives contradict
+	// the status, and the seal refuses. (Rewriting the primitives too is
+	// out of scope here: those are the signature/MAC-bound trust root.)
+	deeper := sealed
+	deeper.outcome.Outcome = OutcomePass
+	deeper.evidence.JobStatus = string(model.StatusSuccess)
+	if _, err := sealDerivedOutcome(deeper.submittedClaim, deeper.outcome, deeper.evidence); err == nil {
+		t.Fatal("seal must refuse evidence whose checks contradict its job status")
+	} else if !errors.Is(err, ErrUnverified) {
+		t.Fatalf("contradictory status/checks error = %v, want ErrUnverified", err)
 	}
 }

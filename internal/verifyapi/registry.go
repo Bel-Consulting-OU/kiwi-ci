@@ -173,23 +173,24 @@ func (r *Registry) RecordVerifiedOutcome(v DerivedVerifiedOutcome) error {
 	if !v.Sealed() {
 		return fmt.Errorf("%w: RecordVerifiedOutcome requires a verifier-produced record", ErrUnverified)
 	}
-	// Re-seal: a sealed value is a Go struct — callers can mutate Outcome
-	// after the verifier sealed it and keep the unexported bit. Re-running
-	// the seal rules refuses any post-seal edit of result/checks/assurance
-	// that disagrees with the evidence.
-	rev, err := sealDerivedOutcome(v.SubmittedClaim, v.Outcome, v.Evidence)
+	// Re-seal: re-running the seal rules re-derives result/checks/assurance
+	// from the evidence primitives, so any post-seal edit that disagrees
+	// with the evidence is refused. The fields are unexported now, so
+	// external mutation is impossible by construction; this is defense in
+	// depth for anything rebuilt inside the package.
+	rev, err := sealDerivedOutcome(v.submittedClaim, v.outcome, v.evidence)
 	if err != nil {
 		return fmt.Errorf("%w: sealed record failed re-validation: %v", ErrUnverified, err)
 	}
 	v = rev
-	out := v.Outcome
+	out := v.outcome
 	if err := out.Validate(); err != nil {
 		return err
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if existing, exists := r.verified[out.VerificationID]; exists {
-		if claimEquivalent(existing.Outcome, out) {
+		if claimEquivalent(existing.outcome, out) {
 			return nil
 		}
 		return fmt.Errorf("%w: outcome %q", ErrExists, out.VerificationID)
@@ -201,7 +202,7 @@ func (r *Registry) RecordVerifiedOutcome(v DerivedVerifiedOutcome) error {
 	// The recipe evidence floor is not only a service-path concern: a direct
 	// registry write must enforce it before the record becomes authority,
 	// matching PostgresStore.RecordVerifiedOutcome / AcceptWithRecipe.
-	if err := r.evidenceFloor(ob, v.Evidence); err != nil {
+	if err := r.evidenceFloor(ob, out, v.evidence); err != nil {
 		return err
 	}
 	if err := Bind(ob, out, r.clock()); err != nil {
@@ -220,10 +221,10 @@ func (r *Registry) RecordVerifiedOutcome(v DerivedVerifiedOutcome) error {
 	// DurationNS is derived from the outcome window; WallTimeNS is filled
 	// only from the sealed evidence's attested job facts (nil on a record
 	// whose attestations carry no window).
-	out.Resources.Measured = DeriveMeasuredFacts(out, v.Evidence.Attested)
+	out.Resources.Measured = DeriveMeasuredFacts(out, v.evidence.Attested)
 	// Model A: the claim side is stored as submitted, never overwritten by
 	// the derived outcome.
-	claim := cloneOutcome(v.SubmittedClaim)
+	claim := cloneOutcome(v.submittedClaim)
 	claim.Resources.Measured = DeriveMeasuredFacts(claim, nil)
 	if stored, exists := r.outcomes[out.VerificationID]; exists {
 		if !claimCompatible(stored, claim) {
@@ -232,9 +233,14 @@ func (r *Registry) RecordVerifiedOutcome(v DerivedVerifiedOutcome) error {
 	} else {
 		r.outcomes[out.VerificationID] = claim
 	}
-	seal := v
-	seal.Outcome = cloneOutcome(out)
-	r.verified[out.VerificationID] = cloneDerived(seal)
+	// The stored seal carries the record-time Measured facts. There are no
+	// exported fields left to patch, so rebuild the sealed value through
+	// the seal rule (which re-derives result/checks/assurance again).
+	storedSeal, err := sealDerivedOutcome(v.submittedClaim, out, v.evidence)
+	if err != nil {
+		return fmt.Errorf("%w: sealed record failed re-validation after measured fill: %v", ErrUnverified, err)
+	}
+	r.verified[out.VerificationID] = storedSeal
 	return nil
 }
 
@@ -243,8 +249,9 @@ func (r *Registry) RecordVerifiedOutcome(v DerivedVerifiedOutcome) error {
 // obligation whose recipe cannot be resolved (no registry configured, or the
 // digest is unknown) is refused — fail closed, exactly like PostgresStore
 // without WithRecipes. The check itself is Recipe.EvidenceMinimum.Check, the
-// same decision AcceptWithRecipe and RestoreVerifiedOutcome apply.
-func (r *Registry) evidenceFloor(ob VerificationObligation, e VerifiedEvidence) error {
+// same decision AcceptWithRecipe and RestoreVerifiedOutcome apply. Pass-only
+// (P2i): the floor gates a pass claim; a fail/partial records as-is.
+func (r *Registry) evidenceFloor(ob VerificationObligation, out VerificationOutcome, e VerifiedEvidence) error {
 	if ob.RecipeDigest == "" {
 		return nil
 	}
@@ -254,6 +261,9 @@ func (r *Registry) evidenceFloor(ob VerificationObligation, e VerifiedEvidence) 
 	recipe, err := r.recipes.ByDigest(ob.RecipeDigest)
 	if err != nil {
 		return err
+	}
+	if out.Outcome != OutcomePass {
+		return nil
 	}
 	if err := recipe.EvidenceMin.Check(e); err != nil {
 		return fmt.Errorf("%w: record fails the recipe evidence floor: %v", ErrEvidence, err)
@@ -488,7 +498,7 @@ func (r *Registry) CompareGroup(groupID string) (GroupComparison, error) {
 		// the fallback for claim-only members.
 		attempt := groupAttempt{outcome: v, verified: false}
 		if seal, ok := r.verified[v.VerificationID]; ok {
-			attempt.outcome = seal.Outcome
+			attempt.outcome = seal.outcome
 			attempt.verified = true
 		}
 		if err := BindGroup(g, nil, attempt.outcome); err != nil {
@@ -633,21 +643,9 @@ func cloneResources(r ResourceFacts) ResourceFacts {
 
 func cloneDerived(v DerivedVerifiedOutcome) DerivedVerifiedOutcome {
 	out := v
-	out.SubmittedClaim = cloneOutcome(v.SubmittedClaim)
-	out.Outcome = cloneOutcome(v.Outcome)
-	out.Evidence.ExecutionIDs = append([]string(nil), v.Evidence.ExecutionIDs...)
-	out.Evidence.AttestationDigests = append([]Digest(nil), v.Evidence.AttestationDigests...)
-	out.Evidence.CompletedChecks = append([]string(nil), v.Evidence.CompletedChecks...)
-	out.Evidence.VerifiedChecks = append([]VerifiedCheck(nil), v.Evidence.VerifiedChecks...)
-	out.Evidence.Kinds = append([]string(nil), v.Evidence.Kinds...)
-	if v.Evidence.Attested != nil {
-		a := *v.Evidence.Attested
-		out.Evidence.Attested = &a
-	}
-	if v.Evidence.ObservedControls != nil {
-		c := *v.Evidence.ObservedControls
-		out.Evidence.ObservedControls = &c
-	}
+	out.submittedClaim = cloneOutcome(v.submittedClaim)
+	out.outcome = cloneOutcome(v.outcome)
+	out.evidence = cloneEvidence(v.evidence)
 	return out
 }
 

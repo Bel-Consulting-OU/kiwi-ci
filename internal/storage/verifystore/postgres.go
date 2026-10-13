@@ -330,7 +330,10 @@ func (s *PostgresStore) RecordVerifiedOutcome(ctx context.Context, v verifyapi.V
 	if s.acceptanceKeyring == nil {
 		return fmt.Errorf("%w: store has no acceptance keyring; refusing to persist unsealed authority", verifyapi.ErrAcceptance)
 	}
-	ob, err := s.GetObligation(ctx, v.SubmittedClaim.ObligationID)
+	claim := v.SubmittedClaim()
+	derived := v.Outcome()
+	evidence := v.Evidence()
+	ob, err := s.GetObligation(ctx, claim.ObligationID)
 	if err != nil {
 		return err
 	}
@@ -347,17 +350,21 @@ func (s *PostgresStore) RecordVerifiedOutcome(ctx context.Context, v verifyapi.V
 		// The recipe's evidence floor is not only a service-path concern: a
 		// direct store write must enforce it before the acceptance record is
 		// minted, or the floor could be bypassed by calling the store
-		// without the service wrapper.
-		if err := recipe.EvidenceMin.Check(v.Evidence); err != nil {
-			return fmt.Errorf("%w: record fails the recipe evidence floor: %v", verifyapi.ErrEvidence, err)
+		// without the service wrapper. Pass-only (P2i): the floor gates a
+		// pass claim; a fail/partial records as-is (AcceptWithRecipe applies
+		// the same rule, so this is defense in depth).
+		if derived.Outcome == verifyapi.OutcomePass {
+			if err := recipe.EvidenceMin.Check(evidence); err != nil {
+				return fmt.Errorf("%w: record fails the recipe evidence floor: %v", verifyapi.ErrEvidence, err)
+			}
 		}
 	}
 	rec, err := verifyapi.AcceptWithRecipe(ob, v, nil, s.acceptanceKeyring, recipe, s.verifyNow())
 	if err != nil {
 		return err
 	}
-	payload := verifiedPayload{Outcome: v.Outcome, Evidence: v.Evidence}
-	return s.recordOutcomeTx(ctx, v.SubmittedClaim, v.Outcome, &payload, &rec)
+	payload := verifiedPayload{Outcome: derived, Evidence: evidence}
+	return s.recordOutcomeTx(ctx, claim, derived, &payload, &rec)
 }
 
 // verifiedPayload is the evidence-column shape of a verified row: the

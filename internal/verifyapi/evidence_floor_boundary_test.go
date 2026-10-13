@@ -34,6 +34,13 @@ func evidenceFloorRecipe(t *testing.T, minAttestations int, requireWindow bool) 
 // given number of resolved attestations and an optional attested window.
 func evidenceFloorFixture(t *testing.T, r Recipe, d Digest, attestedCount int, window *AttestedResourceFacts) (VerificationObligation, DerivedVerifiedOutcome) {
 	t.Helper()
+	return evidenceFloorFixtureStatus(t, r, d, attestedCount, window, string(model.StatusSuccess))
+}
+
+// evidenceFloorFixtureStatus is evidenceFloorFixture with an explicit signed
+// job status (use "failure" to seal a coherent fail record).
+func evidenceFloorFixtureStatus(t *testing.T, r Recipe, d Digest, attestedCount int, window *AttestedResourceFacts, status string) (VerificationObligation, DerivedVerifiedOutcome) {
+	t.Helper()
 	now := time.Date(2026, 1, 2, 3, 5, 0, 0, time.UTC)
 	clock := func() time.Time { return now }
 	clean := baseObligation(t)
@@ -55,14 +62,25 @@ func evidenceFloorFixture(t *testing.T, r Recipe, d Digest, attestedCount int, w
 	claim.CompletedChecks = append([]string(nil), ob.RequiredChecks...)
 	claim.AssuranceProfile = ob.RequiredAssurance
 
-	resolve := func(context.Context, string) (ResolvedAttestation, error) {
+	resolve := func(_ context.Context, ref string) (ResolvedAttestation, error) {
+		checks := passChecks("exec-1", CheckJobStatusSuccess, CheckEvidenceRoot)
+		if status != string(model.StatusSuccess) {
+			for i := range checks {
+				if checks[i].Name == CheckJobStatusSuccess {
+					checks[i].Outcome = CheckOutcomeFail
+				}
+			}
+		}
 		return ResolvedAttestation{
-			ExecutionID:       "exec-1",
-			EvidenceRoot:      mustDigest(t, "floor-root"),
-			AttestationDigest: mustDigest(t, "floor-att"),
-			Status:            "success",
+			ExecutionID:  "exec-1",
+			EvidenceRoot: mustDigest(t, "floor-root"),
+			// P1f: each evidence ref must resolve to a DISTINCT signed
+			// statement — two refs to one statement are one piece of
+			// evidence and duplicate digests are refused at verification.
+			AttestationDigest: mustDigest(t, "floor-att-"+ref),
+			Status:            status,
 			Facts:             &model.ExecutionFacts{FilesystemIsolated: true},
-			Checks:            passChecks("exec-1", CheckJobStatusSuccess, CheckEvidenceRoot),
+			Checks:            checks,
 			Attested:          window,
 		}, nil
 	}
@@ -103,11 +121,17 @@ func TestAcceptWithRecipeEnforcesEvidenceFloor(t *testing.T) {
 		t.Fatalf("AcceptWithRecipe below MinAttestations floor = %v, want ErrEvidence", err)
 	}
 
-	// Recipe demands an attested window; seal without one.
+	// Recipe demands an attested window; seal without one. Without a trusted
+	// window the derived verdict is partial (a pass can never stand on an
+	// Unknown window), and the floor is pass-only (P2i): a fail/partial
+	// records as-is and is NOT gated by the evidence floor.
 	r2, d2 := evidenceFloorRecipe(t, 1, true)
 	ob2, sealed2 := evidenceFloorFixture(t, r2, d2, 1, nil)
-	if _, err := AcceptWithRecipe(ob2, sealed2, key, nil, &r2, at); !errors.Is(err, ErrEvidence) && !errors.Is(err, ErrFreshness) {
-		t.Fatalf("AcceptWithRecipe without attested window = %v, want ErrEvidence/ErrFreshness", err)
+	if sealed2.Outcome().Outcome == OutcomePass {
+		t.Fatal("fixture without attested window must not derive a pass")
+	}
+	if _, err := AcceptWithRecipe(ob2, sealed2, key, nil, &r2, at); err != nil {
+		t.Fatalf("AcceptWithRecipe partial below floor = %v, want success (floor is pass-only)", err)
 	}
 
 	// Meeting the floor mints the record.

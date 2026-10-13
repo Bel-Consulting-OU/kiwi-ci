@@ -231,8 +231,8 @@ type verifiedDoc struct {
 func newVerifiedDoc(v VerifiedOutcome) verifiedDoc {
 	return verifiedDoc{
 		SchemaVersion: SchemaVersion,
-		Outcome:       v.Outcome,
-		Evidence:      v.Evidence,
+		Outcome:       v.outcome,
+		Evidence:      v.evidence,
 		ProvenPass:    v.ProvenPass(),
 	}
 }

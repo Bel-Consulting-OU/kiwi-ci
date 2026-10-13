@@ -179,16 +179,16 @@ func TestServiceVerifyAndRecordDerivesSealed(t *testing.T) {
 	if !ProvenPass(seal) {
 		t.Fatalf("ProvenPass = false, want true for sealed pass")
 	}
-	if seal.Evidence.VerifierIdentity != "service-test-verifier/v1" {
-		t.Fatalf("verifier identity = %q", seal.Evidence.VerifierIdentity)
+	if seal.Evidence().VerifierIdentity != "service-test-verifier/v1" {
+		t.Fatalf("verifier identity = %q", seal.Evidence().VerifierIdentity)
 	}
 	// Measured facts are derived at record time, never caller-asserted.
-	if seal.Outcome.Resources.Measured == nil {
+	if seal.Outcome().Resources.Measured == nil {
 		t.Fatal("Measured is nil on the sealed record")
 	}
 	wantNS := v.CompletedAt.Sub(v.StartedAt).Nanoseconds()
-	if seal.Outcome.Resources.Measured.DurationNS != wantNS {
-		t.Fatalf("DurationNS = %d, want %d", seal.Outcome.Resources.Measured.DurationNS, wantNS)
+	if seal.Outcome().Resources.Measured.DurationNS != wantNS {
+		t.Fatalf("DurationNS = %d, want %d", seal.Outcome().Resources.Measured.DurationNS, wantNS)
 	}
 	// QueryOutcome returns the same sealed pass.
 	got, err := f.svc.QueryOutcome(ctx, f.tenantA, v.VerificationID)
@@ -258,24 +258,24 @@ func TestServiceTenantIsolationOverIdenticalContent(t *testing.T) {
 	}
 
 	// Tenant A reads its own sealed outcome; tenant B is refused on it.
-	if _, err := f.svc.QueryOutcome(ctx, f.tenantA, sealA.Outcome.VerificationID); err != nil {
+	if _, err := f.svc.QueryOutcome(ctx, f.tenantA, sealA.Outcome().VerificationID); err != nil {
 		t.Fatalf("tenant A reads own outcome: %v", err)
 	}
-	if _, err := f.svc.QueryOutcome(ctx, f.tenantB, sealA.Outcome.VerificationID); !errors.Is(err, ErrUnauthorized) {
+	if _, err := f.svc.QueryOutcome(ctx, f.tenantB, sealA.Outcome().VerificationID); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("tenant B reads tenant A outcome = %v, want ErrUnauthorized", err)
 	}
 	// And the reverse.
-	if _, err := f.svc.QueryOutcome(ctx, f.tenantB, sealB.Outcome.VerificationID); err != nil {
+	if _, err := f.svc.QueryOutcome(ctx, f.tenantB, sealB.Outcome().VerificationID); err != nil {
 		t.Fatalf("tenant B reads own outcome: %v", err)
 	}
-	if _, err := f.svc.QueryOutcome(ctx, f.tenantA, sealB.Outcome.VerificationID); !errors.Is(err, ErrUnauthorized) {
+	if _, err := f.svc.QueryOutcome(ctx, f.tenantA, sealB.Outcome().VerificationID); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("tenant A reads tenant B outcome = %v, want ErrUnauthorized", err)
 	}
 	// Admin may read both (cross-subject break-glass, still via Authorizer).
-	if _, err := f.svc.QueryOutcome(ctx, f.admin, sealA.Outcome.VerificationID); err != nil {
+	if _, err := f.svc.QueryOutcome(ctx, f.admin, sealA.Outcome().VerificationID); err != nil {
 		t.Fatalf("admin reads A: %v", err)
 	}
-	if _, err := f.svc.QueryOutcome(ctx, f.admin, sealB.Outcome.VerificationID); err != nil {
+	if _, err := f.svc.QueryOutcome(ctx, f.admin, sealB.Outcome().VerificationID); err != nil {
 		t.Fatalf("admin reads B: %v", err)
 	}
 }
@@ -311,9 +311,9 @@ func TestServiceQueryOutcomeRestartSafe(t *testing.T) {
 	}
 	persisted := PersistedVerified{
 		Obligation:     ob,
-		SubmittedClaim: seal.SubmittedClaim,
-		Outcome:        seal.Outcome,
-		Evidence:       seal.Evidence,
+		SubmittedClaim: seal.SubmittedClaim(),
+		Outcome:        seal.Outcome(),
+		Evidence:       seal.Evidence(),
 		Acceptance:     rec,
 	}
 
@@ -347,8 +347,8 @@ func TestServiceQueryOutcomeRestartSafe(t *testing.T) {
 	if !got.ProvenPass() {
 		t.Fatal("restarted QueryOutcome is not a proven pass")
 	}
-	if got.Evidence.VerifierIdentity != seal.Evidence.VerifierIdentity {
-		t.Fatalf("verifier identity after restart = %q, want %q", got.Evidence.VerifierIdentity, seal.Evidence.VerifierIdentity)
+	if got.Evidence().VerifierIdentity != seal.Evidence().VerifierIdentity {
+		t.Fatalf("verifier identity after restart = %q, want %q", got.Evidence().VerifierIdentity, seal.Evidence().VerifierIdentity)
 	}
 	// A tampered evidence set cannot be restored into authority.
 	tampered := persisted

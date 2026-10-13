@@ -268,9 +268,9 @@ func TestAcceptanceIntegrityRejectsTamperedPayload(t *testing.T) {
 	}
 	persisted := verifyapi.PersistedVerified{
 		Obligation:     ob,
-		SubmittedClaim: sealed.SubmittedClaim,
-		Outcome:        sealed.Outcome,
-		Evidence:       sealed.Evidence,
+		SubmittedClaim: sealed.SubmittedClaim(),
+		Outcome:        sealed.Outcome(),
+		Evidence:       sealed.Evidence(),
 		Acceptance:     rec,
 	}
 

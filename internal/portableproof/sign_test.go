@@ -93,9 +93,9 @@ func sealedProof(t *testing.T) (verifyapi.VerifiedProof, *verifyapi.AcceptanceKe
 	}
 	proof := verifyapi.NewVerificationProof(verifyapi.PersistedVerified{
 		Obligation:     ob,
-		SubmittedClaim: sealed.SubmittedClaim,
-		Outcome:        sealed.Outcome,
-		Evidence:       sealed.Evidence,
+		SubmittedClaim: sealed.SubmittedClaim(),
+		Outcome:        sealed.Outcome(),
+		Evidence:       sealed.Evidence(),
 		Acceptance:     rec,
 	})
 	ring, err := verifyapi.NewSingleKeyring(key)
@@ -144,11 +144,12 @@ func TestSignAndVerifyWithPublicKeyOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("VerifySignedProof = %v", err)
 	}
-	if got.Obligation.ObligationID != verified.Document.Obligation.ObligationID || got.Outcome.VerificationID != verified.Document.Outcome.VerificationID {
+	doc := verified.Document()
+	if got.Obligation.ObligationID != doc.Obligation.ObligationID || got.Outcome.VerificationID != doc.Outcome.VerificationID {
 		t.Fatalf("round-tripped proof identity mismatch: %+v", got)
 	}
 	// The internal HMAC layer is untouched by the portable signature.
-	if _, err := verified.Document.Verify(mustRing(t, mustHMAC(t))); err != nil {
+	if _, err := doc.Verify(mustRing(t, mustHMAC(t))); err != nil {
 		t.Fatalf("internal HMAC proof.Verify after portable sign = %v", err)
 	}
 }
@@ -168,13 +169,15 @@ func TestSignUnsealedRefused(t *testing.T) {
 		t.Fatalf("SignVerifiedProof(zero) = %v, want ErrUnsealed", err)
 	}
 	// A raw unverified VerificationProof document cannot be signed through
-	// the public API at all: wrapping it in VerifiedProof without
-	// VerificationProof.Verify leaves the seal unset.
-	raw := verifyapi.VerifiedProof{Document: verified.Document}
-	if raw.Sealed() {
-		t.Fatal("hand-built VerifiedProof must not be sealed")
+	// the public API at all: VerifiedProof's fields are unexported, so the
+	// only externally-constructible value is the unsealed zero value (and a
+	// Document() copy carries no seal). The portable layer never launders
+	// an unverified document into a signed one.
+	doc := verified.Document()
+	if doc.Obligation.ObligationID == "" {
+		t.Fatal("Document() must return the verified bundle")
 	}
-	if _, err := signer.SignVerifiedProof(raw, time.Time{}); !errors.Is(err, portableproof.ErrUnsealed) {
+	if _, err := signer.SignVerifiedProof(verifyapi.VerifiedProof{}, time.Time{}); !errors.Is(err, portableproof.ErrUnsealed) {
 		t.Fatalf("SignVerifiedProof(unsealed document) = %v, want ErrUnsealed", err)
 	}
 }

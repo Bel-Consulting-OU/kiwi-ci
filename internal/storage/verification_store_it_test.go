@@ -421,8 +421,10 @@ func TestIntegrationVerificationStoreClaimVsVerified(t *testing.T) {
 		t.Fatalf("claim Measured = %+v, want duration %d", claim.Resources.Measured, v.CompletedAt.Sub(v.StartedAt).Nanoseconds())
 	}
 
-	// An unsealed VerifiedOutcome is refused outright.
-	if err := st.RecordVerifiedOutcome(ctx, verifyapi.VerifiedOutcome{Outcome: v}); !errors.Is(err, verifyapi.ErrUnverified) {
+	// An unsealed VerifiedOutcome is refused outright. The fields are
+	// unexported (capability, not DTO), so the zero value is the only shape
+	// an external caller can hand-build — and it carries no seal.
+	if err := st.RecordVerifiedOutcome(ctx, verifyapi.VerifiedOutcome{}); !errors.Is(err, verifyapi.ErrUnverified) {
 		t.Fatalf("RecordVerifiedOutcome unsealed = %v, want ErrUnverified", err)
 	}
 
@@ -445,8 +447,8 @@ func TestIntegrationVerificationStoreClaimVsVerified(t *testing.T) {
 	if !got.ProvenPass() {
 		t.Fatal("want proven pass from durable store")
 	}
-	if got.Evidence.VerifierIdentity != "verification-it-verifier/v1" {
-		t.Fatalf("verifier identity = %q", got.Evidence.VerifierIdentity)
+	if got.Evidence().VerifierIdentity != "verification-it-verifier/v1" {
+		t.Fatalf("verifier identity = %q", got.Evidence().VerifierIdentity)
 	}
 
 	// Conflicting content under the same verification id is refused.
@@ -701,9 +703,9 @@ func TestIntegrationVerificationStoreAcceptanceIntegrity(t *testing.T) {
 	// 1. Tampered payload: edit the derived outcome after write.
 	tampered := verifyapi.PersistedVerified{
 		Obligation:     ob,
-		SubmittedClaim: got.SubmittedClaim,
-		Outcome:        got.Outcome,
-		Evidence:       got.Evidence,
+		SubmittedClaim: got.SubmittedClaim(),
+		Outcome:        got.Outcome(),
+		Evidence:       got.Evidence(),
 		Acceptance:     verifyapi.AcceptanceRecord{}, // filled below from Accept
 	}
 	key, err := verifyapi.NewHMACAcceptanceKey("it-acceptance", []byte("it-acceptance-secret-32-bytes!!"))
@@ -725,7 +727,7 @@ func TestIntegrationVerificationStoreAcceptanceIntegrity(t *testing.T) {
 	// 2. Flipped verified flag shape: a row with is_verified=true but no
 	// acceptance record is refused (QueryOutcome's empty-acceptance gate).
 	flipped := tampered
-	flipped.Outcome = got.Outcome
+	flipped.Outcome = got.Outcome()
 	flipped.Acceptance = verifyapi.AcceptanceRecord{}
 	if _, err := verifyapi.RestoreVerifiedOutcome(flipped, key); err == nil {
 		t.Fatal("row without acceptance record must not restore as sealed")
@@ -738,9 +740,9 @@ func TestIntegrationVerificationStoreAcceptanceIntegrity(t *testing.T) {
 	}
 	wrong := verifyapi.PersistedVerified{
 		Obligation:     ob,
-		SubmittedClaim: got.SubmittedClaim,
-		Outcome:        got.Outcome,
-		Evidence:       got.Evidence,
+		SubmittedClaim: got.SubmittedClaim(),
+		Outcome:        got.Outcome(),
+		Evidence:       got.Evidence(),
 		Acceptance:     rec,
 	}
 	if _, err := verifyapi.RestoreVerifiedOutcome(wrong, other); err == nil {

@@ -240,7 +240,9 @@ func TestFactFromOutcome(t *testing.T) {
 
 	failed := v
 	failed.Outcome = OutcomeFail
-	sealedFailed, err := sealDerivedOutcome(failed, failed, ev)
+	failEv := ev
+	failEv.JobStatus = string(model.StatusFailure)
+	sealedFailed, err := sealDerivedOutcome(failed, failed, failEv)
 	if err != nil {
 		t.Fatalf("sealDerivedOutcome failed = %v", err)
 	}
@@ -253,7 +255,7 @@ func TestFactFromOutcome(t *testing.T) {
 	}
 
 	// A bare (unsealed) claim is refused: it can never mint RowAuthorityVerified.
-	if _, err := FactFromOutcome("c1", DerivedVerifiedOutcome{Outcome: v, Evidence: ev}, complete, 0); !errors.Is(err, ErrUnverified) {
+	if _, err := FactFromOutcome("c1", DerivedVerifiedOutcome{outcome: v, evidence: ev}, complete, 0); !errors.Is(err, ErrUnverified) {
 		t.Fatalf("unsealed FactFromOutcome = %v, want ErrUnverified", err)
 	}
 }
@@ -429,11 +431,12 @@ func TestVerifiedRowReportsReportedCPUEpistemic(t *testing.T) {
 	}
 
 	// The sealed verified comparison surface carries the same provenance.
+	// P2j: every source must share the comparison's base snapshot.
 	src, err := VerifiedFromDerived("c1", sealed, 0)
 	if err != nil {
 		t.Fatalf("VerifiedFromDerived = %v", err)
 	}
-	cmp, err := CompareVerifiedCandidates(mustDigest(t, "snap"), []VerifiedCandidateSource{src}, nil)
+	cmp, err := CompareVerifiedCandidates(mustDigest(t, "snapshot"), []VerifiedCandidateSource{src}, nil)
 	if err != nil {
 		t.Fatalf("CompareVerifiedCandidates = %v", err)
 	}

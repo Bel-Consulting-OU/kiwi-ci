@@ -146,20 +146,26 @@ type PolicyEvaluation struct {
 // VerificationProof.Verify (via sealVerifiedProof), so an unverified
 // document can never be policy-evaluated as if it were proof. EvaluatePolicy
 // accepts ONLY VerifiedProof — the constraint is compile-time.
+//
+// Like DerivedVerifiedOutcome it is a capability, not a mutable DTO: every
+// field is unexported and deep-copied at construction, and the accessors
+// return detached copies. A holder of a verified proof can never rewrite its
+// summary, outcome or document after verification.
 type VerifiedProof struct {
-	// Summary is the compact historical statement of the verified proof.
-	Summary ProofSummary
-	// Out is the sealed derived outcome the document verified to.
-	Out DerivedVerifiedOutcome
-	// Document is the proof bundle that was verified.
-	Document VerificationProof
+	// summary is the compact historical statement of the verified proof.
+	summary ProofSummary
+	// out is the sealed derived outcome the document verified to.
+	out DerivedVerifiedOutcome
+	// document is the proof bundle that was verified (deep-copied in).
+	document VerificationProof
 
 	sealed bool
 }
 
 // sealVerifiedProof is the only way a VerifiedProof is minted. It is called
 // by VerificationProof.Verify after the acceptance MAC and every committed
-// digest have been re-checked.
+// digest have been re-checked. The inputs are deep-copied so later mutation
+// of the caller's values can never change the verified proof.
 func sealVerifiedProof(summary ProofSummary, doc VerificationProof, out DerivedVerifiedOutcome) (VerifiedProof, error) {
 	if err := summary.Valid(); err != nil {
 		return VerifiedProof{}, err
@@ -167,7 +173,7 @@ func sealVerifiedProof(summary ProofSummary, doc VerificationProof, out DerivedV
 	if !out.Sealed() {
 		return VerifiedProof{}, fmt.Errorf("%w: verified proof requires a sealed derived outcome", ErrUnverified)
 	}
-	return VerifiedProof{Summary: summary, Out: out, Document: doc, sealed: true}, nil
+	return VerifiedProof{summary: cloneSummary(summary), out: cloneDerived(out), document: cloneVerificationProof(doc), sealed: true}, nil
 }
 
 // Sealed reports whether this proof was produced by VerificationProof.Verify.
@@ -176,7 +182,20 @@ func (p VerifiedProof) Sealed() bool { return p.sealed }
 
 // ProvenPass reports whether the verified proof is a proven pass: sealed,
 // with a TerminalPassed summary.
-func (p VerifiedProof) ProvenPass() bool { return p.sealed && p.Summary.ProvenPass() }
+func (p VerifiedProof) ProvenPass() bool { return p.sealed && p.summary.ProvenPass() }
+
+// Summary returns a deep copy of the proof's compact historical statement.
+// The copy is detached: mutating it cannot rewrite the verified proof.
+func (p VerifiedProof) Summary() ProofSummary { return cloneSummary(p.summary) }
+
+// Out returns a deep copy of the sealed derived outcome the document
+// verified to.
+func (p VerifiedProof) Out() DerivedVerifiedOutcome { return cloneDerived(p.out) }
+
+// Document returns a deep copy of the proof bundle that was verified.
+func (p VerifiedProof) Document() VerificationProof {
+	return cloneVerificationProof(p.document)
+}
 
 // EvaluatePolicy reports whether a verified proof is acceptable under the
 // given live policy context. It never mutates the proof: the historical
@@ -187,7 +206,7 @@ func EvaluatePolicy(p VerifiedProof, live PolicyContext) (PolicyEvaluation, erro
 	if !p.sealed {
 		return PolicyEvaluation{}, fmt.Errorf("%w: policy evaluation requires a verified proof", ErrUnverified)
 	}
-	if err := p.Summary.Valid(); err != nil {
+	if err := p.summary.Valid(); err != nil {
 		return PolicyEvaluation{}, err
 	}
 	now := live.Now
@@ -195,26 +214,26 @@ func EvaluatePolicy(p VerifiedProof, live PolicyContext) (PolicyEvaluation, erro
 		now = time.Now()
 	}
 	ev := PolicyEvaluation{EvaluatedAt: now}
-	if p.Summary.Terminal != TerminalPassed {
+	if p.summary.Terminal != TerminalPassed {
 		ev.Denials = append(ev.Denials, Denial{Reason: DenialNeverPassed})
 	}
 	// An empty RecipeDigest is an inline proof (no recipe). It is never
 	// denied by the withdrawal list: a map entry for "" must not deny every
 	// recipe-less proof.
-	if p.Summary.RecipeDigest != "" && live.WithdrawnRecipes[p.Summary.RecipeDigest] {
+	if p.summary.RecipeDigest != "" && live.WithdrawnRecipes[p.summary.RecipeDigest] {
 		ev.Denials = append(ev.Denials, Denial{Reason: DenialRecipeWithdrawn})
 	}
-	if live.CompromisedKeys[p.Summary.AcceptanceKeyID] {
+	if live.CompromisedKeys[p.summary.AcceptanceKeyID] {
 		ev.Denials = append(ev.Denials, Denial{Reason: DenialKeyCompromised})
 	}
-	for _, d := range p.Summary.AttestationDigests {
+	for _, d := range p.summary.AttestationDigests {
 		if live.RevokedAttestations[d] {
 			ev.Denials = append(ev.Denials, Denial{Reason: DenialAttestationRevoked})
 			break
 		}
 	}
 	if live.MaxAgeSeconds > 0 {
-		age := now.Sub(p.Summary.CompletedAt)
+		age := now.Sub(p.summary.CompletedAt)
 		if age > time.Duration(live.MaxAgeSeconds)*time.Second {
 			ev.Denials = append(ev.Denials, Denial{Reason: DenialExpired})
 		}
@@ -322,9 +341,11 @@ func (p VerificationProof) VerifyWithRecipe(keyring *AcceptanceKeyring, recipe *
 	// The recipe's evidence floor applies to the proof path too, not only
 	// the service discharge: a record whose evidence does not meet the floor
 	// must never verify into authority. Restore already re-derived Window
-	// and Kinds, so this check sees only MAC-verified material.
-	if recipe != nil {
-		if err := recipe.EvidenceMin.Check(out.Evidence); err != nil {
+	// and Kinds and applied the same floor, so this is defense in depth over
+	// MAC-verified material. Pass-only (P2i): the floor gates a pass claim;
+	// a fail/partial verifies as-is.
+	if recipe != nil && out.outcome.Outcome == OutcomePass {
+		if err := recipe.EvidenceMin.Check(out.Evidence()); err != nil {
 			return VerifiedProof{}, fmt.Errorf("%w: proof fails the recipe evidence floor: %v", ErrUnverified, err)
 		}
 	}
@@ -369,22 +390,24 @@ func ProofSummaryFromBundle(p VerificationProof, out DerivedVerifiedOutcome, rec
 	if err != nil {
 		return ProofSummary{}, err
 	}
-	completed := out.Outcome.CompletedAt
+	derived := out.outcome
+	resolved := out.evidence
+	completed := derived.CompletedAt
 	if completed.IsZero() {
 		completed = p.Acceptance.VerifiedAt
 	}
 	s := ProofSummary{
-		ProofID:            p.Acceptance.KeyID + "/" + out.Outcome.VerificationID,
-		VerificationID:     out.Outcome.VerificationID,
-		ObligationID:       out.Outcome.ObligationID,
+		ProofID:            p.Acceptance.KeyID + "/" + derived.VerificationID,
+		VerificationID:     derived.VerificationID,
+		ObligationID:       derived.ObligationID,
 		RecipeDigest:       demand.RecipeDigest,
-		CandidateDigest:    out.Outcome.CandidateDigest,
-		SnapshotDigest:     out.Outcome.SnapshotDigest,
-		ContractDigest:     out.Outcome.ContractDigest,
-		EvidenceRoot:       out.Evidence.EvidenceRoot,
-		Terminal:           terminalOfOutcome(out.Outcome.Outcome),
-		Assurance:          out.Outcome.AssuranceProfile,
-		AttestationDigests: append([]Digest(nil), out.Evidence.AttestationDigests...),
+		CandidateDigest:    derived.CandidateDigest,
+		SnapshotDigest:     derived.SnapshotDigest,
+		ContractDigest:     derived.ContractDigest,
+		EvidenceRoot:       resolved.EvidenceRoot,
+		Terminal:           terminalOfOutcome(derived.Outcome),
+		Assurance:          derived.AssuranceProfile,
+		AttestationDigests: append([]Digest(nil), resolved.AttestationDigests...),
 		AcceptanceKeyID:    p.Acceptance.KeyID,
 		CompletedAt:        completed,
 	}
@@ -421,4 +444,31 @@ func cloneEvidence(e VerifiedEvidence) VerifiedEvidence {
 		out.ObservedControls = &c
 	}
 	return out
+}
+
+// cloneSummary deep-copies the mutable slice of a ProofSummary.
+func cloneSummary(s ProofSummary) ProofSummary {
+	s.AttestationDigests = append([]Digest(nil), s.AttestationDigests...)
+	return s
+}
+
+// cloneVerificationProof deep-copies a VerificationProof so a VerifiedProof
+// never shares storage with the caller's document.
+func cloneVerificationProof(p VerificationProof) VerificationProof {
+	return VerificationProof{
+		Obligation:     cloneObligation(p.Obligation),
+		SubmittedClaim: cloneOutcome(p.SubmittedClaim),
+		Outcome:        cloneOutcome(p.Outcome),
+		Evidence:       cloneEvidence(p.Evidence),
+		Acceptance:     cloneAcceptance(p.Acceptance),
+	}
+}
+
+// cloneAcceptance deep-copies the mutable pointer of an AcceptanceRecord.
+func cloneAcceptance(r AcceptanceRecord) AcceptanceRecord {
+	if r.SubjectRef != nil {
+		s := *r.SubjectRef
+		r.SubjectRef = &s
+	}
+	return r
 }

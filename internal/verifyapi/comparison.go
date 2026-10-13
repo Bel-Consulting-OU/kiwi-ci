@@ -289,7 +289,7 @@ func FactFromOutcome(candidateID string, d DerivedVerifiedOutcome, c EvidenceCom
 	if !d.Sealed() {
 		return CandidateFact{}, fmt.Errorf("%w: FactFromOutcome requires a sealed derived outcome, never a bare claim", ErrUnverified)
 	}
-	v := d.Outcome
+	v := d.outcome
 	status := StatusFromCompleteness(c, v.Outcome)
 	ec := economicFromResources(v.Resources)
 	return CandidateFact{
@@ -367,7 +367,7 @@ func (s VerifiedCandidateSource) sealed(keyring *AcceptanceKeyring) (DerivedVeri
 		if err != nil {
 			return DerivedVerifiedOutcome{}, err
 		}
-		return vp.Out, nil
+		return vp.out, nil
 	}
 	return DerivedVerifiedOutcome{}, fmt.Errorf("%w: verified candidate source is empty", ErrInvalid)
 }
@@ -453,16 +453,20 @@ type VerifiedCandidateComparison struct {
 // CompareVerifiedCandidates assembles the verified-only comparison. Each
 // source must yield a sealed DerivedVerifiedOutcome (directly or by
 // re-verifying a VerificationProof under keyring); any unsealed or
-// unverifiable source is refused. Rows are de-duplicated by CandidateID and
-// sorted for a deterministic wire shape. No scoring of any kind is applied.
+// unverifiable source is refused. Every source must share the comparison's
+// base snapshot: its Outcome.SnapshotDigest must equal base exactly (P2j) —
+// a candidate verified against a different source state is not comparable
+// and is refused. Rows are de-duplicated by CandidateID and sorted for a
+// deterministic wire shape. No scoring of any kind is applied.
 func CompareVerifiedCandidates(base Digest, sources []VerifiedCandidateSource, keyring *AcceptanceKeyring) (VerifiedCandidateComparison, error) {
 	if len(sources) == 0 {
 		return VerifiedCandidateComparison{}, fmt.Errorf("%w: comparison needs at least one candidate", ErrInvalid)
 	}
-	if base != "" {
-		if err := validateDigest("base_snapshot_digest", base); err != nil {
-			return VerifiedCandidateComparison{}, err
-		}
+	if base == "" {
+		return VerifiedCandidateComparison{}, fmt.Errorf("%w: comparison requires a shared base snapshot digest", ErrInvalid)
+	}
+	if err := validateDigest("base_snapshot_digest", base); err != nil {
+		return VerifiedCandidateComparison{}, err
 	}
 	out := VerifiedCandidateComparison{
 		SchemaVersion:      SchemaVersion,
@@ -474,6 +478,9 @@ func CompareVerifiedCandidates(base Digest, sources []VerifiedCandidateSource, k
 		sealed, err := s.sealed(keyring)
 		if err != nil {
 			return VerifiedCandidateComparison{}, fmt.Errorf("candidates[%d]: %w", i, err)
+		}
+		if sealed.outcome.SnapshotDigest != base {
+			return VerifiedCandidateComparison{}, fmt.Errorf("%w: candidates[%d] (%s): outcome snapshot digest %s does not match shared base %s", ErrGroupBinding, i, s.CandidateID, sealed.outcome.SnapshotDigest, base)
 		}
 		fact := verifiedFactFromDerived(s.CandidateID, s.ArtifactSizeBytes, sealed)
 		if err := fact.Validate(); err != nil {
@@ -500,14 +507,14 @@ func CompareVerifiedCandidates(base Digest, sources []VerifiedCandidateSource, k
 // level; row Authority=verified does not promote reported figures to verified.
 func verifiedFactFromDerived(candidateID string, artifactSizeBytes int64, d DerivedVerifiedOutcome) VerifiedCandidateFact {
 	term, coarse := verifiedTerminal(d)
-	ec := economicFromResources(d.Outcome.Resources)
+	ec := economicFromResources(d.outcome.Resources)
 	return VerifiedCandidateFact{
 		CandidateID:       candidateID,
-		CandidateDigest:   d.Outcome.CandidateDigest,
-		VerificationID:    d.Outcome.VerificationID,
+		CandidateDigest:   d.outcome.CandidateDigest,
+		VerificationID:    d.outcome.VerificationID,
 		Terminal:          term,
 		Outcome:           coarse,
-		Assurance:         d.Outcome.AssuranceProfile,
+		Assurance:         d.outcome.AssuranceProfile,
 		Authority:         RowAuthorityVerified,
 		WallTimeNS:        ec.WallTimeNS,
 		CPUTimeNS:         ec.CPUTimeNS,
@@ -523,13 +530,13 @@ func verifiedFactFromDerived(candidateID string, artifactSizeBytes int64, d Deri
 // Check-conflict evidence is invalid (P3g) regardless of the derived
 // verdict; a proven pass is the only TerminalPassed.
 func verifiedTerminal(d DerivedVerifiedOutcome) (TerminalState, Outcome) {
-	if hasCheckConflicts(d.Evidence.VerifiedChecks) {
+	if hasCheckConflicts(d.evidence.VerifiedChecks) {
 		return TerminalEvidenceInvalid, TerminalEvidenceInvalid.ProjectCoarse()
 	}
 	if d.ProvenPass() {
 		return TerminalPassed, OutcomePass
 	}
-	switch d.Outcome.Outcome {
+	switch d.outcome.Outcome {
 	case OutcomeFail:
 		return TerminalFailed, OutcomeFail
 	default:
