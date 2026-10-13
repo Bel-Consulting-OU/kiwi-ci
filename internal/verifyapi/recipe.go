@@ -241,13 +241,28 @@ func MustRecipeDigest(r Recipe) Digest {
 // can never ride along under a strong recipe digest. Empty fields are filled
 // from the recipe. The obligation id and subject stay the caller's. A recipe
 // that is not live at bind time is refused so a withdrawn recipe cannot mint
-// new demand.
+// new demand. Historical restores must not consult liveness at all: use
+// bindRecipe there so a proof accepted under a since-withdrawn recipe keeps
+// restoring (withdrawal is live policy, not a rewrite of history).
 func BindRecipe(o VerificationObligation, r Recipe, now time.Time) (VerificationObligation, error) {
 	if err := r.Validate(); err != nil {
 		return VerificationObligation{}, err
 	}
 	if !r.Live(now) {
 		return VerificationObligation{}, fmt.Errorf("%w: recipe %s@%d is withdrawn", ErrBinding, r.Name, r.Version)
+	}
+	return bindRecipe(o, r)
+}
+
+// bindRecipe pins recipe-owned fields without any liveness check. It is the
+// historical binding used at restore time: the recipe identity must already
+// match the obligation's pin (a mismatched recipe is a different demand and
+// is refused), and recipe-owned fields are filled or verified exactly as
+// BindRecipe does. Withdrawal is deliberately NOT consulted — a withdrawn
+// recipe keeps the semantics its accepted proofs were measured against.
+func bindRecipe(o VerificationObligation, r Recipe) (VerificationObligation, error) {
+	if err := r.Validate(); err != nil {
+		return VerificationObligation{}, err
 	}
 	d, err := RecipeDigest(r)
 	if err != nil {

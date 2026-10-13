@@ -241,12 +241,50 @@ func encodeResourcesFrozen(f *frozenBuffer, r ResourceFacts) {
 	// apply).
 }
 
-// encodeEvidenceFrozen is the v3 canonical encoding of resolved evidence.
-// v3 binds Window.Source and Kinds in addition to the v2 field set: both are
-// authority-bearing (freshness floor and EvidenceMinimum.RequiredKinds) and
-// must ride the MAC so a database writer cannot forge window authority or
-// evidence kinds. v2 records restore via encodeEvidenceFrozenV2.
-func encodeEvidenceFrozen(e VerifiedEvidence) *frozenBuffer {
+// encodeEvidenceFrozenV2 is the legacy v2 canonical encoding of resolved
+// evidence (AcceptanceVersionV2/V3 records). Retained verbatim so those rows
+// keep restoring; it binds neither Window nor Kinds — both are authority
+// bearing and are covered by encodeEvidenceFrozenV3.
+func encodeEvidenceFrozenV2(e VerifiedEvidence) *frozenBuffer {
+	f := frozenDomain("evidence/v2")
+	f.strings(e.ExecutionIDs)
+	f.str(string(e.EvidenceRoot))
+	f.digests(e.AttestationDigests)
+	if e.Attested == nil {
+		f.str("")
+	} else {
+		f.str("window")
+		f.time(e.Attested.StartedAt)
+		f.time(e.Attested.FinishedAt)
+	}
+	f.str(e.JobStatus)
+	f.strings(e.CompletedChecks)
+	encodeChecksFrozen(f, e.VerifiedChecks)
+	encodeAssuranceFrozen(f, e.Assurance)
+	if e.ObservedControls == nil {
+		f.str("")
+	} else {
+		f.str("observed")
+		f.str(e.ObservedControls.Runtime)
+		f.bool(e.ObservedControls.SandboxStarted)
+		f.str(string(e.ObservedControls.NetworkEnforced))
+		f.bool(e.ObservedControls.RootFilesystemReadOnly)
+		f.bool(e.ObservedControls.WorkspaceQuotaEnforced)
+	}
+	f.str(e.VerifierIdentity)
+	f.time(e.VerifiedAt)
+	return f
+}
+
+// encodeEvidenceFrozenV3 is the v3 canonical encoding of resolved evidence
+// (AcceptanceVersionV4 records). v3 binds Window.Source and Kinds in addition
+// to the v2 field set: both are authority-bearing (freshness floor and
+// EvidenceMinimum.RequiredKinds) and must ride the MAC so a database writer
+// cannot forge window authority or evidence kinds. Restore additionally
+// re-derives Window and Kinds from the MAC-verified primitives (Attested
+// job facts, VerifiedChecks) so even a signed-but-inconsistent record can
+// never feed policy a window or kind set the material does not prove.
+func encodeEvidenceFrozenV3(e VerifiedEvidence) *frozenBuffer {
 	f := frozenDomain("evidence/v3")
 	f.strings(e.ExecutionIDs)
 	f.str(string(e.EvidenceRoot))

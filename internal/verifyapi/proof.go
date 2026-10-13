@@ -319,7 +319,16 @@ func (p VerificationProof) VerifyWithRecipe(keyring *AcceptanceKeyring, recipe *
 	if err != nil {
 		return VerifiedProof{}, err
 	}
-	summary, err := ProofSummaryFromBundle(p, out)
+	// The recipe's evidence floor applies to the proof path too, not only
+	// the service discharge: a record whose evidence does not meet the floor
+	// must never verify into authority. Restore already re-derived Window
+	// and Kinds, so this check sees only MAC-verified material.
+	if recipe != nil {
+		if err := recipe.EvidenceMin.Check(out.Evidence); err != nil {
+			return VerifiedProof{}, fmt.Errorf("%w: proof fails the recipe evidence floor: %v", ErrUnverified, err)
+		}
+	}
+	summary, err := ProofSummaryFromBundle(p, out, recipe)
 	if err != nil {
 		return VerifiedProof{}, err
 	}
@@ -328,10 +337,25 @@ func (p VerificationProof) VerifyWithRecipe(keyring *AcceptanceKeyring, recipe *
 
 // ProofSummaryFromBundle derives the compact historical statement of one
 // verified proof document. Every field comes from the bundle and its sealed
-// derived outcome — never from a caller string.
-func ProofSummaryFromBundle(p VerificationProof, out DerivedVerifiedOutcome) (ProofSummary, error) {
+// derived outcome — never from a caller string. RecipeDigest is taken from
+// the RESOLVED DEMAND (the rule set the discharge was measured against),
+// not from the obligation's recipe pin: the two are required to agree, and
+// the demand is what the acceptance record actually committed.
+//
+// The optional recipe argument (pass at most one) is the resolved recipe the
+// proof was verified against; nil resolves the demand from the obligation
+// alone.
+func ProofSummaryFromBundle(p VerificationProof, out DerivedVerifiedOutcome, recipes ...*Recipe) (ProofSummary, error) {
 	if !out.Sealed() {
 		return ProofSummary{}, fmt.Errorf("%w: ProofSummaryFromBundle requires a sealed derived outcome", ErrUnverified)
+	}
+	var recipe *Recipe
+	if len(recipes) > 0 {
+		recipe = recipes[0]
+	}
+	demand, err := ResolveEffectiveDemand(p.Obligation, recipe)
+	if err != nil {
+		return ProofSummary{}, err
 	}
 	completed := out.Outcome.CompletedAt
 	if completed.IsZero() {
@@ -341,7 +365,7 @@ func ProofSummaryFromBundle(p VerificationProof, out DerivedVerifiedOutcome) (Pr
 		ProofID:            p.Acceptance.KeyID + "/" + out.Outcome.VerificationID,
 		VerificationID:     out.Outcome.VerificationID,
 		ObligationID:       out.Outcome.ObligationID,
-		RecipeDigest:       p.Obligation.RecipeDigest,
+		RecipeDigest:       demand.RecipeDigest,
 		CandidateDigest:    out.Outcome.CandidateDigest,
 		SnapshotDigest:     out.Outcome.SnapshotDigest,
 		ContractDigest:     out.Outcome.ContractDigest,

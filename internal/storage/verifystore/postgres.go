@@ -344,6 +344,13 @@ func (s *PostgresStore) RecordVerifiedOutcome(ctx context.Context, v verifyapi.V
 			return err
 		}
 		recipe = &r
+		// The recipe's evidence floor is not only a service-path concern: a
+		// direct store write must enforce it before the acceptance record is
+		// minted, or the floor could be bypassed by calling the store
+		// without the service wrapper.
+		if err := recipe.EvidenceMin.Check(v.Evidence); err != nil {
+			return fmt.Errorf("%w: record fails the recipe evidence floor: %v", verifyapi.ErrEvidence, err)
+		}
 	}
 	rec, err := verifyapi.AcceptWithRecipe(ob, v, nil, s.acceptanceKeyring, recipe, s.verifyNow())
 	if err != nil {

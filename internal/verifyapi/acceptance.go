@@ -40,10 +40,15 @@ import (
 //     but NOT the submitted claim. An attacker with database write could
 //     therefore alter the claim column on restore. v1 records still restore
 //     when their v1 MAC verifies.
-//   - v2 (AcceptanceVersionV2) is the current write format. It domain-
+//   - v2 (AcceptanceVersionV2) domain-
 //     separates under kiwi-ci/verification-acceptance/v2, binds a submitted
 //     claim digest and the subject identity, and uses the FROZEN canonical
 //     encoding (see frozen.go) rather than opportunistic Go struct JSON.
+//   - v3 (AcceptanceVersionV3) binds the resolved verification demand.
+//   - v4 (AcceptanceVersionV4) is the current write format. Its evidence
+//     digest uses the evidence/v3 encoding, which additionally binds the
+//     resolved Window and the evidence-kind list; restore re-derives both
+//     from MAC-verified primitives instead of trusting the persisted fields.
 
 // AcceptanceVersion is the v1 acceptance-record schema version. Retained so
 // pre-existing rows keep restoring; no new record is written at this version.
@@ -54,15 +59,22 @@ const AcceptanceVersion = 1
 // version.
 const AcceptanceVersionV2 = 2
 
-// AcceptanceVersionV3 is the current acceptance-record schema version. It
+// AcceptanceVersionV3 is the v3 acceptance-record schema version. It
 // binds the resolved verification demand (DemandDigest) and includes the
 // recipe digest in the frozen obligation encoding. Any change to the v3
 // canonical MAC input must bump it (and the domain).
 const AcceptanceVersionV3 = 3
 
+// AcceptanceVersionV4 is the current acceptance-record schema version. The
+// v4 change is the evidence encoding: evidence/v3 additionally binds the
+// resolved Window (source and bracket) and the evidence-kind list, both
+// authority-bearing and previously forgeable by a database writer. Any
+// change to the v4 canonical MAC input must bump it (and the domain).
+const AcceptanceVersionV4 = 4
+
 // AcceptanceVersionCurrent is the version new acceptance records are written
 // at.
-const AcceptanceVersionCurrent = AcceptanceVersionV3
+const AcceptanceVersionCurrent = AcceptanceVersionV4
 
 // AcceptanceAlgorithmHMACSHA256 is the MAC algorithm of HMACAcceptanceKey.
 const AcceptanceAlgorithmHMACSHA256 = "HMAC-SHA256"
@@ -77,6 +89,10 @@ const acceptanceDomainV2 = "kiwi-ci/verification-acceptance/v2"
 // acceptanceDomainV3 is the v3 acceptance MAC domain. The domain string is
 // frozen together with the v3 field list.
 const acceptanceDomainV3 = "kiwi-ci/verification-acceptance/v3"
+
+// acceptanceDomainV4 is the v4 acceptance MAC domain. The domain string is
+// frozen together with the v4 field list.
+const acceptanceDomainV4 = "kiwi-ci/verification-acceptance/v4"
 
 // AcceptanceRecord is the durable integrity record of one accepted
 // verification. It binds the exact bundle that was sealed, under a MAC or
@@ -575,32 +591,54 @@ func acceptWithKeyringRecipe(obligation VerificationObligation, derived DerivedV
 	if !derived.Sealed() {
 		return AcceptanceRecord{}, fmt.Errorf("%w: Accept requires a verifier-produced record", ErrUnverified)
 	}
-	// The derived outcome must actually discharge THIS obligation: candidate,
-	// snapshot, contract, required checks and assurance. A sealed outcome
-	// from another obligation must never ride along under this record.
-	if err := Bind(obligation, derived.Outcome, at); err != nil {
-		return AcceptanceRecord{}, fmt.Errorf("%w: sealed outcome does not bind the obligation: %v", ErrBinding, err)
+	if at.IsZero() {
+		return AcceptanceRecord{}, fmt.Errorf("%w: acceptance time is required", ErrAcceptance)
+	}
+	// The recipe identity is not free: when a recipe is supplied it must be
+	// exactly the recipe the obligation pins, or the demand digest would
+	// measure a different rule set than the obligation identity claims.
+	if recipe != nil {
+		d, err := RecipeDigest(*recipe)
+		if err != nil {
+			return AcceptanceRecord{}, err
+		}
+		if obligation.RecipeDigest != d {
+			return AcceptanceRecord{}, fmt.Errorf("%w: obligation recipe digest %s disagrees with supplied recipe %s", ErrBinding, obligation.RecipeDigest, d)
+		}
 	}
 	if obligation.RecipeDigest != "" && recipe == nil {
 		return AcceptanceRecord{}, fmt.Errorf("%w: recipe-bound obligation requires the resolved recipe at accept time", ErrBinding)
 	}
+	// Bind the recipe onto the obligation and digest the BOUND copy: the
+	// recipe-owned fields (checks, assurance, freshness) are part of the
+	// obligation identity the acceptance record commits, so they can never
+	// ride along empty or weaker under a strong recipe digest. Liveness is
+	// checked at the acceptance clock `at` — a recipe withdrawn before
+	// acceptance cannot mint a new accepted record (historical restores are
+	// liveness-free; see restore).
+	bound := obligation
 	if recipe != nil {
-		if _, err := BindRecipe(obligation, *recipe, at); err != nil {
+		var err error
+		bound, err = BindRecipe(obligation, *recipe, at)
+		if err != nil {
 			return AcceptanceRecord{}, fmt.Errorf("%w: obligation does not match its recipe: %v", ErrBinding, err)
 		}
+	}
+	// The derived outcome must actually discharge THIS obligation: candidate,
+	// snapshot, contract, required checks and assurance. A sealed outcome
+	// from another obligation must never ride along under this record.
+	if err := Bind(bound, derived.Outcome, at); err != nil {
+		return AcceptanceRecord{}, fmt.Errorf("%w: sealed outcome does not bind the obligation: %v", ErrBinding, err)
 	}
 	signer, err := asSigner(key, keyring)
 	if err != nil {
 		return AcceptanceRecord{}, err
 	}
-	if at.IsZero() {
-		return AcceptanceRecord{}, fmt.Errorf("%w: acceptance time is required", ErrAcceptance)
-	}
 	sk, err := signer.SigningKey()
 	if err != nil {
 		return AcceptanceRecord{}, err
 	}
-	obDig, err := obligationDigestV3(obligation)
+	obDig, err := obligationDigestV3(bound)
 	if err != nil {
 		return AcceptanceRecord{}, err
 	}
@@ -612,14 +650,14 @@ func acceptWithKeyringRecipe(obligation VerificationObligation, derived DerivedV
 	if err != nil {
 		return AcceptanceRecord{}, err
 	}
-	evDig, err := evidenceDigestV2(derived.Evidence)
+	evDig, err := evidenceDigestV3(derived.Evidence)
 	if err != nil {
 		return AcceptanceRecord{}, err
 	}
 	// Bind the canonical resolved demand: the recipe's rules when a recipe
 	// is pinned, else the obligation's inline rules. This is the rule set
 	// the discharge was measured against.
-	demandDig, err := EffectiveVerificationDemandDigest(obligation, recipe)
+	demandDig, err := EffectiveVerificationDemandDigest(bound, recipe)
 	if err != nil {
 		return AcceptanceRecord{}, err
 	}
@@ -691,6 +729,8 @@ func RestoreVerifiedOutcomeWithRecipe(p PersistedVerified, key AcceptanceKey, ke
 		return restoreV2(p, rec, verifier)
 	case AcceptanceVersionV3:
 		return restoreV3(p, rec, verifier, recipe)
+	case AcceptanceVersionV4:
+		return restoreV4(p, rec, verifier, recipe)
 	default:
 		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: unsupported acceptance version %d", ErrAcceptance, rec.AcceptanceVersion)
 	}
@@ -817,11 +857,29 @@ func restoreV2(p PersistedVerified, rec AcceptanceRecord, verifier AcceptanceVer
 	return sealDerivedOutcome(p.SubmittedClaim, p.Outcome, p.Evidence)
 }
 
-// restoreV3 verifies a current acceptance record. The v3 MAC binds the
-// resolved verification demand digest (DemandDigest) in addition to the v2
-// field set, so a database writer who swaps the demanded rules (or the
-// recipe identity) breaks the MAC.
+// restoreV3 verifies a v3 acceptance record. The v3 MAC binds the resolved
+// verification demand digest (DemandDigest) in addition to the v2 field set,
+// so a database writer who swaps the demanded rules (or the recipe identity)
+// breaks the MAC. Its evidence digest is the legacy evidence/v2 encoding
+// (no Window / Kinds), so those two fields are re-derived at restore and
+// never trusted; new records are written at AcceptanceVersionV4, whose
+// evidence digest binds them too.
 func restoreV3(p PersistedVerified, rec AcceptanceRecord, verifier AcceptanceVerifier, recipe *Recipe) (DerivedVerifiedOutcome, error) {
+	return restoreCurrent(p, rec, verifier, recipe, evidenceDigestV2)
+}
+
+// restoreV4 verifies a v4 acceptance record. Identical to restoreV3 except
+// the evidence digest uses the evidence/v3 encoding, which additionally
+// binds the resolved Window and the evidence-kind list — tampering either
+// breaks the MAC. Restore still re-derives both from MAC-verified primitives
+// rather than trusting the persisted fields.
+func restoreV4(p PersistedVerified, rec AcceptanceRecord, verifier AcceptanceVerifier, recipe *Recipe) (DerivedVerifiedOutcome, error) {
+	return restoreCurrent(p, rec, verifier, recipe, evidenceDigestV3)
+}
+
+// restoreCurrent is the shared restore path for v3 and v4 records.
+// evDigest selects the evidence encoding the record was signed with.
+func restoreCurrent(p PersistedVerified, rec AcceptanceRecord, verifier AcceptanceVerifier, recipe *Recipe, evDigest func(VerifiedEvidence) (Digest, error)) (DerivedVerifiedOutcome, error) {
 	if rec.MAC == "" {
 		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: acceptance record is unsigned", ErrAcceptance)
 	}
@@ -838,7 +896,32 @@ func restoreV3(p PersistedVerified, rec AcceptanceRecord, verifier AcceptanceVer
 	if rec.Algorithm != key.Algorithm() {
 		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: acceptance algorithm %q does not match key algorithm %q", ErrAcceptance, rec.Algorithm, key.Algorithm())
 	}
-	obDig, err := obligationDigestV3(p.Obligation)
+	// Recipe identity is not free at restore either: the supplied recipe
+	// must be exactly the one the obligation pins, or the recomputed demand
+	// would measure a different rule set than the record was accepted under.
+	if p.Obligation.RecipeDigest != "" && recipe == nil {
+		// Recipe-bound records must restore against the resolved recipe;
+		// without it the demand digest cannot be recomputed faithfully.
+		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: recipe-bound record requires the resolved recipe at restore time", ErrBinding)
+	}
+	bound := p.Obligation
+	if recipe != nil {
+		d, err := RecipeDigest(*recipe)
+		if err != nil {
+			return DerivedVerifiedOutcome{}, err
+		}
+		if p.Obligation.RecipeDigest != d {
+			return DerivedVerifiedOutcome{}, fmt.Errorf("%w: obligation recipe digest %s disagrees with supplied recipe %s", ErrBinding, p.Obligation.RecipeDigest, d)
+		}
+		// Historical restores are liveness-free: bindRecipe fills the
+		// recipe-owned fields without consulting withdrawal, so a proof
+		// accepted under a since-withdrawn recipe keeps restoring.
+		bound, err = bindRecipe(p.Obligation, *recipe)
+		if err != nil {
+			return DerivedVerifiedOutcome{}, fmt.Errorf("%w: obligation does not match its recipe: %v", ErrBinding, err)
+		}
+	}
+	obDig, err := obligationDigestV3(bound)
 	if err != nil {
 		return DerivedVerifiedOutcome{}, err
 	}
@@ -859,24 +942,14 @@ func restoreV3(p PersistedVerified, rec AcceptanceRecord, verifier AcceptanceVer
 	if outDig != rec.OutcomeDigest {
 		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: outcome digest mismatch", ErrAcceptance)
 	}
-	evDig, err := evidenceDigestV2(p.Evidence)
+	evDig, err := evDigest(p.Evidence)
 	if err != nil {
 		return DerivedVerifiedOutcome{}, err
 	}
 	if evDig != rec.VerifiedEvidenceDigest {
 		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: evidence digest mismatch", ErrAcceptance)
 	}
-	if p.Obligation.RecipeDigest != "" && recipe == nil {
-		// Recipe-bound records must restore against the resolved recipe;
-		// without it the demand digest cannot be recomputed faithfully.
-		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: recipe-bound record requires the resolved recipe at restore time", ErrBinding)
-	}
-	if recipe != nil {
-		if err := recipe.EvidenceMin.Check(p.Evidence); err != nil {
-			return DerivedVerifiedOutcome{}, fmt.Errorf("%w: restored record fails the recipe evidence floor: %v", ErrUnverified, err)
-		}
-	}
-	demandDig, err := EffectiveVerificationDemandDigest(p.Obligation, recipe)
+	demandDig, err := EffectiveVerificationDemandDigest(bound, recipe)
 	if err != nil {
 		return DerivedVerifiedOutcome{}, err
 	}
@@ -897,11 +970,23 @@ func restoreV3(p PersistedVerified, rec AcceptanceRecord, verifier AcceptanceVer
 		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: acceptance MAC verification failed", ErrAcceptance)
 	}
 	// Re-apply the obligation-binding rule at restore so a MAC-valid pair
-	// of (other-obligation outcome, this obligation) cannot restore.
-	if err := Bind(p.Obligation, p.Outcome, rec.VerifiedAt); err != nil {
+	// of (other-obligation outcome, this obligation) cannot restore. The
+	// acceptance clock is the record's own acceptance instant, so a
+	// historical record is judged as of when it was accepted.
+	if err := Bind(bound, p.Outcome, rec.VerifiedAt); err != nil {
 		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: restored outcome does not bind the obligation: %v", ErrBinding, err)
 	}
-	return sealDerivedOutcome(p.SubmittedClaim, p.Outcome, p.Evidence)
+	// Never trust the persisted Window / Kinds: both are authority-bearing
+	// (freshness floor and EvidenceMinimum.RequiredKinds) and are re-derived
+	// from the MAC-verified primitives. The sealed output and every policy
+	// check see only the re-derived values.
+	evidence := rederiveEvidenceWindowKinds(p.Evidence, p.SubmittedClaim)
+	if recipe != nil {
+		if err := recipe.EvidenceMin.Check(evidence); err != nil {
+			return DerivedVerifiedOutcome{}, fmt.Errorf("%w: restored record fails the recipe evidence floor: %v", ErrUnverified, err)
+		}
+	}
+	return sealDerivedOutcome(p.SubmittedClaim, p.Outcome, evidence)
 }
 
 func subjectRefsEqual(a, b *SubjectRef) bool {
@@ -918,10 +1003,9 @@ func subjectRefsEqual(a, b *SubjectRef) bool {
 	return a.Equal(*b)
 }
 
-// acceptancePayload is the canonical MAC input. v3 uses the FROZEN
-// length-prefixed encoding (see frozen.go) including the demand digest; v2
-// keeps its original frozen form so legacy MACs keep verifying; v1 keeps its
-// original newline-joined form.
+// acceptancePayload is the canonical MAC input. v4 uses the FROZEN
+// length-prefixed encoding (see frozen.go) including the demand digest; v3
+// and earlier keep their original frozen forms so legacy MACs keep verifying.
 func acceptancePayload(rec AcceptanceRecord) ([]byte, error) {
 	switch rec.AcceptanceVersion {
 	case AcceptanceVersion:
@@ -930,6 +1014,8 @@ func acceptancePayload(rec AcceptanceRecord) ([]byte, error) {
 		return acceptancePayloadV2(rec)
 	case AcceptanceVersionV3:
 		return acceptancePayloadV3(rec)
+	case AcceptanceVersionV4:
+		return acceptancePayloadV4(rec)
 	default:
 		return nil, fmt.Errorf("%w: unsupported acceptance version %d", ErrAcceptance, rec.AcceptanceVersion)
 	}
@@ -1039,6 +1125,47 @@ func acceptancePayloadV3(rec AcceptanceRecord) ([]byte, error) {
 	return f.buf, nil
 }
 
+// acceptancePayloadV4 is the FROZEN v4 MAC input: the v3 field list under a
+// new domain. The v4 change lives in the evidence digest (evidence/v3 binds
+// Window and Kinds); the record field list is unchanged, but the domain is
+// bumped so a v3 payload can never verify as v4 (or vice versa).
+func acceptancePayloadV4(rec AcceptanceRecord) ([]byte, error) {
+	if err := validateDigest("obligation_digest", rec.ObligationDigest); err != nil {
+		return nil, err
+	}
+	if err := validateDigest("submitted_claim_digest", rec.SubmittedClaimDigest); err != nil {
+		return nil, err
+	}
+	if err := validateDigest("outcome_digest", rec.OutcomeDigest); err != nil {
+		return nil, err
+	}
+	if err := validateDigest("verified_evidence_digest", rec.VerifiedEvidenceDigest); err != nil {
+		return nil, err
+	}
+	if err := validateDigest("demand_digest", rec.DemandDigest); err != nil {
+		return nil, err
+	}
+	if rec.Algorithm == "" || rec.KeyID == "" {
+		return nil, fmt.Errorf("%w: acceptance algorithm and key id are required", ErrAcceptance)
+	}
+	if rec.VerifiedAt.IsZero() {
+		return nil, fmt.Errorf("%w: acceptance verified_at is required", ErrAcceptance)
+	}
+	f := frozenDomain(acceptanceDomainV4)
+	f.int64(int64(rec.SchemaVersion))
+	f.str(string(rec.ObligationDigest))
+	f.str(string(rec.SubmittedClaimDigest))
+	f.str(string(rec.OutcomeDigest))
+	f.str(string(rec.VerifiedEvidenceDigest))
+	f.str(string(rec.DemandDigest))
+	f.str(rec.Subject)
+	encodeSubjectRefFrozen(f, rec.SubjectRef)
+	f.str(rec.Algorithm)
+	f.time(rec.VerifiedAt)
+	f.str(rec.KeyID)
+	return f.buf, nil
+}
+
 // obligationDigest commits the canonical encoding of an obligation (v1
 // rule, retained for legacy restore).
 func obligationDigest(o VerificationObligation) (Digest, error) {
@@ -1073,9 +1200,16 @@ func outcomeDigestV2(v VerificationOutcome) (Digest, error) {
 	return encodeOutcomeFrozen(normalizeOutcome(v)).frozenHash("outcome")
 }
 
-// evidenceDigestV2 commits the FROZEN encoding of resolved evidence.
+// evidenceDigestV2 commits the legacy FROZEN v2 encoding of resolved
+// evidence (no Window / Kinds). Retained for AcceptanceVersionV2/V3 records.
 func evidenceDigestV2(e VerifiedEvidence) (Digest, error) {
-	return encodeEvidenceFrozen(normalizeEvidence(e)).frozenHash("evidence")
+	return encodeEvidenceFrozenV2(normalizeEvidence(e)).frozenHash("evidence")
+}
+
+// evidenceDigestV3 commits the FROZEN v3 encoding of resolved evidence,
+// which also binds the resolved Window and the evidence-kind list.
+func evidenceDigestV3(e VerifiedEvidence) (Digest, error) {
+	return encodeEvidenceFrozenV3(normalizeEvidence(e)).frozenHash("evidence")
 }
 
 // submittedClaimDigest commits the FROZEN encoding of the caller's submitted

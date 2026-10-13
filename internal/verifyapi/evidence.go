@@ -436,6 +436,41 @@ func (f *FuncEvidenceVerifier) Verify(ctx context.Context, obligation Verificati
 	})
 }
 
+// rederiveEvidenceWindowKinds returns e with its policy-facing Window and
+// Kinds recomputed exclusively from MAC-verified material: the window from
+// the attested job facts (attested exactly when those facts exist) and the
+// kinds from the attestation digests and verified checks. The persisted
+// Window / Kinds fields are never consulted — a database writer cannot forge
+// an attested window or inject an evidence kind, and a signed-but-inconsistent
+// record can never feed policy a window or kind set the material does not
+// prove. The claim supplies only the structural bracket of an Unknown
+// window (the same role it plays in deriveWindow) and is itself digest-bound.
+func rederiveEvidenceWindowKinds(e VerifiedEvidence, claim VerificationOutcome) VerifiedEvidence {
+	e.Window = deriveWindow(claim, e.Attested, nil)
+	e.Kinds = rederiveKinds(e)
+	return e
+}
+
+// rederiveKinds recomputes the evidence-kind set from MAC-verified material
+// only: an execution-attestation kind is present exactly when attestation
+// digests were resolved, and a test-report kind exactly when some verified
+// check's verdict was derived from a suite digest other than the shared
+// evidence root. Same rule as deriveEvidenceKinds, restated over the
+// persisted primitives instead of the resolver's view.
+func rederiveKinds(e VerifiedEvidence) []string {
+	var kinds []string
+	if len(e.AttestationDigests) > 0 {
+		kinds = append(kinds, EvidenceKindExecutionAttestation)
+	}
+	for _, c := range e.VerifiedChecks {
+		if c.EvidenceDigest != "" && c.EvidenceDigest != e.EvidenceRoot {
+			kinds = append(kinds, EvidenceKindTestReport)
+			break
+		}
+	}
+	return kinds
+}
+
 // deriveEvidenceKinds computes the verifier-derived evidence-kind set: a
 // resolved execution attestation is always "execution-attestation", and a
 // check whose verdict was derived from signed test-report material (its
