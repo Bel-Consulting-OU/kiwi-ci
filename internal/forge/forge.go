@@ -43,6 +43,10 @@ type EventContext struct {
 	Trusted        bool
 	Draft          bool
 	Tag            string // tag name when Ref is refs/tags/...
+	// PullRequest is the forge's PR/MR number when the event is a
+	// pull-request family event (Bitbucket pullrequest.id, GitHub number,
+	// GitLab iid). Zero when not applicable.
+	PullRequest int
 	// ChangedFiles is the changed-file diff for this event together with
 	// its completeness. It is part of the matching contract: include-path
 	// triggers never match unless Complete is true, so the matcher cannot

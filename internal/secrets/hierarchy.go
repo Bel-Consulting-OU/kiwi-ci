@@ -45,16 +45,16 @@ type SecretRef struct {
 
 // Policy is the request context a secret must match.
 type Policy struct {
-	Repository string
-	Team       string
-	Org        string
+	Repository  string
+	Team        string
+	Org         string
 	Environment string
-	Branch     string
-	Tag        string
-	Event      string
-	Fork       bool
-	Trusted    bool
-	Now        time.Time
+	Branch      string
+	Tag         string
+	Event       string
+	Fork        bool
+	Trusted     bool
+	Now         time.Time
 }
 
 // matches reports whether the ref's policy dimensions admit the request.
@@ -115,13 +115,13 @@ func (h *Hierarchy) Add(r SecretRef) {
 
 // Explanation is the `kiwi secret explain` report.
 type Explanation struct {
-	Name     string   `json:"name"`
-	Source   string   `json:"source,omitempty"`
+	Name         string `json:"name"`
+	Source       string `json:"source,omitempty"`
 	OverriddenBy string `json:"overridden_by,omitempty"`
-	Available bool    `json:"available"`
-	Reason   string   `json:"reason"`
-	Expires  string   `json:"expires,omitempty"`
-	Provider string   `json:"provider,omitempty"`
+	Available    bool   `json:"available"`
+	Reason       string `json:"reason"`
+	Expires      string `json:"expires,omitempty"`
+	Provider     string `json:"provider,omitempty"`
 	// Consulted lists every ref considered, most-specific first.
 	Consulted []string `json:"consulted"`
 }

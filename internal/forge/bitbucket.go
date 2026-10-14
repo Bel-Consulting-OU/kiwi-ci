@@ -81,52 +81,52 @@ func (b *Bitbucket) VerifyWebhook(body []byte, signatureOrToken string, headers 
 // ParseEvent normalizes a Bitbucket push/pull-request payload.
 func (b *Bitbucket) ParseEvent(body []byte) (EventContext, error) {
 	var env struct {
-		Push     *bitbucketPush `json:"push"`
-		PullReq  *bitbucketPR   `json:"pullrequest"`
-		Repo     bitbucketRepo  `json:"repository"`
-		Actor    struct {
+		Push    *bitbucketPush `json:"push"`
+		PullReq *bitbucketPR   `json:"pullrequest"`
+		Repo    bitbucketRepo  `json:"repository"`
+		Actor   struct {
 			Username string `json:"username"`
 		} `json:"actor"`
 	}
 	if err := json.Unmarshal(body, &env); err != nil {
 		return EventContext{}, fmt.Errorf("parse bitbucket payload: %w", err)
 	}
+	repo := Repository{Forge: "bitbucket", FullName: env.Repo.FullName}
 	if env.Push != nil && len(env.Push.Changes) > 0 {
 		ch := env.Push.Changes[0]
 		sha := ""
+		ref := ""
 		if ch.New != nil {
 			sha = ch.New.Target.Hash
+			ref = ch.New.Name
 		}
 		if sha == "" && ch.Old != nil {
 			sha = ch.Old.Target.Hash
-		}
-		branch := ""
-		if ch.New != nil {
-			branch = strings.TrimPrefix(ch.New.Name, "refs/heads/")
+			ref = ch.Old.Name
 		}
 		return EventContext{
-			Event:        "push",
-			RepoFullName: env.Repo.FullName,
-			SHA:          sha,
-			Branch:       branch,
-			Author:       env.Actor.Username,
+			Forge:          "bitbucket",
+			Event:          "push",
+			Ref:            ref,
+			HeadSHA:        sha,
+			Repository:     repo,
+			HeadRepository: repo,
 		}, nil
 	}
 	if env.PullReq != nil {
-		event := "pull_request"
-		if env.PullReq.State == "merged" || env.PullReq.State == "declined" {
-			event = "pull_request"
-		}
+		srcRef := "refs/heads/" + env.PullReq.Source.Branch.Name
+		dstRef := "refs/heads/" + env.PullReq.Destination.Branch.Name
 		return EventContext{
-			Event:        event,
-			RepoFullName: env.Repo.FullName,
-			SHA:          env.PullReq.Source.Commit.Hash,
-			Branch:       env.PullReq.Source.Branch.Name,
-			BaseSHA:      env.PullReq.Destination.Commit.Hash,
-			BaseBranch:   env.PullReq.Destination.Branch.Name,
-			PRNumber:     env.PullReq.ID,
-			Author:       env.PullReq.Author.Username,
-			Action:       env.PullReq.State,
+			Forge:          "bitbucket",
+			Event:          "pull_request",
+			Action:         env.PullReq.State,
+			Ref:            srcRef,
+			BaseRef:        dstRef,
+			HeadSHA:        env.PullReq.Source.Commit.Hash,
+			BaseSHA:        env.PullReq.Destination.Commit.Hash,
+			PullRequest:    env.PullReq.ID,
+			Repository:     repo,
+			HeadRepository: repo,
 		}, nil
 	}
 	return EventContext{}, nil
@@ -218,12 +218,12 @@ func (b *Bitbucket) FetchFile(ctx context.Context, repoFullName, path, ref strin
 }
 
 func (b *Bitbucket) ChangedFiles(ctx context.Context, ec EventContext) (ChangedFilesResult, error) {
-	if ec.PRNumber == 0 {
-		// Push: Bitbucket exposes a diffstat per commit range; without a
-		// base we report incomplete so path filters fail closed.
+	if ec.PullRequest == 0 {
+		// Push: without a PR number we report incomplete so path filters
+		// fail closed rather than guess a diff.
 		return ChangedFilesResult{Complete: false}, nil
 	}
-	u := fmt.Sprintf("%s/repositories/%s/pullrequests/%d/diffstat?pagelen=100", b.apiBase(), ec.RepoFullName, ec.PRNumber)
+	u := fmt.Sprintf("%s/repositories/%s/pullrequests/%d/diffstat?pagelen=100", b.apiBase(), ec.Repository.FullName, ec.PullRequest)
 	raw, err := b.do(ctx, "GET", u)
 	if err != nil {
 		return ChangedFilesResult{}, err

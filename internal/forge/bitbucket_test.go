@@ -25,7 +25,7 @@ func TestBitbucketParsePushAndPR(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ec.Event != "push" || ec.SHA != "abc123" || ec.Branch != "main" || ec.RepoFullName != "ws/repo" {
+	if ec.Event != "push" || ec.HeadSHA != "abc123" || !strings.HasSuffix(ec.Ref, "main") || ec.Repository.FullName != "ws/repo" {
 		t.Fatalf("push ec = %+v", ec)
 	}
 	pr := []byte(`{"repository":{"full_name":"ws/repo"},"pullrequest":{"id":7,"state":"open","author":{"username":"bob"},"source":{"branch":{"name":"feat"},"commit":{"hash":"head"}},"destination":{"branch":{"name":"main"},"commit":{"hash":"base"}}}}`)
@@ -33,7 +33,7 @@ func TestBitbucketParsePushAndPR(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ec.PRNumber != 7 || ec.SHA != "head" || ec.BaseSHA != "base" || ec.BaseBranch != "main" {
+	if ec.PullRequest != 7 || ec.HeadSHA != "head" || ec.BaseSHA != "base" || !strings.HasSuffix(ec.BaseRef, "main") {
 		t.Fatalf("pr ec = %+v", ec)
 	}
 	// Unknown shape yields empty event (never a guess).

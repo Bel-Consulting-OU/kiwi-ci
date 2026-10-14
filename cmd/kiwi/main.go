@@ -82,6 +82,8 @@ func dispatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return app.ContextCommand(append([]string{args[0]}, args[1:]...))
 	case "lock":
 		return app.LockCommand(args[1:])
+	case "secret":
+		return app.SecretCommand(args[1:])
 	case "setup":
 		return app.Setup(args[1:])
 	case "runs", "jobs", "logs", "cancel", "approve", "rerun", "artifacts", "schedules", "policy":
