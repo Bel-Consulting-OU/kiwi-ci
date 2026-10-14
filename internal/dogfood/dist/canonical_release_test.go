@@ -1092,8 +1092,9 @@ func canonicalResolveNMinusOne(t *testing.T, srcDir, goBin, outPath string) stri
 	}
 	if required {
 		t.Fatal("canonical N-1→N: " + msg)
+	} else {
+		t.Skip("canonical N-1→N: " + msg)
 	}
-	t.Skip("canonical N-1→N: " + msg)
 	return ""
 }
 

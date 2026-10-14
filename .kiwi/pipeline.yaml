@@ -210,10 +210,16 @@ jobs:
         run: make docs-check
       - name: license-check
         run: make license-check
+      - name: license-notice
+        run: make license-notice
       - name: cross
         run: make cross
       - name: repro-build
         run: make repro-build
+      - name: release-formula-test
+        run: make release-formula-test
+      - name: release-snapshot-signing-test
+        run: make release-snapshot-signing-test
 
   fuzz:
     needs: [quality]
@@ -235,14 +241,3 @@ jobs:
     steps:
       - name: fuzz
         run: make fuzz
-
-  # Platform-lane acknowledgements: the self-hosted pipeline owns these
-  # lanes (linux-amd64, linux-arm64, native-macos, native-windows,
-  # integration-coverage). While .woodpecker/ still exists it must only
-  # mirror this file; extinction deletes it.
-  platform-lanes:
-    runtime: container
-    image: alpine:3.20
-    run: |
-      echo "lanes: linux-amd64 linux-arm64 native-macos native-windows integration-coverage"
-      test -f .kiwi/pipeline.yaml

@@ -1,124 +1,103 @@
-# Public capability manifest — the release contract for coverage.
+# Public capability manifest — the AUTHORITATIVE coverage contract.
 #
-# Every externally supported capability must name its required proofs.
-# surfacecheck.TestCapabilityManifestCoversPublicSurface fails when a
-# capability exists with no required proof, or when a listed capability id
-# is unknown. No manually curated loopholes: the gate is this file.
+# surfacecheck.TestCapabilityManifestCoversPublicSurface fails when:
+#   - a CLI command (cmd/kiwi) or HTTP route family (server mux) is not
+#     named in any capability's `covers` list;
+#   - a capability covers nothing (a row with no surface is not a proof);
+#   - a system/adversarial proof has no Implemented dogfood scenario;
+#   - a release proof is not a Makefile release-gate --require.
 #
-# proof kinds: unit | component | system | adversarial | release
+# `covers` entries are the extracted surface ids: "cli:<command>" or
+# "route:<family>". `scenarios` are DF-… ids or --require test names.
 version: 1
 capabilities:
-  - id: pipeline.validate
-    summary: "Parse and validate a Kiwi pipeline"
+  - id: cli.local
+    summary: "Local pipeline run / validate / explain / init / lock"
     proofs: [unit, component]
-  - id: pipeline.compile
-    summary: "Compile jobs, matrix, DAG"
+    covers: [cli:run, cli:validate, cli:explain, cli:init, cli:lock, cli:import]
+  - id: cli.ops
+    summary: "Remote ops commands (runs/jobs/logs/cancel/approve/rerun/artifacts/schedules/policy)"
     proofs: [unit, component]
-  - id: pipeline.shorthand_run
-    summary: "Job-level run: shorthand"
+    covers: [cli:runs, cli:jobs, cli:logs, cli:cancel, cli:approve, cli:rerun, cli:artifacts, cli:schedules, cli:policy]
+  - id: cli.identity
+    summary: "login / logout / context / secret explain"
     proofs: [unit]
-  - id: pipeline.concurrency
-    summary: "Concurrency group / cancel / limit"
+    covers: [cli:login, cli:logout, cli:context, cli:secret]
+  - id: cli.platform
+    summary: "server / runner / dispatch / up / doctor / setup / database / storage / config / tui / version"
     proofs: [unit, system]
-  - id: execution.native
-    summary: "Native host execution"
-    proofs: [unit, system, adversarial]
-  - id: execution.container
-    summary: "Docker container execution"
-    proofs: [unit, system, adversarial]
-  - id: execution.tart
-    summary: "Tart macOS VM execution"
-    proofs: [unit, component]
-  - id: execution.services
-    summary: "Service containers with healthchecks"
-    proofs: [unit, system]
-  - id: execution.matrix
-    summary: "Matrix expansion"
-    proofs: [unit, system]
-  - id: execution.clone
-    summary: "Clone skip/depth/submodules/lfs/sparse"
-    proofs: [unit, system]
-  - id: execution.workspace
-    summary: "Workspace base/path placement"
-    proofs: [unit, system]
-  - id: execution.volumes
-    summary: "Job volumes (named + trust-gated host_path)"
-    proofs: [unit, adversarial]
-  - id: execution.privileged
-    summary: "Trust-gated privileged containers"
-    proofs: [unit, adversarial]
-  - id: execution.registry
-    summary: "Job registry credentials via secrets"
-    proofs: [unit]
-  - id: execution.background
-    summary: "Background/detach steps"
-    proofs: [unit]
-  - id: execution.cancel_on_failure
-    summary: "cancel_job_on_failure"
-    proofs: [unit]
-  - id: scheduler.lease
-    summary: "Atomic lease claim and fencing"
-    proofs: [unit, system, adversarial]
-  - id: scheduler.standby
-    summary: "Leader/standby lease routing"
-    proofs: [unit, system]
-  - id: artifact.upload
-    summary: "Artifact upload/download/hash"
-    proofs: [unit, system, adversarial]
-  - id: cache.restore
-    summary: "Cache hit/miss/fallback/trust namespaces"
-    proofs: [unit, system, adversarial]
-  - id: secrets.broker
-    summary: "Secret issuance, masking, hierarchy"
-    proofs: [unit, system, adversarial]
-  - id: forge.webhook
-    summary: "Webhook parse/validate/dedupe/status"
-    proofs: [unit, system, adversarial]
-  - id: evidence.generate
-    summary: "Execution attestation and evidence root"
-    proofs: [unit, system, adversarial, release]
-  - id: evidence.verify
-    summary: "Derived verified outcome / sealed authority"
-    proofs: [unit, system, adversarial, release]
-  - id: evidence.acceptance
-    summary: "Acceptance MAC, restore, key rotation"
-    proofs: [unit, system, adversarial, release]
-  - id: evidence.portable
-    summary: "Portable Ed25519 proof + discovery anti-rollback"
+    covers: [cli:server, cli:runner, cli:dispatch, cli:up, cli:doctor, cli:setup, cli:database, cli:storage, cli:config, cli:tui, cli:version, cli:help, cli:migrate, cli:status, cli:check, cli:outbox, cli:repair-repo-identities, cli:verify, cli:replay]
+    scenarios: [DF-BOOT-001, TestSysDFBoot001]
+  - id: route.runs
+    summary: "Run submit/list/get/cancel/rerun/jobs/logs/artifacts/tests"
     proofs: [unit, system, release]
-  - id: replay.exact
-    summary: "Recorded execution replay"
+    covers: [route:api/v1/runs, route:api/v1/jobs, route:api/v1/artifacts, route:api/v1/test-intelligence]
+    scenarios: [DF-SCALE-001, TestSysDFScale002Soak, TestSysDFVerificationProductionPath]
+  - id: route.auth
+    summary: "Web login/logout, OIDC discovery/JWKS, secret issuance"
     proofs: [unit, system]
-  - id: graph.dynamic
-    summary: "Add-only dynamic child fragments"
+    covers: [route:api/v1/login, route:api/v1/logout, route:oidc, route:api/v1/oidc]
+    scenarios: [DF-EVID-005, TestSysTrustedIngress]
+  - id: route.health
+    summary: "Liveness, readiness, readiness/lease, version, metrics"
+    proofs: [unit, system]
+    covers: [route:liveness, route:readiness, route:readiness/lease, route:version, route:metrics, route:ui]
+    scenarios: [DF-BOOT-001, TestSysDFBoot001]
+  - id: route.forge
+    summary: "Forge webhooks (GitHub/GitLab/Forgejo) and check publication"
+    proofs: [unit, adversarial]
+    covers: ["route:hooks/*"]
+    scenarios: [DF-EVID-001, TestSysDFForgeCanary001]
+  - id: route.runners
+    summary: "Runner enroll/next/heartbeat/complete, profiles, drain"
+    proofs: [unit, system, adversarial, release]
+    covers: [route:api/v1/runners, route:api/v1/runner-profiles, route:api/v1/drain]
+    scenarios: [DF-LEASE-001, DF-LEASE-002, TestSysDFLease001, TestSysDFChaos001, TestSysRootlessEnforced]
+  - id: route.events
+    summary: "Event stream, audit, execution snapshots"
+    proofs: [unit, system]
+    covers: [route:api/v1/events, route:api/v1/audit, route:api/v1/execution-snapshot]
+    scenarios: [DF-EVID-001, TestSysDFEvid001]
+  - id: route.schedules
+    summary: "Schedule list/upsert/trigger"
+    proofs: [unit, system]
+    covers: [route:api/v1/schedules]
+    scenarios: [DF-BOOT-001, TestSysTrustedScheduleIngress]
+  - id: evidence.authority
+    summary: "Claims, derived verified outcomes, acceptance MAC, portable proofs"
+    proofs: [unit, system, adversarial, release]
+    covers: [pkg:internal/verifyapi, pkg:internal/provenance]
+    scenarios: [DF-EVID-001, DF-EVID-002, DF-EVID-003, DF-EVID-004, TestSysDFVerificationProductionPath, TestVerifyExecutionAttestationSchemaVersionError]
+  - id: scheduler.lease
+    summary: "Atomic lease, fencing, concurrency.limit, environment slots"
     proofs: [unit, system, adversarial]
-  - id: ha.blob_topology
-    summary: "Shared-fs / single-replica / s3 contract"
-    proofs: [unit, system]
-  - id: dr.restore
-    summary: "Backup / destroy / restore"
-    proofs: [system, release]
-  - id: upgrade.n_minus_one
-    summary: "N-1 upgrade (released binary)"
-    proofs: [system, release]
-  - id: release.certify
-    summary: "Release gate before tag"
-    proofs: [release]
-  - id: cli.context
-    summary: "login / context / logout with keyring"
-    proofs: [unit]
-  - id: cli.lock
-    summary: "Image lockfile (kiwi lock)"
-    proofs: [unit]
-  - id: cli.setup
-    summary: "Onboarding wizard"
-    proofs: [unit]
-  - id: cli.doctor
-    summary: "Local and server diagnostics"
-    proofs: [unit, system]
-  - id: fleet.provisioner
-    summary: "Dynamic fleet provider SPI"
-    proofs: [unit]
-  - id: importer.woodpecker
-    summary: "Woodpecker import → Kiwi equivalence"
+    covers: [pkg:internal/scheduler, pkg:internal/storage]
+    scenarios: [DF-LEASE-001, DF-LEASE-002, TestSysDFChaos001]
+  - id: storage.durability
+    summary: "Postgres/fs stores, DR restore, N-1 upgrade, HA blob topology"
+    proofs: [unit, system, release]
+    covers: [pkg:internal/storage, pkg:internal/blob, pkg:internal/cas]
+    scenarios: [DF-UPGRADE-001, TestSysDFDr001PostgresObjectStore, TestSysDFUpgrade002NMinusOne, TestSysDFCanonicalReleaseScenario]
+  - id: execution.security
+    summary: "Untrusted quota, rootless, secrets, cache/artifact trust domains"
+    proofs: [unit, system, adversarial]
+    covers: [pkg:internal/executor, pkg:internal/secrets, pkg:internal/secretbroker]
+    scenarios: [DF-QUOTA-001, DF-CACHE-001, DF-ART-001, TestSysQuotaGate, TestSysUntrustedContainerEvidenceLane]
+  - id: effects.authorization
+    summary: "External-effect capability: winner once, losers zero"
+    proofs: [unit, system, adversarial]
+    covers: [pkg:internal/deploy, pkg:internal/model]
+    scenarios: [DF-EFFECT-001, DF-EFFECT-002]
+  - id: pipeline.language
+    summary: "Parse/validate/compile, run: shorthand, matrix, concurrency.limit, clone/workspace/volumes"
     proofs: [unit, component]
+    covers: [pkg:internal/pipeline, pkg:internal/importer]
+  - id: importer.woodpecker
+    summary: "Woodpecker import → Kiwi equivalence mapping"
+    proofs: [unit, component]
+    covers: [cli:import]
+  - id: selfhost.release
+    summary: "Self-host G1→G2, packaged artifact, release gate before tag"
+    proofs: [system, release]
+    covers: [pkg:internal/dogfood, pkg:cmd/kiwi]
+    scenarios: [DF-SELF-001, TestSysDFSelf002G1ToG2, TestSysDFRelease001PackagedArtifact]
