@@ -1,17 +1,32 @@
 name: release-gate
 
-# Mandatory production dogfood closure for release tags. This is the
-# "HEAD has passed the release-gate" proof — not merely that the target
-# exists. Break-glass bypass must be an explicit, audited incident (see
-# docs/releases.md § Release governance on `main`).
+# Causal release certification: the tag is created ONLY AFTER this workflow
+# succeeds. A tag that exists before certification is a governance defect —
+# this workflow's job is to make the tag the CONSEQUENCE of green evidence.
+#
+# Trigger: workflow_dispatch with the version to certify (e.g. v1.2.3).
+# Optional: push to main runs the closure as a dry-run without tagging.
+#
+# Break-glass (creating a tag without this gate) must be an explicit,
+# audited incident (docs/releases.md § Release governance on `main`).
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version to certify and tag (e.g. v1.2.3)"
+        required: true
+        type: string
+      create_tag:
+        description: "Create the git tag after certification succeeds"
+        required: false
+        default: true
+        type: boolean
+  push:
+    branches:
+      - main
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   production-closure:
@@ -33,3 +48,16 @@ jobs:
           go run ./cmd/filemap --check
           ./scripts/docs-lint.sh --source --baseline scripts/docs-lint-baseline.txt
           ./scripts/docs-links-check.sh
+      - name: tag after certification
+        if: github.event_name == 'workflow_dispatch' && inputs.create_tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          echo "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || {
+            echo "version must look like v1.2.3" >&2
+            exit 1
+          }
+          git tag -a "$VERSION" -m "release $VERSION (certified by release-gate)"
+          git push origin "$VERSION"
+          echo "tag $VERSION created AFTER certification"

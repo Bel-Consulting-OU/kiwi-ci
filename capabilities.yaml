@@ -1,0 +1,124 @@
+# Public capability manifest — the release contract for coverage.
+#
+# Every externally supported capability must name its required proofs.
+# surfacecheck.TestCapabilityManifestCoversPublicSurface fails when a
+# capability exists with no required proof, or when a listed capability id
+# is unknown. No manually curated loopholes: the gate is this file.
+#
+# proof kinds: unit | component | system | adversarial | release
+version: 1
+capabilities:
+  - id: pipeline.validate
+    summary: "Parse and validate a Kiwi pipeline"
+    proofs: [unit, component]
+  - id: pipeline.compile
+    summary: "Compile jobs, matrix, DAG"
+    proofs: [unit, component]
+  - id: pipeline.shorthand_run
+    summary: "Job-level run: shorthand"
+    proofs: [unit]
+  - id: pipeline.concurrency
+    summary: "Concurrency group / cancel / limit"
+    proofs: [unit, system]
+  - id: execution.native
+    summary: "Native host execution"
+    proofs: [unit, system, adversarial]
+  - id: execution.container
+    summary: "Docker container execution"
+    proofs: [unit, system, adversarial]
+  - id: execution.tart
+    summary: "Tart macOS VM execution"
+    proofs: [unit, component]
+  - id: execution.services
+    summary: "Service containers with healthchecks"
+    proofs: [unit, system]
+  - id: execution.matrix
+    summary: "Matrix expansion"
+    proofs: [unit, system]
+  - id: execution.clone
+    summary: "Clone skip/depth/submodules/lfs/sparse"
+    proofs: [unit, system]
+  - id: execution.workspace
+    summary: "Workspace base/path placement"
+    proofs: [unit, system]
+  - id: execution.volumes
+    summary: "Job volumes (named + trust-gated host_path)"
+    proofs: [unit, adversarial]
+  - id: execution.privileged
+    summary: "Trust-gated privileged containers"
+    proofs: [unit, adversarial]
+  - id: execution.registry
+    summary: "Job registry credentials via secrets"
+    proofs: [unit]
+  - id: execution.background
+    summary: "Background/detach steps"
+    proofs: [unit]
+  - id: execution.cancel_on_failure
+    summary: "cancel_job_on_failure"
+    proofs: [unit]
+  - id: scheduler.lease
+    summary: "Atomic lease claim and fencing"
+    proofs: [unit, system, adversarial]
+  - id: scheduler.standby
+    summary: "Leader/standby lease routing"
+    proofs: [unit, system]
+  - id: artifact.upload
+    summary: "Artifact upload/download/hash"
+    proofs: [unit, system, adversarial]
+  - id: cache.restore
+    summary: "Cache hit/miss/fallback/trust namespaces"
+    proofs: [unit, system, adversarial]
+  - id: secrets.broker
+    summary: "Secret issuance, masking, hierarchy"
+    proofs: [unit, system, adversarial]
+  - id: forge.webhook
+    summary: "Webhook parse/validate/dedupe/status"
+    proofs: [unit, system, adversarial]
+  - id: evidence.generate
+    summary: "Execution attestation and evidence root"
+    proofs: [unit, system, adversarial, release]
+  - id: evidence.verify
+    summary: "Derived verified outcome / sealed authority"
+    proofs: [unit, system, adversarial, release]
+  - id: evidence.acceptance
+    summary: "Acceptance MAC, restore, key rotation"
+    proofs: [unit, system, adversarial, release]
+  - id: evidence.portable
+    summary: "Portable Ed25519 proof + discovery anti-rollback"
+    proofs: [unit, system, release]
+  - id: replay.exact
+    summary: "Recorded execution replay"
+    proofs: [unit, system]
+  - id: graph.dynamic
+    summary: "Add-only dynamic child fragments"
+    proofs: [unit, system, adversarial]
+  - id: ha.blob_topology
+    summary: "Shared-fs / single-replica / s3 contract"
+    proofs: [unit, system]
+  - id: dr.restore
+    summary: "Backup / destroy / restore"
+    proofs: [system, release]
+  - id: upgrade.n_minus_one
+    summary: "N-1 upgrade (released binary)"
+    proofs: [system, release]
+  - id: release.certify
+    summary: "Release gate before tag"
+    proofs: [release]
+  - id: cli.context
+    summary: "login / context / logout with keyring"
+    proofs: [unit]
+  - id: cli.lock
+    summary: "Image lockfile (kiwi lock)"
+    proofs: [unit]
+  - id: cli.setup
+    summary: "Onboarding wizard"
+    proofs: [unit]
+  - id: cli.doctor
+    summary: "Local and server diagnostics"
+    proofs: [unit, system]
+  - id: fleet.provisioner
+    summary: "Dynamic fleet provider SPI"
+    proofs: [unit]
+  - id: importer.woodpecker
+    summary: "Woodpecker import → Kiwi equivalence"
+    proofs: [unit, component]

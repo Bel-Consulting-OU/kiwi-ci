@@ -1233,6 +1233,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/logout", s.webLogoutMethodNotAllowed)
 	mux.HandleFunc("POST /api/v1/logout", s.webLogout)
 	mux.HandleFunc("GET /readiness", s.readiness)
+	mux.HandleFunc("GET /readiness/lease", s.readinessLease)
 	mux.HandleFunc("GET /liveness", s.liveness)
 	mux.HandleFunc("GET /version", s.versionInfo)
 	mux.HandleFunc("POST /hooks/github", s.githubWebhook)
@@ -1362,7 +1363,7 @@ func (s *Server) schemaMutationFence(next http.Handler) http.Handler {
 			return
 		}
 		switch r.URL.Path {
-		case "/liveness", "/readiness", "/metrics", "/version":
+		case "/liveness", "/readiness", "/readiness/lease", "/metrics", "/version":
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -4379,6 +4380,8 @@ func (s *Server) nextDB(w http.ResponseWriter, r *http.Request, id string) {
 			// Not this replica's ledger to rebuild: answer the scheduler's
 			// normal not-leader rejection (no reconcile attempt, no error
 			// log, no reconciling state), like every other standby poll.
+			w.Header().Set("X-Kiwi-Leader", "required")
+			w.Header().Set("X-Kiwi-Readiness-Lease", "/readiness/lease")
 			http.Error(w, "scheduler standby", http.StatusServiceUnavailable)
 			return
 		}
@@ -4454,6 +4457,8 @@ func (s *Server) nextDB(w http.ResponseWriter, r *http.Request, id string) {
 	j, rawToken, exp, err := s.Sched.Lease(ctx, id, leaseNow.UTC())
 	switch {
 	case errors.Is(err, scheduler.ErrNotLeader):
+		w.Header().Set("X-Kiwi-Leader", "required")
+		w.Header().Set("X-Kiwi-Readiness-Lease", "/readiness/lease")
 		http.Error(w, "scheduler standby", http.StatusServiceUnavailable)
 		return
 	case errors.Is(err, scheduler.ErrNoJobs), errors.Is(err, storage.ErrLeaseConflict),

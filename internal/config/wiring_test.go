@@ -11,6 +11,7 @@ func TestLoadNewSections(t *testing.T) {
 [server]
 mode = "production"
 external_url = "https://ci.example.com"
+single_replica = true
 
 [gitlab]
 webhook_secret = "gl-wh"

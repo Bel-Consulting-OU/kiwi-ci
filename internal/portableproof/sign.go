@@ -3,8 +3,10 @@ package portableproof
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -371,15 +373,57 @@ func (d PublicKeyDoc) Verifiable() error {
 // portable-signature verification keys a deployment publishes, each with
 // its lifecycle state and rotation / revocation note. A consumer fetches
 // this document over its own channel and verifies envelopes against it.
+//
+// Anti-rollback (P1): Sequence is monotonically increasing, ExpiresAt bounds
+// the document's validity, and PredecessorHash chains each publication to
+// the previous one. A consumer that persists the highest-seen sequence and
+// predecessor hash refuses a replay of an older (still-signed) document that
+// would hide a later revocation. Highest-assurance deployments sign the
+// document itself with an offline root key (SignedDiscovery).
 type PublicKeyDiscovery struct {
 	// SchemaVersion is DiscoverySchemaVersion.
 	SchemaVersion int `json:"schema_version"`
+	// Sequence is the monotonically increasing publication number. A
+	// consumer must never accept a sequence lower than the highest it has
+	// already seen for this deployment.
+	Sequence uint64 `json:"sequence"`
+	// ExpiresAt bounds validity. An expired discovery is refused even if
+	// its signature still verifies.
+	ExpiresAt time.Time `json:"expires_at"`
+	// PredecessorHash is the SHA-256 of the previous discovery document's
+	// canonical JSON (empty for the genesis publication). It chains
+	// publications so a truncated history is detectable.
+	PredecessorHash string `json:"predecessor_hash,omitempty"`
 	// IssuedAt is when this document was published.
 	IssuedAt time.Time `json:"issued_at"`
 	// Keys is the published key set. Order is operator-defined; lookup is
 	// by KeyID.
 	Keys []PublicKeyDoc `json:"keys"`
 }
+
+// SignedDiscovery is a PublicKeyDiscovery plus an offline-root signature
+// over its canonical bytes. The root key is the highest-assurance trust
+// anchor: it is NOT one of the portable proof signing keys, and it should
+// live offline. Ordinary deployments may skip this and rely on the
+// transport channel alone; the strongest assurance profile requires it.
+type SignedDiscovery struct {
+	Discovery PublicKeyDiscovery `json:"discovery"`
+	// RootKeyID names the offline root key that signed this document.
+	RootKeyID string `json:"root_key_id"`
+	// Signature is Ed25519 over discoveryCanonicalBytes(discovery).
+	Signature string `json:"signature"`
+}
+
+// DiscoveryState is the anti-rollback state a consumer persists between
+// discovery fetches.
+type DiscoveryState struct {
+	Sequence        uint64 `json:"sequence"`
+	PredecessorHash string `json:"predecessor_hash,omitempty"`
+}
+
+// ErrRollback is returned when a discovery document is older than the
+// highest sequence already seen (a replay that could hide a revocation).
+var ErrRollback = errors.New("portableproof: discovery rollback refused")
 
 // NewDiscovery builds an empty discovery document stamped now.
 func NewDiscovery(at time.Time) PublicKeyDiscovery {
@@ -497,4 +541,120 @@ func VerifyWithDiscovery(signed SignedProof, disc PublicKeyDiscovery) error {
 		return err
 	}
 	return Verify(signed, doc.KeyID, pub)
+}
+
+// discoveryCanonicalBytes is the anti-rollback identity of a discovery
+// document: JSON with sorted keys (struct field order is already stable)
+// and no signature. PredecessorHash chains against this.
+func discoveryCanonicalBytes(d PublicKeyDiscovery) ([]byte, error) {
+	n := d
+	n.PredecessorHash = "" // the hash is computed over the doc WITHOUT the chain link
+	return json.Marshal(n)
+}
+
+// DiscoveryHash is the SHA-256 hex of a discovery document's canonical
+// bytes (with PredecessorHash blanked — see discoveryCanonicalBytes).
+func DiscoveryHash(d PublicKeyDiscovery) (string, error) {
+	raw, err := discoveryCanonicalBytes(d)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// SignDiscovery signs a discovery document with the offline root key. The
+// signature covers the canonical bytes (sequence, expiry, predecessor hash,
+// issued_at, and the full key set).
+func SignDiscovery(d PublicKeyDiscovery, rootKeyID string, rootPriv ed25519.PrivateKey) (SignedDiscovery, error) {
+	if rootKeyID == "" {
+		return SignedDiscovery{}, fmt.Errorf("%w: root key id is required", ErrKey)
+	}
+	if len(rootPriv) != ed25519.PrivateKeySize {
+		return SignedDiscovery{}, fmt.Errorf("%w: root key is not Ed25519", ErrKey)
+	}
+	raw, err := discoveryCanonicalBytes(d)
+	if err != nil {
+		return SignedDiscovery{}, err
+	}
+	sig := ed25519.Sign(rootPriv, discoverySignPayload(raw))
+	return SignedDiscovery{
+		Discovery: d,
+		RootKeyID: rootKeyID,
+		Signature: base64.StdEncoding.EncodeToString(sig),
+	}, nil
+}
+
+// discoverySignPayload domain-separates the root signature from portable
+// proof signatures so a proof signature can never replay as a discovery
+// signature (and vice versa).
+func discoverySignPayload(raw []byte) []byte {
+	const domain = "kiwi-ci/portable-proof-discovery/v1\n"
+	out := make([]byte, 0, len(domain)+len(raw))
+	out = append(out, domain...)
+	out = append(out, raw...)
+	return out
+}
+
+// VerifySignedDiscovery checks the offline-root signature, expiry, and
+// anti-rollback state. prev is the consumer's persisted highest-seen state
+// (zero value accepts the genesis publication). Returns the new state the
+// consumer must persist on success.
+func VerifySignedDiscovery(signed SignedDiscovery, rootPub ed25519.PublicKey, prev DiscoveryState, now time.Time) (DiscoveryState, error) {
+	if signed.Discovery.SchemaVersion != DiscoverySchemaVersion {
+		return DiscoveryState{}, fmt.Errorf("%w: discovery schema %d", ErrSchema, signed.Discovery.SchemaVersion)
+	}
+	if signed.RootKeyID == "" || signed.Signature == "" {
+		return DiscoveryState{}, fmt.Errorf("%w: signed discovery is missing root key id or signature", ErrSignature)
+	}
+	if len(rootPub) != ed25519.PublicKeySize {
+		return DiscoveryState{}, fmt.Errorf("%w: root key is not Ed25519", ErrKey)
+	}
+	raw, err := discoveryCanonicalBytes(signed.Discovery)
+	if err != nil {
+		return DiscoveryState{}, err
+	}
+	sig, err := base64.StdEncoding.DecodeString(signed.Signature)
+	if err != nil {
+		return DiscoveryState{}, fmt.Errorf("%w: discovery signature is not base64: %v", ErrSignature, err)
+	}
+	if !ed25519.Verify(rootPub, discoverySignPayload(raw), sig) {
+		return DiscoveryState{}, fmt.Errorf("%w: discovery root signature", ErrSignature)
+	}
+	// Expiry is checked against the consumer clock: an expired document is
+	// useless even when authentic.
+	if !signed.Discovery.ExpiresAt.IsZero() && now.After(signed.Discovery.ExpiresAt) {
+		return DiscoveryState{}, fmt.Errorf("%w: discovery expired at %s", ErrSchema, signed.Discovery.ExpiresAt.UTC().Format(time.RFC3339))
+	}
+	// Anti-rollback: sequence must strictly increase past the persisted
+	// high-water mark. A replay of an older document (even a validly signed
+	// one) is refused so it cannot hide a later revocation.
+	if signed.Discovery.Sequence < prev.Sequence {
+		return DiscoveryState{}, fmt.Errorf("%w: discovery sequence %d < seen %d", ErrRollback, signed.Discovery.Sequence, prev.Sequence)
+	}
+	if prev.Sequence > 0 && signed.Discovery.Sequence == prev.Sequence {
+		// Same sequence is only acceptable as an idempotent re-fetch of the
+		// document already accepted. A different document at the same
+		// sequence is a fork/replay attempt.
+		prevHash, err := DiscoveryHash(signed.Discovery)
+		if err != nil {
+			return DiscoveryState{}, err
+		}
+		if prev.PredecessorHash != prevHash {
+			return DiscoveryState{}, fmt.Errorf("%w: discovery sequence %d does not match the accepted document", ErrRollback, signed.Discovery.Sequence)
+		}
+		return prev, nil
+	}
+	// Strictly increasing: the chain link must match the document we
+	// already accepted when the publisher supplies one.
+	if prev.Sequence > 0 && prev.PredecessorHash != "" && signed.Discovery.PredecessorHash != "" {
+		if signed.Discovery.PredecessorHash != prev.PredecessorHash {
+			return DiscoveryState{}, fmt.Errorf("%w: discovery sequence %d predecessor hash does not chain to the accepted document", ErrRollback, signed.Discovery.Sequence)
+		}
+	}
+	h, err := DiscoveryHash(signed.Discovery)
+	if err != nil {
+		return DiscoveryState{}, err
+	}
+	return DiscoveryState{Sequence: signed.Discovery.Sequence, PredecessorHash: h}, nil
 }

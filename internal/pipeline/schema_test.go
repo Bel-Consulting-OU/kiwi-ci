@@ -80,8 +80,11 @@ func TestSchemaJSONParsesAndIsStrict(t *testing.T) {
 			t.Fatalf("$defs.job.properties missing %q", k)
 		}
 	}
-	if jobRequired, _ := job["required"].([]any); len(jobRequired) != 1 || jobRequired[0] != "steps" {
-		t.Fatalf("$defs.job required = %v, want [steps]", jobRequired)
+	// Job no longer hard-requires "steps": the job-level run: shorthand and
+	// component jobs both omit an explicit step list. Go validation enforces
+	// "run or steps" after canonicalization.
+	if jobRequired, _ := job["required"].([]any); len(jobRequired) != 0 {
+		t.Fatalf("$defs.job required = %v, want empty (run:/component jobs omit steps)", jobRequired)
 	}
 }
 

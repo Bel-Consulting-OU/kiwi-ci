@@ -1,15 +1,15 @@
 # Kiwi CI's own self-hosted dogfooding pipeline: Kiwi runs the whole
 # verification matrix on itself through the same engine users run.
 #
-# Both images are pinned by REAL OCI digests, reused verbatim from the
-# Woodpecker workflows so the dogfood run and the merge-gating CI verify the
-# same bytes:
+# Both images are pinned by REAL OCI digests. .kiwi/ is the CANONICAL
+# self-host pipeline — Woodpecker mirrors it during transition (never the
+# reverse), and .woodpecker/ disappears at extinction:
 #   golang:1.27@sha256:f44f6e88636cfb311f9ebace870ded69d943f227bb3cb27d32ffd84ea18c43ea
 #     (see .woodpecker/linux-amd64.yml)
 #   postgres:16-alpine@sha256:3c5c8892d184f738f4fe282d14ddaa613a38f00f4189d2d94725ebe6f2909ddb
 #     (see .woodpecker/integration-coverage.yml)
-# Bump them deliberately (docker buildx imagetools inspect) and keep them in
-# sync with the Woodpecker workflows.
+# Bump them deliberately (docker buildx imagetools inspect) here first;
+# any remaining Woodpecker file follows this pipeline.
 #
 # Gates (run texts mirror the Makefile targets exactly):
 #   quality      gofmt, go vet, go build, make surface-check, make schema-check
@@ -235,3 +235,14 @@ jobs:
     steps:
       - name: fuzz
         run: make fuzz
+
+  # Platform-lane acknowledgements: the self-hosted pipeline owns these
+  # lanes (linux-amd64, linux-arm64, native-macos, native-windows,
+  # integration-coverage). While .woodpecker/ still exists it must only
+  # mirror this file; extinction deletes it.
+  platform-lanes:
+    runtime: container
+    image: alpine:3.20
+    run: |
+      echo "lanes: linux-amd64 linux-arm64 native-macos native-windows integration-coverage"
+      test -f .kiwi/pipeline.yaml

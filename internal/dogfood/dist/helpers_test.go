@@ -274,9 +274,10 @@ func restorePGDump(t *testing.T, dsn, dumpPath string) {
 	}
 	ensureRepoIdentityFunctions(t, dsn)
 	if out, err := exec.Command(pgRestore, "-L", filter.Name(), "-d", dsn, dumpPath).CombinedOutput(); err != nil {
-		// pg_restore may exit non-zero on harmless warnings; the schema
-		// rebuild below is the completeness gate.
-		t.Logf("pg_restore: %v\n%s", err, out)
+		// Fail closed: after the controlled exclude list, a non-zero
+		// pg_restore means the dump itself is damaged (not a known
+		// function-order quirk). Logging it away would hide restore damage.
+		t.Fatalf("pg_restore: %v\n%s", err, out)
 	}
 	rebuildRepoIdentitySchema(t, dsn)
 }

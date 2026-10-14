@@ -278,6 +278,7 @@ func TestValidateRemainingBranches(t *testing.T) {
 		t.Fatalf("bad database url = %v", err)
 	}
 	cfg.Database.URL = "postgresql://db"
+	cfg.Server.SingleReplica = true
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("postgresql url = %v", err)
 	}

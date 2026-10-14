@@ -102,6 +102,14 @@ type ServerConfig struct {
 	// server cannot promise a higher version's semantics. Never configure
 	// this below 1.
 	MinRunnerProtocol int `toml:"min_runner_protocol"`
+	// SingleReplica explicitly acknowledges a ONE-NODE production
+	// deployment. It is required when blob.backend = "fs" without
+	// blob.shared = true: otherwise two replicas can each hold node-local
+	// CAS bytes while sharing one PostgreSQL metadata plane, and a
+	// runner's upload through A becomes unreadable on B. Production
+	// refuses to start on that topology until the operator names which
+	// side of the contract they are on (single_replica or shared fs).
+	SingleReplica bool `toml:"single_replica"`
 }
 
 type DatabaseConfig struct {
@@ -125,8 +133,15 @@ type RunnerPKIConfig struct {
 
 type BlobConfig struct {
 	// Backend selects artifact/blob storage: "fs" (default) or "s3".
-	Backend    string `toml:"backend"`
-	Path       string `toml:"path"`
+	Backend string `toml:"backend"`
+	Path    string `toml:"path"`
+	// Shared acknowledges that every control-plane replica mounts the SAME
+	// filesystem at Path (NFS/EFS/…). Required for backend = "fs" in a
+	// multi-replica production deployment; without it (and without
+	// server.single_replica) production refuses to start, because
+	// node-local CAS bytes under shared PostgreSQL metadata lose artifacts
+	// across replicas.
+	Shared     bool   `toml:"shared"`
 	S3Endpoint string `toml:"s3_endpoint"`
 	S3Bucket   string `toml:"s3_bucket"`
 	S3Region   string `toml:"s3_region"`
@@ -587,6 +602,20 @@ func (c *Config) Validate() error {
 	}
 	if backend != "fs" && backend != "s3" {
 		return fmt.Errorf("blob.backend must be \"fs\" or \"s3\", got %q", backend)
+	}
+	if backend == "fs" && mode == "production" && strings.TrimSpace(c.Database.URL) != "" {
+		// HA blob topology is a production contract: node-local CAS under
+		// shared PostgreSQL metadata loses artifacts across replicas
+		// (upload through A, read through B). The dangerous shape is
+		// specifically DB mode + local fs, so the acknowledgement is
+		// required there — and only there. A production node without
+		// PostgreSQL is a single-process store and implies one replica.
+		if !c.Blob.Shared && !c.Server.SingleReplica {
+			return fmt.Errorf("blob.backend \"fs\" with database.url in production requires either blob.shared = true (every replica mounts the same filesystem at blob.path) or server.single_replica = true (exactly one control-plane node); multi-replica deployments should use blob.backend = \"s3\"")
+		}
+		if c.Blob.Shared && c.Server.SingleReplica {
+			return fmt.Errorf("blob.shared and server.single_replica are mutually exclusive: name exactly one topology")
+		}
 	}
 	if backend == "s3" {
 		if c.Blob.S3Endpoint == "" || c.Blob.S3Bucket == "" || c.Blob.S3Region == "" {
@@ -1077,6 +1106,10 @@ func (c *Config) OverrideFromFlags(fs *flag.FlagSet) error {
 			c.Server.TLSKey = f.Value.String()
 		case "database-url":
 			c.Database.URL = f.Value.String()
+		case "single-replica":
+			c.Server.SingleReplica = f.Value.String() == "true"
+		case "blob-shared":
+			c.Blob.Shared = f.Value.String() == "true"
 		case "runner-token":
 			c.Auth.RunnerToken = f.Value.String()
 		case "admin-token":

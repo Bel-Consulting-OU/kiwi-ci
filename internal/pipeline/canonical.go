@@ -114,6 +114,7 @@ type canonicalJob struct {
 	If          string             `json:"if,omitempty"`
 	Runner      []string           `json:"runner,omitempty"`
 	Runtime     string             `json:"runtime,omitempty"`
+	Run         string             `json:"run,omitempty"`
 	Image       string             `json:"image,omitempty"`
 	Network     string             `json:"network,omitempty"`
 	VM          string             `json:"vm,omitempty"`
@@ -207,7 +208,7 @@ type canonicalComponentUse struct {
 func canonicalJobOf(j Job) canonicalJob {
 	c := canonicalJob{
 		Name: j.Name, Needs: j.Needs, If: j.If, Runner: j.Runner,
-		Runtime: j.Runtime, Image: j.Image, Network: j.Network, VM: j.VM,
+		Runtime: j.Runtime, Run: j.Run, Image: j.Image, Network: j.Network, VM: j.VM,
 		Shell: j.Shell, Timeout: durOf(j.Timeout), Retry: retryOf(j.Retry),
 		Env: pairs(j.Env), Matrix: pairs(j.Matrix),
 		Paths: j.Paths, PathsIgnore: j.PathsIgnore,

@@ -89,6 +89,26 @@ const AcceptanceVersionV5 = 5
 // at.
 const AcceptanceVersionCurrent = AcceptanceVersionV5
 
+// AcceptanceWireSchema returns the verify-API wire schema version an
+// acceptance record of this acceptance version was minted under. The mapping
+// is FROZEN per acceptance version: a future SchemaVersion bump must never
+// invalidate historical records, so restore compares against this table —
+// never against "whatever SchemaVersion happens to be today".
+func AcceptanceWireSchema(acceptanceVersion int) (int, bool) {
+	switch acceptanceVersion {
+	case AcceptanceVersion:
+		// v1 records predate the wire-schema field.
+		return 0, true
+	case AcceptanceVersionV2, AcceptanceVersionV3, AcceptanceVersionV4, AcceptanceVersionV5:
+		// Minted under verify API schema 1. When SchemaVersion bumps to 2,
+		// new records write under a new acceptance version + schema 2;
+		// these stay pinned at 1 forever.
+		return 1, true
+	default:
+		return 0, false
+	}
+}
+
 // AcceptanceAlgorithmHMACSHA256 is the MAC algorithm of HMACAcceptanceKey.
 const AcceptanceAlgorithmHMACSHA256 = "HMAC-SHA256"
 
@@ -865,8 +885,8 @@ func restoreV2(p PersistedVerified, rec AcceptanceRecord, verifier AcceptanceVer
 	if err := authenticateAcceptance(rec, verifier); err != nil {
 		return DerivedVerifiedOutcome{}, err
 	}
-	if rec.SchemaVersion != SchemaVersion {
-		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: unsupported schema version %d (want %d)", ErrAcceptance, rec.SchemaVersion, SchemaVersion)
+	if want, ok := AcceptanceWireSchema(rec.AcceptanceVersion); !ok || rec.SchemaVersion != want {
+		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: schema version %d is not the frozen wire schema for acceptance v%d", ErrAcceptance, rec.SchemaVersion, rec.AcceptanceVersion)
 	}
 	obDig, err := obligationDigestV2(p.Obligation)
 	if err != nil {
@@ -974,8 +994,8 @@ func restoreCurrent(p PersistedVerified, rec AcceptanceRecord, verifier Acceptan
 	if err := authenticateAcceptance(rec, verifier); err != nil {
 		return DerivedVerifiedOutcome{}, err
 	}
-	if rec.SchemaVersion != SchemaVersion {
-		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: unsupported schema version %d (want %d)", ErrAcceptance, rec.SchemaVersion, SchemaVersion)
+	if want, ok := AcceptanceWireSchema(rec.AcceptanceVersion); !ok || rec.SchemaVersion != want {
+		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: schema version %d is not the frozen wire schema for acceptance v%d", ErrAcceptance, rec.SchemaVersion, rec.AcceptanceVersion)
 	}
 	bound := p.Obligation
 	if recipe != nil {

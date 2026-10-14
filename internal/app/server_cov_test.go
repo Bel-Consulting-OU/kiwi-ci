@@ -308,6 +308,7 @@ func TestServerProductionRunnerTokenDecisionIsPostDB(t *testing.T) {
 	// and TestIntegrationServerDBModeProductionNoRunnerMechanismFailsPostDB).
 	err := Server(context.Background(), []string{
 		"--mode", "production",
+		"--single-replica",
 		"--database-url", "postgres://postgres@127.0.0.1:1/postgres?sslmode=disable",
 		"--external-url", "https://ci.example.com",
 		"--tls-cert", "c.pem", "--tls-key", "k.pem",

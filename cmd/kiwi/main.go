@@ -78,6 +78,12 @@ func dispatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return app.VerifyArtifact(args[1:])
 	case "init":
 		return app.Init(args[1:])
+	case "login", "logout", "context":
+		return app.ContextCommand(append([]string{args[0]}, args[1:]...))
+	case "lock":
+		return app.LockCommand(args[1:])
+	case "setup":
+		return app.Setup(args[1:])
 	case "runs", "jobs", "logs", "cancel", "approve", "rerun", "artifacts", "schedules", "policy":
 		return app.Ops(ctx, args[0], args[1:])
 	case "tui":

@@ -437,7 +437,7 @@ var knownFieldTables = map[string]map[string]bool{
 		"packages": true, "components": true, "jobs": true,
 	},
 	"defaults":       {"shell": true, "timeout": true, "retry": true},
-	"concurrency":    {"group": true, "cancel_in_progress": true},
+	"concurrency":    {"group": true, "cancel_in_progress": true, "limit": true},
 	"permissions":    {"id_token": true},
 	"defaults.retry": {"max": true, "backoff": true, "on": true, "max_set": true},
 	"on.*": {
@@ -452,6 +452,7 @@ var knownFieldTables = map[string]map[string]bool{
 		"name": true, "needs": true, "if": true, "runner": true, "runtime": true,
 		"image": true, "network": true, "vm": true, "shell": true, "timeout": true,
 		"retry": true, "env": true, "matrix": true, "paths": true, "paths_ignore": true,
+		"run":      true,
 		"services": true, "steps": true, "cache": true, "artifacts": true,
 		"downloads": true, "clone": true, "workspace": true, "volumes": true,
 		"registries":   true,

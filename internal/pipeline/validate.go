@@ -171,6 +171,9 @@ func validateSpec(s *Spec, relaxComponentJobs bool) error {
 	if err := checkInterpolation(s.Concurrency.Group, "concurrency.group"); err != nil {
 		return err
 	}
+	if s.Concurrency.Limit < 0 {
+		return fmt.Errorf("concurrency.limit must be >= 0")
+	}
 	for name, v := range s.Env {
 		if err := checkEnvName(name); err != nil {
 			return fmt.Errorf("pipeline env: %w", err)
@@ -430,6 +433,12 @@ func matrixComboCount(m map[string][]any) int {
 }
 
 func validateJob(s *Spec, id string, j Job) error {
+	// After UnmarshalYAML canonicalization a job always has its step list:
+	// job-level run: becomes one step. An empty list is legal only for a
+	// component job (steps come from the component body).
+	if len(j.Steps) == 0 && j.Component == "" {
+		return fmt.Errorf("job %q: run or steps is required", id)
+	}
 	switch j.Runtime {
 	case "", "native", "container", "tart":
 	default:

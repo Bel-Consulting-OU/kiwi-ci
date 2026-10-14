@@ -266,6 +266,11 @@ type Defaults struct {
 type Concurrency struct {
 	Group            string `yaml:"group,omitempty" json:"group,omitempty"`
 	CancelInProgress bool   `yaml:"cancel_in_progress,omitempty" json:"cancel_in_progress,omitempty"`
+	// Limit queues work on the group instead of running it concurrently or
+	// cancelling: at most Limit runs of the group are active at once, the
+	// rest wait (FIFO). 0 is unlimited. Essential for deployments,
+	// hardware rigs and scarce licenses.
+	Limit int `yaml:"limit,omitempty" json:"limit,omitempty"`
 }
 
 type Environment struct {
@@ -452,11 +457,16 @@ type DeploymentSpec struct {
 }
 
 type Job struct {
-	Name         string            `yaml:"name,omitempty" json:"name,omitempty"`
-	Needs        []string          `yaml:"needs,omitempty" json:"needs,omitempty"`
-	If           string            `yaml:"if,omitempty" json:"if,omitempty"`
-	Runner       []string          `yaml:"runner,omitempty" json:"runner,omitempty"`
-	Runtime      string            `yaml:"runtime,omitempty" json:"runtime,omitempty"`
+	Name    string   `yaml:"name,omitempty" json:"name,omitempty"`
+	Needs   []string `yaml:"needs,omitempty" json:"needs,omitempty"`
+	If      string   `yaml:"if,omitempty" json:"if,omitempty"`
+	Runner  []string `yaml:"runner,omitempty" json:"runner,omitempty"`
+	Runtime string   `yaml:"runtime,omitempty" json:"runtime,omitempty"`
+	// Run is the simple-case shorthand: a single command step. It is
+	// canonicalized into Steps = [{run: Run}] at parse time (and is mutually
+	// exclusive with an explicit steps list). The simple case must be
+	// absurdly simple:  image + run  is a complete job.
+	Run          string            `yaml:"run,omitempty" json:"run,omitempty"`
 	Image        string            `yaml:"image,omitempty" json:"image,omitempty"`
 	Network      string            `yaml:"network,omitempty" json:"network,omitempty"`
 	VM           string            `yaml:"vm,omitempty" json:"vm,omitempty"`
@@ -530,7 +540,8 @@ func (s *Service) UnmarshalYAML(value *yaml.Node) error {
 }
 
 // UnmarshalYAML records the presence of infra_retries alongside the decoded
-// value (the nested retry block records its own max presence).
+// value (the nested retry block records its own max presence) and
+// canonicalizes the job-level run: shorthand into a single step.
 func (j *Job) UnmarshalYAML(value *yaml.Node) error {
 	type plain Job
 	var p plain
@@ -544,6 +555,27 @@ func (j *Job) UnmarshalYAML(value *yaml.Node) error {
 			case "infra_retries", "infra_retries_set":
 				j.InfraRetriesSet = true
 			}
+		}
+	}
+	// Shorthand: jobs.test.run expands to one step. The simple case must
+	// not require expert syntax.
+	if j.Run != "" {
+		if len(j.Steps) > 0 {
+			return fmt.Errorf("job %q: run and steps are mutually exclusive (use one)", j.Name)
+		}
+		j.Steps = []Step{{Run: j.Run}}
+		j.Run = "" // canonical form carries only steps
+	}
+	// Infer runtime from the declared execution surface when unset. Never
+	// infer native for an untrusted workload — an absent runtime with
+	// image/vm is container/tart, and a bare job is validated as native
+	// only by the trusted admission path (see policy.ValidatePipeline).
+	if j.Runtime == "" {
+		switch {
+		case j.Image != "":
+			j.Runtime = "container"
+		case j.VM != "":
+			j.Runtime = "tart"
 		}
 	}
 	return nil

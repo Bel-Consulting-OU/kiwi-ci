@@ -129,6 +129,9 @@ func TestSecretBrokerFallbackOnValidation(t *testing.T) {
 					cfg.Server.Mode = mode
 					if mode == "production" {
 						cfg.Server.ExternalURL = "https://ci.example.com"
+						// Name the HA topology so the blob-fs contract is
+						// satisfied; this test is about fallback_on.
+						cfg.Server.SingleReplica = true
 					}
 					cfg.SecretBroker.Broker = "vault"
 					cfg.SecretBroker.VaultAddr = "https://vault.example"

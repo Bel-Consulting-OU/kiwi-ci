@@ -75,7 +75,7 @@ func TestValidateProductionConfigRequiresStagingBound(t *testing.T) {
 // no flags), Server() rejects production before any network work.
 func TestServerProductionRefusesMissingStagingBoundAtStartup(t *testing.T) {
 	err := Server(context.Background(), []string{
-		"--mode", "production",
+		"--mode", "production", "--single-replica",
 		"--database-url", "postgres://postgres@127.0.0.1:1/postgres?sslmode=disable",
 		"--external-url", "https://ci.example.com",
 		"--tls-cert", "c.pem", "--tls-key", "k.pem",
@@ -99,7 +99,7 @@ func TestServerProductionRefusesUnusableStagingDirectoryAtStartup(t *testing.T) 
 		t.Fatal(err)
 	}
 	err := Server(context.Background(), []string{
-		"--mode", "production",
+		"--mode", "production", "--single-replica",
 		"--database-url", "postgres://postgres@127.0.0.1:1/postgres?sslmode=disable",
 		"--external-url", "https://ci.example.com",
 		"--tls-cert", "c.pem", "--tls-key", "k.pem",

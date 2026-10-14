@@ -212,6 +212,10 @@ const schemaSource = `{
         },
         "cancel_in_progress": {
           "type": "boolean"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 0
         }
       },
       "additionalProperties": false
@@ -750,9 +754,6 @@ const schemaSource = `{
     },
     "job": {
       "type": "object",
-      "required": [
-        "steps"
-      ],
       "properties": {
         "name": {
           "type": "string"
@@ -778,6 +779,9 @@ const schemaSource = `{
           ]
         },
         "image": {
+          "type": "string"
+        },
+        "run": {
           "type": "string"
         },
         "network": {

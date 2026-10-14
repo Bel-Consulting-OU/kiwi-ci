@@ -71,6 +71,36 @@ func (s *Server) liveness(w http.ResponseWriter, _ *http.Request) {
 // signal is exposed as X-Kiwi-State: degraded until a later persist succeeds.
 // The uncertain directories themselves are named in the structured log
 // (noteFilePersistResult), never in this unauthenticated body.
+// readinessLease reports whether THIS replica can serve runner lease
+// mutations (POST /api/v1/runners/{id}/next). Standbys answer 503 so a load
+// balancer can pin lease traffic to the scheduler leader while still using
+// /readiness for every other route. The body is a fixed string: the probe is
+// unauthenticated.
+func (s *Server) readinessLease(w http.ResponseWriter, r *http.Request) {
+	if s.isDraining() {
+		w.Header().Set("X-Kiwi-Draining", "true")
+		http.Error(w, "control plane draining", http.StatusServiceUnavailable)
+		return
+	}
+	if s.persistenceDegraded() {
+		w.Header().Set("X-Kiwi-State", "degraded")
+		http.Error(w, statePersistenceDegradedBody, http.StatusServiceUnavailable)
+		return
+	}
+	if s.DB == nil {
+		// Dev in-memory store: the single process is always the scheduler.
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if s.Sched == nil || !s.Sched.IsLeader(ctx) {
+		http.Error(w, "scheduler standby", http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
 func (s *Server) readiness(w http.ResponseWriter, r *http.Request) {
 	if s.isDraining() {
 		w.Header().Set("X-Kiwi-Draining", "true")

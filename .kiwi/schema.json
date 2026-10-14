@@ -192,6 +192,10 @@
         },
         "cancel_in_progress": {
           "type": "boolean"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 0
         }
       },
       "additionalProperties": false
@@ -730,9 +734,6 @@
     },
     "job": {
       "type": "object",
-      "required": [
-        "steps"
-      ],
       "properties": {
         "name": {
           "type": "string"
@@ -758,6 +759,9 @@
           ]
         },
         "image": {
+          "type": "string"
+        },
+        "run": {
           "type": "string"
         },
         "network": {

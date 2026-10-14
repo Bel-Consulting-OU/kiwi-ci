@@ -1019,12 +1019,21 @@ func canonicalCopyFile(src, dst string) error {
 // upgrade stage. Returns the N-1 identity (released sha256 or commit sha).
 func canonicalResolveNMinusOne(t *testing.T, srcDir, goBin, outPath string) string {
 	t.Helper()
+	releasedOnly := false
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("KIWI_REQUIRE_RELEASED_N_MINUS_ONE"))) {
+	case "1", "true", "yes":
+		releasedOnly = true
+	}
 	if bin := strings.TrimSpace(os.Getenv("KIWI_N_MINUS_ONE_BIN")); bin != "" {
 		if st, err := os.Stat(bin); err != nil || st.IsDir() {
 			t.Fatalf("released N-1 artifact %q is not a readable file: %v", bin, err)
 		}
 		sha := canonicalSHA256File(t, bin)
-		if want := strings.TrimSpace(strings.ToLower(os.Getenv("KIWI_N_MINUS_ONE_SHA256"))); want != "" && sha != want {
+		want := strings.TrimSpace(strings.ToLower(os.Getenv("KIWI_N_MINUS_ONE_SHA256")))
+		if releasedOnly && want == "" {
+			t.Fatal("KIWI_REQUIRE_RELEASED_N_MINUS_ONE=1 also requires KIWI_N_MINUS_ONE_SHA256 (the published digest)")
+		}
+		if want != "" && sha != want {
 			t.Fatalf("released N-1 artifact %q sha256 = %s, want pinned %s", bin, sha, want)
 		}
 		if err := canonicalCopyFile(bin, outPath); err != nil {
@@ -1034,6 +1043,9 @@ func canonicalResolveNMinusOne(t *testing.T, srcDir, goBin, outPath string) stri
 			t.Fatalf("installed N-1 sha256 = %s, want released %s", got, sha)
 		}
 		return sha
+	}
+	if releasedOnly {
+		t.Fatal("KIWI_REQUIRE_RELEASED_N_MINUS_ONE=1 requires KIWI_N_MINUS_ONE_BIN (the published release binary); source rebuild is not release certification")
 	}
 
 	n1SHA := canonicalPickNMinusOneSHA(t, srcDir)
