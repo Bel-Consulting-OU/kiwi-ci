@@ -509,6 +509,43 @@ func normalizedRunRepoRepoExpr() string {
 	return "COALESCE(NULLIF(BTRIM(payload->>'policy_repo_id'), ''), " + canonicalRepoIDFunctionName + "(payload, url_key))"
 }
 
+// EnsureRepoIdentityFunctionsSQL renders CREATE OR REPLACE FUNCTION for the
+// whole repo-identity SQL function family in DEPENDENCY order. pg_dump records
+// no pg_depend edge from an expression INDEX to an inner SQL function that the
+// index's top-level function inlines, so a vanilla pg_restore can create
+// runs_repo_*_normalized_keyset_idx before kiwi_canonical_repo_id exists and
+// fail (or silently skip the index). Every restore path must run this prelude
+// AFTER the database is created and BEFORE pg_restore — the functions are
+// IMMUTABLE and idempotent, so re-running them after restore is also safe.
+func EnsureRepoIdentityFunctionsSQL() string {
+	var b strings.Builder
+	// Order is load-bearing: host → canonical_repo_id → normalize_* (each
+	// normalize body calls every predecessor). Bodies are bare SQL
+	// expressions (CASE ...), matching the migration form `AS $$SELECT ...$$`.
+	emit := func(name, args, body string) {
+		b.WriteString("CREATE OR REPLACE FUNCTION " + name + "(" + args + ") RETURNS text LANGUAGE sql IMMUTABLE AS $$SELECT ")
+		b.WriteString(body)
+		b.WriteString("$$;\n")
+	}
+	emit(canonicalHostFunctionName, "host text", canonicalHostFunctionBody())
+	emit(canonicalRepoIDFunctionName, "payload jsonb, url_key text", canonicalRepoIDFunctionBody())
+	emit(normalizedRunRepoIdentityFunctionName, "payload jsonb, url_key text", normalizedRunRepoIdentityFunctionBody())
+	emit(normalizedRunRepoFullNameFunctionName, "payload jsonb, url_key text", normalizedRunRepoFullNameFunctionBody())
+	return b.String()
+}
+
+// EnsureRepoIdentitySchemaSQL is EnsureRepoIdentityFunctionsSQL plus a
+// rebuild of the expression indexes that inline those functions. It MUST
+// only run after the runs table exists (post-restore or on a live database).
+func EnsureRepoIdentitySchemaSQL() string {
+	return EnsureRepoIdentityFunctionsSQL() + "\n" +
+		"DROP INDEX IF EXISTS runs_repo_identity_idx;\n" +
+		"DROP INDEX IF EXISTS runs_repo_identity_normalized_keyset_idx;\n" +
+		"DROP INDEX IF EXISTS runs_repo_full_name_normalized_keyset_idx;\n" +
+		normalizedRunRepoIdentityFallbackKeysetIndexDDL() + ";\n" +
+		normalizedRunRepoFullNameFallbackKeysetIndexDDL() + ";\n"
+}
+
 // normalizedRunRepoBackfillSQL renders the migration-0034 backfill UPDATE: it
 // derives both normalized columns for every row that does not have them yet
 // (legacy rows, and rows written by a pre-upgrade binary between 0033 and

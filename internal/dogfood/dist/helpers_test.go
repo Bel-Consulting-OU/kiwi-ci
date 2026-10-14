@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/provenance"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 // ---------------------------------------------------------------------------
@@ -200,12 +201,103 @@ func pgCreateDatabase(t *testing.T, adminDSN string) string {
 	dbName := fmt.Sprintf("kiwi_dist_%d", time.Now().UnixNano()%1_000_000_000)
 	mk := exec.Command(psql, adminDSN, "-c", "CREATE DATABASE "+dbName)
 	if out, err := mk.CombinedOutput(); err != nil {
-		t.Fatalf("create database on external server: %v\n%s", err, out)
+		t.Fatalf("create database on external server: %v\n%s", out, err)
 	}
 	t.Cleanup(func() {
 		_ = exec.Command(psql, adminDSN, "-c", "DROP DATABASE IF EXISTS "+dbName+" WITH (FORCE)").Run()
 	})
 	return replaceURLDatabase(adminDSN, dbName)
+}
+
+// ensureRepoIdentityFunctions runs the repo-identity SQL function prelude
+// against dsn (functions only — safe on an empty database). Call it BEFORE
+// pg_restore so callees exist the moment the dump starts creating objects.
+func ensureRepoIdentityFunctions(t *testing.T, dsn string) {
+	t.Helper()
+	runRepoIdentitySQL(t, dsn, storage.EnsureRepoIdentityFunctionsSQL())
+}
+
+// rebuildRepoIdentitySchema converges functions AND the expression indexes
+// that inline them. Call it AFTER pg_restore: a dump may recreate normalize_*
+// before kiwi_canonical_repo_id (no pg_depend edge) and skip the keyset
+// indexes; this makes the restored database complete.
+func rebuildRepoIdentitySchema(t *testing.T, dsn string) {
+	t.Helper()
+	runRepoIdentitySQL(t, dsn, storage.EnsureRepoIdentitySchemaSQL())
+}
+
+// restorePGDump restores a pg_dump custom-format archive into dsn, then
+// converges the repo-identity function/index family. The two keyset indexes
+// are EXCLUDED from the dump restore: they inline the normalize functions,
+// pg_dump records no edge that orders those functions first, and a vanilla
+// pg_restore therefore fails (or skips) the indexes. rebuildRepoIdentitySchema
+// creates them after the functions exist — so restore is complete and quiet.
+func restorePGDump(t *testing.T, dsn, dumpPath string) {
+	t.Helper()
+	pgRestore := resolvePG(t, "pg_restore")
+	listOut, err := exec.Command(pgRestore, "-l", dumpPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("pg_restore -l: %v\n%s", err, listOut)
+	}
+	filter, err := os.CreateTemp(t.TempDir(), "pg-restore-filter-*.list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(listOut), "\n") {
+		// Skip objects the prelude/rebuild owns: the dump's CREATE FUNCTION
+		// order is unreliable and its CREATE INDEX inlines callees that may
+		// not exist yet. Match on object names (pg_restore -l prints
+		// schema-qualified forms).
+		skip := false
+		for _, name := range []string{
+			"runs_repo_identity_normalized_keyset_idx",
+			"runs_repo_full_name_normalized_keyset_idx",
+			"kiwi_canonical_host",
+			"kiwi_canonical_repo_id",
+			"kiwi_normalize_run_repo_identity",
+			"kiwi_normalize_run_repo_full_name",
+		} {
+			if strings.Contains(line, name) {
+				skip = true
+				break
+			}
+		}
+		if skip {
+			continue
+		}
+		if _, err := filter.WriteString(line + "\n"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := filter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ensureRepoIdentityFunctions(t, dsn)
+	if out, err := exec.Command(pgRestore, "-L", filter.Name(), "-d", dsn, dumpPath).CombinedOutput(); err != nil {
+		// pg_restore may exit non-zero on harmless warnings; the schema
+		// rebuild below is the completeness gate.
+		t.Logf("pg_restore: %v\n%s", err, out)
+	}
+	rebuildRepoIdentitySchema(t, dsn)
+}
+
+func runRepoIdentitySQL(t *testing.T, dsn, sql string) {
+	t.Helper()
+	psql := resolvePG(t, "psql")
+	f, err := os.CreateTemp(t.TempDir(), "repo-identity-*.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(sql); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(psql, dsn, "-v", "ON_ERROR_STOP=1", "-f", f.Name())
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("repo-identity SQL: %v\n%s", err, out)
+	}
 }
 
 // replaceURLDatabase swaps the database component of a postgres:// URL.

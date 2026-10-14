@@ -671,10 +671,7 @@ func TestSysDFCanonicalReleaseScenarioIntegration(t *testing.T) {
 	if out, err := exec.Command(psql, pgAdmin, "-c", "CREATE DATABASE "+dbName).CombinedOutput(); err != nil {
 		t.Fatalf("recreate database: %v\n%s", err, out)
 	}
-	pgRestore := resolvePG(t, "pg_restore")
-	if out, err := exec.Command(pgRestore, "-d", pgDSN, dumpPath).CombinedOutput(); err != nil {
-		t.Logf("pg_restore: %v\n%s", err, out)
-	}
+	restorePGDump(t, pgDSN, dumpPath)
 	dataDir2 := filepath.Join(root, "data-restored")
 	if err := copyTree(dataBackup, dataDir2); err != nil {
 		t.Fatalf("restore object store: %v", err)

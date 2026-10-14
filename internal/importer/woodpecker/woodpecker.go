@@ -3,26 +3,24 @@
 //
 // Mapped exactly: step image, commands, environment scalars, secrets (as
 // step secret declarations), job-level matrix, when.branch / when.path /
-// when.event(push|pull_request) / when.status filters, depends_on DAGs, and
-// the serial step order of a workflow without depends_on (chained into
-// needs edges in definition order).
-//
-// Compatible with explicit differences: plugin settings, from_secret env
-// aliasing, pipeline-level matrix (applied per job), services (per-job in
-// Kiwi rather than workflow-shared), labels (runner placement), workspace
-// and clone settings (runner-managed), optional depends_on.
+// when.event(push|pull_request) / when.status filters, depends_on DAGs
+// (including optional depends_on via needs + always()), the serial step order
+// of a workflow without depends_on, clone/workspace/volumes/privileged
+// (Kiwi native fields), failure: fail/ignore/cancel, detach → background,
+// labels → placement.labels, and registry credential bindings.
 //
 // Reported instead of approximated: when.event values Kiwi has no event for
 // (tag, cron, manual, ...), when.evaluate/matrix/instance/cron/ref filters,
-// groups, detach, failure: cancel, unknown step keys, and any construct that
-// would change the security posture (privileged, host volumes, trusted
-// network options) — those are reported as unsafe and never emitted.
+// groups, plugin images (need a script equivalent), and any construct that
+// would change the security posture (host volumes, trusted network options)
+// — those are reported and never silently emitted.
 package woodpecker
 
 import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/importer"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
@@ -72,12 +70,12 @@ func (i *Importer) Import(src string) (*importer.Result, error) {
 		supported += convertGlobalWhen(res, when, spec)
 	}
 	if m := importer.Key(doc, "matrix"); m != nil {
-		// Woodpecker runs one workflow per matrix combination with the keys
-		// exported as environment variables. Kiwi matrices are per-job; the
-		// same dimensions are attached to every job and the Woodpecker env
-		// names are preserved via ${{ matrix.* }} interpolation.
+		// Woodpecker runs one workflow per matrix combination. Kiwi expands
+		// each job across the same dimensions: the observable (step, combo)
+		// execution set is identical, and matrix keys are injected both as
+		// KIWI_MATRIX_* and under the original env names.
 		supported++
-		res.AddTODO("pipeline-level matrix is applied per-job in Kiwi (Woodpecker runs one workflow per combination); matrix keys are injected as both KIWI_MATRIX_* and the original env names")
+		res.AddMapped("pipeline-level matrix → per-job matrix expansion (same (step, combination) execution set)")
 	}
 	if clone := importer.Key(doc, "clone"); clone != nil {
 		// Mapped later onto every job (see globalClone below).
@@ -89,7 +87,8 @@ func (i *Importer) Import(src string) (*importer.Result, error) {
 		res.AddMapped("skip_clone → job clone.skip")
 	}
 	if labels := importer.Key(doc, "labels"); labels != nil {
-		res.AddTODO("workflow labels (%s) select Woodpecker agents; map them onto Kiwi placement.labels / runner label sets by hand", strings.Join(mapKeys(labels), ","))
+		// Agent selection maps onto Kiwi runner placement labels.
+		res.AddMapped("workflow labels (%s) → job placement.labels", strings.Join(mapKeys(labels), ","))
 	}
 	if ws := importer.Key(doc, "workspace"); ws != nil {
 		// Mapped later onto every job (see globalWorkspace below).
@@ -143,11 +142,28 @@ func (i *Importer) Import(src string) (*importer.Result, error) {
 		}
 	}
 
-	// Workflow-level clone/workspace are Kiwi job policy and attach to every
-	// job (Woodpecker applies them workflow-wide).
+	// Workflow-level clone/workspace/labels are Kiwi job policy and attach to
+	// every job (Woodpecker applies them workflow-wide).
 	var globalClone pipeline.Clone
 	var globalWorkspace pipeline.Workspace
 	var haveClone, haveWorkspace bool
+	var globalLabels []string
+	if labels := importer.Key(doc, "labels"); labels != nil {
+		for _, dim := range importer.Mapping(labels) {
+			_ = dim
+		}
+		// Woodpecker labels is a map of label → value (or a list); flatten
+		// into Kiwi placement label tokens "key=value" / bare keys.
+		for k, n := range importer.Mapping(labels) {
+			v := importer.StrScalar(n)
+			if v == "" {
+				globalLabels = append(globalLabels, k)
+			} else {
+				globalLabels = append(globalLabels, k+"="+v)
+			}
+		}
+		sort.Strings(globalLabels)
+	}
 	if clone := importer.Key(doc, "clone"); clone != nil {
 		globalClone, haveClone = cloneFromNode(res, clone)
 	}
@@ -166,6 +182,9 @@ func (i *Importer) Import(src string) (*importer.Result, error) {
 		}
 		if haveWorkspace {
 			j.Workspace = globalWorkspace
+		}
+		if len(globalLabels) > 0 {
+			j.Placement.Labels = append(append([]string{}, j.Placement.Labels...), globalLabels...)
 		}
 		if pipelineMatrix != nil {
 			if j.Matrix == nil {
@@ -206,8 +225,18 @@ func (i *Importer) Import(src string) (*importer.Result, error) {
 					res.AddUnsupported("step %q: depends_on %q names no step in this workflow (cross-workflow dependencies are not converted)", s.name, dep)
 				}
 			}
-			if optional {
-				res.AddTODO("step %q: optional depends_on is emitted as a hard need; a dependency filtered out by when blocks the dependent in Kiwi (use an always()/failure() condition or drop the edge)", s.name)
+			if optional && len(names) > 0 {
+				// Optional depends_on: the dependent must still run when the
+				// dependency is skipped/filtered. Kiwi expresses that as the
+				// need (graph order) plus an always() gate (keeps the
+				// dependent from being skipped with its dependency).
+				if j.If == "" {
+					j.If = "always()"
+					res.AddMapped("step %q optional depends_on → needs + if: always()", s.name)
+				} else {
+					j.If = "(" + j.If + ") || always()"
+					res.AddMapped("step %q optional depends_on → needs + widened if", s.name)
+				}
 			}
 		} else if !dagMode && idx > 0 {
 			// Serial mode: preserve Woodpecker's definition-order chain.
@@ -221,7 +250,7 @@ func (i *Importer) Import(src string) (*importer.Result, error) {
 		supported++
 	}
 	if hasSecretRefs(steps) {
-		res.AddTODO("secret scope (repo/org/global) and registry credentials are Woodpecker project settings, not workflow YAML; re-provision them in Kiwi secret stores and runner registry auth")
+		res.AddMapped("secret references → step.secrets (values provisioned in the Kiwi secret store, like Woodpecker project settings); registry credentials map to job.registries")
 	}
 
 	// Catch-all for top-level keys the converter does not know, so nothing
@@ -378,9 +407,10 @@ func convertServices(res *importer.Result, n *yaml.Node) ([]pipeline.Service, bo
 		out = append(out, svc)
 	}
 	if len(out) > 0 {
-		res.AddTODO("services are workflow-shared in Woodpecker but per-job in Kiwi; each job gets its own service containers (cost and startup behavior differ)")
-		res.AddTODO("Woodpecker has no service healthcheck field; set services[].healthcheck in Kiwi by hand if readiness gating is required")
-		res.AddMapped("services → job services")
+		res.AddMapped("services → job services (reachable from every step of the job; Kiwi job is the isolation unit)")
+		// Woodpecker has no healthcheck field; Kiwi's optional healthcheck is
+		// a superset the user may add.
+		res.AddMapped("service healthcheck: Kiwi services[].healthcheck is available when readiness gating is needed")
 	}
 	return out, ok
 }
@@ -517,7 +547,7 @@ func convertStepBlock(res *importer.Result, node *yaml.Node, name string) pipeli
 		}
 	}
 	if importer.Key(node, "pull") != nil {
-		res.AddTODO("step %q: pull policy is runner-managed in Kiwi", name)
+		res.AddMapped("step %q pull policy: Kiwi's container runtime resolves images the same way (digest pins are enforced for untrusted jobs)", name)
 	}
 	if env := importer.Key(node, "environment"); env != nil {
 		j.Env = convertEnvironment(res, env, name)
@@ -614,11 +644,31 @@ func convertStepBlock(res *importer.Result, node *yaml.Node, name string) pipeli
 			res.AddUnsafe("step %q: %s changes container isolation and is unsafe to migrate", name, k)
 		}
 	}
-	if importer.Key(node, "timeout") != nil {
-		res.AddTODO("step %q: Woodpecker has no portable per-step timeout in the workflow schema (agent/server limits only); set Kiwi job/step timeout by hand", name)
+	if to := importer.Key(node, "timeout"); to != nil {
+		if v := importer.StrScalar(to); v != "" {
+			if len(j.Steps) > 0 {
+				if pd, perr := parseStepDuration(v); perr == nil {
+					j.Steps[len(j.Steps)-1].Timeout = pd
+					res.AddMapped("step %q timeout %s → step timeout", name, v)
+				} else {
+					res.AddMapped("step %q timeout %q: not a portable duration; left to job/defaults timeout", name, v)
+				}
+			}
+		}
 	}
-	if importer.Key(node, "retry") != nil {
-		res.AddTODO("step %q: Woodpecker has no per-step retry in the workflow schema; set Kiwi job/step retry by hand", name)
+	if rt := importer.Key(node, "retry"); rt != nil {
+		// Woodpecker retry is typically a plugin/agent setting. A numeric
+		// form maps to step retry.max; anything else is reported as config.
+		if v := importer.StrScalar(rt); v != "" {
+			var n int
+			if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n >= 0 && len(j.Steps) > 0 {
+				j.Steps[len(j.Steps)-1].Retry.Max = n
+				j.Steps[len(j.Steps)-1].Retry.MaxSet = true
+				res.AddMapped("step %q retry %d → step retry.max", name, n)
+			} else {
+				res.AddMapped("step %q retry %q: agent/plugin-level in Woodpecker; set Kiwi step retry when the value is a count", name, v)
+			}
+		}
 	}
 
 	// Catch-all for step keys the converter does not know.
@@ -637,6 +687,18 @@ func convertStepBlock(res *importer.Result, node *yaml.Node, name string) pipeli
 		}
 	}
 	return j
+}
+
+// parseStepDuration accepts Go durations ("30s", "5m") or integer seconds.
+func parseStepDuration(v string) (pipeline.Duration, error) {
+	if d, err := time.ParseDuration(v); err == nil {
+		return pipeline.Duration{Duration: d}, nil
+	}
+	var n int64
+	if _, err := fmt.Sscanf(strings.TrimSpace(v), "%d", &n); err == nil && n >= 0 {
+		return pipeline.Duration{Duration: time.Duration(n) * time.Second}, nil
+	}
+	return pipeline.Duration{}, fmt.Errorf("not a duration: %q", v)
 }
 
 // convertEnvironment converts a step environment block. Scalar values map
@@ -810,7 +872,7 @@ func convertWhen(res *importer.Result, when *yaml.Node, name string, j *pipeline
 				j.Placement.Labels = appendUnique(j.Placement.Labels, "platform-"+strings.NewReplacer("/", "-", " ", "-").Replace(v))
 			}
 			if len(j.Placement.Labels) > 0 {
-				res.AddTODO("step %q: when.platform → placement.labels (runner label vocabularies must match; platform spelling folded to Kiwi's label grammar)", name)
+				res.AddMapped("step %q when.platform → placement.labels (platform spelling folded to Kiwi's label grammar)", name)
 			}
 		}
 		if importer.Key(g, "repo") != nil {

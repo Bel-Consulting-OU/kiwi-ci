@@ -74,14 +74,16 @@ func TestImportEdgeFixture(t *testing.T) {
 	}
 
 	for _, want := range []string{
-		"pipeline-level matrix",
 		"when.event", "when.repo", "group",
 	} {
 		if !hasNote(res.Unsupported, want) && !hasNote(res.TODOs, want) {
 			t.Errorf("note %q missing: unsupported=%v todos=%v", want, res.Unsupported, res.TODOs)
 		}
 	}
-	// Clone/skip_clone/privileged/detach are native Kiwi capabilities.
+	// Matrix, clone, skip_clone, privileged, detach are native mappings.
+	if !hasNote(res.Mapped, "matrix") {
+		t.Errorf("matrix not mapped: %v", res.Mapped)
+	}
 	if !hasNote(res.Mapped, "clone") {
 		t.Errorf("clone not mapped: mapped=%v", res.Mapped)
 	}
