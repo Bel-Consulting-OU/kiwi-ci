@@ -13,6 +13,10 @@ type Command struct {
 	Dir            string
 	Env            []string
 	TimeoutSeconds int64
+	// Background starts the script without waiting for it (Woodpecker
+	// detach). The process is torn down with the job workspace/container.
+	// No step outputs are collected from a background step.
+	Background bool
 }
 
 type Backend interface {

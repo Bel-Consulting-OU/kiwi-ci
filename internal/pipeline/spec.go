@@ -318,6 +318,12 @@ func (n *NetworkPolicy) UnmarshalYAML(node *yaml.Node) error {
 type Sandbox struct {
 	Rootless       bool `yaml:"rootless,omitempty" json:"rootless,omitempty"`
 	ReadOnlyRootFS bool `yaml:"read_only_rootfs,omitempty" json:"read_only_rootfs,omitempty"`
+	// Privileged requests a privileged container/VM. It exists as a
+	// first-class capability (some build workloads need it) and is gated by
+	// trust: untrusted jobs are refused at admission, and trusted jobs only
+	// run it on runners whose policy allows privileged execution. The
+	// default is always the hardened non-privileged plan.
+	Privileged bool `yaml:"privileged,omitempty" json:"privileged,omitempty"`
 	// NonRoot demands the workload not run as container UID 0 on a ROOTFUL
 	// daemon. Under rootless Docker the hardened plan runs container UID 0
 	// inside a user namespace that cannot map to host root, which satisfies
@@ -332,6 +338,66 @@ type Sandbox struct {
 type Placement struct {
 	Regions []string `yaml:"regions,omitempty" json:"regions,omitempty"`
 	Labels  []string `yaml:"labels,omitempty" json:"labels,omitempty"`
+}
+
+// Clone configures how the runner checks the repository out into the job
+// workspace. It is first-class Kiwi execution policy (not a foreign-CI
+// adapter): every field is honored by the default checkout path and is part
+// of the compiled job identity. Zero value means the default checkout
+// (blob-filtered clone of the pinned ref).
+type Clone struct {
+	// Skip leaves the workspace without a checkout. Jobs that only consume
+	// artifacts, caches, or services set this.
+	Skip bool `yaml:"skip,omitempty" json:"skip,omitempty"`
+	// Depth is the shallow-clone depth. Zero is a full history fetch under
+	// the default blob filter; 1 is a tip-only tree.
+	Depth int `yaml:"depth,omitempty" json:"depth,omitempty"`
+	// Submodules: false (default) leaves submodules uninitialized; true
+	// initializes and updates them recursively after checkout.
+	Submodules bool `yaml:"submodules,omitempty" json:"submodules,omitempty"`
+	// LFS pulls Git LFS objects after checkout when true.
+	LFS bool `yaml:"lfs,omitempty" json:"lfs,omitempty"`
+	// SparsePaths, when non-empty, limits the checkout to these pathspecs
+	// (sparse-checkout cone). Empty checks the full tree.
+	SparsePaths []string `yaml:"sparse_paths,omitempty" json:"sparse_paths,omitempty"`
+}
+
+// Workspace configures where the job's working tree lands inside the
+// runner-assigned workspace root. The runner still owns the root and its
+// quota; these fields only place the checkout within it (Woodpecker
+// workspace.base/path semantics, expressed as Kiwi policy).
+type Workspace struct {
+	// Base is the directory name under the workspace root that holds the
+	// checkout. Empty means the runner default (the repository name).
+	Base string `yaml:"base,omitempty" json:"base,omitempty"`
+	// Path is the subdirectory under Base that is the job's working
+	// directory for steps. Empty means Base itself.
+	Path string `yaml:"path,omitempty" json:"path,omitempty"`
+}
+
+// Volume is one job-scoped named volume. Volumes are shared across steps of
+// the same job (and its services), live outside the checkout, and are
+// destroyed with the job workspace. Host paths are refused unless the job is
+// trusted AND the volume is explicitly a host mount — untrusted workloads
+// never see host filesystem paths.
+type Volume struct {
+	Name string `yaml:"name" json:"name"`
+	// Path is the absolute mount point inside the job containers.
+	Path string `yaml:"path" json:"path"`
+	// HostPath, when set, bind-mounts a host directory. Trusted-only; a
+	// non-empty HostPath on an untrusted job is a validation refusal.
+	HostPath string `yaml:"host_path,omitempty" json:"host_path,omitempty"`
+	// ReadOnly mounts the volume read-only when true.
+	ReadOnly bool `yaml:"read_only,omitempty" json:"read_only,omitempty"`
+}
+
+// Registry is one private container registry credential binding. The secret
+// names are resolved through the job's secret provider at execution time and
+// never appear in logs or evidence. Empty host means Docker Hub.
+type Registry struct {
+	Host           string `yaml:"host,omitempty" json:"host,omitempty"`
+	UsernameSecret string `yaml:"username_secret" json:"username_secret"`
+	PasswordSecret string `yaml:"password_secret" json:"password_secret"`
 }
 
 // Resources declares the compute resources a job requires.
@@ -406,6 +472,10 @@ type Job struct {
 	Cache        []Cache           `yaml:"cache,omitempty" json:"cache,omitempty"`
 	Artifacts    []Artifact        `yaml:"artifacts,omitempty" json:"artifacts,omitempty"`
 	Downloads    []ArtifactInput   `yaml:"downloads,omitempty" json:"downloads,omitempty"`
+	Clone        Clone             `yaml:"clone,omitempty" json:"clone,omitempty"`
+	Workspace    Workspace         `yaml:"workspace,omitempty" json:"workspace,omitempty"`
+	Volumes      []Volume          `yaml:"volumes,omitempty" json:"volumes,omitempty"`
+	Registries   []Registry        `yaml:"registries,omitempty" json:"registries,omitempty"`
 	TestReports  []string          `yaml:"test_reports,omitempty" json:"test_reports,omitempty"`
 	Environment  Environment       `yaml:"environment,omitempty" json:"environment,omitempty"`
 	InfraRetries int               `yaml:"infra_retries,omitempty" json:"infra_retries,omitempty"`
@@ -491,6 +561,15 @@ type Step struct {
 	Timeout          Duration          `yaml:"timeout,omitempty" json:"timeout,omitempty"`
 	Retry            Retry             `yaml:"retry,omitempty" json:"retry,omitempty"`
 	ContinueOnError  bool              `yaml:"continue_on_error,omitempty" json:"continue_on_error,omitempty"`
+	// CancelJobOnFailure cancels the whole job as soon as this step fails
+	// (Woodpecker `failure: cancel`). Remaining steps — including always() /
+	// failure() diagnostics — do not run. Mutually exclusive with
+	// ContinueOnError.
+	CancelJobOnFailure bool `yaml:"cancel_job_on_failure,omitempty" json:"cancel_job_on_failure,omitempty"`
+	// Background starts the step and does not wait for it (Woodpecker
+	// `detach: true`). The process is torn down with the job workspace. No
+	// step outputs are collected from a background step.
+	Background bool `yaml:"background,omitempty" json:"background,omitempty"`
 }
 
 // Retry-policy caps. They are finite policy choices enforced at admission

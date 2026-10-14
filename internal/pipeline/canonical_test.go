@@ -96,6 +96,110 @@ jobs:
 	}
 }
 
+// TestPipelineDigestChangesWithCheckoutAndMounts: Clone, Workspace and
+// Volumes are execution identity. A digest that ignores them would let two
+// different checkouts/mounts collide as one pipeline definition.
+func TestPipelineDigestChangesWithCheckoutAndMounts(t *testing.T) {
+	base := `version: 1
+jobs:
+  x:
+    steps:
+      - run: echo hi
+`
+	cases := map[string]string{
+		"clone.skip": `version: 1
+jobs:
+  x:
+    clone:
+      skip: true
+    steps:
+      - run: echo hi
+`,
+		"clone.depth": `version: 1
+jobs:
+  x:
+    clone:
+      depth: 1
+    steps:
+      - run: echo hi
+`,
+		"clone.lfs": `version: 1
+jobs:
+  x:
+    clone:
+      lfs: true
+    steps:
+      - run: echo hi
+`,
+		"workspace.base": `version: 1
+jobs:
+  x:
+    workspace:
+      base: repo
+    steps:
+      - run: echo hi
+`,
+		"workspace.path": `version: 1
+jobs:
+  x:
+    workspace:
+      path: src
+    steps:
+      - run: echo hi
+`,
+		"volumes": `version: 1
+jobs:
+  x:
+    volumes:
+      - name: data
+        path: /data
+    steps:
+      - run: echo hi
+`,
+		"volume.host_path": `version: 1
+jobs:
+  x:
+    volumes:
+      - name: data
+        path: /data
+        host_path: /var/data
+    steps:
+      - run: echo hi
+`,
+		"sandbox.privileged": `version: 1
+jobs:
+  x:
+    runtime: container
+    image: alpine:3.20
+    sandbox:
+      privileged: true
+    steps:
+      - run: echo hi
+`,
+	}
+	s0, err := Parse([]byte(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d0, err := PipelineDigest(s0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, doc := range cases {
+		s, err := Parse([]byte(doc))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		d, err := PipelineDigest(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d == d0 {
+			t.Fatalf("%s must change the pipeline digest", name)
+		}
+	}
+}
+
 func TestPipelineDigestIgnoresSecretOrderAndDuplicates(t *testing.T) {
 	docA := `version: 1
 secrets: [a, b, a]

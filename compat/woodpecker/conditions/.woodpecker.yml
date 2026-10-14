@@ -1,0 +1,44 @@
+# conditions: when/event/branch/tag/path/platform/status filters. Branch
+# globs become branchMatch, push/pull_request events become event
+# comparisons, status filters map to success()/failure()/always(). tag
+# events and when.ref have no Kiwi job-condition equivalent and are
+# reported as unsupported (the step would run unconditionally).
+branches: [main, develop]
+
+when:
+  - event: [push, pull_request]
+
+steps:
+  docs:
+    image: alpine:3.20
+    commands:
+      - ./build-docs.sh
+    when:
+      branch: docs/**
+      path: ["docs/**", "*.md"]
+  lint:
+    image: golang:1.23
+    commands:
+      - go vet ./...
+    when:
+      branch: [main, develop]
+      event: [push, pull_request]
+  release:
+    image: golang:1.23
+    commands:
+      - ./release.sh
+    when:
+      event: [tag]
+      ref: refs/tags/v*
+  notify:
+    image: alpine:3.20
+    commands:
+      - ./notify.sh
+    when:
+      status: [success, failure]
+  failure_report:
+    image: alpine:3.20
+    commands:
+      - ./failure-report.sh
+    when:
+      status: [failure]

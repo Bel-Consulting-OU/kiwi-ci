@@ -191,15 +191,15 @@ exit 0
 	t.Setenv("KIWI_GIT_ALLOWED_HTTPS_HOSTS", "example.com")
 	r := &Runner{ID: "r", Cfg: Config{}, Client: &http.Client{Timeout: 30 * time.Second}, Metrics: NewMetrics()}
 	job := model.Job{RepoURL: "https://example.com/acme/app.git", Ref: "main"}
-	if err := r.checkout(context.Background(), job, filepath.Join(t.TempDir(), "clone")); err != nil {
+	if err := r.checkout(context.Background(), job, filepath.Join(t.TempDir(), "clone"), pipeline.Clone{}, pipeline.Workspace{}); err != nil {
 		t.Fatalf("checkout: %v", err)
 	}
 	// SHA is preferred over ref.
-	if err := r.checkout(context.Background(), model.Job{RepoURL: job.RepoURL, SHA: "deadbeef"}, filepath.Join(t.TempDir(), "clone2")); err != nil {
+	if err := r.checkout(context.Background(), model.Job{RepoURL: job.RepoURL, SHA: "deadbeef"}, filepath.Join(t.TempDir(), "clone2"), pipeline.Clone{}, pipeline.Workspace{}); err != nil {
 		t.Fatalf("sha checkout: %v", err)
 	}
 	// Neither ref nor SHA defaults to HEAD.
-	if err := r.checkout(context.Background(), model.Job{RepoURL: job.RepoURL}, filepath.Join(t.TempDir(), "clone3")); err != nil {
+	if err := r.checkout(context.Background(), model.Job{RepoURL: job.RepoURL}, filepath.Join(t.TempDir(), "clone3"), pipeline.Clone{}, pipeline.Workspace{}); err != nil {
 		t.Fatalf("HEAD checkout: %v", err)
 	}
 	log, _ := os.ReadFile(os.Getenv("FAKE_GIT_LOG"))
@@ -207,18 +207,18 @@ exit 0
 		t.Fatalf("git invocations = %s", log)
 	}
 	// The clone URL scheme is validated before git runs.
-	if err := r.checkout(context.Background(), model.Job{RepoURL: "http://[::1"}, filepath.Join(t.TempDir(), "bad")); err == nil {
+	if err := r.checkout(context.Background(), model.Job{RepoURL: "http://[::1"}, filepath.Join(t.TempDir(), "bad"), pipeline.Clone{}, pipeline.Workspace{}); err == nil {
 		t.Fatal("invalid repo URL accepted")
 	}
 	// Clone failure.
 	t.Setenv("FAKE_GIT_FAIL_CLONE", "1")
-	if err := r.checkout(context.Background(), job, filepath.Join(t.TempDir(), "clone4")); err == nil {
+	if err := r.checkout(context.Background(), job, filepath.Join(t.TempDir(), "clone4"), pipeline.Clone{}, pipeline.Workspace{}); err == nil {
 		t.Fatal("clone failure accepted")
 	}
 	// Checkout failure.
 	t.Setenv("FAKE_GIT_FAIL_CLONE", "")
 	t.Setenv("FAKE_GIT_FAIL_CHECKOUT", "1")
-	if err := r.checkout(context.Background(), job, filepath.Join(t.TempDir(), "clone5")); err == nil {
+	if err := r.checkout(context.Background(), job, filepath.Join(t.TempDir(), "clone5"), pipeline.Clone{}, pipeline.Workspace{}); err == nil {
 		t.Fatal("checkout failure accepted")
 	}
 	// checkoutTask routes through the same path.

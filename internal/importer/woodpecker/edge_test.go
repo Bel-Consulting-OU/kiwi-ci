@@ -61,20 +61,47 @@ func TestImportEdgeFixture(t *testing.T) {
 	if build.Image != "golang:1.23" || build.Env["CGO"] != "0" {
 		t.Fatalf("build = %+v", build)
 	}
-	if build.If != "(branch == 'main' || branch == 'develop')" {
+	// when.branch list is an OR, when.event list is an OR, and the two
+	// filters AND together. tag is reported (not silently dropped).
+	if build.If != "((branch == 'main' || branch == 'develop') && event == 'push')" {
 		t.Fatalf("build if = %q", build.If)
 	}
 	if len(build.Paths) != 1 || build.Paths[0] != "src/**" {
 		t.Fatalf("build paths = %v", build.Paths)
 	}
+	if len(build.Placement.Labels) != 1 || build.Placement.Labels[0] != "platform-linux-amd64" {
+		t.Fatalf("build placement = %+v", build.Placement)
+	}
 
 	for _, want := range []string{
-		"pipeline-level matrix", "clone settings", "skip_clone",
-		"when.event", "when.repo/platform", "detach/privileged", "group",
+		"pipeline-level matrix",
+		"when.event", "when.repo", "group",
 	} {
 		if !hasNote(res.Unsupported, want) && !hasNote(res.TODOs, want) {
 			t.Errorf("note %q missing: unsupported=%v todos=%v", want, res.Unsupported, res.TODOs)
 		}
+	}
+	// Clone/skip_clone/privileged/detach are native Kiwi capabilities.
+	if !hasNote(res.Mapped, "clone") {
+		t.Errorf("clone not mapped: mapped=%v", res.Mapped)
+	}
+	if !hasNote(res.Mapped, "skip_clone") {
+		t.Errorf("skip_clone not mapped: %v", res.Mapped)
+	}
+	if !hasNote(res.Mapped, "privileged") {
+		t.Errorf("privileged not mapped as trust-gated capability: %v", res.Mapped)
+	}
+	if hasNote(res.Unsafe, "privileged") {
+		t.Errorf("privileged is a trust-gated Kiwi capability, not an unsafe drop: %v", res.Unsafe)
+	}
+	if !hasNote(res.Mapped, "detach") {
+		t.Errorf("detach not mapped to step background: %v", res.Mapped)
+	}
+	if build.Sandbox.Privileged != true {
+		t.Errorf("build sandbox.privileged = %v, want true", build.Sandbox.Privileged)
+	}
+	if !build.Clone.Skip {
+		t.Errorf("build clone.skip = false, want true from skip_clone")
 	}
 
 	dup := spec.Jobs["dup"]

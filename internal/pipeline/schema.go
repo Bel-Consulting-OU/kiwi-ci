@@ -271,6 +271,12 @@ const schemaSource = `{
         "read_only_rootfs": {
           "type": "boolean"
         },
+        "privileged": {
+          "type": "boolean"
+        },
+        "non_root": {
+          "type": "boolean"
+        },
         "network": {
           "enum": [
             "default",
@@ -278,6 +284,75 @@ const schemaSource = `{
             "services-only",
             "internet"
           ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "clone": {
+      "type": "object",
+      "properties": {
+        "skip": {
+          "type": "boolean"
+        },
+        "depth": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "submodules": {
+          "type": "boolean"
+        },
+        "lfs": {
+          "type": "boolean"
+        },
+        "sparse_paths": {
+          "$ref": "#/$defs/stringArray"
+        }
+      },
+      "additionalProperties": false
+    },
+    "workspace": {
+      "type": "object",
+      "properties": {
+        "base": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "volume": {
+      "type": "object",
+      "required": ["name", "path"],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "host_path": {
+          "type": "string"
+        },
+        "read_only": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "registry": {
+      "type": "object",
+      "required": ["username_secret", "password_secret"],
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "username_secret": {
+          "type": "string"
+        },
+        "password_secret": {
+          "type": "string"
         }
       },
       "additionalProperties": false
@@ -426,6 +501,12 @@ const schemaSource = `{
           "$ref": "#/$defs/retry"
         },
         "continue_on_error": {
+          "type": "boolean"
+        },
+        "cancel_job_on_failure": {
+          "type": "boolean"
+        },
+        "background": {
           "type": "boolean"
         }
       },
@@ -762,6 +843,24 @@ const schemaSource = `{
           "type": "array",
           "items": {
             "$ref": "#/$defs/download"
+          }
+        },
+        "clone": {
+          "$ref": "#/$defs/clone"
+        },
+        "workspace": {
+          "$ref": "#/$defs/workspace"
+        },
+        "volumes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/volume"
+          }
+        },
+        "registries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/registry"
           }
         },
         "test_reports": {

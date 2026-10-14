@@ -776,27 +776,57 @@ func RestoreVerifiedOutcomeWithRecipe(p PersistedVerified, key AcceptanceKey, ke
 	}
 }
 
+// authenticateAcceptance runs the minimal envelope parse and MAC check
+// BEFORE any semantic interpretation of the persisted payload. Order is
+// load-bearing for a verification substrate:
+//
+//	parse envelope (version, MAC, KeyID, Algorithm)
+//	→ resolve key / algorithm
+//	→ authenticate MAC over the acceptance record
+//	→ only then interpret digests, recipes, subjects and evidence
+//
+// Doing digest or recipe work first expands the pre-auth parser surface,
+// leaks error oracles distinguishing "payload tampered" from "MAC bad", and
+// invites a later helper to accidentally become authority-relevant. The MAC
+// covers the acceptance record only (the commit to digests and identity);
+// payload↔record digest comparison is the post-authentication step that binds
+// the persisted objects to that authenticated commitment.
+func authenticateAcceptance(rec AcceptanceRecord, verifier AcceptanceVerifier) error {
+	if rec.MAC == "" {
+		return fmt.Errorf("%w: acceptance record is unsigned", ErrAcceptance)
+	}
+	if rec.KeyID == "" || rec.Algorithm == "" {
+		return fmt.Errorf("%w: acceptance record is missing key id or algorithm", ErrAcceptance)
+	}
+	key, err := verifier.KeyByID(rec.KeyID)
+	if err != nil {
+		return err
+	}
+	if rec.Algorithm != key.Algorithm() {
+		return fmt.Errorf("%w: acceptance algorithm %q does not match key algorithm %q", ErrAcceptance, rec.Algorithm, key.Algorithm())
+	}
+	payload, err := acceptancePayload(rec)
+	if err != nil {
+		return err
+	}
+	if !key.Verify(payload, rec.MAC) {
+		return fmt.Errorf("%w: acceptance MAC verification failed", ErrAcceptance)
+	}
+	return nil
+}
+
 // restoreV1 verifies a legacy acceptance record. v1 bound (obligation,
 // outcome, evidence) but not the claim; the record still restores when its
 // v1 MAC is valid, and sealDerivedOutcome's identity rule is applied so a
 // claim swapped into a v1 row cannot carry a mismatched identity.
 func restoreV1(p PersistedVerified, rec AcceptanceRecord, verifier AcceptanceVerifier) (DerivedVerifiedOutcome, error) {
-	if rec.MAC == "" {
-		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: acceptance record is unsigned", ErrAcceptance)
-	}
-	if rec.KeyID == "" || rec.Algorithm == "" {
-		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: acceptance record is missing key id or algorithm", ErrAcceptance)
-	}
-	key, err := verifier.KeyByID(rec.KeyID)
-	if err != nil {
+	// Authenticate before interpreting any payload content.
+	if err := authenticateAcceptance(rec, verifier); err != nil {
 		return DerivedVerifiedOutcome{}, err
-	}
-	if rec.Algorithm != key.Algorithm() {
-		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: acceptance algorithm %q does not match key algorithm %q", ErrAcceptance, rec.Algorithm, key.Algorithm())
 	}
 	// Canonical re-encoding: the stored triple must hash to the digests the
 	// acceptance record commits, so a tampered payload cannot ride along
-	// under a stale MAC.
+	// under a stale MAC. The digests themselves are now authenticated.
 	obDig, err := obligationDigest(p.Obligation)
 	if err != nil {
 		return DerivedVerifiedOutcome{}, err
@@ -818,13 +848,6 @@ func restoreV1(p PersistedVerified, rec AcceptanceRecord, verifier AcceptanceVer
 	if evDig != rec.VerifiedEvidenceDigest {
 		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: evidence digest mismatch", ErrAcceptance)
 	}
-	payload, err := acceptancePayload(rec)
-	if err != nil {
-		return DerivedVerifiedOutcome{}, err
-	}
-	if !key.Verify(payload, rec.MAC) {
-		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: acceptance MAC verification failed", ErrAcceptance)
-	}
 	// Completeness rules identical to first sealing: a truncated or edited
 	// row is refused instead of quietly losing the proven-pass bit.
 	// v1 encodings never bound Window/Kinds; re-derive both so a database
@@ -838,21 +861,12 @@ func restoreV1(p PersistedVerified, rec AcceptanceRecord, verifier AcceptanceVer
 // obligation / outcome / evidence digests, so a database writer who swaps the
 // claim column (or the subject) breaks the MAC.
 func restoreV2(p PersistedVerified, rec AcceptanceRecord, verifier AcceptanceVerifier) (DerivedVerifiedOutcome, error) {
-	if rec.MAC == "" {
-		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: acceptance record is unsigned", ErrAcceptance)
-	}
-	if rec.KeyID == "" || rec.Algorithm == "" {
-		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: acceptance record is missing key id or algorithm", ErrAcceptance)
+	// Authenticate before interpreting any payload content.
+	if err := authenticateAcceptance(rec, verifier); err != nil {
+		return DerivedVerifiedOutcome{}, err
 	}
 	if rec.SchemaVersion != SchemaVersion {
 		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: unsupported schema version %d (want %d)", ErrAcceptance, rec.SchemaVersion, SchemaVersion)
-	}
-	key, err := verifier.KeyByID(rec.KeyID)
-	if err != nil {
-		return DerivedVerifiedOutcome{}, err
-	}
-	if rec.Algorithm != key.Algorithm() {
-		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: acceptance algorithm %q does not match key algorithm %q", ErrAcceptance, rec.Algorithm, key.Algorithm())
 	}
 	obDig, err := obligationDigestV2(p.Obligation)
 	if err != nil {
@@ -889,13 +903,6 @@ func restoreV2(p PersistedVerified, rec AcceptanceRecord, verifier AcceptanceVer
 	}
 	if !subjectRefsEqual(rec.SubjectRef, p.Obligation.SubjectRef) {
 		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: acceptance subject_ref does not match obligation subject_ref", ErrAcceptance)
-	}
-	payload, err := acceptancePayload(rec)
-	if err != nil {
-		return DerivedVerifiedOutcome{}, err
-	}
-	if !key.Verify(payload, rec.MAC) {
-		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: acceptance MAC verification failed", ErrAcceptance)
 	}
 	// Never trust the persisted Window / Kinds on a v2 row: the evidence/v2
 	// encoding the v2 MAC covers binds neither, so a database writer could
@@ -957,28 +964,19 @@ type restoreEncodings struct {
 }
 
 // restoreCurrent is the shared restore path for v3+ records. enc selects the
-// digest encodings the record was signed with.
+// digest encodings the record was signed with. Authentication runs before any
+// semantic interpretation (see authenticateAcceptance).
 func restoreCurrent(p PersistedVerified, rec AcceptanceRecord, verifier AcceptanceVerifier, recipe *Recipe, enc restoreEncodings) (DerivedVerifiedOutcome, error) {
-	if rec.MAC == "" {
-		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: acceptance record is unsigned", ErrAcceptance)
-	}
-	if rec.KeyID == "" || rec.Algorithm == "" {
-		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: acceptance record is missing key id or algorithm", ErrAcceptance)
+	// Authenticate before interpreting any payload content: MAC over the
+	// acceptance record first, then payload↔record digests, then recipe /
+	// subject / binding semantics. A tampered persisted object must report
+	// ErrAcceptance (MAC) rather than a pre-auth digest or recipe oracle.
+	if err := authenticateAcceptance(rec, verifier); err != nil {
+		return DerivedVerifiedOutcome{}, err
 	}
 	if rec.SchemaVersion != SchemaVersion {
 		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: unsupported schema version %d (want %d)", ErrAcceptance, rec.SchemaVersion, SchemaVersion)
 	}
-	key, err := verifier.KeyByID(rec.KeyID)
-	if err != nil {
-		return DerivedVerifiedOutcome{}, err
-	}
-	if rec.Algorithm != key.Algorithm() {
-		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: acceptance algorithm %q does not match key algorithm %q", ErrAcceptance, rec.Algorithm, key.Algorithm())
-	}
-	// Integrity first: MAC over the acceptance record, then payload↔record
-	// digests. A tampered persisted object must report ErrAcceptance before
-	// any contextual recipe dependency — "the authenticated object changed"
-	// is the stronger, less ambiguous boundary.
 	bound := p.Obligation
 	if recipe != nil {
 		d, err := RecipeDigest(*recipe)
@@ -1042,13 +1040,6 @@ func restoreCurrent(p PersistedVerified, rec AcceptanceRecord, verifier Acceptan
 	}
 	if !subjectRefsEqual(rec.SubjectRef, p.Obligation.SubjectRef) {
 		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: acceptance subject_ref does not match obligation subject_ref", ErrAcceptance)
-	}
-	payload, err := acceptancePayload(rec)
-	if err != nil {
-		return DerivedVerifiedOutcome{}, err
-	}
-	if !key.Verify(payload, rec.MAC) {
-		return DerivedVerifiedOutcome{}, fmt.Errorf("%w: acceptance MAC verification failed", ErrAcceptance)
 	}
 	// Re-apply the obligation-binding rule at restore so a MAC-valid pair
 	// of (other-obligation outcome, this obligation) cannot restore. The

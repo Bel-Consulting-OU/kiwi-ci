@@ -1,0 +1,31 @@
+# cancellation: skip/fail/cancel-related step semantics. skip_clone is
+# runner-managed; `timeout` and `retry` are not Woodpecker workflow-schema
+# fields (agent/server limits only) and must be set by hand in Kiwi;
+# `failure: ignore` maps to continue_on_error; `when.status: [success,
+# failure]` maps to always(); `failure: cancel` has no Kiwi per-step
+# equivalent and is reported as unsupported.
+skip_clone: true
+
+steps:
+  test:
+    image: golang:1.23
+    commands:
+      - go test ./...
+    timeout: 10m
+    retry: 2
+  flaky:
+    image: alpine:3.20
+    commands:
+      - ./flaky.sh
+    failure: ignore
+  cleanup:
+    image: alpine:3.20
+    commands:
+      - ./cleanup.sh
+    when:
+      status: [success, failure]
+  abort_guard:
+    image: alpine:3.20
+    commands:
+      - ./halt.sh
+    failure: cancel

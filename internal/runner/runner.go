@@ -1934,12 +1934,59 @@ func networkPolicyName(p pipeline.NetworkPolicy) string {
 }
 
 // checkoutTask provisions the job workspace: the default git checkout or
-// the configured replacement.
+// the configured replacement. The job's declared clone/workspace policy is
+// resolved from the persisted pipeline and honored by the default checkout.
 func (r *Runner) checkoutTask(ctx context.Context, j model.Job, dir string) error {
 	if r.Cfg.CheckoutFn != nil {
 		return r.Cfg.CheckoutFn(ctx, j, dir)
 	}
-	return r.checkout(ctx, j, dir)
+	clone, ws, err := checkoutPolicyFromPipeline(j)
+	if err != nil {
+		return err
+	}
+	return r.checkout(ctx, j, dir, clone, ws)
+}
+
+// checkoutPolicyFromPipeline resolves the job's Clone and Workspace policy
+// from its persisted pipeline. A missing pipeline yields the default checkout
+// policy (the job cannot execute later without one); a pipeline that fails to
+// parse or compile, or that has no such job, is fail-closed so a checkout can
+// never ignore a declared skip/depth/submodule/lfs policy.
+func checkoutPolicyFromPipeline(j model.Job) (pipeline.Clone, pipeline.Workspace, error) {
+	if strings.TrimSpace(j.Pipeline) == "" {
+		return pipeline.Clone{}, pipeline.Workspace{}, nil
+	}
+	spec, err := pipeline.Parse([]byte(j.Pipeline))
+	if err != nil {
+		return pipeline.Clone{}, pipeline.Workspace{}, fmt.Errorf("cannot resolve checkout policy for job %s: parse persisted pipeline: %w", j.ID, err)
+	}
+	g, err := pipeline.Compile(spec)
+	if err != nil {
+		return pipeline.Clone{}, pipeline.Workspace{}, fmt.Errorf("cannot resolve checkout policy for job %s: compile persisted pipeline: %w", j.ID, err)
+	}
+	cj, ok := g.Jobs[j.Key]
+	if !ok {
+		return pipeline.Clone{}, pipeline.Workspace{}, fmt.Errorf("cannot resolve checkout policy for job %s: compiled job %q not found in the persisted pipeline", j.ID, j.Key)
+	}
+	return cj.Job.Clone, cj.Job.Workspace, nil
+}
+
+// checkoutDir places the working tree under the workspace root according to
+// the job's workspace policy (base then path). The runner still owns the
+// root and its quota.
+func checkoutDir(root string, ws pipeline.Workspace) (string, error) {
+	base := ws.Base
+	if base == "" {
+		base = "."
+	}
+	rel := filepath.Clean(filepath.Join(base, ws.Path))
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("workspace policy escapes the job workspace root: base=%q path=%q", ws.Base, ws.Path)
+	}
+	if rel == "." {
+		return root, nil
+	}
+	return filepath.Join(root, rel), nil
 }
 
 func (r *Runner) heartbeatLoop(ctx context.Context, cancel context.CancelFunc, t server.Task, done <-chan struct{}) {
@@ -2062,12 +2109,26 @@ func changedFiles(ctx context.Context, dir string) []string {
 	return out
 }
 
-func (r *Runner) checkout(ctx context.Context, j model.Job, dir string) error {
+func (r *Runner) checkout(ctx context.Context, j model.Job, root string, clone pipeline.Clone, ws pipeline.Workspace) error {
+	if clone.Skip {
+		return nil
+	}
+	dir, err := checkoutDir(root, ws)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("workspace checkout dir: %w", err)
+	}
 	gitEnv, err := gitEnvForRepo(j.RepoURL, os.Environ())
 	if err != nil {
 		return err
 	}
-	args := []string{"clone", "--filter=blob:none", "--no-checkout", j.RepoURL, dir}
+	args := []string{"clone", "--filter=blob:none", "--no-checkout"}
+	if clone.Depth > 0 {
+		args = append(args, fmt.Sprintf("--depth=%d", clone.Depth))
+	}
+	args = append(args, j.RepoURL, dir)
 	cmdClone := exec.CommandContext(ctx, "git", args...)
 	cmdClone.Env = gitEnv
 	if out, truncated, err := executil.CaptureBounded(cmdClone, maxGitDiagnosticBytes); err != nil {
@@ -2084,6 +2145,33 @@ func (r *Runner) checkout(ctx context.Context, j model.Job, dir string) error {
 	cmd.Env = gitEnv
 	if out, truncated, err := executil.CaptureBounded(cmd, maxGitDiagnosticBytes); err != nil {
 		return fmt.Errorf("git checkout: %v: %s%s", err, out, truncationMarker(truncated))
+	}
+	if len(clone.SparsePaths) > 0 {
+		cmdSparseInit := exec.CommandContext(ctx, "git", "-C", dir, "sparse-checkout", "init", "--cone")
+		cmdSparseInit.Env = gitEnv
+		if out, truncated, err := executil.CaptureBounded(cmdSparseInit, maxGitDiagnosticBytes); err != nil {
+			return fmt.Errorf("git sparse-checkout init: %v: %s%s", err, out, truncationMarker(truncated))
+		}
+		setArgs := append([]string{"-C", dir, "sparse-checkout", "set"}, clone.SparsePaths...)
+		cmdSparseSet := exec.CommandContext(ctx, "git", setArgs...)
+		cmdSparseSet.Env = gitEnv
+		if out, truncated, err := executil.CaptureBounded(cmdSparseSet, maxGitDiagnosticBytes); err != nil {
+			return fmt.Errorf("git sparse-checkout set: %v: %s%s", err, out, truncationMarker(truncated))
+		}
+	}
+	if clone.Submodules {
+		cmdSub := exec.CommandContext(ctx, "git", "-C", dir, "submodule", "update", "--init", "--recursive")
+		cmdSub.Env = gitEnv
+		if out, truncated, err := executil.CaptureBounded(cmdSub, maxGitDiagnosticBytes); err != nil {
+			return fmt.Errorf("git submodule update: %v: %s%s", err, out, truncationMarker(truncated))
+		}
+	}
+	if clone.LFS {
+		cmdLFS := exec.CommandContext(ctx, "git", "-C", dir, "lfs", "pull")
+		cmdLFS.Env = gitEnv
+		if out, truncated, err := executil.CaptureBounded(cmdLFS, maxGitDiagnosticBytes); err != nil {
+			return fmt.Errorf("git lfs pull: %v: %s%s", err, out, truncationMarker(truncated))
+		}
 	}
 	return nil
 }

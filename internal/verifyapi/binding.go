@@ -53,11 +53,16 @@ func validateDigest(field string, d Digest) error {
 	return nil
 }
 
-// Validate reports whether the obligation is structurally sound. It fails
-// closed: missing ids, unpinned digests, an empty check set, an empty
-// assurance profile, or a freshness policy that constrains nothing are all
-// refusals.
-func (o VerificationObligation) Validate() error {
+// ValidateSubmission reports whether the obligation is a structurally sound
+// SUBMISSION: identity, pinned digests, subject hierarchy and provider-axis
+// coherence. Recipe-owned policy dimensions (required_checks,
+// required_assurance, freshness) are NOT required here — when RecipeDigest is
+// set they are supplied by BindRecipe, and requiring them at the submission
+// boundary would force the caller to duplicate recipe authority inline. When
+// they ARE present they must be well formed, so a later BindRecipe agreement
+// check compares clean values. This is the pre-bind half of the submit
+// sequence (see Service.SubmitObligation); Validate is the post-bind gate.
+func (o VerificationObligation) ValidateSubmission() error {
 	if o.ObligationID == "" {
 		return fmt.Errorf("%w: obligation_id is required", ErrInvalid)
 	}
@@ -86,22 +91,6 @@ func (o VerificationObligation) Validate() error {
 			return err
 		}
 	}
-	if len(o.RequiredChecks) == 0 {
-		return fmt.Errorf("%w: required_checks must be non-empty", ErrInvalid)
-	}
-	seen := make(map[string]bool, len(o.RequiredChecks))
-	for _, c := range o.RequiredChecks {
-		if c == "" {
-			return fmt.Errorf("%w: required_checks contains an empty check", ErrInvalid)
-		}
-		if seen[c] {
-			return fmt.Errorf("%w: required_checks contains duplicate %q", ErrInvalid, c)
-		}
-		seen[c] = true
-	}
-	if o.RequiredAssurance == "" {
-		return fmt.Errorf("%w: required_assurance is required", ErrInvalid)
-	}
 	// Provider constraints without a provider kind are unaddressable demand:
 	// an auxiliary axis (contract version, claim class, platform, evidence
 	// types) only means something for a named VerifierProviderKind. Without
@@ -122,11 +111,49 @@ func (o VerificationObligation) Validate() error {
 		}
 		seenET[et] = true
 	}
-	if err := o.Freshness.validate(o.IssuedAt); err != nil {
-		return err
-	}
 	if o.IssuedAt.IsZero() {
 		return fmt.Errorf("%w: issued_at is required", ErrInvalid)
+	}
+	// Present policy dimensions must be well formed; empty ones are filled
+	// by BindRecipe (or required by Validate on the bound copy).
+	if len(o.RequiredChecks) > 0 {
+		seen := make(map[string]bool, len(o.RequiredChecks))
+		for _, c := range o.RequiredChecks {
+			if c == "" {
+				return fmt.Errorf("%w: required_checks contains an empty check", ErrInvalid)
+			}
+			if seen[c] {
+				return fmt.Errorf("%w: required_checks contains duplicate %q", ErrInvalid, c)
+			}
+			seen[c] = true
+		}
+	}
+	if o.Freshness != (FreshnessPolicy{}) {
+		if err := o.Freshness.validate(o.IssuedAt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Validate reports whether the obligation is structurally sound as a BOUND
+// obligation: a complete rule set that can authorize and discharge. It fails
+// closed: missing ids, unpinned digests, an empty check set, an empty
+// assurance profile, or a freshness policy that constrains nothing are all
+// refusals. Call ValidateSubmission first when the caller still intends to
+// BindRecipe; this is the post-bind gate.
+func (o VerificationObligation) Validate() error {
+	if err := o.ValidateSubmission(); err != nil {
+		return err
+	}
+	if len(o.RequiredChecks) == 0 {
+		return fmt.Errorf("%w: required_checks must be non-empty", ErrInvalid)
+	}
+	if o.RequiredAssurance == "" {
+		return fmt.Errorf("%w: required_assurance is required", ErrInvalid)
+	}
+	if err := o.Freshness.validate(o.IssuedAt); err != nil {
+		return err
 	}
 	return nil
 }

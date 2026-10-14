@@ -1,0 +1,62 @@
+{
+  "schema": "kiwi.woodpecker-compat-trace/v1",
+  "source": ".woodpecker.yml",
+  "verdict": "COMPATIBLE WITH EXPLICIT DIFFERENCES",
+  "trigger": {
+    "events": [],
+    "branches": []
+  },
+  "definition_order": ["lint", "build", "integration", "notify"],
+  "step_order": ["lint", "build", "integration", "notify"],
+  "graph": {
+    "lint": [],
+    "build": ["lint"],
+    "integration": ["build"],
+    "notify": ["integration"]
+  },
+  "env": {
+    "lint": {"GO": "${{ matrix.GO }}"},
+    "build": {"GO": "${{ matrix.GO }}"},
+    "integration": {"DATABASE_URL": "postgres://db:5432/app", "GO": "${{ matrix.GO }}"},
+    "notify": {"GO": "${{ matrix.GO }}"}
+  },
+  "skip_states": {
+    "lint": "run",
+    "build": "run",
+    "integration": "run",
+    "notify": "run"
+  },
+  "fail_states": {
+    "lint": "abort_on_error",
+    "build": "abort_on_error",
+    "integration": "abort_on_error",
+    "notify": "abort_on_error"
+  },
+  "matrix": {
+    "lint": {"GO": ["1.22", "1.23"]},
+    "build": {"GO": ["1.22", "1.23"]},
+    "integration": {"GO": ["1.22", "1.23"]},
+    "notify": {"GO": ["1.22", "1.23"]}
+  },
+  "exact": [
+    "services → job services",
+    "step \"integration\" environment → job env",
+    "step \"lint\" image → job image",
+    "step \"build\" commands → steps[].run",
+    "step \"notify\" image → job image"
+  ],
+  "differences": [
+    "services are workflow-shared in Woodpecker but per-job in Kiwi",
+    "Woodpecker has no service healthcheck field",
+    "optional depends_on is emitted as a hard need",
+    "pipeline-level matrix is applied per-job in Kiwi"
+  ],
+  "unsupported": [],
+  "unsafe": [],
+  "todos": [
+    "services are workflow-shared",
+    "service healthcheck",
+    "optional depends_on",
+    "pipeline-level matrix"
+  ]
+}

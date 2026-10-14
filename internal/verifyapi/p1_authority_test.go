@@ -153,6 +153,85 @@ func TestServiceSubmitObligationResolvesRecipeFromRegistry(t *testing.T) {
 	}
 }
 
+// TestServiceSubmitObligationRecipeSuppliesPolicyFields: the documented
+// recipe-bound usage is "submit identity + recipe, Kiwi resolves and fills
+// the recipe-owned policy dimensions". The caller must NOT have to
+// pre-populate required_checks / required_assurance / freshness before
+// SubmitObligation — that would duplicate recipe authority into the caller.
+// ValidateSubmission accepts the partial form; the bound obligation is then
+// fully validated before authorize/persist.
+func TestServiceSubmitObligationRecipeSuppliesPolicyFields(t *testing.T) {
+	f := newServiceFixture(t)
+	reg := NewRecipeRegistry()
+	f.svc.Recipes = reg
+	f.store.WithRecipes(reg)
+	r := testRecipe(t)
+	r.Requirements = []string{CheckJobStatusSuccess, CheckEvidenceRoot}
+	r.Assurance = "no_injected_credentials"
+	r.Freshness = FreshnessPolicy{MaxAgeSeconds: 7200}
+	r.EvidenceMin = EvidenceMinimum{MinAttestations: 1, RequiredKinds: []string{EvidenceKindExecutionAttestation}}
+	d, err := reg.Register(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Identity + recipe only: no checks, no assurance, no freshness.
+	ob := baseObligation(t)
+	ob.ObligationID = "ob-recipe-supplied"
+	ref := tenantRef("tenant-a")
+	ob.SubjectRef = &ref
+	ob.RecipeDigest = d
+	ob.RequiredChecks = nil
+	ob.RequiredAssurance = ""
+	ob.Freshness = FreshnessPolicy{}
+
+	// Pre-bind gate accepts the partial submission.
+	if err := ob.ValidateSubmission(); err != nil {
+		t.Fatalf("ValidateSubmission of recipe-owned-empty obligation = %v, want success", err)
+	}
+	// Full bound Validate must still refuse the unbound partial form: the
+	// policy dimensions are required on the BOUND obligation.
+	if err := ob.Validate(); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("Validate of unbound partial obligation = %v, want ErrInvalid", err)
+	}
+
+	if err := f.svc.SubmitObligation(context.Background(), f.tenantA, ob); err != nil {
+		t.Fatalf("SubmitObligation identity+recipe = %v, want success", err)
+	}
+
+	stored, err := f.store.GetObligation(context.Background(), ob.ObligationID)
+	if err != nil {
+		t.Fatalf("GetObligation: %v", err)
+	}
+	if !stringSetsEqual(stored.RequiredChecks, r.Requirements) {
+		t.Fatalf("stored checks = %v, want recipe %v", stored.RequiredChecks, r.Requirements)
+	}
+	if stored.RequiredAssurance != r.Assurance {
+		t.Fatalf("stored assurance = %q, want recipe %q", stored.RequiredAssurance, r.Assurance)
+	}
+	if !freshnessEqual(stored.Freshness, r.Freshness) {
+		t.Fatalf("stored freshness = %+v, want recipe %+v", stored.Freshness, r.Freshness)
+	}
+	if stored.RecipeDigest != d {
+		t.Fatalf("stored recipe digest = %s, want %s", stored.RecipeDigest, d)
+	}
+	if err := stored.Validate(); err != nil {
+		t.Fatalf("bound stored obligation must Validate: %v", err)
+	}
+
+	// Without a recipe the same empty policy dimensions stay refused — the
+	// full Validate gate is unchanged for inline obligations.
+	inline := baseObligation(t)
+	inline.ObligationID = "ob-inline-empty"
+	inline.SubjectRef = &ref
+	inline.RequiredChecks = nil
+	inline.RequiredAssurance = ""
+	inline.Freshness = FreshnessPolicy{}
+	if err := f.svc.SubmitObligation(context.Background(), f.tenantA, inline); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("inline empty policy = %v, want ErrInvalid", err)
+	}
+}
+
 // TestAcceptBindsEffectiveVerificationDemandDigest: the acceptance record
 // commits the canonical resolved demand, and tampering the demand (or the
 // recipe identity) breaks restore.

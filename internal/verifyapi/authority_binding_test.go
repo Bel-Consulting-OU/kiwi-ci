@@ -216,6 +216,92 @@ func TestProviderConstraintsRideDemand(t *testing.T) {
 	}
 }
 
+// TestDemandSchemaIdentityV1V2: the demand document schema version tracks the
+// semantic object. Historical (no provider contract) demand is schema 1;
+// provider-bearing current demand is schema 2. The two meanings never share a
+// schema number, and the historical v1 digest reconstructs schema 1 rather
+// than trusting the current object's claim.
+func TestDemandSchemaIdentityV1V2(t *testing.T) {
+	ob := baseObligation(t)
+	ob.VerifierProviderKind = "prov-a"
+
+	d, err := ResolveEffectiveDemand(ob, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.SchemaVersion != EffectiveVerificationDemandSchemaVersionV2 {
+		t.Fatalf("current demand SchemaVersion = %d, want %d", d.SchemaVersion, EffectiveVerificationDemandSchemaVersionV2)
+	}
+	if EffectiveVerificationDemandSchemaVersionV1 == EffectiveVerificationDemandSchemaVersionV2 {
+		t.Fatal("v1 and v2 demand schema identities must differ")
+	}
+
+	// A schema-1 demand cannot carry provider axes.
+	hist := d
+	hist.SchemaVersion = EffectiveVerificationDemandSchemaVersionV1
+	if err := hist.Validate(); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("schema-1 demand with provider axes = %v, want ErrInvalid", err)
+	}
+
+	// A schema-1 demand with empty provider axes is valid historical shape.
+	hist.VerifierProviderKind = ""
+	if err := hist.Validate(); err != nil {
+		t.Fatalf("clean schema-1 demand = %v, want success", err)
+	}
+
+	// CanonicalDigest is the schema-2 rule; schema 1 is refused there.
+	if _, err := hist.CanonicalDigest(); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("CanonicalDigest of schema-1 demand = %v, want ErrInvalid", err)
+	}
+	v2dig, err := d.CanonicalDigest()
+	if err != nil {
+		t.Fatalf("CanonicalDigest of schema-2 demand = %v", err)
+	}
+
+	// canonicalDigestV1 reconstructs the historical meaning: it must not
+	// require the caller to have built a schema-1 object, and it must not
+	// hash the provider axes even when the source demand carries them.
+	v1dig, err := d.canonicalDigestV1()
+	if err != nil {
+		t.Fatalf("canonicalDigestV1 = %v", err)
+	}
+	histClean := hist
+	histClean.SchemaVersion = EffectiveVerificationDemandSchemaVersionV1
+	wantV1, err := histClean.canonicalDigestV1()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v1dig != wantV1 {
+		t.Fatalf("canonicalDigestV1 must reconstruct historical meaning: got %s want %s", v1dig, wantV1)
+	}
+	if v1dig == v2dig {
+		t.Fatal("v1 and v2 demand digests must not collide")
+	}
+
+	// Schema-1 digests are stable under the historical rule even when the
+	// obligation names a provider (V3/V4 restore path).
+	obNoProv := ob
+	obNoProv.VerifierProviderKind = ""
+	v1NoProv, err := effectiveVerificationDemandDigestV1(obNoProv, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1WithProv, err := effectiveVerificationDemandDigestV1(ob, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v1NoProv != v1WithProv {
+		t.Fatal("historical v1 demand digest must ignore provider axes")
+	}
+
+	// Unknown schema identities are refused rather than silently upgraded.
+	bad := d
+	bad.SchemaVersion = 99
+	if err := bad.Validate(); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("schema-99 demand = %v, want ErrInvalid", err)
+	}
+}
+
 // TestAcceptanceV5BindsProviderConstraints: a v5 acceptance record refuses to
 // restore under an obligation whose provider kind was swapped on the row.
 func TestAcceptanceV5BindsProviderConstraints(t *testing.T) {

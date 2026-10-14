@@ -1,0 +1,18 @@
+# simple: sequential steps. No step declares depends_on, so Woodpecker runs
+# them serially in definition order (build → test → package). The importer
+# preserves that order as chained needs edges.
+steps:
+  build:
+    image: golang:1.23
+    environment:
+      CGO_ENABLED: "0"
+    commands:
+      - go build ./...
+  test:
+    image: golang:1.23
+    commands:
+      - go test ./...
+  package:
+    image: alpine:3.20
+    commands:
+      - tar czf dist.tar.gz .

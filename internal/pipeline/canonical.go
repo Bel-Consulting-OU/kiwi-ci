@@ -109,29 +109,36 @@ type canonicalSpec struct {
 }
 
 type canonicalJob struct {
-	Name         string             `json:"name,omitempty"`
-	Needs        []string           `json:"needs,omitempty"`
-	If           string             `json:"if,omitempty"`
-	Runner       []string           `json:"runner,omitempty"`
-	Runtime      string             `json:"runtime,omitempty"`
-	Image        string             `json:"image,omitempty"`
-	Network      string             `json:"network,omitempty"`
-	VM           string             `json:"vm,omitempty"`
-	Shell        string             `json:"shell,omitempty"`
-	Timeout      canonicalDuration  `json:"timeout,omitempty"`
-	Retry        canonicalRetry     `json:"retry,omitempty"`
-	Env          orderedMap         `json:"env,omitempty"`
-	Matrix       orderedMap         `json:"matrix,omitempty"`
-	Paths        []string           `json:"paths,omitempty"`
-	PathsIgnore  []string           `json:"paths_ignore,omitempty"`
-	Services     []canonicalService `json:"services,omitempty"`
-	Steps        []canonicalStep    `json:"steps"`
-	Cache        []Cache            `json:"cache,omitempty"`
-	Artifacts    []Artifact         `json:"artifacts,omitempty"`
-	Downloads    []ArtifactInput    `json:"downloads,omitempty"`
-	TestReports  []string           `json:"test_reports,omitempty"`
-	Environment  Environment        `json:"environment,omitempty"`
-	InfraRetries int                `json:"infra_retries,omitempty"`
+	Name        string             `json:"name,omitempty"`
+	Needs       []string           `json:"needs,omitempty"`
+	If          string             `json:"if,omitempty"`
+	Runner      []string           `json:"runner,omitempty"`
+	Runtime     string             `json:"runtime,omitempty"`
+	Image       string             `json:"image,omitempty"`
+	Network     string             `json:"network,omitempty"`
+	VM          string             `json:"vm,omitempty"`
+	Shell       string             `json:"shell,omitempty"`
+	Timeout     canonicalDuration  `json:"timeout,omitempty"`
+	Retry       canonicalRetry     `json:"retry,omitempty"`
+	Env         orderedMap         `json:"env,omitempty"`
+	Matrix      orderedMap         `json:"matrix,omitempty"`
+	Paths       []string           `json:"paths,omitempty"`
+	PathsIgnore []string           `json:"paths_ignore,omitempty"`
+	Services    []canonicalService `json:"services,omitempty"`
+	Steps       []canonicalStep    `json:"steps"`
+	Cache       []Cache            `json:"cache,omitempty"`
+	Artifacts   []Artifact         `json:"artifacts,omitempty"`
+	Downloads   []ArtifactInput    `json:"downloads,omitempty"`
+	// Clone/Workspace/Volumes are part of the job's execution identity: two
+	// jobs that differ only in checkout policy or mounts are different
+	// pipelines and must never share a digest.
+	Clone        Clone       `json:"clone,omitempty"`
+	Workspace    Workspace   `json:"workspace,omitempty"`
+	Volumes      []Volume    `json:"volumes,omitempty"`
+	Registries   []Registry  `json:"registries,omitempty"`
+	TestReports  []string    `json:"test_reports,omitempty"`
+	Environment  Environment `json:"environment,omitempty"`
+	InfraRetries int         `json:"infra_retries,omitempty"`
 	// InfraRetriesSet keeps `infra_retries: 0` (never requeue) distinct from
 	// absent in the compiled hash.
 	InfraRetriesSet bool                `json:"infra_retries_set,omitempty"`
@@ -163,17 +170,19 @@ type canonicalService struct {
 }
 
 type canonicalStep struct {
-	ID               string            `json:"id,omitempty"`
-	Name             string            `json:"name,omitempty"`
-	Run              string            `json:"run"`
-	If               string            `json:"if,omitempty"`
-	Shell            string            `json:"shell,omitempty"`
-	WorkingDirectory string            `json:"working_directory,omitempty"`
-	Env              orderedMap        `json:"env,omitempty"`
-	Secrets          []string          `json:"secrets,omitempty"`
-	Timeout          canonicalDuration `json:"timeout,omitempty"`
-	Retry            canonicalRetry    `json:"retry,omitempty"`
-	ContinueOnError  bool              `json:"continue_on_error,omitempty"`
+	ID                 string            `json:"id,omitempty"`
+	Name               string            `json:"name,omitempty"`
+	Run                string            `json:"run"`
+	If                 string            `json:"if,omitempty"`
+	Shell              string            `json:"shell,omitempty"`
+	WorkingDirectory   string            `json:"working_directory,omitempty"`
+	Env                orderedMap        `json:"env,omitempty"`
+	Secrets            []string          `json:"secrets,omitempty"`
+	Timeout            canonicalDuration `json:"timeout,omitempty"`
+	Retry              canonicalRetry    `json:"retry,omitempty"`
+	ContinueOnError    bool              `json:"continue_on_error,omitempty"`
+	CancelJobOnFailure bool              `json:"cancel_job_on_failure,omitempty"`
+	Background         bool              `json:"background,omitempty"`
 }
 
 type canonicalDownstream struct {
@@ -203,6 +212,7 @@ func canonicalJobOf(j Job) canonicalJob {
 		Env: pairs(j.Env), Matrix: pairs(j.Matrix),
 		Paths: j.Paths, PathsIgnore: j.PathsIgnore,
 		Cache: j.Cache, Artifacts: j.Artifacts, Downloads: j.Downloads,
+		Clone: j.Clone, Workspace: j.Workspace, Volumes: j.Volumes, Registries: j.Registries,
 		TestReports: j.TestReports, Environment: j.Environment,
 		InfraRetries: j.InfraRetries, InfraRetriesSet: j.InfraRetriesSet, Permissions: j.Permissions,
 		Outputs: pairs(j.Outputs), Sandbox: j.Sandbox, Placement: j.Placement,
@@ -241,7 +251,9 @@ func canonicalSteps(in []Step) []canonicalStep {
 			Shell: in[i].Shell, WorkingDirectory: in[i].WorkingDirectory,
 			Env: pairs(in[i].Env), Secrets: in[i].Secrets,
 			Timeout: durOf(in[i].Timeout), Retry: retryOf(in[i].Retry),
-			ContinueOnError: in[i].ContinueOnError,
+			ContinueOnError:    in[i].ContinueOnError,
+			CancelJobOnFailure: in[i].CancelJobOnFailure,
+			Background:         in[i].Background,
 		}
 	}
 	return out

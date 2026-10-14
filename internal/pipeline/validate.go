@@ -457,8 +457,8 @@ func validateJob(s *Spec, id string, j Job) error {
 	// hardening (rootless user namespace, read-only root filesystem,
 	// non-root container user) that does not exist. native execution is
 	// exactly the trusted host path those flags are meant to avoid.
-	if (j.Runtime == "" || j.Runtime == "native") && (j.Sandbox.Rootless || j.Sandbox.ReadOnlyRootFS || j.Sandbox.NonRoot) {
-		return fmt.Errorf("job %q: sandbox.rootless/read_only_rootfs/non_root require the container runtime; native execution cannot enforce them", id)
+	if (j.Runtime == "" || j.Runtime == "native") && (j.Sandbox.Rootless || j.Sandbox.ReadOnlyRootFS || j.Sandbox.NonRoot || j.Sandbox.Privileged) {
+		return fmt.Errorf("job %q: sandbox.rootless/read_only_rootfs/non_root/privileged require the container runtime; native execution cannot enforce them", id)
 	}
 	if !shellNames[j.Shell] {
 		return fmt.Errorf("job %q has unsupported shell %q", id, j.Shell)
@@ -500,6 +500,18 @@ func validateJob(s *Spec, id string, j Job) error {
 		}
 	}
 	if err := validateResources(fmt.Sprintf("job %q", id), j.Runtime, j.Resources); err != nil {
+		return err
+	}
+	if err := validateClone(fmt.Sprintf("job %q", id), j.Clone); err != nil {
+		return err
+	}
+	if err := validateWorkspace(fmt.Sprintf("job %q", id), j.Workspace); err != nil {
+		return err
+	}
+	if err := validateVolumes(fmt.Sprintf("job %q", id), j.Volumes); err != nil {
+		return err
+	}
+	if err := validateRegistries(fmt.Sprintf("job %q", id), j.Registries); err != nil {
 		return err
 	}
 	for name, v := range j.Env {
@@ -762,6 +774,9 @@ func validateService(jobID string, svc *Service) error {
 }
 
 func validateStep(jobID string, idx int, st *Step, seenIDs map[string]bool) error {
+	if st.ContinueOnError && st.CancelJobOnFailure {
+		return fmt.Errorf("job %q step %d: continue_on_error and cancel_job_on_failure are mutually exclusive", jobID, idx)
+	}
 	where := fmt.Sprintf("job %q step %d", jobID, idx+1)
 	if st.ID != "" {
 		if !idRegexp.MatchString(st.ID) {
@@ -985,6 +1000,106 @@ func checkRelPath(where string, paths ...string) error {
 			if part == ".." {
 				return fmt.Errorf("%s: path %q contains a .. component", where, p)
 			}
+		}
+	}
+	return nil
+}
+
+// MaxCloneDepth is the shallow-clone depth ceiling. A pipeline cannot request
+// an unbounded fetch.
+const MaxCloneDepth = 10000
+
+// MaxVolumesPerJob is the absolute per-job volume declaration cap.
+const MaxVolumesPerJob = 32
+
+// validateClone checks the job's checkout policy: depth is a positive finite
+// bound, sparse pathspecs are workspace-relative and free of "..".
+func validateClone(where string, c Clone) error {
+	if c.Depth < 0 {
+		return fmt.Errorf("%s: clone.depth must be >= 0", where)
+	}
+	if c.Depth > MaxCloneDepth {
+		return fmt.Errorf("%s: clone.depth %d exceeds the %d limit", where, c.Depth, MaxCloneDepth)
+	}
+	return checkRelPath(where+" clone.sparse_paths", c.SparsePaths...)
+}
+
+// validateWorkspace checks that the checkout placement is a relative path
+// under the runner-assigned workspace root. Absolute bases and ".." escapes
+// would let a pipeline write outside the job workspace.
+func validateWorkspace(where string, w Workspace) error {
+	if err := checkRelPath(where+" workspace.base", w.Base); err != nil {
+		return err
+	}
+	return checkRelPath(where+" workspace.path", w.Path)
+}
+
+// validateVolumes checks volume names and mount points. HostPath is accepted
+// here as a declared capability; the TRUST gate (untrusted jobs refuse
+// HostPath; privileged/host mounts only on policy-allowing runners) is
+// enforced at enqueue admission and by the executor, because pipeline
+// validation does not know the job's trust tier.
+func validateVolumes(where string, vols []Volume) error {
+	if len(vols) > MaxVolumesPerJob {
+		return fmt.Errorf("%s: %d volumes exceeds the %d limit", where, len(vols), MaxVolumesPerJob)
+	}
+	seen := make(map[string]bool, len(vols))
+	for i, v := range vols {
+		if v.Name == "" {
+			return fmt.Errorf("%s volume %d: name is required", where, i)
+		}
+		if !idRegexp.MatchString(v.Name) {
+			return fmt.Errorf("%s volume %q has invalid name", where, v.Name)
+		}
+		if seen[v.Name] {
+			return fmt.Errorf("%s volume %q is declared twice", where, v.Name)
+		}
+		seen[v.Name] = true
+		// The in-container mount point is always absolute; the optional host
+		// path is also absolute (bind source). Neither may contain "..".
+		if !portableAbsPath(v.Path) {
+			return fmt.Errorf("%s volume %q: mount path %q must be absolute", where, v.Name, v.Path)
+		}
+		if hasDotDot(v.Path) {
+			return fmt.Errorf("%s volume %q: mount path %q contains a .. component", where, v.Name, v.Path)
+		}
+		if v.HostPath != "" {
+			if !portableAbsPath(v.HostPath) {
+				return fmt.Errorf("%s volume %q: host_path %q must be absolute", where, v.Name, v.HostPath)
+			}
+			if hasDotDot(v.HostPath) {
+				return fmt.Errorf("%s volume %q: host_path %q contains a .. component", where, v.Name, v.HostPath)
+			}
+		}
+	}
+	return nil
+}
+
+func hasDotDot(p string) bool {
+	for _, part := range strings.FieldsFunc(p, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if part == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+// MaxRegistriesPerJob is the absolute per-job registry-credential cap.
+const MaxRegistriesPerJob = 16
+
+// validateRegistries checks registry credential bindings: both secret names
+// are required identifiers. The secrets themselves are resolved only at
+// execution time through the job's secret provider.
+func validateRegistries(where string, regs []Registry) error {
+	if len(regs) > MaxRegistriesPerJob {
+		return fmt.Errorf("%s: %d registries exceeds the %d limit", where, len(regs), MaxRegistriesPerJob)
+	}
+	for i, r := range regs {
+		if r.UsernameSecret == "" || r.PasswordSecret == "" {
+			return fmt.Errorf("%s registry %d: username_secret and password_secret are required", where, i)
+		}
+		if !idRegexp.MatchString(r.UsernameSecret) || !idRegexp.MatchString(r.PasswordSecret) {
+			return fmt.Errorf("%s registry %d: secret names must be identifiers", where, i)
 		}
 	}
 	return nil

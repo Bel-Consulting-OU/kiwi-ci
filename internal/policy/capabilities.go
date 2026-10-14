@@ -43,6 +43,13 @@ type Capabilities struct {
 	RunnerLabels       []string
 	GenerateChildGraph bool
 	CrossRepoTrigger   bool
+	// Privileged grants job.sandbox.privileged. Untrusted floor is false
+	// (Intersect ANDs it away); even trusted is opt-in like Deployments —
+	// a repository/organization policy must grant it explicitly.
+	Privileged bool
+	// HostMounts grants job.volumes[].host_path bind mounts. Same opt-in
+	// rule as Privileged; the untrusted floor never has it.
+	HostMounts bool
 	// RequireRootless, RequireReadOnlyRootFS and RequireNonRoot are
 	// sandbox requirements the effective policy demands of every executed
 	// job, not grants: Intersect ORs them (any layer that demands one
@@ -134,6 +141,8 @@ func Intersect(base, restriction Capabilities) Capabilities {
 		RunnerLabels:          intersectStrings(base.RunnerLabels, restriction.RunnerLabels),
 		GenerateChildGraph:    base.GenerateChildGraph && restriction.GenerateChildGraph,
 		CrossRepoTrigger:      base.CrossRepoTrigger && restriction.CrossRepoTrigger,
+		Privileged:            base.Privileged && restriction.Privileged,
+		HostMounts:            base.HostMounts && restriction.HostMounts,
 		RequireRootless:       base.RequireRootless || restriction.RequireRootless,
 		RequireReadOnlyRootFS: base.RequireReadOnlyRootFS || restriction.RequireReadOnlyRootFS,
 		RequireNonRoot:        base.RequireNonRoot || restriction.RequireNonRoot,

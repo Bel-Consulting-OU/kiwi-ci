@@ -1,0 +1,149 @@
+{
+  "obligation": {
+    "obligation_id": "ob-historical",
+    "subject": "cand-historical",
+    "immutable_candidate_digest": "3207d97bdcb90620465429fb9dfedb284268764b1dbf10fd4a648a986d3fd132",
+    "source_snapshot_digest": "3f337d5bb7bbf5d33f337d5bb7bbf5d33f337d5bb7bbf5d33f337d5bb7bbf5d3",
+    "verification_contract_digest": "3007669bb88fee133007669bb88fee133007669bb88fee133007669bb88fee13",
+    "required_checks": [
+      "job-status-success",
+      "evidence-root"
+    ],
+    "required_assurance": "uncontrolled",
+    "freshness": {
+      "max_age_seconds": 3600
+    },
+    "issued_at": "2026-01-02T03:04:05Z"
+  },
+  "submitted_claim": {
+    "verification_id": "ver-historical",
+    "obligation_id": "ob-historical",
+    "candidate_digest": "3207d97bdcb90620465429fb9dfedb284268764b1dbf10fd4a648a986d3fd132",
+    "snapshot_digest": "3f337d5bb7bbf5d33f337d5bb7bbf5d33f337d5bb7bbf5d33f337d5bb7bbf5d3",
+    "contract_digest": "3007669bb88fee133007669bb88fee133007669bb88fee133007669bb88fee13",
+    "outcome": "pass",
+    "assurance_profile": "uncontrolled",
+    "completed_checks": [
+      "job-status-success",
+      "evidence-root"
+    ],
+    "execution_ids": [
+      "exec-1"
+    ],
+    "evidence_root": "8a5737fa957dbc2794626e9846cab1683515d8735b9a0572404c7624a89f4613",
+    "resources": {
+      "queue_latency_ns": 1000000,
+      "execution_latency_ns": 5000000000,
+      "wall_time_ns": 5200000000,
+      "cpu_time_ns": 4800000000,
+      "peak_memory_bytes": 67108864,
+      "io_bytes": 1048576,
+      "cache_hits": 3,
+      "cache_misses": 1,
+      "runner_class": "standard",
+      "retry_count": 0,
+      "cancelled": false,
+      "duplicate_avoided": false,
+      "speculative": false
+    },
+    "started_at": "2026-01-02T03:04:06Z",
+    "completed_at": "2026-01-02T03:04:15Z",
+    "provenance_refs": [
+      "att-1"
+    ]
+  },
+  "outcome": {
+    "verification_id": "ver-historical",
+    "obligation_id": "ob-historical",
+    "candidate_digest": "3207d97bdcb90620465429fb9dfedb284268764b1dbf10fd4a648a986d3fd132",
+    "snapshot_digest": "3f337d5bb7bbf5d33f337d5bb7bbf5d33f337d5bb7bbf5d33f337d5bb7bbf5d3",
+    "contract_digest": "3007669bb88fee133007669bb88fee133007669bb88fee133007669bb88fee13",
+    "outcome": "pass",
+    "assurance_profile": "uncontrolled",
+    "completed_checks": [
+      "job-status-success",
+      "evidence-root"
+    ],
+    "execution_ids": [
+      "exec-1"
+    ],
+    "evidence_root": "8a5737fa957dbc2794626e9846cab1683515d8735b9a0572404c7624a89f4613",
+    "resources": {
+      "queue_latency_ns": 1000000,
+      "execution_latency_ns": 5000000000,
+      "wall_time_ns": 5200000000,
+      "cpu_time_ns": 4800000000,
+      "peak_memory_bytes": 67108864,
+      "io_bytes": 1048576,
+      "cache_hits": 3,
+      "cache_misses": 1,
+      "runner_class": "standard",
+      "retry_count": 0,
+      "cancelled": false,
+      "duplicate_avoided": false,
+      "speculative": false,
+      "measured": {
+        "duration_ns": 9000000000,
+        "wall_time_ns": 9000000000
+      }
+    },
+    "started_at": "2026-01-02T03:04:06Z",
+    "completed_at": "2026-01-02T03:04:15Z",
+    "provenance_refs": [
+      "att-1"
+    ]
+  },
+  "evidence": {
+    "execution_ids": [
+      "exec-1"
+    ],
+    "evidence_root": "8a5737fa957dbc2794626e9846cab1683515d8735b9a0572404c7624a89f4613",
+    "attestation_digests": [
+      "8a5737fa957c01683515d8735aef4613f3b65138cd24f1d1943f16ab02dfbf72"
+    ],
+    "attested": {
+      "started_at": "2026-01-02T03:04:06Z",
+      "finished_at": "2026-01-02T03:04:15Z"
+    },
+    "window": {
+      "started_at": "2026-01-02T03:04:06Z",
+      "completed_at": "2026-01-02T03:04:15Z",
+      "source": "attested"
+    },
+    "kinds": [
+      "execution-attestation"
+    ],
+    "job_status": "success",
+    "completed_checks": [
+      "job-status-success",
+      "evidence-root"
+    ],
+    "verified_checks": [
+      {
+        "name": "job-status-success",
+        "outcome": "pass",
+        "evidence_digest": "8a5737fa957dbc2794626e9846cab1683515d8735b9a0572404c7624a89f4613",
+        "execution_id": ""
+      },
+      {
+        "name": "evidence-root",
+        "outcome": "pass",
+        "evidence_digest": "8a5737fa957dbc2794626e9846cab1683515d8735b9a0572404c7624a89f4613",
+        "execution_id": ""
+      }
+    ],
+    "assurance": 0,
+    "verifier_identity": "historical-fixture-verifier/v1",
+    "verified_at": "2026-01-02T03:04:16Z"
+  },
+  "acceptance": {
+    "acceptance_version": 1,
+    "obligation_digest": "c899c9234f41fd29f9a9ade9b7930bb5914b3716bff5a323bbc220450558df0a",
+    "outcome_digest": "f27c22db77dc566ed8b2b4259babc1f484e0b4cf8b3ea101c93517d5600d5f2e",
+    "verified_evidence_digest": "02c8e388bea4d961bb73c86d5674e5b3495847a8d0ff496c7d79c246869a9a68",
+    "algorithm": "HMAC-SHA256",
+    "verified_at": "2026-01-02T03:06:00Z",
+    "key_id": "acc-hist-fixture",
+    "mac": "1919fb9a900c2c04e96e76413c94e36b3b8fa7bacf1c07ce47a9886a1aa9640f"
+  }
+}

@@ -297,8 +297,14 @@ func (s *Service) subjectOf(ctx context.Context, obligationID string) (Verificat
 // (checks, assurance, freshness) must not disagree with the recipe — a
 // weaker inline demand under a strong recipe digest is refused. Empty fields
 // are filled from the recipe. The stored obligation is the bound copy.
+//
+// Submit sequence is identity → recipe → bind → full validation → authorize
+// → persist. ValidateSubmission runs first so a recipe-owned field need not
+// be pre-populated by the caller (the recipe is the authority for those
+// dimensions); the complete bound obligation is then validated before
+// anything is authorized or stored.
 func (s *Service) SubmitObligation(ctx context.Context, p Principal, o VerificationObligation) error {
-	if err := o.Validate(); err != nil {
+	if err := o.ValidateSubmission(); err != nil {
 		return err
 	}
 	bound := o
@@ -317,6 +323,9 @@ func (s *Service) SubmitObligation(ctx context.Context, p Principal, o Verificat
 		if err != nil {
 			return err
 		}
+	}
+	if err := bound.Validate(); err != nil {
+		return err
 	}
 	if err := s.authorize(ctx, p, ActionObligationCreate, bound.SubjectReference()); err != nil {
 		return err

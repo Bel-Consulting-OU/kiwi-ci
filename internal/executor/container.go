@@ -149,10 +149,31 @@ type ContainerBackend struct {
 	// NonRoot demands the workload not run as container UID 0 on a rootful
 	// daemon (see pipeline.Sandbox.NonRoot for the rootless semantics).
 	NonRoot bool
+	// Privileged requests a privileged container (pipeline.Sandbox.Privileged).
+	// Trusted-only: StartJob refuses it for an untrusted job, and it is never
+	// a default. Privileged relaxes cap-drop/no-new-privileges — that is the
+	// point — so it is gated at admission AND here (defense in depth).
+	Privileged bool
+	// Volumes are the job's declared volume mounts (pipeline.Job.Volumes).
+	// Named volumes are job-scoped; HostPath mounts are trusted-only and
+	// refused here for untrusted jobs even if they reach the backend.
+	Volumes []pipeline.Volume
+	// WorkSubdir is the in-container working directory under /workspace
+	// (pipeline.Workspace base/path). Empty means /workspace itself.
+	WorkSubdir string
+	// volumeNames records the docker named volumes created for this job so
+	// CloseJob can remove them. Volumes are job-scoped (never bare
+	// pipeline names) so two concurrent jobs can never share one mount.
+	volumeNames []string
 	// runnerClientEnv is the runner's own docker client-control environment
 	// (captured once at StartJob) so job-declared values can never redirect
 	// the CLI or its config/trust.
 	runnerClientEnv []string
+	// DockerConfigDir, when set, is exported as DOCKER_CONFIG for every
+	// docker invocation so job-scoped registry credentials never touch the
+	// runner's ~/.docker/config.json. Provisioned and removed by the
+	// executor around the job.
+	DockerConfigDir string
 	// Resources carries the job's resource requests, rendered into docker
 	// run flags by StartJob. Values are already admission-checked by
 	// pipeline validation; zero requests produce no flags. resources.disk
@@ -227,6 +248,11 @@ func (b *ContainerBackend) ObservedRuntime() *model.ObservedRuntime { return b.o
 // behave like developers expect from a job while the checkout remains mounted.
 func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit func(string)) error {
 	b.runnerClientEnv = runnerClientEnv()
+	if b.DockerConfigDir != "" {
+		// Job-scoped registry credentials: every docker command (run, exec,
+		// pull, cleanup) must use THIS config, never the runner's home.
+		b.runnerClientEnv = append(b.runnerClientEnv, "DOCKER_CONFIG="+b.DockerConfigDir)
+	}
 	if b.Image == "" {
 		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("container runtime requires job.image")}
 	}
@@ -274,6 +300,28 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 			b.quotaCleanup = cleanup
 		}
 	}
+	// Trust gates for declared capabilities run BEFORE the docker lookup so
+	// a missing daemon can never mask a policy refusal. These are defense in
+	// depth: admission should have refused an untrusted privileged/host-mount
+	// job already, but the backend is the last word before docker.
+	if b.Privileged && b.Untrusted {
+		_ = b.cleanupWorkspaceQuota()
+		return &RunError{Kind: ErrorPolicy, Err: fmt.Errorf("privileged containers are refused for untrusted jobs")}
+	}
+	for _, v := range b.Volumes {
+		if v.HostPath != "" && b.Untrusted {
+			_ = b.cleanupWorkspaceQuota()
+			return &RunError{Kind: ErrorPolicy, Err: fmt.Errorf("host_path volume %q is refused for untrusted jobs", v.Name)}
+		}
+	}
+	// WorkSubdir is validated (no "..", not absolute) even though admission
+	// already refuses escapes: the backend is the last word before docker.
+	if b.WorkSubdir != "" {
+		if strings.HasPrefix(b.WorkSubdir, "/") || strings.Contains(b.WorkSubdir, "..") {
+			_ = b.cleanupWorkspaceQuota()
+			return &RunError{Kind: ErrorPolicy, Err: fmt.Errorf("workspace subdir %q escapes the job workspace", b.WorkSubdir)}
+		}
+	}
 	docker, err := exec.LookPath("docker")
 	if err != nil {
 		_ = b.cleanupWorkspaceQuota()
@@ -291,10 +339,41 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 	if network == "" {
 		network = "bridge"
 	}
+	workdir := "/workspace"
+	if b.WorkSubdir != "" {
+		workdir = "/workspace/" + b.WorkSubdir
+	}
 	args := []string{
 		"run", "-d", "--rm", "--init", "--network=" + network,
-		"--cap-drop=ALL", "--security-opt=no-new-privileges",
-		"-v", abs + ":/workspace", "-w", "/workspace", "--name", b.container,
+		"-v", abs + ":/workspace", "-w", workdir, "--name", b.container,
+	}
+	if b.Privileged {
+		// Privileged mode deliberately drops the hardened flags: those two
+		// flags are exactly what privileged workloads cannot run under.
+		args = append(args, "--privileged")
+	} else {
+		args = append(args, "--cap-drop=ALL", "--security-opt=no-new-privileges")
+	}
+	b.volumeNames = nil
+	for _, v := range b.Volumes {
+		if v.HostPath != "" {
+			spec := v.HostPath + ":" + v.Path
+			if v.ReadOnly {
+				spec += ":ro"
+			}
+			args = append(args, "-v", spec)
+			continue
+		}
+		// Job-scoped named volume: the bare pipeline name would be shared
+		// across every concurrent job (cross-job contamination) and would
+		// never be removed. Record it so CloseJob can clean up.
+		dockerVol := jobVolumeName(b.RunID, b.JobID, v.Name)
+		b.volumeNames = append(b.volumeNames, dockerVol)
+		spec := dockerVol + ":" + v.Path
+		if v.ReadOnly {
+			spec += ":ro"
+		}
+		args = append(args, "-v", spec)
 	}
 	if b.CgroupParent != "" {
 		args = append(args, "--cgroup-parent="+b.CgroupParent)
@@ -656,9 +735,57 @@ func (b *ContainerBackend) CloseJob() error {
 		return fmt.Errorf("remove job container %s: %w", name, err)
 	}
 	// Docker proved the container removed (or already absent): only now may
-	// the runtime handle be dropped and the workspace teardown run.
+	// the runtime handle be dropped and the workspace teardown run. Job-scoped
+	// named volumes are removed with the container; a failure keeps them in
+	// volumeNames so a retry can finish the cleanup.
 	b.container = ""
+	if rmErr := b.removeJobVolumes(); rmErr != nil {
+		return rmErr
+	}
 	return b.finishJobWorkspace()
+}
+
+// jobVolumeName builds the docker named-volume identity for one job volume.
+// It is scoped by runner instance and job so two concurrent jobs never share
+// a mount, and the name is docker-safe ([a-zA-Z0-9][a-zA-Z0-9_.-]*).
+func jobVolumeName(runID, jobID, name string) string {
+	sanitize := func(s string) string {
+		var b strings.Builder
+		for _, r := range s {
+			switch {
+			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+				b.WriteRune(r)
+			default:
+				b.WriteByte('-')
+			}
+		}
+		out := b.String()
+		if out == "" {
+			return "x"
+		}
+		return out
+	}
+	return "kiwi-v-" + sanitize(runID) + "-" + sanitize(jobID) + "-" + sanitize(name)
+}
+
+// removeJobVolumes removes every docker named volume this job created.
+// Cleared only on success so CloseJob stays retryable.
+func (b *ContainerBackend) removeJobVolumes() error {
+	if len(b.volumeNames) == 0 {
+		return nil
+	}
+	var errs []error
+	remaining := b.volumeNames[:0]
+	for _, vol := range b.volumeNames {
+		err := dockerCleanupCommand(context.Background(), b.docker, "volume", "rm", "-f", vol)
+		if err != nil && !strings.Contains(err.Error(), "no such volume") {
+			// Keep it for a retry: a leaked job volume is cleanup debt.
+			remaining = append(remaining, vol)
+			errs = append(errs, fmt.Errorf("remove job volume %s: %w", vol, err))
+		}
+	}
+	b.volumeNames = remaining
+	return errors.Join(errs...)
 }
 
 // isContainerAbsentError reports whether docker positively said the container
@@ -846,7 +973,13 @@ func (b *ContainerBackend) Run(ctx context.Context, c Command, emit func(string)
 	if rel != "." && rel != "" {
 		containerDir += "/" + filepath.ToSlash(rel)
 	}
-	args := []string{"exec", "-w", containerDir}
+	args := []string{"exec"}
+	if c.Background {
+		// detach: docker exec -d returns as soon as the process is started.
+		// The process dies with the job container.
+		args = append(args, "-d")
+	}
+	args = append(args, "-w", containerDir)
 	cliEnv := make([]string, 0, len(c.Env))
 	for _, e := range c.Env {
 		if i := strings.IndexByte(e, '='); i > 0 {

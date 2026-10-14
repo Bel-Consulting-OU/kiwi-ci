@@ -2,6 +2,8 @@ package executor
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -509,6 +511,22 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		workspace = dir
 		defer cleanup()
 	}
+	// Job work root (workspace.base/path): relative step, cache, artifact and
+	// download paths resolve here. Quota and the container bind mount stay on
+	// the runner-owned workspace root.
+	workRoot, werr := jobWorkRoot(workspace, cj.Job.Workspace)
+	if werr != nil {
+		res.Status = model.StatusFailure
+		res.Error = werr.Error()
+		return finish(res)
+	}
+	if workRoot != workspace {
+		if err := os.MkdirAll(workRoot, 0o755); err != nil {
+			res.Status = model.StatusFailure
+			res.Error = fmt.Sprintf("workspace base/path: %v", err)
+			return finish(res)
+		}
+	}
 	if e.Opt.WorkspaceMaxBytes > 0 && !e.Opt.WorkspaceAvailabilityChecked {
 		if err := WorkspaceDiskAvailable(workspace, e.Opt.WorkspaceMaxBytes); err != nil {
 			infra := &RunError{Kind: ErrorInfra, Err: fmt.Errorf("workspace quota: %v", err)}
@@ -570,11 +588,11 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		bases := append([]string{c.Key}, c.RestoreKeys...)
 		restored := false
 		for i, base := range bases {
-			key, er := e.Opt.Cache.KeyContext(ctx, e.cacheBase(base)+"|"+runtime.GOOS+"|"+runtime.GOARCH+"|"+cj.Job.Runtime, workspace, c.HashFiles)
+			key, er := e.Opt.Cache.KeyContext(ctx, e.cacheBase(base)+"|"+runtime.GOOS+"|"+runtime.GOARCH+"|"+cj.Job.Runtime, workRoot, c.HashFiles)
 			if er != nil {
 				return cacheFail("cache key: " + er.Error())
 			}
-			hit, er := e.Opt.Cache.RestoreContextWithDebt(ctx, key, workspace, c.Paths, func(_ string, path string, err error) {
+			hit, er := e.Opt.Cache.RestoreContextWithDebt(ctx, key, workRoot, c.Paths, func(_ string, path string, err error) {
 				// Both a rollback residue inside the workspace and a
 				// leftover staging tree after a SUCCESSFUL restore reach the
 				// runner's recovery ledger through the existing debt
@@ -620,7 +638,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		e.log(cj.ID, "generate", "child job expansion is a control-plane feature; this local run executes the generator step only")
 	}
 	if e.Opt.LocalDownloads && len(cj.Job.Downloads) > 0 {
-		if err := e.restoreLocalDownloads(cj.Job.Downloads, workspace); err != nil {
+		if err := e.restoreLocalDownloads(cj.Job.Downloads, workRoot); err != nil {
 			res.Status = model.StatusFailure
 			res.Error = err.Error()
 			return finish(res)
@@ -769,6 +787,19 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		b.Rootless = cj.Job.Sandbox.Rootless
 		b.ReadOnlyRootFS = cj.Job.Sandbox.ReadOnlyRootFS
 		b.NonRoot = cj.Job.Sandbox.NonRoot
+		b.Privileged = cj.Job.Sandbox.Privileged
+		b.Volumes = cj.Job.Volumes
+		b.WorkSubdir = workSubdirRel(cj.Job.Workspace)
+		if len(cj.Job.Registries) > 0 {
+			cfgDir, cleanup, rerr := e.provisionRegistryAuth(ctx, cj)
+			if rerr != nil {
+				res.Status = model.StatusFailure
+				res.Error = rerr.Error()
+				return finish(res)
+			}
+			defer cleanup()
+			b.DockerConfigDir = cfgDir
+		}
 		b.RunID = e.Opt.RunID
 		b.JobID = cj.ID
 		b.RunnerID = e.Opt.RunnerID
@@ -901,7 +932,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		if shell == "" {
 			shell = defaultShell(cj.Job.Runtime)
 		}
-		dir, dirErr := secureWorkingDir(workspace, st.WorkingDirectory)
+		dir, dirErr := secureWorkingDir(workRoot, st.WorkingDirectory)
 		if dirErr != nil {
 			e.log(cj.ID, name, "working directory: "+dirErr.Error())
 			if currentStatus == model.StatusSuccess {
@@ -960,7 +991,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			}
 			res.Attempts++
 			e.log(cj.ID, name, fmt.Sprintf("running on %s (attempt %d/%d)", backend.Name(), attempt, attempts))
-			runErr = backend.Run(stepCtx, Command{Shell: shell, Script: st.Run, Dir: dir, Env: stepEnv, TimeoutSeconds: int64(timeout.Seconds())}, func(line string) { e.log(cj.ID, name, line) })
+			runErr = backend.Run(stepCtx, Command{Shell: shell, Script: st.Run, Dir: dir, Env: stepEnv, TimeoutSeconds: int64(timeout.Seconds()), Background: st.Background}, func(line string) { e.log(cj.ID, name, line) })
 			if runErr == nil {
 				break
 			}
@@ -977,7 +1008,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 				}
 			}
 		}
-		if st.ID != "" {
+		if st.ID != "" && !st.Background {
 			var (
 				data   []byte
 				outErr error
@@ -987,7 +1018,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 				// symlinked intermediate directory cannot redirect the read
 				// outside the workspace; container/Tart resolve the path
 				// inside their own sandbox.
-				data, outErr = readFileWithinRoot(workspace, outputFile, 1<<20)
+				data, outErr = readFileWithinRoot(workRoot, outputFile, 1<<20)
 			} else {
 				data, outErr = backend.ReadFile(stepCtx, outputFile, 1<<20)
 			}
@@ -1020,6 +1051,17 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			if st.ContinueOnError {
 				e.log(cj.ID, name, "failed but continue_on_error=true: "+runErr.Error())
 				continue
+			}
+			if st.CancelJobOnFailure {
+				// Woodpecker `failure: cancel`: the whole job stops here.
+				// Remaining steps — including always()/failure() diagnostics —
+				// do not run.
+				e.log(cj.ID, name, "failed; cancel_job_on_failure=true: canceling job")
+				currentStatus = model.StatusCancelled
+				if res.Error == "" {
+					res.Error = runErr.Error()
+				}
+				break
 			}
 			if errorKind(runErr) == ErrorCancelled || ctx.Err() != nil {
 				currentStatus = model.StatusCancelled
@@ -1072,9 +1114,9 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 				// Root-anchored read: the fragment path is workspace-relative
 				// (already cleaned above), so no symlinked component below the
 				// workspace can redirect it to host content.
-				data, gerr = readFileWithinRoot(workspace, filepath.Join(workspace, clean), maxGeneratedFragmentBytes)
+				data, gerr = readFileWithinRoot(workRoot, filepath.Join(workRoot, clean), maxGeneratedFragmentBytes)
 			} else {
-				data, gerr = e.ReadJobFile(ctx, cj.ID, filepath.Join(workspace, clean), maxGeneratedFragmentBytes)
+				data, gerr = e.ReadJobFile(ctx, cj.ID, filepath.Join(workRoot, clean), maxGeneratedFragmentBytes)
 			}
 			if gerr != nil {
 				genErr := fmt.Errorf("generate.path %q: %w", genPath, gerr)
@@ -1115,12 +1157,12 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	}
 	if currentStatus == model.StatusSuccess {
 		for _, c := range cj.Job.Cache {
-			key, er := e.Opt.Cache.KeyContext(ctx, e.cacheBase(c.Key)+"|"+runtime.GOOS+"|"+runtime.GOARCH+"|"+cj.Job.Runtime, workspace, c.HashFiles)
+			key, er := e.Opt.Cache.KeyContext(ctx, e.cacheBase(c.Key)+"|"+runtime.GOOS+"|"+runtime.GOARCH+"|"+cj.Job.Runtime, workRoot, c.HashFiles)
 			if er == nil {
 				// SaveContext, never Save: the legacy wrapper uses a
 				// timeout-free background context, so a big archive would
 				// ignore the job deadline entirely.
-				if er = e.Opt.Cache.SaveContext(ctx, key, workspace, c.Paths); er != nil {
+				if er = e.Opt.Cache.SaveContext(ctx, key, workRoot, c.Paths); er != nil {
 					e.log(cj.ID, "cache", "save warning: "+er.Error())
 				} else {
 					e.log(cj.ID, "cache", "saved "+cacheName(c)+" ("+key[:12]+")")
@@ -1143,7 +1185,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		res.Error = err.Error()
 		res.Outputs = nil
 	}
-	e.saveArtifacts(cj, workspace, res.Status, jobParent, lifecycle)
+	e.saveArtifacts(cj, workRoot, res.Status, jobParent, lifecycle)
 	// Artifact delivery is part of the declared job lifetime (the runner
 	// wires ArtifactReporter to the job context), so a deadline or
 	// cancellation that lands while artifacts are being published must not
@@ -1257,6 +1299,51 @@ func detachedJobContext(parent, lifecycle context.Context, timeout time.Duration
 // fragment read through the execution backend (mirrors the control plane's
 // upload bound).
 const maxGeneratedFragmentBytes = 256 << 10
+
+// provisionRegistryAuth writes a job-scoped docker config.json carrying the
+// pipeline's registry credential bindings. Secrets are resolved through the
+// job's secret provider and never logged. The returned directory is set as
+// DOCKER_CONFIG for every docker invocation of this job; cleanup removes it.
+func (e *Executor) provisionRegistryAuth(ctx context.Context, cj pipeline.CompiledJob) (string, func(), error) {
+	names := make([]string, 0, len(cj.Job.Registries)*2)
+	for _, r := range cj.Job.Registries {
+		names = append(names, r.UsernameSecret, r.PasswordSecret)
+	}
+	vals, err := e.resolveSecrets(ctx, names, map[string]string{})
+	if err != nil {
+		return "", func() {}, fmt.Errorf("registry credentials: %w", err)
+	}
+	auths := map[string]map[string]string{}
+	for _, r := range cj.Job.Registries {
+		user := vals[secretEnvName(r.UsernameSecret)]
+		pass := vals[secretEnvName(r.PasswordSecret)]
+		if user == "" || pass == "" {
+			return "", func() {}, fmt.Errorf("registry credentials: secret %q/%q did not resolve", r.UsernameSecret, r.PasswordSecret)
+		}
+		host := r.Host
+		if host == "" {
+			host = "https://index.docker.io/v1/"
+		}
+		auths[host] = map[string]string{"auth": base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))}
+	}
+	cfgDir, err := os.MkdirTemp("", "kiwi-docker-cfg-")
+	if err != nil {
+		return "", func() {}, fmt.Errorf("registry credentials: %w", err)
+	}
+	cleanup := func() { _ = os.RemoveAll(cfgDir) }
+	raw, err := json.Marshal(map[string]any{"auths": auths})
+	if err != nil {
+		cleanup()
+		return "", func() {}, fmt.Errorf("registry credentials: %w", err)
+	}
+	// 0600: the config holds live credentials. The directory is job-scoped
+	// and removed with the job.
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.json"), raw, 0o600); err != nil {
+		cleanup()
+		return "", func() {}, fmt.Errorf("registry credentials: %w", err)
+	}
+	return cfgDir, cleanup, nil
+}
 
 func (e *Executor) saveArtifacts(cj pipeline.CompiledJob, workspace string, status model.Status, jobParent, lifecycle context.Context) {
 	for _, a := range cj.Job.Artifacts {
@@ -1549,6 +1636,47 @@ func secureWorkingDir(workspace, rel string) (string, error) {
 	return filepath.Join(root, relToRoot), nil
 }
 
+// jobWorkRoot resolves the job's working root under the runner-assigned
+// workspace root: workspace.base/workspace.path when declared, else the
+// root itself. Steps with no working_directory, cache paths, artifact paths
+// and downloads all resolve from here (Woodpecker workspace.base/path
+// semantics). The runner still owns the root and its quota; this only
+// places the job's relative paths inside it.
+func jobWorkRoot(workspace string, ws pipeline.Workspace) (string, error) {
+	if ws.Base == "" && ws.Path == "" {
+		return workspace, nil
+	}
+	base := ws.Base
+	if base == "" {
+		base = "."
+	}
+	rel := filepath.Clean(filepath.Join(base, ws.Path))
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("workspace policy escapes the job workspace root: base=%q path=%q", ws.Base, ws.Path)
+	}
+	if rel == "." {
+		return workspace, nil
+	}
+	return filepath.Join(workspace, rel), nil
+}
+
+// workSubdirRel returns the in-workspace relative subdir for container -w
+// ("" means the workspace root).
+func workSubdirRel(ws pipeline.Workspace) string {
+	if ws.Base == "" && ws.Path == "" {
+		return ""
+	}
+	base := ws.Base
+	if base == "" {
+		base = "."
+	}
+	rel := filepath.Clean(filepath.Join(base, ws.Path))
+	if rel == "." {
+		return ""
+	}
+	return filepath.ToSlash(rel)
+}
+
 func collectNeedsOutputs(needs []string, jobs map[string]pipeline.CompiledJob, results map[string]model.JobResult) map[string]map[string]string {
 	out := map[string]map[string]string{}
 	baseCount := map[string]int{}
@@ -1603,8 +1731,10 @@ func (e *Executor) resolveSecrets(ctx context.Context, names []string, cache map
 			if er != nil {
 				return nil, er
 			}
-			if err := e.Masker.AddStrict(v); err != nil {
-				return nil, &RunError{Kind: ErrorConfig, Err: fmt.Errorf("secret %q cannot be masked; refusing to run: %w", name, err)}
+			if e.Masker != nil {
+				if err := e.Masker.AddStrict(v); err != nil {
+					return nil, &RunError{Kind: ErrorConfig, Err: fmt.Errorf("secret %q cannot be masked; refusing to run: %w", name, err)}
+				}
 			}
 			cache[name] = v
 		}

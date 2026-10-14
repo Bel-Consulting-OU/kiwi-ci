@@ -215,6 +215,27 @@ func (*NativeBackend) Run(ctx context.Context, c Command, emit func(string)) err
 		joinDrains(done, 2*time.Second, stdoutR, stderrR)
 		wait <- err
 	}()
+	if c.Background {
+		// detach: the step is started and supervised, but the job does not
+		// wait for it. Job teardown (ctx cancellation → terminate) reaps it.
+		go func() {
+			select {
+			case <-wait:
+			case <-ctx.Done():
+				_ = terminateProcess(cmd)
+				select {
+				case <-wait:
+				case <-time.After(nativeTermGrace):
+					_ = killProcess(cmd)
+					select {
+					case <-wait:
+					case <-time.After(killGrace):
+					}
+				}
+			}
+		}()
+		return nil
+	}
 	select {
 	case err := <-wait:
 		if err != nil {

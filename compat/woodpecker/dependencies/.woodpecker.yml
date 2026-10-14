@@ -1,0 +1,39 @@
+# dependencies: explicit DAG via depends_on. As soon as any step declares
+# depends_on, Woodpecker switches to DAG mode: steps with an empty
+# depends_on: [] start immediately, and steps without the key start
+# immediately too. An optional dependency is ignored when the referenced
+# step is not part of the pipeline.
+matrix:
+  GO: ["1.22", "1.23"]
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: example
+
+steps:
+  lint:
+    image: golang:1.23
+    depends_on: []
+    commands:
+      - golangci-lint run
+  build:
+    image: golang:1.23
+    depends_on: [lint]
+    commands:
+      - go build ./...
+  integration:
+    image: golang:1.23
+    depends_on: [build]
+    environment:
+      DATABASE_URL: postgres://db:5432/app
+    commands:
+      - go test -tags integration ./...
+  notify:
+    image: alpine:3.20
+    depends_on:
+      - name: integration
+        optional: true
+    commands:
+      - echo done

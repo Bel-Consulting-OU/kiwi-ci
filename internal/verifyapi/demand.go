@@ -16,9 +16,29 @@ import (
 // exact rules it was measured against, not to whatever the obligation
 // happened to carry inline.
 
-// EffectiveVerificationDemandSchemaVersion is the demand document schema
-// version. Any change to the canonical digest input must bump it.
-const EffectiveVerificationDemandSchemaVersion = 1
+// Effective demand schema identity (P1b).
+//
+// The canonical semantic object changed when verifier provider axes were
+// added. Per the package versioning rule, the object's schema identity must
+// change with it: historical v1 demand carries no provider contract and says
+// schema 1; provider-bearing current demand says schema 2. Digest domains
+// (demand/v1, demand/v2) separate the encodings; SchemaVersion separates the
+// MEANINGS. Do not reconstruct both meanings under one global constant.
+const (
+	// EffectiveVerificationDemandSchemaVersionV1 is the historical demand
+	// document schema: the pre-provider-axes field set. AcceptanceVersionV3
+	// and V4 records restore against this meaning (demand/v1 digest).
+	EffectiveVerificationDemandSchemaVersionV1 = 1
+	// EffectiveVerificationDemandSchemaVersionV2 is the current demand
+	// document schema: the v1 field set plus the verifier provider
+	// contract (kind, contract version, claim class, platform, evidence
+	// types). AcceptanceVersionV5 records restore against this meaning
+	// (demand/v2 digest).
+	EffectiveVerificationDemandSchemaVersionV2 = 2
+	// EffectiveVerificationDemandSchemaVersion is the schema version new
+	// demand documents are written at.
+	EffectiveVerificationDemandSchemaVersion = EffectiveVerificationDemandSchemaVersionV2
+)
 
 // demandDomain separates demand digests from every other digest in the
 // package. This is the v1 domain: the pre-provider-axes field set, retained
@@ -104,7 +124,7 @@ func ResolveEffectiveDemand(o VerificationObligation, recipe *Recipe) (Effective
 			return EffectiveVerificationDemand{}, err
 		}
 		return EffectiveVerificationDemand{
-			SchemaVersion: EffectiveVerificationDemandSchemaVersion,
+			SchemaVersion: EffectiveVerificationDemandSchemaVersionV2,
 			RecipeDigest:  d,
 			Requirements:  append([]string(nil), recipe.Requirements...),
 			Assurance:     recipe.Assurance,
@@ -121,7 +141,7 @@ func ResolveEffectiveDemand(o VerificationObligation, recipe *Recipe) (Effective
 		}, nil
 	}
 	return EffectiveVerificationDemand{
-		SchemaVersion: EffectiveVerificationDemandSchemaVersion,
+		SchemaVersion: EffectiveVerificationDemandSchemaVersionV2,
 		RecipeDigest:  o.RecipeDigest,
 		Requirements:  append([]string(nil), o.RequiredChecks...),
 		Assurance:     o.RequiredAssurance,
@@ -136,10 +156,22 @@ func ResolveEffectiveDemand(o VerificationObligation, recipe *Recipe) (Effective
 	}, nil
 }
 
-// Validate reports whether the demand is structurally sound.
+// Validate reports whether the demand is structurally sound for its own
+// schema identity. Schema 1 is the historical no-provider-contract meaning
+// (provider axes must be empty); schema 2 is the current provider-bearing
+// meaning. Any other schema is refused — a demand never quietly upgrades its
+// own meaning.
 func (d EffectiveVerificationDemand) Validate() error {
-	if d.SchemaVersion != EffectiveVerificationDemandSchemaVersion {
-		return fmt.Errorf("%w: demand schema_version %d (want %d)", ErrInvalid, d.SchemaVersion, EffectiveVerificationDemandSchemaVersion)
+	switch d.SchemaVersion {
+	case EffectiveVerificationDemandSchemaVersionV1:
+		// Historical meaning: no provider contract rides the demand.
+		if d.VerifierProviderKind != "" || d.VerifierContractVersion != "" || d.VerifierClaimClass != "" || d.VerifierPlatform != "" || len(d.VerifierEvidenceTypes) > 0 {
+			return fmt.Errorf("%w: demand schema_version %d cannot carry verifier provider constraints", ErrInvalid, d.SchemaVersion)
+		}
+	case EffectiveVerificationDemandSchemaVersionV2:
+		// Current meaning: provider axes are part of the contract.
+	default:
+		return fmt.Errorf("%w: demand schema_version %d (want %d or %d)", ErrInvalid, d.SchemaVersion, EffectiveVerificationDemandSchemaVersionV1, EffectiveVerificationDemandSchemaVersionV2)
 	}
 	if d.RecipeDigest != "" {
 		if err := validateDigest("demand recipe_digest", d.RecipeDigest); err != nil {
@@ -190,8 +222,16 @@ func (d EffectiveVerificationDemand) Validate() error {
 // lists sorted and timestamps UTC-normalized. Two demands digest equal
 // exactly when they demand the same rules from the same verifier family —
 // this is the value acceptance records and proofs bind as DemandDigest.
+//
+// The current digest is the schema-2 (provider-bearing) meaning. A demand
+// that still claims schema 1 is the historical shape and is refused here;
+// use canonicalDigestV1 for that meaning.
 func (d EffectiveVerificationDemand) CanonicalDigest() (Digest, error) {
 	n := d
+	if n.SchemaVersion != EffectiveVerificationDemandSchemaVersionV2 {
+		return "", fmt.Errorf("%w: CanonicalDigest is the schema_version %d rule, got %d (historical schema %d uses canonicalDigestV1)",
+			ErrInvalid, EffectiveVerificationDemandSchemaVersionV2, n.SchemaVersion, EffectiveVerificationDemandSchemaVersionV1)
+	}
 	if err := n.Validate(); err != nil {
 		return "", err
 	}
@@ -207,11 +247,20 @@ func (d EffectiveVerificationDemand) CanonicalDigest() (Digest, error) {
 }
 
 // canonicalDigestV1 is the pre-provider-fields demand digest (the v1 frozen
-// field set under the v1 demand domain). Retained verbatim so historical
-// AcceptanceVersionV3/V4 acceptance records keep restoring: their DemandDigest
-// was minted before the provider axes existed and must keep hashing equal.
+// field set under the v1 demand domain, schema identity 1). Retained verbatim
+// so historical AcceptanceVersionV3/V4 acceptance records keep restoring:
+// their DemandDigest was minted before the provider axes existed and must
+// keep hashing equal. The historical meaning is reconstructed here — schema 1
+// with empty provider axes — rather than trusted from whatever the current
+// demand object claims.
 func (d EffectiveVerificationDemand) canonicalDigestV1() (Digest, error) {
 	n := d
+	n.SchemaVersion = EffectiveVerificationDemandSchemaVersionV1
+	n.VerifierProviderKind = ""
+	n.VerifierContractVersion = ""
+	n.VerifierClaimClass = ""
+	n.VerifierPlatform = ""
+	n.VerifierEvidenceTypes = nil
 	if err := n.Validate(); err != nil {
 		return "", err
 	}

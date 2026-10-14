@@ -453,7 +453,9 @@ var knownFieldTables = map[string]map[string]bool{
 		"image": true, "network": true, "vm": true, "shell": true, "timeout": true,
 		"retry": true, "env": true, "matrix": true, "paths": true, "paths_ignore": true,
 		"services": true, "steps": true, "cache": true, "artifacts": true,
-		"downloads": true, "test_reports": true, "environment": true,
+		"downloads": true, "clone": true, "workspace": true, "volumes": true,
+		"registries":   true,
+		"test_reports": true, "environment": true,
 		"infra_retries": true, "permissions": true, "outputs": true,
 		"placement": true, "sandbox": true, "resources": true,
 		"tests": true, "generate": true, "downstream": true, "deployment": true,
@@ -462,7 +464,11 @@ var knownFieldTables = map[string]map[string]bool{
 	},
 	"jobs.*.retry":                       {"max": true, "backoff": true, "on": true, "max_set": true},
 	"jobs.*.environment":                 {"name": true, "url": true, "approval": true, "branches": true, "concurrency": true},
-	"jobs.*.sandbox":                     {"rootless": true, "read_only_rootfs": true, "network": true},
+	"jobs.*.sandbox":                     {"rootless": true, "read_only_rootfs": true, "privileged": true, "non_root": true, "network": true},
+	"jobs.*.clone":                       {"skip": true, "depth": true, "submodules": true, "lfs": true, "sparse_paths": true},
+	"jobs.*.workspace":                   {"base": true, "path": true},
+	"jobs.*.volumes.*":                   {"name": true, "path": true, "host_path": true, "read_only": true},
+	"jobs.*.registries.*":                {"host": true, "username_secret": true, "password_secret": true},
 	"jobs.*.placement":                   {"regions": true, "labels": true},
 	"jobs.*.resources":                   {"cpu": true, "memory": true, "disk": true, "pids": true},
 	"jobs.*.tests":                       {"reports": true, "manifest": true, "shards": true, "retry_failed": true, "quarantine_flaky": true},
@@ -471,7 +477,7 @@ var knownFieldTables = map[string]map[string]bool{
 	"jobs.*.snapshot":                    {"on": true},
 	"jobs.*.deployment":                  {"canary": true, "verify": true, "rollback": true},
 	"jobs.*.services.*":                  {"name": true, "image": true, "env": true, "healthcheck": true, "interval": true, "timeout": true, "retries": true, "retries_set": true},
-	"jobs.*.steps.*":                     {"id": true, "name": true, "run": true, "if": true, "shell": true, "working_directory": true, "env": true, "secrets": true, "timeout": true, "retry": true, "continue_on_error": true},
+	"jobs.*.steps.*":                     {"id": true, "name": true, "run": true, "if": true, "shell": true, "working_directory": true, "env": true, "secrets": true, "timeout": true, "retry": true, "continue_on_error": true, "cancel_job_on_failure": true, "background": true},
 	"jobs.*.steps.*.retry":               {"max": true, "backoff": true, "on": true, "max_set": true},
 	"jobs.*.cache.*":                     {"name": true, "paths": true, "key": true, "hash_files": true, "restore_keys": true},
 	"jobs.*.artifacts.*":                 {"name": true, "paths": true, "if": true, "retention": true, "sbom": true, "sigstore": true, "required": true, "max_size": true, "provenance": true},
@@ -489,7 +495,8 @@ var knownFieldTables = map[string]map[string]bool{
 // their own known-field table.
 var sequenceSections = map[string]bool{
 	"jobs.*.steps": true, "jobs.*.services": true, "jobs.*.cache": true,
-	"jobs.*.artifacts": true, "jobs.*.downloads": true,
+	"jobs.*.artifacts": true, "jobs.*.downloads": true, "jobs.*.volumes": true,
+	"jobs.*.registries":        true,
 	"jobs.*.deployment.canary": true, "jobs.*.deployment.verify": true, "jobs.*.deployment.rollback": true,
 }
 

@@ -1,0 +1,43 @@
+{
+  "schema": "kiwi.woodpecker-compat-trace/v1",
+  "source": ".woodpecker.yml",
+  "verdict": "EXACT",
+  "trigger": {
+    "events": [],
+    "branches": []
+  },
+  "definition_order": ["build", "test", "package"],
+  "step_order": ["build", "test", "package"],
+  "graph": {
+    "build": [],
+    "test": ["build"],
+    "package": ["test"]
+  },
+  "env": {
+    "build": {"CGO_ENABLED": "0"}
+  },
+  "skip_states": {
+    "build": "run",
+    "test": "run",
+    "package": "run"
+  },
+  "fail_states": {
+    "build": "abort_on_error",
+    "test": "abort_on_error",
+    "package": "abort_on_error"
+  },
+  "exact": [
+    "sequential steps (no depends_on) → chained needs edges in definition order",
+    "step \"build\" image → job image",
+    "step \"build\" commands → steps[].run",
+    "step \"build\" environment → job env",
+    "step \"test\" image → job image",
+    "step \"test\" commands → steps[].run",
+    "step \"package\" image → job image",
+    "step \"package\" commands → steps[].run"
+  ],
+  "differences": [],
+  "unsupported": [],
+  "unsafe": [],
+  "todos": []
+}

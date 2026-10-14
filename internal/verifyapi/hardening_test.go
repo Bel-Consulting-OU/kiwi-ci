@@ -140,6 +140,103 @@ func TestAcceptanceV2DomainSeparatedFromV1(t *testing.T) {
 	}
 }
 
+// TestRestoreAuthenticatesMACBeforeSemanticInterpretation: the restore order
+// is parse envelope → authenticate MAC → interpret digests/recipes/subjects.
+// A corrupted acceptance record must fail on the MAC itself and must NOT
+// surface a pre-auth digest, recipe, or subject oracle. Payload tampering
+// under a still-valid MAC is the post-auth digest path.
+func TestRestoreAuthenticatesMACBeforeSemanticInterpretation(t *testing.T) {
+	ob := baseObligation(t)
+	ob.RequiredChecks = []string{CheckJobStatusSuccess, CheckEvidenceRoot}
+	v := baseOutcome(t, ob)
+	v.EvidenceRoot = mustDigest(t, "mac-order-root")
+	v.ProvenanceRefs = []string{"att-1"}
+	v.ExecutionIDs = []string{"exec-1"}
+
+	f := &FuncEvidenceVerifier{
+		Identity: "mac-order-verifier/v1",
+		Resolve: func(context.Context, string) (ResolvedAttestation, error) {
+			return ResolvedAttestation{
+				ExecutionID:       "exec-1",
+				EvidenceRoot:      mustDigest(t, "mac-order-root"),
+				AttestationDigest: mustDigest(t, "mac-order-att"),
+				Status:            "success",
+				Attested:          trustedWindow(),
+				Checks:            passChecks("exec-1", CheckJobStatusSuccess, CheckEvidenceRoot),
+			}, nil
+		},
+	}
+	sealed, err := f.Verify(context.Background(), ob, v)
+	if err != nil {
+		t.Fatalf("Verify = %v", err)
+	}
+	key := mustKey(t, "acc-mac-order", "mac-order-secret-32-bytes-long!!")
+	rec, err := Accept(ob, sealed, key, time.Date(2026, 1, 2, 3, 6, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("Accept = %v", err)
+	}
+	persisted := PersistedVerified{
+		Obligation:     ob,
+		SubmittedClaim: sealed.SubmittedClaim(),
+		Outcome:        sealed.Outcome(),
+		Evidence:       sealed.Evidence(),
+		Acceptance:     rec,
+	}
+	if _, err := RestoreVerifiedOutcome(persisted, key); err != nil {
+		t.Fatalf("intact restore = %v", err)
+	}
+
+	// 1. Corrupted ACCEPTANCE RECORD (stale MAC over rewritten digests).
+	// Must report MAC failure — not "obligation digest mismatch", not a
+	// recipe ErrBinding, not a subject mismatch.
+	forged := persisted
+	forged.Acceptance = rec
+	forged.Acceptance.ObligationDigest = mustDigest(t, "forged-ob")
+	_, err = RestoreVerifiedOutcome(forged, key)
+	if err == nil {
+		t.Fatal("forged acceptance digests must not restore")
+	}
+	if !errors.Is(err, ErrAcceptance) {
+		t.Fatalf("forged acceptance error = %v, want ErrAcceptance", err)
+	}
+	if !strings.Contains(err.Error(), "MAC") {
+		t.Fatalf("forged acceptance must fail on MAC authentication, got %v", err)
+	}
+
+	// 2. Corrupted SUBJECT on the record under a stale MAC: still MAC-first.
+	forgedSub := persisted
+	forgedSub.Acceptance = rec
+	forgedSub.Acceptance.Subject = "forged-subject"
+	_, err = RestoreVerifiedOutcome(forgedSub, key)
+	if err == nil || !errors.Is(err, ErrAcceptance) || !strings.Contains(err.Error(), "MAC") {
+		t.Fatalf("forged record subject must fail MAC-first, got %v", err)
+	}
+
+	// 3. Corrupted record with a garbage MAC value: still MAC failure.
+	forgedMAC := persisted
+	forgedMAC.Acceptance = rec
+	forgedMAC.Acceptance.MAC = strings.Repeat("0", 64)
+	forgedMAC.Acceptance.ObligationDigest = mustDigest(t, "other")
+	_, err = RestoreVerifiedOutcome(forgedMAC, key)
+	if err == nil || !errors.Is(err, ErrAcceptance) || !strings.Contains(err.Error(), "MAC") {
+		t.Fatalf("garbage MAC must fail MAC-first, got %v", err)
+	}
+
+	// 4. Payload (PersistedVerified) tampering under an intact MAC is the
+	// post-auth digest path — the MAC is valid because it commits only the
+	// record, and the payload↔record comparison catches the swap.
+	tamperedPayload := persisted
+	tamperedPayload.Obligation = persisted.Obligation
+	tamperedPayload.Obligation.Subject = "other-subject"
+	_, err = RestoreVerifiedOutcome(tamperedPayload, key)
+	if err == nil {
+		t.Fatal("tampered payload obligation must not restore")
+	}
+	if !errors.Is(err, ErrAcceptance) {
+		t.Fatalf("tampered payload error = %v, want ErrAcceptance", err)
+	}
+}
+
 // TestAcceptanceV1StillRestores: a v1 record (no claim digest) keeps
 // restoring when its v1 MAC verifies — migration must not brick existing
 // rows. New records still write v2.

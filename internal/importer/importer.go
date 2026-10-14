@@ -34,8 +34,15 @@ type Result struct {
 	// TODOs lists constructs that need human action to finish the
 	// migration (e.g. actions/setup-go has no Kiwi equivalent).
 	TODOs []string
+	// Unsafe lists constructs that could be emitted but would change the
+	// security posture of the pipeline (host mounts, privileged containers,
+	// trusted-repo-only features). They are never silently converted.
+	Unsafe []string
+	// Mapped lists constructs that converted 1:1 into a Kiwi equivalent.
+	// Used by the compatibility surface to report what is exact.
+	Mapped []string
 	// Confidence in [0,1] rates how much of the source mapped cleanly.
-	// Unsupported constructs cost twice as much as TODOs.
+	// Unsupported and unsafe constructs cost twice as much as TODOs.
 	Confidence float64
 }
 
@@ -59,12 +66,23 @@ func (r *Result) AddTODO(format string, args ...any) {
 	r.TODOs = append(r.TODOs, fmt.Sprintf(format, args...))
 }
 
+// AddUnsafe records a construct whose conversion would change the security
+// posture of the pipeline (privileged mode, host volume mounts, ...).
+func (r *Result) AddUnsafe(format string, args ...any) {
+	r.Unsafe = append(r.Unsafe, fmt.Sprintf(format, args...))
+}
+
+// AddMapped records a construct that converted 1:1 into a Kiwi equivalent.
+func (r *Result) AddMapped(format string, args ...any) {
+	r.Mapped = append(r.Mapped, fmt.Sprintf(format, args...))
+}
+
 // Finalize computes Confidence from the number of constructs that mapped
 // cleanly versus the reports. supported counts constructs that were
 // converted; unsupported counts dropped constructs; todos counts
-// human-action items. Unsupported constructs weigh double.
+// human-action items. Unsupported and unsafe constructs weigh double.
 func (r *Result) Finalize(supported int) {
-	total := supported + 2*len(r.Unsupported) + len(r.TODOs)
+	total := supported + 2*len(r.Unsupported) + 2*len(r.Unsafe) + len(r.TODOs)
 	if total <= 0 {
 		r.Confidence = 1
 		return

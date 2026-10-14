@@ -19,6 +19,8 @@ const (
 	ViolationKindLabels     = "runner_labels"
 	ViolationKindDeployment = "deployments"
 	ViolationKindRuntime    = "runtime"
+	ViolationKindPrivileged = "privileged"
+	ViolationKindHostMount  = "host_mount"
 )
 
 // Violation is a typed policy admission failure.
@@ -141,6 +143,14 @@ func validateJob(id string, job pipeline.Job, caps Capabilities) error {
 	}
 	if job.Environment.Name != "" && !caps.Deployments {
 		return &Violation{Kind: ViolationKindDeployment, Detail: fmt.Sprintf("job %q targets environment %q", id, job.Environment.Name)}
+	}
+	if job.Sandbox.Privileged && !caps.Privileged {
+		return &Violation{Kind: ViolationKindPrivileged, Detail: fmt.Sprintf("job %q requests sandbox.privileged", id)}
+	}
+	for _, v := range job.Volumes {
+		if v.HostPath != "" && !caps.HostMounts {
+			return &Violation{Kind: ViolationKindHostMount, Detail: fmt.Sprintf("job %q volume %q mounts host path %q", id, v.Name, v.HostPath)}
+		}
 	}
 	if caps.Secrets != nil {
 		for _, step := range job.Steps {

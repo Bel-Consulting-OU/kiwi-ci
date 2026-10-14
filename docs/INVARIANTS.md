@@ -24,6 +24,42 @@ quickly; the named symbol is the stable reference. PostgreSQL is the canonical
 store (the only one with transactional ledgers); filesystem/memory stores mirror
 its behavior but are explicitly non-canonical unless stated otherwise.
 
+## Design rule A1 — authority from immutable truth
+
+**No authority-bearing object may derive its authority from mutable public
+projections.**
+
+For every transition in the chain
+
+```text
+SCM event → execution → provenance → evidence → derived result
+         → accepted result → restored result → verification proof
+         → portable proof
+```
+
+the next level must come from either:
+
+1. re-deriving from lower-level authenticated truth, or
+2. verifying a cryptographic content binding (MAC/signature over a frozen
+   encoding of the committed digests).
+
+Never merely: *"this object says it was already verified."*
+
+Concretely:
+
+| Object | Authority source |
+|---|---|
+| `DerivedVerifiedOutcome` | sealed unexported fields + accessors; `sealDerivedOutcome` re-derives result/checks/assurance from evidence primitives (`internal/verifyapi/evidence.go`) |
+| `VerifiedProof` | sealed document/summary/outcome; portable Ed25519 envelope over frozen digests (`internal/verifyapi/proof.go`) |
+| Acceptance record | MAC over frozen payload, verified **before** any semantic interpretation (`authenticateAcceptance`) |
+| Restored record | re-derives Window/Kinds from MAC-verified primitives; never trusts persisted projections |
+| Effective demand | recipe-bound rule set; schema identity 1 vs 2 tracks the semantic object (`internal/verifyapi/demand.go`) |
+| Recipe binding | `ValidateSubmission` → `BindRecipe` → `Validate`; caller never pre-populates recipe-owned policy |
+
+A violation is any path where an exported field, a `sealed bool`, or a
+self-declared status can mint or preserve authority without going through
+re-derivation or a content binding.
+
 ## Status legend
 
 | Status | Meaning |
@@ -47,6 +83,7 @@ its behavior but are explicitly non-canonical unless stated otherwise.
 | I8 | Cancellation/terminal monotonicity (idempotent cancel/approve) | enforced+tested |
 | I9 | Credentials never exceed the execution that requested them | enforced+tested |
 | I10 | Untrusted execution cannot populate a trusted cache namespace | enforced+tested |
+| I11 | Authority derives only from immutable truth (A1): no authority from mutable public projections | enforced+tested |
 
 ## Evidence map (deterministic / randomized / chaos / fuzz)
 
