@@ -545,6 +545,47 @@ func (a ExecutionAssurance) Satisfies(need ExecutionAssurance) bool {
 	return a.properties()&needProps == needProps
 }
 
+// countProps counts set property bits so "strongest" means most properties.
+func countProps(p assuranceProperties) int {
+	n := 0
+	for p != 0 {
+		n += int(p & 1)
+		p >>= 1
+	}
+	return n
+}
+
+// Meet returns the greatest lower bound of two assurance profiles in the
+// property lattice: the strongest profile whose properties both a and b
+// prove. Network-denied and kiwi-mediated are siblings, so their meet is
+// weaker than either (they share isolation + clean credentials only).
+// Unknown profiles meet to Uncontrolled (fail closed toward less authority).
+func (a ExecutionAssurance) Meet(b ExecutionAssurance) ExecutionAssurance {
+	if !a.Valid() || !b.Valid() {
+		return AssuranceUncontrolled
+	}
+	inter := a.properties() & b.properties()
+	// Strongest defined profile whose properties are a subset of the
+	// intersection.
+	best := AssuranceUncontrolled
+	var bestProps assuranceProperties
+	for _, c := range []ExecutionAssurance{
+		AssuranceSealedPinnedNoNetwork,
+		AssuranceNetworkDenied,
+		AssuranceKiwiMediatedAuthority,
+		AssuranceNoInjectedCredentials,
+		AssuranceIsolatedFilesystem,
+		AssuranceUncontrolled,
+	} {
+		cp := c.properties()
+		if cp&inter == cp && (bestProps == 0 || countProps(cp) >= countProps(bestProps)) {
+			best = c
+			bestProps = cp
+		}
+	}
+	return best
+}
+
 // DeriveAssuranceProfile derives the profile label from the authoritative
 // fact vector under SCHEMA v6 semantics. Network-denied and sealed profiles
 // require the PROVEN NetworkAccessDenied fact — never the policy field alone.

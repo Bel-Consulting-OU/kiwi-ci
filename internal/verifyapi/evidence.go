@@ -787,7 +787,15 @@ func DeriveCheckOutcomeFromCases(rep model.TestReport) CheckOutcome {
 // a stronger sibling. An attestation without facts derives the conservative
 // unproven profile (model.UnprovenExecutionFacts → uncontrolled).
 func deriveAssurance(resolved []ResolvedAttestation) model.ExecutionAssurance {
-	weakest := model.AssuranceSealedPinnedNoNetwork
+	// The combined guarantee is the property-lattice MEET of every
+	// attestation's derived profile — not the numeric minimum. Profiles 3
+	// (network_denied) and 4 (kiwi_mediated_authority) are siblings: their
+	// numeric min overclaims one sibling's property set as if it were a
+	// subset of the other.
+	if len(resolved) == 0 {
+		return model.AssuranceUncontrolled
+	}
+	meet := model.AssuranceSealedPinnedNoNetwork
 	for _, att := range resolved {
 		facts := model.UnprovenExecutionFacts()
 		if att.Facts != nil {
@@ -798,11 +806,9 @@ func deriveAssurance(resolved []ResolvedAttestation) model.ExecutionAssurance {
 			schema = provenanceCurrentAssuranceSchema
 		}
 		p := model.DeriveAssuranceProfileSchema(schema, facts)
-		if p < weakest {
-			weakest = p
-		}
+		meet = meet.Meet(p)
 	}
-	return weakest
+	return meet
 }
 
 // provenanceCurrentAssuranceSchema is the schema version assumed when a

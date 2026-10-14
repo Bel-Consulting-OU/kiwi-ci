@@ -487,3 +487,24 @@ func TestExecutionAssuranceSatisfiesIsPropertyLattice(t *testing.T) {
 		}
 	}
 }
+
+// TestAssuranceMeetIsPropertyLattice: network_denied and kiwi_mediated are
+// siblings — their meet must NOT be the numeric minimum (which would
+// overclaim network denial). The meet is the shared property subset only.
+func TestAssuranceMeetIsPropertyLattice(t *testing.T) {
+	m := AssuranceNetworkDenied.Meet(AssuranceKiwiMediatedAuthority)
+	if m != AssuranceNoInjectedCredentials {
+		t.Fatalf("network_denied ∧ kiwi_mediated = %d, want no_injected_credentials (shared subset)", int(m))
+	}
+	if m.Satisfies(AssuranceNetworkDenied) || m.Satisfies(AssuranceKiwiMediatedAuthority) {
+		t.Fatal("meet must not satisfy either sibling")
+	}
+	s := AssuranceSealedPinnedNoNetwork.Meet(AssuranceNetworkDenied)
+	if s != AssuranceNetworkDenied {
+		t.Fatalf("sealed ∧ network_denied = %d, want network_denied", int(s))
+	}
+	u := AssuranceUncontrolled.Meet(AssuranceSealedPinnedNoNetwork)
+	if u != AssuranceUncontrolled {
+		t.Fatalf("uncontrolled ∧ sealed = %d, want uncontrolled", int(u))
+	}
+}

@@ -26,7 +26,7 @@ func testClaimCandidateFact(t *testing.T, id string) CandidateFact {
 		IOBytes:           Observed(int64(1 << 20)),
 		CacheHits:         Observed(int64(10)),
 		CacheMisses:       Observed(int64(2)),
-		ArtifactSizeBytes: 1024,
+		ArtifactSizeBytes: Epistemic[int64]{Value: 1024, Level: EpistemicObserved},
 	}
 }
 
@@ -109,7 +109,7 @@ func TestCompareCandidatesRefuses(t *testing.T) {
 		},
 		"negative size": func(rows *[]CandidateFact) {
 			c := (*rows)[0]
-			c.ArtifactSizeBytes = -1
+			c.ArtifactSizeBytes = Epistemic[int64]{Value: -1, Level: EpistemicObserved}
 			*rows = append(*rows, c)
 		},
 	} {
@@ -189,7 +189,7 @@ func TestFactFromOutcome(t *testing.T) {
 	if f.IOBytes.Level != EpistemicObserved || f.CacheHits.Level != EpistemicObserved || f.CacheMisses.Level != EpistemicObserved {
 		t.Fatalf("io/cache levels = %s/%s/%s, want observed", f.IOBytes.Level, f.CacheHits.Level, f.CacheMisses.Level)
 	}
-	if f.ArtifactSizeBytes != 2048 {
+	if f.ArtifactSizeBytes.Value != 2048 {
 		t.Fatalf("ArtifactSizeBytes = %d", f.ArtifactSizeBytes)
 	}
 	if err := f.Validate(); err != nil {
@@ -277,7 +277,7 @@ func TestCandidateFactValidate(t *testing.T) {
 		"unknown wall level": func(c *CandidateFact) {
 			c.WallTimeNS = Epistemic[int64]{Value: 1, Level: EpistemicUnknown}
 		},
-		"neg size": func(c *CandidateFact) { c.ArtifactSizeBytes = -1 },
+		"neg size": func(c *CandidateFact) { c.ArtifactSizeBytes = Epistemic[int64]{Value: -1, Level: EpistemicObserved} },
 		"outcome mismatch": func(c *CandidateFact) {
 			c.Terminal = TerminalEvidenceIncomplete
 			// Outcome left as fail.

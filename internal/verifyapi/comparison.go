@@ -157,7 +157,7 @@ type CandidateFact struct {
 	CacheMisses Epistemic[int64] `json:"cache_misses"`
 	// ArtifactSizeBytes is the size in bytes of the candidate artifact
 	// this attempt verified. Zero when the surface recorded none.
-	ArtifactSizeBytes int64 `json:"artifact_size_bytes"`
+	ArtifactSizeBytes Epistemic[int64] `json:"artifact_size_bytes"`
 }
 
 // Validate reports whether the row is structurally sound: identity present,
@@ -191,7 +191,7 @@ func (f CandidateFact) Validate() error {
 	if err := f.economic().validate(); err != nil {
 		return err
 	}
-	if f.ArtifactSizeBytes < 0 {
+	if f.ArtifactSizeBytes.Value < 0 {
 		return fmt.Errorf("%w: artifact_size_bytes must be >= 0", ErrInvalid)
 	}
 	return nil
@@ -306,7 +306,7 @@ func FactFromOutcome(candidateID string, d DerivedVerifiedOutcome, c EvidenceCom
 		IOBytes:           ec.IOBytes,
 		CacheHits:         ec.CacheHits,
 		CacheMisses:       ec.CacheMisses,
-		ArtifactSizeBytes: artifactSizeBytes,
+		ArtifactSizeBytes: Epistemic[int64]{Value: artifactSizeBytes, Level: EpistemicObserved},
 	}, nil
 }
 
@@ -321,7 +321,7 @@ type VerifiedCandidateSource struct {
 	// CandidateID is the caller's candidate identity inside the comparison.
 	CandidateID string
 	// ArtifactSizeBytes is the candidate artifact size (0 when unknown).
-	ArtifactSizeBytes int64
+	ArtifactSizeBytes Epistemic[int64]
 
 	derived *DerivedVerifiedOutcome
 	proof   *VerificationProof
@@ -338,7 +338,7 @@ func VerifiedFromDerived(candidateID string, d DerivedVerifiedOutcome, artifactS
 		return VerifiedCandidateSource{}, fmt.Errorf("%w: verified comparison accepts only sealed records, never raw claims", ErrUnverified)
 	}
 	cp := d
-	return VerifiedCandidateSource{CandidateID: candidateID, ArtifactSizeBytes: artifactSizeBytes, derived: &cp}, nil
+	return VerifiedCandidateSource{CandidateID: candidateID, ArtifactSizeBytes: Epistemic[int64]{Value: artifactSizeBytes, Level: EpistemicObserved}, derived: &cp}, nil
 }
 
 // VerifiedFromProof wraps a VerificationProof as a comparison source. The
@@ -350,7 +350,7 @@ func VerifiedFromProof(candidateID string, p VerificationProof, artifactSizeByte
 		return VerifiedCandidateSource{}, fmt.Errorf("%w: candidate_id is required", ErrInvalid)
 	}
 	cp := p
-	return VerifiedCandidateSource{CandidateID: candidateID, ArtifactSizeBytes: artifactSizeBytes, proof: &cp}, nil
+	return VerifiedCandidateSource{CandidateID: candidateID, ArtifactSizeBytes: Epistemic[int64]{Value: artifactSizeBytes, Level: EpistemicObserved}, proof: &cp}, nil
 }
 
 // sealed returns the sealed DerivedVerifiedOutcome behind this source,
@@ -392,7 +392,7 @@ type VerifiedCandidateFact struct {
 	IOBytes           Epistemic[int64] `json:"io_bytes"`
 	CacheHits         Epistemic[int64] `json:"cache_hits"`
 	CacheMisses       Epistemic[int64] `json:"cache_misses"`
-	ArtifactSizeBytes int64            `json:"artifact_size_bytes"`
+	ArtifactSizeBytes Epistemic[int64] `json:"artifact_size_bytes"`
 }
 
 // Validate reports structural soundness: identity present, valid terminal
@@ -422,7 +422,7 @@ func (f VerifiedCandidateFact) Validate() error {
 	if err := f.economic().validate(); err != nil {
 		return err
 	}
-	if f.ArtifactSizeBytes < 0 {
+	if f.ArtifactSizeBytes.Value < 0 {
 		return fmt.Errorf("%w: artifact_size_bytes must be >= 0", ErrInvalid)
 	}
 	return nil
@@ -505,7 +505,7 @@ func CompareVerifiedCandidates(base Digest, sources []VerifiedCandidateSource, k
 // anything else is evidence_incomplete. The row is never built from a claim.
 // Resource/economic facts are Epistemic-tagged at their ResourceFacts source
 // level; row Authority=verified does not promote reported figures to verified.
-func verifiedFactFromDerived(candidateID string, artifactSizeBytes int64, d DerivedVerifiedOutcome) VerifiedCandidateFact {
+func verifiedFactFromDerived(candidateID string, artifactSizeBytes Epistemic[int64], d DerivedVerifiedOutcome) VerifiedCandidateFact {
 	term, coarse := verifiedTerminal(d)
 	ec := economicFromResources(d.outcome.Resources)
 	return VerifiedCandidateFact{
