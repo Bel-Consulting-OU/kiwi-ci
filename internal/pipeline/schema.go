@@ -1057,9 +1057,14 @@ func checkSchemaJob(id string, j *yaml.Node) []string {
 		errs = append(errs, checkRetryNode(v, fmt.Sprintf("job %q retry", id))...)
 	}
 	steps := mappingValue(j, "steps")
-	if steps == nil || steps.Kind != yaml.SequenceNode || len(steps.Content) == 0 {
-		errs = append(errs, fmt.Sprintf("job %q has no steps", id))
-	} else {
+	runShorthand := mappingValue(j, "run")
+	if (steps == nil || steps.Kind != yaml.SequenceNode || len(steps.Content) == 0) &&
+		(runShorthand == nil || runShorthand.Kind != yaml.ScalarNode || strings.TrimSpace(runShorthand.Value) == "") {
+		errs = append(errs, fmt.Sprintf("job %q has no steps (or run: shorthand)", id))
+	} else if steps != nil && steps.Kind == yaml.SequenceNode && len(steps.Content) > 0 {
+		if runShorthand != nil && runShorthand.Kind == yaml.ScalarNode && strings.TrimSpace(runShorthand.Value) != "" {
+			errs = append(errs, fmt.Sprintf("job %q: run and steps are mutually exclusive", id))
+		}
 		for i, sn := range steps.Content {
 			where := fmt.Sprintf("job %q step %d", id, i+1)
 			if sn.Kind != yaml.MappingNode {

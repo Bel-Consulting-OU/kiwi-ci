@@ -103,6 +103,7 @@ func PublicRoute(method, path string) bool {
 		path == "/api/v1/login" ||
 		path == "/api/v1/logout" ||
 		path == "/readiness" ||
+		path == "/readiness/lease" ||
 		path == "/liveness" ||
 		path == "/version" ||
 		path == "/.well-known/openid-configuration" ||

@@ -1048,61 +1048,69 @@ func canonicalResolveNMinusOne(t *testing.T, srcDir, goBin, outPath string) stri
 		t.Fatal("KIWI_REQUIRE_RELEASED_N_MINUS_ONE=1 requires KIWI_N_MINUS_ONE_BIN (the published release binary); source rebuild is not release certification")
 	}
 
-	n1SHA := canonicalPickNMinusOneSHA(t, srcDir)
+	n1SHAs := canonicalPickNMinusOneSHAs(t, srcDir)
 	required := false
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("KIWI_REQUIRE_N_MINUS_ONE"))) {
 	case "1", "true", "yes":
 		required = true
 	}
-	if n1SHA == "" {
+	if len(n1SHAs) == 0 {
 		msg := "no prior commit produced a buildable N-1 worktree (set KIWI_REQUIRE_N_MINUS_ONE=1 to fail closed, or supply KIWI_N_MINUS_ONE_BIN/KIWI_N_MINUS_ONE_SHA256)"
 		if required {
 			t.Fatal("canonical N-1→N: " + msg)
 		}
 		t.Skip("canonical N-1→N: " + msg)
 	}
-	wt := filepath.Join(t.TempDir(), "kiwi-n1-wt")
-	add := exec.Command("git", "worktree", "add", "--detach", wt, n1SHA)
-	add.Dir = srcDir
-	if out, err := add.CombinedOutput(); err != nil {
-		msg := fmt.Sprintf("git worktree add %s: %v\n%s", n1SHA, err, out)
-		if required {
-			t.Fatal("canonical N-1→N: " + msg)
+	// Try candidates newest-first until one BUILDS. A broken intermediate
+	// commit (a mid-edit tree that does not compile) must not poison N-1
+	// resolution: walk back to the last buildable ancestor.
+	var lastErr string
+	for _, n1SHA := range n1SHAs {
+		wt := filepath.Join(t.TempDir(), "kiwi-n1-wt")
+		add := exec.Command("git", "worktree", "add", "--detach", wt, n1SHA)
+		add.Dir = srcDir
+		if out, err := add.CombinedOutput(); err != nil {
+			lastErr = fmt.Sprintf("git worktree add %s: %v\n%s", n1SHA, err, out)
+			continue
 		}
-		t.Skip("canonical N-1→N: " + msg)
-	}
-	defer func() {
+		build := exec.Command(goBin, "build", "-o", outPath, "./cmd/kiwi")
+		build.Dir = wt
+		build.Env = os.Environ()
+		out, err := build.CombinedOutput()
 		rm := exec.Command("git", "worktree", "remove", "--force", wt)
 		rm.Dir = srcDir
 		_ = rm.Run()
-	}()
-	build := exec.Command(goBin, "build", "-o", outPath, "./cmd/kiwi")
-	build.Dir = wt
-	build.Env = os.Environ()
-	if out, err := build.CombinedOutput(); err != nil {
-		msg := fmt.Sprintf("N-1 go build from %s: %v\n%s", n1SHA, err, out)
-		if required {
-			t.Fatal("canonical N-1→N: " + msg)
+		if err != nil {
+			lastErr = fmt.Sprintf("N-1 go build from %s: %v\n%s", n1SHA, err, out)
+			continue
 		}
-		t.Skip("canonical N-1→N: " + msg)
+		return n1SHA
 	}
-	return n1SHA
+	msg := lastErr
+	if msg == "" {
+		msg = "no prior commit produced a buildable N-1 worktree"
+	}
+	if required {
+		t.Fatal("canonical N-1→N: " + msg)
+	}
+	t.Skip("canonical N-1→N: " + msg)
+	return ""
 }
 
-// canonicalPickNMinusOneSHA walks recent history for a commit that is not
-// HEAD. KIWI_N_MINUS_ONE_SHA forces the commit. Returns "" when none is
-// acceptable (caller skips or fatals per KIWI_REQUIRE_N_MINUS_ONE).
-func canonicalPickNMinusOneSHA(t *testing.T, srcDir string) string {
+// canonicalPickNMinusOneSHAs walks recent history for commits that are not
+// HEAD, newest first. KIWI_N_MINUS_ONE_SHA forces a single commit. Returns
+// every candidate so the caller can walk back past unbuildable trees.
+func canonicalPickNMinusOneSHAs(t *testing.T, srcDir string) []string {
 	t.Helper()
 	if forced := strings.TrimSpace(os.Getenv("KIWI_N_MINUS_ONE_SHA")); forced != "" {
 		rev := exec.Command("git", "rev-parse", "--verify", forced+"^{commit}")
 		rev.Dir = srcDir
 		if o, err := rev.CombinedOutput(); err == nil {
-			return strings.TrimSpace(string(o))
+			return []string{strings.TrimSpace(string(o))}
 		}
-		return ""
+		return nil
 	}
-	log := exec.Command("git", "log", "--format=%H", "-n", "15")
+	log := exec.Command("git", "log", "--format=%H", "-n", "30")
 	log.Dir = srcDir
 	out, err := log.CombinedOutput()
 	if err != nil {
@@ -1115,13 +1123,25 @@ func canonicalPickNMinusOneSHA(t *testing.T, srcDir string) string {
 		t.Fatalf("git rev-parse HEAD: %v\n%s", err, headOut)
 	}
 	headSHA := strings.TrimSpace(string(headOut))
+	var shas []string
 	for _, line := range strings.Split(string(out), "\n") {
 		sha := strings.TrimSpace(line)
 		if sha != "" && sha != headSHA {
-			return sha
+			shas = append(shas, sha)
 		}
 	}
-	return ""
+	return shas
+}
+
+// canonicalPickNMinusOneSHA is the single-candidate form (kept for callers
+// that only need a name).
+func canonicalPickNMinusOneSHA(t *testing.T, srcDir string) string {
+	t.Helper()
+	shas := canonicalPickNMinusOneSHAs(t, srcDir)
+	if len(shas) == 0 {
+		return ""
+	}
+	return shas[0]
 }
 
 // canonicalWriteHistory creates durable run/job history over the public API:

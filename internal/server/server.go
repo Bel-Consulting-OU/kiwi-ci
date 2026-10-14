@@ -2103,6 +2103,7 @@ func (s *Server) enqueueID(ctx context.Context, in SubmitRun, preRunID string) (
 			RepoURL: in.RepoURL, RepoFullName: in.RepoFullName, Ref: in.Ref, SHA: in.SHA,
 			Event: in.Event, Condition: cj.Job.If, DependencyStatus: model.StatusSuccess, Pipeline: in.Pipeline, Trusted: in.Trusted, ChangedFiles: append([]string{}, in.ChangedFiles...), ChangedFilesKnown: in.ChangedFilesKnown, Needs: needs,
 			RequiredLabels: labelsForJob(cj.Job), Network: effectiveNetwork, Environment: env, ApprovalRequired: cj.Job.Environment.Approval, EnvironmentBranches: append([]string{}, cj.Job.Environment.Branches...), EnvironmentConcurrency: cj.Job.Environment.Concurrency, OIDCAllowed: cj.Job.Permissions.IDToken, OIDCAudiences: cloneStrings(oidcAudiences),
+			ConcurrencyGroup: group, ConcurrencyLimit: spec.Concurrency.Limit,
 			DeclaredSecrets: declaredSecrets(spec, cj.Job),
 			Status:          model.StatusQueued, Priority: scheduler.DownstreamDepth(g, key), MaxInfraRetries: infraRetries, CreatedAt: now,
 			PlacementRegions: append([]string{}, cj.Job.Placement.Regions...),
@@ -4229,11 +4230,23 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+		groupRunning := 0
+		if j.ConcurrencyGroup != "" && j.ConcurrencyLimit > 0 {
+			for _, other := range s.jobs {
+				if other.ID == j.ID || other.Status != model.StatusRunning {
+					continue
+				}
+				if other.ConcurrencyGroup == j.ConcurrencyGroup {
+					groupRunning++
+				}
+			}
+		}
 		policyRuntimes, policyEnforced := storage.LeasePolicyRuntimes(j)
 		if !(storage.LeasePredicate{
 			Runner:         ri,
 			Job:            j,
 			EnvRunning:     envRunning,
+			GroupRunning:   groupRunning,
 			PolicyEnforced: policyEnforced,
 			PolicyRuntimes: policyRuntimes,
 		}).Allows() {

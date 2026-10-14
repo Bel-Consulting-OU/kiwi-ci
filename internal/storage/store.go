@@ -185,6 +185,9 @@ type Store interface {
 	// Legacy rows without a stored repo_id derive the same canonical
 	// identity from their clone URL + full name.
 	ListJobsByEnvironment(ctx context.Context, repoID, environment string) ([]model.Job, error)
+	// ListJobsByConcurrencyGroup returns every job carrying the given
+	// concurrency group, for group-limit accounting (spec.concurrency.limit).
+	ListJobsByConcurrencyGroup(ctx context.Context, group string) ([]model.Job, error)
 	ListQueuedJobs(ctx context.Context) ([]model.Job, error)
 	UpdateJob(ctx context.Context, job model.Job) error
 

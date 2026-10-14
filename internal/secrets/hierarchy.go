@@ -136,15 +136,21 @@ func (h *Hierarchy) Explain(name string, p Policy) Explanation {
 			byScope[r.Scope] = append(byScope[r.Scope], r)
 		}
 	}
-	for _, scope := range HierarchyOrder {
-		for i := range byScope[scope] {
-			r := byScope[scope][i]
+	// Explain walks LEAST-specific first: "source" is where the secret is
+	// defined; "overridden by" names the more specific ref that wins.
+	// Resolve still takes the most specific match.
+	for i := len(HierarchyOrder) - 1; i >= 0; i-- {
+		scope := HierarchyOrder[i]
+		for _, r := range byScope[scope] {
 			label := string(r.Scope)
 			if r.Owner != "" {
 				label += " " + r.Owner
 			}
 			e.Consulted = append(e.Consulted, label)
-			if hit == nil && r.matches(p) {
+			if !r.matches(p) {
+				continue
+			}
+			if hit == nil {
 				cp := r
 				hit = &cp
 				e.Source = label
@@ -152,8 +158,15 @@ func (h *Hierarchy) Explain(name string, p Policy) Explanation {
 					e.Expires = r.ExpiresAt.UTC().Format(time.RFC3339)
 				}
 				e.Provider = r.Provider
-			} else if hit != nil && r.matches(p) {
+			} else {
+				// A MORE specific match overrides the definition.
 				e.OverriddenBy = label
+				cp := r
+				hit = &cp
+				if !r.ExpiresAt.IsZero() {
+					e.Expires = r.ExpiresAt.UTC().Format(time.RFC3339)
+				}
+				e.Provider = r.Provider
 			}
 		}
 	}

@@ -638,6 +638,10 @@ func (f *dbFakeStore) ListJobsByEnvironment(ctx context.Context, repoID, environ
 	return out, nil
 }
 
+func (f *dbFakeStore) ListJobsByConcurrencyGroup(context.Context, string) ([]model.Job, error) {
+	return nil, nil
+}
+
 func (f *dbFakeStore) ListQueuedJobs(ctx context.Context) ([]model.Job, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

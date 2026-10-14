@@ -61,6 +61,7 @@ type LeasePredicate struct {
 	Runner         model.Runner
 	Job            model.Job
 	EnvRunning     int
+	GroupRunning   int
 	PolicyEnforced bool
 	PolicyRuntimes []string
 }
@@ -120,6 +121,11 @@ func (p LeasePredicate) Allows() bool {
 		return false
 	}
 	if j.Environment != "" && j.EnvironmentConcurrency > 0 && p.EnvRunning >= j.EnvironmentConcurrency {
+		return false
+	}
+	// Concurrency group limit (spec.concurrency.limit): at most Limit jobs
+	// of the group run at once; the rest wait. 0 is unlimited.
+	if j.ConcurrencyGroup != "" && j.ConcurrencyLimit > 0 && p.GroupRunning >= j.ConcurrencyLimit {
 		return false
 	}
 	return true

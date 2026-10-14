@@ -1081,11 +1081,31 @@ func (w *leaseCandidateWalk) eligible(candidate model.Job) (map[string]model.Job
 			}
 		}
 	}
+	// Concurrency-group limit (spec.concurrency.limit): count OTHER running
+	// jobs of the group; at Limit the candidate waits.
+	groupRunning := 0
+	if candidate.ConcurrencyGroup != "" && candidate.ConcurrencyLimit > 0 {
+		all, ok := w.envJobs["grp\x00"+candidate.ConcurrencyGroup]
+		if !ok {
+			listed, err := w.s.Store.ListJobsByConcurrencyGroup(w.ctx, candidate.ConcurrencyGroup)
+			if err != nil {
+				return nil, false, err
+			}
+			w.envJobs["grp\x00"+candidate.ConcurrencyGroup] = listed
+			all = listed
+		}
+		for _, other := range all {
+			if other.ID != candidate.ID && other.Status == model.StatusRunning {
+				groupRunning++
+			}
+		}
+	}
 	policyRuntimes, policyEnforced := storage.LeasePolicyRuntimes(candidate)
 	if !(storage.LeasePredicate{
 		Runner:         w.eff,
 		Job:            candidate,
 		EnvRunning:     envRunning,
+		GroupRunning:   groupRunning,
 		PolicyEnforced: policyEnforced,
 		PolicyRuntimes: policyRuntimes,
 	}).Allows() {

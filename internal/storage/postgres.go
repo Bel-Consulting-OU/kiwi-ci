@@ -1603,6 +1603,29 @@ func (s *PostgresStore) ListJobsByEnvironment(ctx context.Context, repoID, envir
 	return out, rows.Err()
 }
 
+// ListJobsByConcurrencyGroup returns every job carrying the given
+// concurrency group (spec.concurrency.limit accounting).
+func (s *PostgresStore) ListJobsByConcurrencyGroup(ctx context.Context, group string) ([]model.Job, error) {
+	rows, err := s.pool.Query(ctx, `SELECT `+jobCols+` FROM jobs WHERE payload->>'concurrency_group'=$1 ORDER BY created_at ASC, id ASC`, group)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.Job{}
+	for rows.Next() {
+		js := jobScanner{}
+		if err := rows.Scan(jobTargets(&js)...); err != nil {
+			return nil, err
+		}
+		j, err := js.job()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
 func (s *PostgresStore) ListQueuedJobs(ctx context.Context) ([]model.Job, error) {
 	rows, err := s.pool.Query(ctx, `SELECT `+jobCols+` FROM jobs WHERE status='queued' ORDER BY priority DESC, created_at ASC, id ASC`)
 	if err != nil {

@@ -338,6 +338,10 @@ func (f *fcStore) ListJobsByEnvironment(ctx context.Context, repoID, environment
 	return f.dbFakeStore.ListJobsByEnvironment(ctx, repoID, environment)
 }
 
+func (f *fcStore) ListJobsByConcurrencyGroup(context.Context, string) ([]model.Job, error) {
+	return nil, nil
+}
+
 func (f *fcStore) SetQueueReasons(ctx context.Context, reasons map[string]string) error {
 	if f.setQueueReasonsErr != nil {
 		return f.setQueueReasonsErr

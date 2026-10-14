@@ -91,6 +91,24 @@ func TestBitbucketFetchAndPublish(t *testing.T) {
 	}
 }
 
+func TestBitbucketChangedFilesPaginationFailsClosed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"values":[{"new":{"path":"a.go"}}],"next":"https://api.bitbucket.org/2.0/page2"}`))
+	}))
+	defer srv.Close()
+	b := &Bitbucket{BaseURL: srv.URL, Token: "t", Client: srv.Client()}
+	res, err := b.ChangedFiles(context.Background(), EventContext{PullRequest: 7, Repository: Repository{FullName: "ws/repo"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Complete {
+		t.Fatal("paginated diffstat must never report Complete (path filters fail closed)")
+	}
+	if len(res.Files) != 1 {
+		t.Fatalf("files = %v", res.Files)
+	}
+}
+
 func TestBitbucketImplementsForge(t *testing.T) {
 	var _ Forge = &Bitbucket{}
 }

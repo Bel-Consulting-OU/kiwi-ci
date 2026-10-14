@@ -47,6 +47,9 @@ func RunLocal(ctx context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// Resolve image tags through .kiwi/lock.json so a local run uses the
+	// locked digests even when the YAML kept readable tags.
+	executor.ImageResolver = LockLookup
 	spec, err := pipeline.Load(*file)
 	if err != nil {
 		return err

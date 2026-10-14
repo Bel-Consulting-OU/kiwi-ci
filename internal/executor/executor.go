@@ -462,6 +462,15 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	cj.Job.If = pipeline.InterpolateOutputs(cj.Job.If, needsOutputs, nil)
 	cj.Job.Env = pipeline.InterpolateOutputMap(cj.Job.Env, needsOutputs, nil)
 	cj.Job.Image = pipeline.InterpolateOutputs(cj.Job.Image, needsOutputs, nil)
+	// Image lockfile (.kiwi/lock.json): a readable tag is resolved to its
+	// locked digest before the container starts, so execution uses the
+	// immutable bytes even when the YAML kept the tag. Unset resolver keeps
+	// the image as written.
+	if ImageResolver != nil {
+		if pinned := ImageResolver(cj.Job.Image); pinned != "" {
+			cj.Job.Image = pinned
+		}
+	}
 	cj.Job.VM = pipeline.InterpolateOutputs(cj.Job.VM, needsOutputs, nil)
 	cond, err := pipeline.Eval(cj.Job.If, pipeline.EvalContext{Status: dependencyStatus, Env: cj.Job.Env, Event: e.Opt.Event, Branch: e.Opt.Branch})
 	if err != nil {
@@ -1210,6 +1219,11 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 // working directory has been removed (getcwd ENOENT on Linux) but cannot be
 // reproduced on darwin, where getcwd keeps resolving an unlinked directory.
 var absWorkspacePath = filepath.Abs
+
+// ImageResolver, when set, maps a container image reference to its immutable
+// digest form (the kiwi lockfile). Returning "" keeps the ref as written.
+// Wired by local/run to LockLookup; nil in tests and when no lockfile exists.
+var ImageResolver func(image string) string
 
 // backendForNetwork is a test-only seam over BackendForNetwork. Production
 // behavior is unchanged; it lets runJob's backend lifecycle error paths

@@ -28,17 +28,18 @@ func TestHierarchyResolutionMostSpecificWins(t *testing.T) {
 		t.Fatalf("resolve = %q, want env (most specific)", v)
 	}
 	e := h.Explain("DB_PASSWORD", p)
-	if e.Source != "environment production" {
-		t.Fatalf("source = %q", e.Source)
+	if e.Source != "organization starz" && e.Source != "instance" {
+		// Source is the definition (least specific match).
+		t.Fatalf("source = %q, want the definition scope", e.Source)
+	}
+	if e.OverriddenBy != "environment production" {
+		t.Fatalf("overridden_by = %q, want the winning environment ref", e.OverriddenBy)
 	}
 	if !e.Available {
 		t.Fatal("must be available")
 	}
 	if e.Provider != "vault" {
 		t.Fatalf("provider = %q", e.Provider)
-	}
-	if e.OverriddenBy == "" {
-		t.Fatalf("explain must name an overridden-by level: %+v", e)
 	}
 }
 

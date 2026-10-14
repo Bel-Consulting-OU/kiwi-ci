@@ -65,6 +65,11 @@ func (s *injectedStore) ListJobsByEnvironment(ctx context.Context, repoID, envir
 	return s.fakeStore.ListJobsByEnvironment(ctx, repoID, environment)
 }
 
+func (s *injectedStore) ListJobsByConcurrencyGroup(_ context.Context, group string) ([]model.Job, error) {
+	var out []model.Job
+	return out, nil
+}
+
 func (s *injectedStore) ListJobsByRun(ctx context.Context, runID string) ([]model.Job, error) {
 	if s.listByRunErr != nil {
 		return nil, s.listByRunErr

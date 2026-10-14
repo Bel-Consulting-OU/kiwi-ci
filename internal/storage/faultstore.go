@@ -346,6 +346,10 @@ func (f *FaultyStore) ListJobsByEnvironment(ctx context.Context, repoID, environ
 	return f.Inner.ListJobsByEnvironment(ctx, repoID, environment)
 }
 
+func (f *FaultyStore) ListJobsByConcurrencyGroup(ctx context.Context, group string) ([]model.Job, error) {
+	return f.Inner.ListJobsByConcurrencyGroup(ctx, group)
+}
+
 func (f *FaultyStore) ListJobsByRunner(ctx context.Context, runnerID string) ([]model.Job, error) {
 	inner, ok := f.Inner.(RunnerJobStore)
 	if !ok {
@@ -2535,6 +2539,20 @@ func (m *memStore) ListJobsByEnvironment(ctx context.Context, repoID, environmen
 	out := []model.Job{}
 	for _, j := range m.jobs {
 		if j.Environment == environment && RepoIDForJob(j) == repoID {
+			out = append(out, j)
+		}
+	}
+	return out, nil
+}
+
+// ListJobsByConcurrencyGroup returns every job carrying the given
+// concurrency group (spec.concurrency.limit accounting).
+func (m *memStore) ListJobsByConcurrencyGroup(_ context.Context, group string) ([]model.Job, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []model.Job{}
+	for _, j := range m.jobs {
+		if j.ConcurrencyGroup == group {
 			out = append(out, j)
 		}
 	}

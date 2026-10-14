@@ -952,6 +952,10 @@ func (f *fakeStore) ListJobsByEnvironment(ctx context.Context, repoID, environme
 	return out, nil
 }
 
+func (f *fakeStore) ListJobsByConcurrencyGroup(context.Context, string) ([]model.Job, error) {
+	return nil, nil
+}
+
 func (f *fakeStore) UpdateJob(ctx context.Context, job model.Job) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

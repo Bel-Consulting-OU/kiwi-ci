@@ -237,6 +237,7 @@ func (b *Bitbucket) ChangedFiles(ctx context.Context, ec EventContext) (ChangedF
 				Path string `json:"path"`
 			} `json:"old"`
 		} `json:"values"`
+		Next string `json:"next"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return ChangedFilesResult{}, err
@@ -251,7 +252,10 @@ func (b *Bitbucket) ChangedFiles(ctx context.Context, ec EventContext) (ChangedF
 			}
 		}
 	}
-	return ChangedFilesResult{Files: files, Complete: true}, nil
+	// Pagination: a truncated diffstat must NEVER report Complete — include-
+	// path triggers fail closed on an incomplete list.
+	complete := doc.Next == ""
+	return ChangedFilesResult{Files: files, Complete: complete}, nil
 }
 
 func (b *Bitbucket) PublishCheck(ctx context.Context, repoFullName, sha, name, status, conclusion, detailsURL, summary string, annotations []CheckAnnotation) error {

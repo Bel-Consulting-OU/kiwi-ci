@@ -218,8 +218,13 @@ type Job struct {
 	ApprovalRequired       bool     `json:"approval_required,omitempty"`
 	EnvironmentBranches    []string `json:"environment_branches,omitempty"`
 	EnvironmentConcurrency int      `json:"environment_concurrency,omitempty"`
-	OIDCAllowed            bool     `json:"oidc_allowed,omitempty"`
-	OIDCAudiences          []string `json:"oidc_audiences,omitempty"`
+	// ConcurrencyGroup/ConcurrencyLimit serialize runs of one group: at
+	// most Limit jobs of the group run at once, the rest wait (FIFO). Limit
+	// 0 is unlimited. Copied from spec.concurrency at enqueue.
+	ConcurrencyGroup string   `json:"concurrency_group,omitempty"`
+	ConcurrencyLimit int      `json:"concurrency_limit,omitempty"`
+	OIDCAllowed      bool     `json:"oidc_allowed,omitempty"`
+	OIDCAudiences    []string `json:"oidc_audiences,omitempty"`
 	// DeclaredSecrets is the deduplicated union of the run's global secrets
 	// and every step secret of this job, compiled at enqueue time. It is the
 	// per-step scoping allowlist the control plane enforces when a runner
