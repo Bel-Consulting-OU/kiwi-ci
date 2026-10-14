@@ -72,8 +72,18 @@ func TestStarterSpecsParse(t *testing.T) {
 				if len(j.Steps) == 0 {
 					t.Fatalf("job %q has no steps", id)
 				}
-				if j.Runtime == "container" && !strings.Contains(j.Image, placeholderDigest) {
-					t.Fatalf("job %q image %q is not pinned to the placeholder digest", id, j.Image)
+				if j.Runtime == "container" {
+					// Images must be READABLE tags: `kiwi lock` resolves
+					// them to digests. The historical all-zero placeholder
+					// must never reappear.
+					if strings.Contains(j.Image, "sha256:0000000000000000000000000000000000000000000000000000000000000000") {
+						t.Fatalf("job %q image %q carries the zero placeholder digest", id, j.Image)
+					}
+					if strings.Contains(j.Image, "@sha256:") && !strings.Contains(j.Image, "@sha256:0") {
+						// A real digest is acceptable only if lock wrote it;
+						// init itself emits tags.
+						t.Fatalf("job %q image %q: init should emit a readable tag, not a digest", id, j.Image)
+					}
 				}
 			}
 		})
@@ -109,8 +119,11 @@ func TestInitWritesAndRefusesOverwrite(t *testing.T) {
 	if _, err := pipeline.Parse(b); err != nil {
 		t.Fatalf("generated pipeline does not parse: %v", err)
 	}
-	if !strings.Contains(string(b), placeholderDigest) {
-		t.Fatalf("generated pipeline lacks the pinning comment/digest")
+	if strings.Contains(string(b), "sha256:0000000000000000000000000000000000000000000000000000000000000000") {
+		t.Fatalf("generated pipeline must not carry the zero placeholder digest")
+	}
+	if !strings.Contains(string(b), "kiwi lock") {
+		t.Fatalf("generated pipeline must point at kiwi lock for digest resolution")
 	}
 	// A second run without --force must refuse.
 	if err := Init([]string{"-dir", dir}); err == nil {

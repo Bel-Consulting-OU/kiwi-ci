@@ -5857,13 +5857,49 @@ func (m *memStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim) (mo
 			}
 		}
 	}
+	// Concurrency-group limit is reserved inside the claim (the transaction
+	// boundary for the memory store): the prefilter is never authority.
+	group := claim.ConcurrencyGroup
+	groupLimit := claim.ConcurrencyLimit
+	if group == "" {
+		group = j.ConcurrencyGroup
+		groupLimit = j.ConcurrencyLimit
+	}
+	// Namespace the count with GroupKey: (canonical repo, group) by default.
+	groupKey := claim.GroupKey()
+	if groupKey == "" && group != "" {
+		groupKey = claimRepoID + "\x1f" + group
+	}
+	groupRunning := 0
+	if group != "" && groupLimit > 0 {
+		for id, other := range m.jobs {
+			if id == j.ID || other.Status != model.StatusRunning {
+				continue
+			}
+			otherKey := RepoIDForJob(other) + "\x1f" + other.ConcurrencyGroup
+			if claim.ConcurrencyScope == "global" {
+				otherKey = "global\x1f" + other.ConcurrencyGroup
+			}
+			if other.ConcurrencyGroup != group || otherKey != groupKey {
+				continue
+			}
+			groupRunning++
+		}
+	}
+	// Bind the claim's group fields onto the job view the predicate sees so
+	// the limit gate fires even when a legacy row lacks them.
+	j.ConcurrencyGroup = group
+	j.ConcurrencyLimit = groupLimit
 	runtimes, enforced := LeasePolicyRuntimes(j)
-	if !(LeasePredicate{Runner: effective, Job: j, EnvRunning: envRunning, PolicyEnforced: enforced, PolicyRuntimes: runtimes}).Allows() {
+	if !(LeasePredicate{Runner: effective, Job: j, EnvRunning: envRunning, GroupRunning: groupRunning, PolicyEnforced: enforced, PolicyRuntimes: runtimes}).Allows() {
 		if effective.Disabled || effective.Draining || effective.Capacity <= 0 || len(effective.ActiveJobs) >= effective.Capacity {
 			return model.Job{}, ErrNoCapacity
 		}
 		if j.Environment != "" && j.EnvironmentConcurrency > 0 && envRunning >= j.EnvironmentConcurrency {
 			return model.Job{}, ErrEnvConcurrency
+		}
+		if group != "" && groupLimit > 0 && groupRunning >= groupLimit {
+			return model.Job{}, ErrGroupConcurrency
 		}
 		return model.Job{}, ErrNoCapacity
 	}

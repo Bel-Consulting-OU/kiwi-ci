@@ -105,6 +105,10 @@ func collectImageRefs(src string) []string {
 		}
 		v := strings.TrimSpace(strings.TrimPrefix(trim, "image:"))
 		v = strings.Trim(v, `"'`)
+		// Strip a trailing YAML comment (`image: golang:1.27 # pin`).
+		if i := strings.Index(v, " #"); i >= 0 {
+			v = strings.TrimSpace(v[:i])
+		}
 		if v == "" || seen[v] {
 			continue
 		}
@@ -115,9 +119,14 @@ func collectImageRefs(src string) []string {
 	return out
 }
 
-// LockLookup returns the digest locked for ref, or "" when unknown.
-func LockLookup(ref string) string {
-	b, err := os.ReadFile(lockfilePath)
+// LockLookup returns the digest locked for ref in the lockfile at the given
+// root (the job workspace / project dir), or "" when unknown. The root is
+// required: a remote runner's process CWD is NOT the checkout, so reading
+// ".kiwi/lock.json" relative to CWD would silently skip the lock for every
+// distributed job.
+func LockLookup(root, ref string) string {
+	p := filepath.Join(root, lockfilePath)
+	b, err := os.ReadFile(p)
 	if err != nil {
 		return ""
 	}

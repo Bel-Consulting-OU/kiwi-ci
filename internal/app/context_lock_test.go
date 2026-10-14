@@ -116,3 +116,30 @@ func TestSetupPrintChecklist(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// LockLookup must read the lockfile from the given root (the job workspace),
+// never from process CWD — a remote runner's CWD is not the checkout.
+func TestLockLookupUsesWorkspaceRootNotCWD(t *testing.T) {
+	ws := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(ws, ".kiwi"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lock := `{"version":1,"images":[{"ref":"golang:1.27","digest":"golang:1.27@sha256:abc"}]}`
+	if err := os.WriteFile(filepath.Join(ws, ".kiwi", "lock.json"), []byte(lock), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A different CWD with a different lockfile must NOT win.
+	other := t.TempDir()
+	t.Chdir(other)
+	if err := os.MkdirAll(filepath.Join(other, ".kiwi"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	otherLock := `{"version":1,"images":[{"ref":"golang:1.27","digest":"golang:1.27@sha256:WRONG"}]}`
+	if err := os.WriteFile(filepath.Join(other, ".kiwi", "lock.json"), []byte(otherLock), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := LockLookup(ws, "golang:1.27")
+	if got != "golang:1.27@sha256:abc" {
+		t.Fatalf("LockLookup(ws) = %q, want the WORKSPACE lock (not CWD %q)", got, other)
+	}
+}

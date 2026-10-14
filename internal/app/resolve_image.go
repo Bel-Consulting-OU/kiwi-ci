@@ -11,9 +11,15 @@ import (
 var ResolveImageDigest = resolveImageDigestCLI
 
 func resolveImageDigestCLI(ref string) (string, error) {
-	if strings.Contains(ref, "@sha256:") {
-		// Already pinned.
+	// The historical all-zero placeholder is NOT a pin: resolve it like a
+	// mutable tag so an old starter cannot smuggle zero bytes as authority.
+	if strings.Contains(ref, "@sha256:") && !strings.Contains(ref, "sha256:0000000000000000000000000000000000000000000000000000000000000000") {
+		// Already pinned with a real digest.
 		return ref, nil
+	}
+	// Strip any placeholder digest before resolving the tag.
+	if i := strings.Index(ref, "@sha256:"); i > 0 {
+		ref = ref[:i]
 	}
 	// docker buildx imagetools inspect is the portable resolver when Docker
 	// is present; crane is the alternative.

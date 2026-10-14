@@ -4475,7 +4475,8 @@ func (s *Server) nextDB(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, "scheduler standby", http.StatusServiceUnavailable)
 		return
 	case errors.Is(err, scheduler.ErrNoJobs), errors.Is(err, storage.ErrLeaseConflict),
-		errors.Is(err, storage.ErrEnvConcurrency), errors.Is(err, storage.ErrQuotaExceeded):
+		errors.Is(err, storage.ErrEnvConcurrency), errors.Is(err, storage.ErrGroupConcurrency),
+		errors.Is(err, storage.ErrQuotaExceeded):
 		s.applyQueueReasonsDB(ctx, ri)
 		w.WriteHeader(http.StatusNoContent)
 		return

@@ -941,12 +941,16 @@ func (w *leaseCandidateWalk) consider(candidate model.Job) leaseWalkResult {
 		PlacementRegions:       candidate.PlacementRegions,
 		Environment:            candidate.Environment,
 		EnvironmentConcurrency: candidate.EnvironmentConcurrency,
-		RepoConcurrency:        w.repoConcurrency,
-		TeamConcurrency:        w.teamConcurrency,
-		CPURequest:             candidate.CPURequest,
-		MemoryRequest:          candidate.MemoryRequest,
-		DiskRequest:            candidate.DiskRequest,
-		PIDsRequest:            candidate.PIDsRequest,
+		// Concurrency-group limit is reserved inside the claim transaction
+		// (spec.concurrency.limit) — the prefilter is efficiency only.
+		ConcurrencyGroup: candidate.ConcurrencyGroup,
+		ConcurrencyLimit: candidate.ConcurrencyLimit,
+		RepoConcurrency:  w.repoConcurrency,
+		TeamConcurrency:  w.teamConcurrency,
+		CPURequest:       candidate.CPURequest,
+		MemoryRequest:    candidate.MemoryRequest,
+		DiskRequest:      candidate.DiskRequest,
+		PIDsRequest:      candidate.PIDsRequest,
 		// The aggregate service envelope rides the claim so the claim
 		// transaction reserves job request + envelope in the ONE
 		// ledger row (LeaseClaim.RequestedResources).
@@ -993,11 +997,12 @@ func (w *leaseCandidateWalk) consider(candidate model.Job) leaseWalkResult {
 			return leaseWalkResult{}
 		case errors.Is(err, storage.ErrNoCapacity),
 			errors.Is(err, storage.ErrEnvConcurrency),
+			errors.Is(err, storage.ErrGroupConcurrency),
 			errors.Is(err, storage.ErrResourceCapacity),
 			errors.Is(err, storage.ErrQuotaExceeded):
 			// A predicate lost a race (filled capacity slot, taken
-			// environment slot, exhausted resource capacity or quota) or
-			// this candidate is not eligible for this runner: try the
+			// environment/group slot, exhausted resource capacity or quota)
+			// or this candidate is not eligible for this runner: try the
 			// next candidate.
 			return leaseWalkResult{}
 		default:

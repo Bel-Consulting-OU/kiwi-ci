@@ -2,6 +2,7 @@ package secrets
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -107,5 +108,69 @@ func TestExplainNamesSourceAndReason(t *testing.T) {
 	e2 := h.Explain("T", Policy{Team: "other", Trusted: true, Now: time.Now()})
 	if e2.Available {
 		t.Fatal("wrong team must not resolve")
+	}
+}
+
+// Trust floor: a nil Trusted on the ref means "trusted only". Untrusted
+// execution must never see it, even when no explicit pin exists.
+func TestHierarchyTrustFloorDefaultsClosed(t *testing.T) {
+	h := NewHierarchy()
+	h.Add(SecretRef{Name: "S", Value: "v", Scope: ScopeRepository, Owner: "r"})
+	p := Policy{Repository: "r", Trusted: false, Now: time.Now()}
+	if e := h.Explain("S", p); e.Available {
+		t.Fatal("untrusted must not see an unpinned secret (nil Trusted = trusted only)")
+	}
+	// Explicit untrusted-allowed ref (Trusted=false) is visible to untrusted.
+	untrustedAllowed := false
+	h.Add(SecretRef{Name: "U", Value: "v", Scope: ScopeRepository, Owner: "r", Trusted: &untrustedAllowed})
+	e := h.Explain("U", p)
+	if !e.Available {
+		t.Fatalf("explicitly untrusted-allowed secret must resolve: %+v", e)
+	}
+}
+
+// Expiry must not fail open when Policy.Now is zero.
+func TestHierarchyExpiryDoesNotFailOpen(t *testing.T) {
+	h := NewHierarchy()
+	h.Add(SecretRef{Name: "E", Value: "v", Scope: ScopeInstance, ExpiresAt: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)})
+	// Now omitted (zero): treated as time.Now(), so a 2020 expiry is past.
+	e := h.Explain("E", Policy{Trusted: true})
+	if e.Available {
+		t.Fatal("expiry must apply even when Policy.Now is zero")
+	}
+}
+
+// Two matching refs at the same scope are ambiguous — fail closed.
+func TestHierarchyAmbiguousScopeFailsClosed(t *testing.T) {
+	h := NewHierarchy()
+	h.Add(SecretRef{Name: "A", Value: "one", Scope: ScopeRepository, Owner: "r"})
+	h.Add(SecretRef{Name: "A", Value: "two", Scope: ScopeRepository, Owner: "r"})
+	_, err := h.Resolve(context.Background(), "A", Policy{Repository: "r", Trusted: true, Now: time.Now()})
+	if err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("ambiguous scope = %v, want fail-closed", err)
+	}
+}
+
+// A job/step-scoped ref with no owner matches every job/step — that is a
+// cross-execution leak. Require the owner.
+func TestHierarchyJobStepRequireOwner(t *testing.T) {
+	h := NewHierarchy()
+	h.Add(SecretRef{Name: "J", Value: "v", Scope: ScopeJob}) // no owner
+	p := Policy{Job: "job-a", Trusted: true, Now: time.Now()}
+	if e := h.Explain("J", p); e.Available {
+		t.Fatal("job-scoped ref without owner must not match any job")
+	}
+	h.Add(SecretRef{Name: "K", Value: "v", Scope: ScopeJob, Owner: "job-a"})
+	if e := h.Explain("K", p); !e.Available {
+		t.Fatalf("job-scoped ref with matching owner must resolve: %+v", e)
+	}
+	p2 := Policy{Job: "job-b", Trusted: true, Now: time.Now()}
+	if e := h.Explain("K", p2); e.Available {
+		t.Fatal("job-scoped ref must not leak to another job")
+	}
+	s := Policy{Step: "s1", Trusted: true, Now: time.Now()}
+	h.Add(SecretRef{Name: "S", Value: "v", Scope: ScopeStep}) // no owner
+	if e := h.Explain("S", s); e.Available {
+		t.Fatal("step-scoped ref without owner must not match any step")
 	}
 }

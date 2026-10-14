@@ -11,11 +11,6 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
-// placeholderDigest is the pinned-image placeholder written into generated
-// starters. It is deliberately not a real image: users must replace it
-// before running, as the generated comment instructs.
-const placeholderDigest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-
 // Init implements `kiwi init`: it detects the project language from marker
 // files and writes a starter .kiwi/pipeline.yaml tailored to it. Images are
 // written as READABLE tags; `kiwi lock` resolves them to digests in
@@ -199,7 +194,7 @@ func starterSpec(lang, tool string) *pipeline.Spec {
 }
 
 func containerJob(name, image string) pipeline.Job {
-	return pipeline.Job{Runtime: "container", Image: image + "@" + placeholderDigest}
+	return pipeline.Job{Runtime: "container", Image: image}
 }
 
 func goStarter() *pipeline.Spec {

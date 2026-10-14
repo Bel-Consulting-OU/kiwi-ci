@@ -10,10 +10,8 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -93,19 +91,6 @@ func toolCheck(name string) {
 	fmt.Printf("%-14s %s\n", name, p)
 }
 
-func diskUsage(path string) string {
-	var st syscall.Statfs_t
-	if err := syscall.Statfs(path, &st); err != nil {
-		return ""
-	}
-	free := int64(st.Bavail) * int64(st.Bsize)
-	total := int64(st.Blocks) * int64(st.Bsize)
-	if total == 0 {
-		return ""
-	}
-	return fmt.Sprintf("%.1f GiB free of %.1f GiB", float64(free)/(1<<30), float64(total)/(1<<30))
-}
-
 func serverDoctor(base string) {
 	fmt.Println("== server " + base + " ==")
 	base = strings.TrimRight(base, "/")
@@ -149,11 +134,3 @@ func serverDoctor(base string) {
 		fmt.Printf("%-14s %s\n", probe.label, status)
 	}
 }
-
-// PathExists is a helper for tests and setup.
-func PathExists(p string) bool {
-	_, err := os.Stat(p)
-	return err == nil
-}
-
-var _ = filepath.Join

@@ -117,3 +117,64 @@ func TestSignedDiscoveryChainBreakRefused(t *testing.T) {
 		t.Fatalf("broken chain = %v, want predecessor refusal", err)
 	}
 }
+
+// Sequence 0 is reserved for "no accepted metadata yet" and must never be
+// a valid signed discovery document (the signer refuses it too).
+func TestSignedDiscoveryRejectsSequenceZero(t *testing.T) {
+	_, rootPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	d := NewDiscovery(now)
+	d.Sequence = 0
+	d.ExpiresAt = now.Add(time.Hour)
+	if _, err := SignDiscovery(d, "root", rootPriv); err == nil {
+		t.Fatal("SignDiscovery must refuse sequence 0")
+	}
+}
+
+// After genesis the predecessor hash is mandatory: a later signed document
+// that omits it must not bypass continuity.
+func TestSignedDiscoveryRequiresPredecessorAfterGenesis(t *testing.T) {
+	rootPub, rootPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	d1 := NewDiscovery(now)
+	d1.ExpiresAt = now.Add(time.Hour)
+	s1, err := SignDiscovery(d1, "root", rootPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st1, err := VerifySignedDiscovery(s1, rootPub, DiscoveryState{}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d2 := NewDiscovery(now)
+	d2.Sequence = 2
+	d2.ExpiresAt = now.Add(2 * time.Hour)
+	// PredecessorHash intentionally omitted.
+	s2, err := SignDiscovery(d2, "root", rootPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := VerifySignedDiscovery(s2, rootPub, st1, now.Add(time.Hour)); err == nil || !strings.Contains(err.Error(), "predecessor") {
+		t.Fatalf("missing predecessor after genesis = %v, want mandatory-chain refusal", err)
+	}
+}
+
+// The signer must refuse sequence 0 too — verify-side rejection alone would
+// let a publisher mint unusable (or worse, ambiguous) documents.
+func TestSignDiscoveryRejectsSequenceZero(t *testing.T) {
+	_, rootPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := NewDiscovery(time.Now())
+	d.Sequence = 0
+	if _, err := SignDiscovery(d, "root", rootPriv); err == nil {
+		t.Fatal("SignDiscovery must refuse sequence 0")
+	}
+}

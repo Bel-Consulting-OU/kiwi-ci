@@ -1995,6 +1995,50 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 		}
 	}
 
+	// Step 2b: concurrency-group limit (spec.concurrency.limit) is reserved
+	// inside this transaction with the same advisory-lock + count pattern.
+	// The scheduler's prefilter is efficiency only — the transaction is the
+	// authority, so two runners cannot both win the last group slot. The
+	// claim's fields are authoritative; when a legacy claim carries none the
+	// job payload's own group/limit is used (mirroring the memory store).
+	groupName := claim.ConcurrencyGroup
+	groupLimit := claim.ConcurrencyLimit
+	if groupName == "" {
+		// Fall back to the job row (the claim job was already locked above).
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(payload->>'concurrency_group',''), COALESCE((payload->>'concurrency_limit')::int, 0) FROM jobs WHERE id=$1`, claim.JobID).
+			Scan(&groupName, &groupLimit); err != nil {
+			return model.Job{}, err
+		}
+	}
+	// Derive the group key from the EFFECTIVE group name (claim, else job),
+	// matching LeaseClaim.GroupKey's namespace rule.
+	groupKey := ""
+	if groupName != "" {
+		if claim.ConcurrencyScope == "global" {
+			groupKey = "global\x1f" + groupName
+		} else if claim.CanonRepoID != "" {
+			groupKey = claim.CanonRepoID + "\x1f" + groupName
+		}
+	}
+	if groupKey != "" && groupLimit > 0 {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, advisoryLockKey("kiwi-group", groupKey)); err != nil {
+			return model.Job{}, err
+		}
+		var running int
+		countSQL := `SELECT count(*) FROM jobs WHERE status='running' AND payload->>'concurrency_group'=$1 AND id<>$2`
+		args := []any{groupName, claim.JobID}
+		if claim.ConcurrencyScope != "global" {
+			countSQL += ` AND ` + canonicalPolicyRepoIDSQLExpr("repo_url") + `=$3`
+			args = append(args, claim.CanonRepoID)
+		}
+		if err := tx.QueryRow(ctx, countSQL, args...).Scan(&running); err != nil {
+			return model.Job{}, err
+		}
+		if running >= groupLimit {
+			return model.Job{}, ErrGroupConcurrency
+		}
+	}
+
 	// Step 3: lock the runner row and read its full registration snapshot
 	// (the same model the in-memory store holds) plus its live admin state.
 	// The snapshot is the fallback scheduling view for an unlinked runner;

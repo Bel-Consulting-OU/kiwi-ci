@@ -64,6 +64,9 @@ var (
 	// The lease transaction rolled back; the scheduler tries the next
 	// candidate.
 	ErrEnvConcurrency = errors.New("storage: environment at capacity")
+	// ErrGroupConcurrency is the concurrency-group limit (spec.concurrency.
+	// limit): the group's running slots are full and the candidate must wait.
+	ErrGroupConcurrency = errors.New("storage: concurrency group at capacity")
 	// ErrQuotaExceeded means the atomic lease's conditional queued->running
 	// quota transition matched zero rows: running+1 would exceed the
 	// repository or team concurrency limit. The whole lease rolled back.
@@ -1690,8 +1693,17 @@ type LeaseClaim struct {
 
 	Environment            string
 	EnvironmentConcurrency int
-	RepoConcurrency        float64
-	TeamConcurrency        float64
+	// ConcurrencyGroup/Limit reserve a group slot inside the SAME
+	// transaction as the lease (spec.concurrency.limit). The prefilter in
+	// the scheduler is efficiency only — the transaction is authority, so
+	// two runners cannot both win the last slot.
+	ConcurrencyGroup string
+	ConcurrencyLimit int
+	// ConcurrencyScope is the namespace for the group key. Empty defaults
+	// to "repo" (the canonical repository identity + group name).
+	ConcurrencyScope string
+	RepoConcurrency  float64
+	TeamConcurrency  float64
 
 	CPURequest    float64
 	MemoryRequest int64
@@ -1746,6 +1758,23 @@ func (c LeaseClaim) EnvKey() string {
 		return ""
 	}
 	return c.CanonRepoID + "\x1f" + c.Environment
+}
+
+// GroupKey names the concurrency-group key: the CANONICAL repository
+// identity plus the group name (scope "repo", the default), or the bare
+// group name under scope "global". Two repositories with the same group
+// name never share a slot under the repo scope.
+func (c LeaseClaim) GroupKey() string {
+	if c.ConcurrencyGroup == "" {
+		return ""
+	}
+	if c.ConcurrencyScope == "global" {
+		return "global\x1f" + c.ConcurrencyGroup
+	}
+	if c.CanonRepoID == "" {
+		return ""
+	}
+	return c.CanonRepoID + "\x1f" + c.ConcurrencyGroup
 }
 
 // AtomicLeaseStore acquires a job lease and reserves the runner capacity

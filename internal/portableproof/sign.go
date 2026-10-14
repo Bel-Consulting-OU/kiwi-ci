@@ -425,12 +425,13 @@ type DiscoveryState struct {
 // highest sequence already seen (a replay that could hide a revocation).
 var ErrRollback = errors.New("portableproof: discovery rollback refused")
 
-// NewDiscovery builds an empty discovery document stamped now.
+// NewDiscovery builds an empty discovery document stamped now. Sequence
+// starts at 1: 0 is reserved for "no accepted metadata yet".
 func NewDiscovery(at time.Time) PublicKeyDiscovery {
 	if at.IsZero() {
 		at = time.Now()
 	}
-	return PublicKeyDiscovery{SchemaVersion: DiscoverySchemaVersion, IssuedAt: at.UTC()}
+	return PublicKeyDiscovery{SchemaVersion: DiscoverySchemaVersion, Sequence: 1, IssuedAt: at.UTC()}
 }
 
 // PublishDoc returns a document entry for a raw Ed25519 public key.
@@ -573,6 +574,10 @@ func SignDiscovery(d PublicKeyDiscovery, rootKeyID string, rootPriv ed25519.Priv
 	if len(rootPriv) != ed25519.PrivateKeySize {
 		return SignedDiscovery{}, fmt.Errorf("%w: root key is not Ed25519", ErrKey)
 	}
+	// Sequence 0 is reserved for "no accepted metadata yet" — never sign it.
+	if d.Sequence < 1 {
+		return SignedDiscovery{}, fmt.Errorf("%w: discovery sequence must be >= 1", ErrSchema)
+	}
 	raw, err := discoveryCanonicalBytes(d)
 	if err != nil {
 		return SignedDiscovery{}, err
@@ -626,9 +631,13 @@ func VerifySignedDiscovery(signed SignedDiscovery, rootPub ed25519.PublicKey, pr
 	if !signed.Discovery.ExpiresAt.IsZero() && now.After(signed.Discovery.ExpiresAt) {
 		return DiscoveryState{}, fmt.Errorf("%w: discovery expired at %s", ErrSchema, signed.Discovery.ExpiresAt.UTC().Format(time.RFC3339))
 	}
-	// Anti-rollback: sequence must strictly increase past the persisted
+	// Anti-rollback: sequence must be at least 1 (0 is reserved for "no
+	// accepted metadata yet") and strictly increase past the persisted
 	// high-water mark. A replay of an older document (even a validly signed
 	// one) is refused so it cannot hide a later revocation.
+	if signed.Discovery.Sequence < 1 {
+		return DiscoveryState{}, fmt.Errorf("%w: discovery sequence must be >= 1 (0 means no accepted metadata)", ErrSchema)
+	}
 	if signed.Discovery.Sequence < prev.Sequence {
 		return DiscoveryState{}, fmt.Errorf("%w: discovery sequence %d < seen %d", ErrRollback, signed.Discovery.Sequence, prev.Sequence)
 	}
@@ -645,9 +654,12 @@ func VerifySignedDiscovery(signed SignedDiscovery, rootPub ed25519.PublicKey, pr
 		}
 		return prev, nil
 	}
-	// Strictly increasing: the chain link must match the document we
-	// already accepted when the publisher supplies one.
-	if prev.Sequence > 0 && prev.PredecessorHash != "" && signed.Discovery.PredecessorHash != "" {
+	// After genesis the chain link is MANDATORY: a validly signed later
+	// document that omits PredecessorHash must not bypass continuity.
+	if prev.Sequence > 0 {
+		if signed.Discovery.PredecessorHash == "" {
+			return DiscoveryState{}, fmt.Errorf("%w: discovery sequence %d omits the required predecessor hash", ErrRollback, signed.Discovery.Sequence)
+		}
 		if signed.Discovery.PredecessorHash != prev.PredecessorHash {
 			return DiscoveryState{}, fmt.Errorf("%w: discovery sequence %d predecessor hash does not chain to the accepted document", ErrRollback, signed.Discovery.Sequence)
 		}

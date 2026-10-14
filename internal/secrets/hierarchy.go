@@ -49,16 +49,35 @@ type Policy struct {
 	Team        string
 	Org         string
 	Environment string
+	Job         string
+	Step        string
 	Branch      string
 	Tag         string
 	Event       string
 	Fork        bool
 	Trusted     bool
-	Now         time.Time
+	// Now is the request clock. Zero is NOT "no expiry check" — the
+	// resolver treats it as time.Now() so an expiry can never fail open
+	// because a caller forgot to stamp the clock.
+	Now time.Time
 }
 
 // matches reports whether the ref's policy dimensions admit the request.
 func (r SecretRef) matches(p Policy) bool {
+	// Trust floor. Trusted is the MINIMUM trust the ref admits:
+	//   nil   → trusted only (safe default)
+	//   true  → trusted only
+	//   false → untrusted also allowed (explicit opt-in)
+	// Untrusted execution is refused every ref that is not explicitly
+	// untrusted-allowed.
+	switch {
+	case r.Trusted == nil || *r.Trusted:
+		if !p.Trusted {
+			return false
+		}
+	default: // *r.Trusted == false: untrusted-allowed
+		// both trusted and untrusted may see it
+	}
 	if r.Branch != "" && r.Branch != p.Branch {
 		return false
 	}
@@ -71,13 +90,14 @@ func (r SecretRef) matches(p Policy) bool {
 	if r.Fork != nil && *r.Fork != p.Fork {
 		return false
 	}
-	if r.Trusted != nil && *r.Trusted != p.Trusted {
+	now := p.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if !r.ExpiresAt.IsZero() && now.After(r.ExpiresAt) {
 		return false
 	}
-	if !r.ExpiresAt.IsZero() && !p.Now.IsZero() && p.Now.After(r.ExpiresAt) {
-		return false
-	}
-	// Scope-owner matching.
+	// Scope-owner matching: a scoped ref must name the matching owner.
 	switch r.Scope {
 	case ScopeRepository:
 		if r.Owner != "" && r.Owner != p.Repository {
@@ -93,6 +113,16 @@ func (r SecretRef) matches(p Policy) bool {
 		}
 	case ScopeEnvironment:
 		if r.Owner != "" && r.Owner != p.Environment {
+			return false
+		}
+	case ScopeJob:
+		// A job-scoped ref MUST name its job: an empty owner would match
+		// every job and leak across the execution boundary.
+		if r.Owner == "" || r.Owner != p.Job {
+			return false
+		}
+	case ScopeStep:
+		if r.Owner == "" || r.Owner != p.Step {
 			return false
 		}
 	}
@@ -223,22 +253,32 @@ func reasonUnavailable(name string, p Policy, refs []SecretRef) string {
 }
 
 // Resolve returns the winning value. The hierarchy walk is most-specific
-// first; the first policy match wins.
+// first; the first policy match wins. Two matching refs at the SAME scope are
+// ambiguous authority and fail closed — resolution never depends on
+// insertion order.
 func (h *Hierarchy) Resolve(ctx context.Context, name string, p Policy) (string, error) {
 	e := h.Explain(name, p)
 	if !e.Available {
 		return "", fmt.Errorf("secret %q unavailable: %s", name, e.Reason)
 	}
 	for _, scope := range HierarchyOrder {
+		var hits []SecretRef
 		for _, r := range h.refs {
 			if r.Name != name || r.Scope != scope || !r.matches(p) {
 				continue
 			}
-			if r.Value == "" {
-				return "", fmt.Errorf("secret %q at %s has no value", name, scope)
-			}
-			return r.Value, nil
+			hits = append(hits, r)
 		}
+		if len(hits) == 0 {
+			continue
+		}
+		if len(hits) > 1 {
+			return "", fmt.Errorf("secret %q is ambiguous at scope %s (%d matching refs): fail closed", name, scope, len(hits))
+		}
+		if hits[0].Value == "" {
+			return "", fmt.Errorf("secret %q at %s has no value", name, scope)
+		}
+		return hits[0].Value, nil
 	}
 	return "", fmt.Errorf("secret %q unavailable: %s", name, e.Reason)
 }

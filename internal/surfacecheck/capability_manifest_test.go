@@ -2,6 +2,7 @@ package surfacecheck
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -344,6 +345,28 @@ func TestCapabilityManifestCoversPublicSurface(t *testing.T) {
 			if !found && !requires[c.ID] {
 				t.Errorf("capability %q claims release proof but no release-gate --require names it (scenarios=%v)", c.ID, c.Scenarios)
 			}
+		}
+	}
+}
+
+// TestCrossCompileWindowsAndARM64: the product claims native Windows and
+// Linux ARM64 lanes. A syscall.Statfs_t in an untagged file (or any other
+// Unix-only API) must fail this gate, not a user's Windows build.
+func TestCrossCompileWindowsAndARM64(t *testing.T) {
+	goBin := "/opt/homebrew/bin/go"
+	if _, err := os.Stat(goBin); err != nil {
+		goBin = "go"
+	}
+	for _, target := range []struct{ goos, arch string }{
+		{"windows", "amd64"},
+		{"linux", "arm64"},
+	} {
+		cmd := exec.Command(goBin, "build", "-o", os.DevNull, "./cmd/kiwi")
+		cmd.Dir = filepath.Join("..", "..")
+		cmd.Env = append(os.Environ(), "GOOS="+target.goos, "GOARCH="+target.arch)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("GOOS=%s GOARCH=%s go build ./cmd/kiwi: %v\n%s", target.goos, target.arch, err, out)
 		}
 	}
 }
