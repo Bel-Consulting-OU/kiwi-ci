@@ -28,6 +28,9 @@ func (f *fakeForgeFiles) ParseEvent([]byte) (forge.EventContext, error) {
 func (f *fakeForgeFiles) FetchFile(context.Context, string, string, string) (string, error) {
 	return "", nil
 }
+func (f *fakeForgeFiles) ResolveRevision(context.Context, string, string) (string, error) {
+	return strings.Repeat("a", 40), nil
+}
 func (f *fakeForgeFiles) ChangedFiles(context.Context, forge.EventContext) (forge.ChangedFilesResult, error) {
 	f.calls++
 	return forge.ChangedFilesResult{Files: f.files, Complete: f.complete}, f.err

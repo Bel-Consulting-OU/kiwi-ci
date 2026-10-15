@@ -109,6 +109,11 @@ type Forge interface {
 	// repository (a token for https://x-access-token:$TOKEN@ URLs), or
 	// (false) when the forge exposes no credential.
 	CloneCredentialFor(repoFullName string) (string, bool)
+	// ResolveRevision returns the full commit SHA a ref points at (branch,
+	// tag, or an abbreviated/ambiguous ref). Every remote run must pin this
+	// SHA before admission: a branch is human metadata, never execution
+	// authority. Implementations must return the FULL hex SHA.
+	ResolveRevision(ctx context.Context, repoFullName, ref string) (string, error)
 }
 
 // VerifyHMACSignature verifies a "sha256=<hex>" HMAC-SHA256 signature

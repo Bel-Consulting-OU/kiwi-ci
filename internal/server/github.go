@@ -243,22 +243,85 @@ func (s *Server) fetchImageLock(ctx context.Context, fg forge.Forge, repoFullNam
 	return raw, true, nil
 }
 
-// fetchImageLockByRepo fetches the lockfile using each configured forge
-// adapter. First adapter that HAS the file wins. A 404 is "no lockfile"; a
-// 4xx from a non-matching forge is "this adapter cannot serve this repo"
-// (skip); a transport/5xx failure is fail-closed. An empty ref is refused
-// (a lock is revision-scoped; without a revision there is nothing to bind).
-func (s *Server) fetchImageLockByRepo(ctx context.Context, repoFullName, ref string) (string, error) {
+// fetchImageLockByForge fetches the lockfile through the EXACT forge adapter
+// named by kind. Never "try every adapter": github.com/acme/backend and
+// gitlab.com/acme/backend are different repositories, and a lock fetched
+// from the wrong forge is forged execution authority. kind=="" is refused
+// (no adapter can be trusted to own that coordinate).
+func (s *Server) fetchImageLockByForge(ctx context.Context, kind, repoFullName, ref string) (string, error) {
 	if strings.TrimSpace(ref) == "" {
 		return "", nil // no revision to bind the lock to
+	}
+	if s.ImageLockFetcher != nil {
+		return s.ImageLockFetcher(ctx, kind, repoFullName, ref)
+	}
+	var fg forge.Forge
+	switch kind {
+	case "github":
+		fg = s.gitHubForge()
+	case "gitlab":
+		fg = s.gitLabForge()
+	case "forgejo":
+		fg = s.forgejoForge()
+	default:
+		return "", fmt.Errorf("image lock: unknown forge kind %q for %s", kind, repoFullName)
+	}
+	raw, found, err := s.fetchImageLock(ctx, fg, repoFullName, ref)
+	if err != nil {
+		return "", err
+	}
+	if !found {
+		return "", nil
+	}
+	return raw, nil
+}
+
+// resolveExecutionRevision pins the immutable commit SHA for a remote run.
+// Every server-created run (schedule, downstream, API) must carry this SHA
+// before admission: a branch is human metadata, never execution authority.
+// Pipeline and lock are then fetched at the SAME SHA, so the compiled plan
+// and the checkout can never disagree.
+func (s *Server) resolveExecutionRevision(ctx context.Context, kind, repoFullName, ref string) (string, error) {
+	// An empty ref means "the repository's current default tip" (HEAD).
+	// It is still pinned to a SHA before admission — a default branch is
+	// human metadata, never execution authority.
+	if strings.TrimSpace(ref) == "" {
+		ref = "HEAD"
+	}
+	if s.RevisionResolver != nil {
+		return s.RevisionResolver(ctx, kind, repoFullName, ref)
+	}
+	var fg forge.Forge
+	switch kind {
+	case "github":
+		fg = s.gitHubForge()
+	case "gitlab":
+		fg = s.gitLabForge()
+	case "forgejo":
+		fg = s.forgejoForge()
+	default:
+		return "", fmt.Errorf("resolve revision: unknown forge kind %q for %s", kind, repoFullName)
+	}
+	sha, err := fg.ResolveRevision(ctx, repoFullName, ref)
+	if err != nil {
+		return "", err
+	}
+	if len(sha) < 40 {
+		return "", fmt.Errorf("resolve revision %q: SHA %q is not a full commit id", ref, sha)
+	}
+	return sha, nil
+}
+
+// fetchImageLockByRepo is the legacy multi-adapter helper. It is retained
+// only for tests; authority-sensitive paths use fetchImageLockByForge.
+func (s *Server) fetchImageLockByRepo(ctx context.Context, repoFullName, ref string) (string, error) {
+	if strings.TrimSpace(ref) == "" {
+		return "", nil
 	}
 	var lastHard error
 	for _, f := range []forge.Forge{s.gitHubForge(), s.gitLabForge(), s.forgejoForge()} {
 		raw, found, err := s.fetchImageLock(ctx, f, repoFullName, ref)
 		if err != nil {
-			// fetchImageLock already collapsed 404 to ( "", false ). Any
-			// error here is non-404. Distinguish wrong-forge 4xx from a
-			// genuine transport/5xx failure.
 			if isForgeClientErr(err) {
 				continue
 			}
@@ -272,7 +335,7 @@ func (s *Server) fetchImageLockByRepo(ctx context.Context, repoFullName, ref str
 	if lastHard != nil {
 		return "", lastHard
 	}
-	return "", nil // genuinely no lockfile on any adapter
+	return "", nil
 }
 
 // isForgeClientErr reports whether err is a 4xx forge API response (wrong

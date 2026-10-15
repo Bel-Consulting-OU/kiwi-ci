@@ -1,0 +1,58 @@
+# Adversarial detector matrix — every bug CLASS gets an executable detector.
+#
+# This is the meta-contract for CI: surfacecheck.TestAdversarialClassesHaveDetectors
+# fails when a class listed here has no `func Test…` in the tree, or when a
+# detector is removed. A class without a detector is an open hole.
+#
+# Class names are stable. Detectors are test prefixes (same contract as
+# dogfood-run.sh --require).
+version: 1
+classes:
+  - id: authority-discarded-before-use
+    summary: "Authority applied to a temporary object is discarded before execution"
+    detectors: [TestSysDFLockAuthority, TestResolvePipelineAppliesImageLock]
+  - id: fail-open-on-error
+    summary: "Any error treated as 'absent' lets mutable/unsafe defaults through"
+    detectors: [TestResolvePipelineMalformedLockFailsClosed, TestBitbucketChangedFilesPaginationFailsClosed]
+  - id: wildcard-by-omission
+    summary: "Empty scoped field silently matches everything"
+    detectors: [TestHierarchyNoWildcardByOmittedOwner, TestHierarchyJobStepRequireOwner]
+  - id: divergent-dual-implementation
+    summary: "Two precedence paths disagree (UI lies about runtime authority)"
+    detectors: [TestExplainResolveObservationallyEquivalent]
+  - id: prefilter-not-authority
+    summary: "Capacity checked outside the atomic claim/lease boundary"
+    detectors: [TestConcurrencyLimitAtomicClaimRace, TestConcurrencyLimitGatesLease]
+  - id: mutable-identity
+    summary: "Tags / placeholder digests treated as immutable authority"
+    detectors: [TestLockLookupUsesWorkspaceRootNotCWD, TestLockLookupCoversServiceAndVM, TestLockCommandWritesFile]
+  - id: phantom-evidence
+    summary: "Guards that name tests/functions which do not exist"
+    detectors: [TestEveryMakeRequireHasDefinition, TestRequireDefinitionGuardCatchesPhantoms]
+  - id: ingress-resolver-split
+    summary: "Ingress parser stricter than the real resolver (valid input rejected)"
+    detectors: [TestComponentOnlyJobSurvivesTriggerParse]
+  - id: cross-platform-compile
+    summary: "Unix-only API in shared code breaks supported platforms"
+    detectors: [TestCrossCompileWindowsAndARM64]
+  - id: schema-rollback
+    summary: "Historical schema / sequence identity not frozen; rollback possible"
+    detectors: [TestSignDiscoveryRejectsSequenceZero, TestSignedDiscoveryRejectsSequenceZero, TestSignedDiscoveryRequiresPredecessorAfterGenesis]
+  - id: trust-floor-fail-open
+    summary: "Untrusted execution reaches secrets/privileged/host mounts"
+    detectors: [TestHierarchyTrustFloorDefaultsClosed, TestPrivilegedAndHostMountsAreTrustGated, TestContainerBackendRefusesUntrustedPrivilegedAndHostMounts]
+  - id: ambiguous-authority
+    summary: "Equal-specificity authority resolves by insertion order"
+    detectors: [TestHierarchyAmbiguousScopeFailsClosed]
+  - id: error-oracle-leak
+    summary: "Raw internal/transport detail on unauthenticated or 5xx surfaces"
+    detectors: [TestInternalErrorNoRaw5xxErrorBodies]
+  - id: skip-path-authority
+    summary: "A code path that enqueues/executes without the shared authority"
+    detectors: [TestEverySubmitRunWiresImageLock, TestResolvePipelineAppliesImageLock]
+  - id: path-escape
+    summary: "Workspace/lock/volume paths escape their root"
+    detectors: [TestJobWorkRootRejectsEscape, TestWorkSubdirEscapeRefused, TestValidateCloneWorkspaceVolumes]
+  - id: historical-acceptance
+    summary: "Historical records invalid after a schema bump; restore order wrong"
+    detectors: [TestHistoricalAcceptanceFixturesFromDisk, TestHistoricalFixturesAreDistinctEncodings, TestRestoreAuthenticatesMACBeforeSemanticInterpretation]

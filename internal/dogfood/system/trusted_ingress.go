@@ -40,6 +40,11 @@ type TrustedWebhookConfig struct {
 	// PipelineYAML is served as the repository's .kiwi/pipeline.yaml by the
 	// forge stand-in. DeliverTrustedPush may replace it per delivery.
 	PipelineYAML string
+	// LockYAML is served as the repository's .kiwi/lock.json (optional).
+	// When set, the control plane must apply it at compilation: the
+	// canonical pipeline text and every job's images must carry the locked
+	// digests. This is the determinism authority dogfood.
+	LockYAML string
 	// RepoFullName / RepoCloneURL identify the repository the push event
 	// names. Defaults: DefaultTrustedRepo / DefaultTrustedRepoURL.
 	RepoFullName string
@@ -53,6 +58,7 @@ type TrustedWebhookConfig struct {
 type trustedForge struct {
 	mu       sync.Mutex
 	pipeline []byte
+	lock     []byte
 	repo     string
 	srv      *httptest.Server
 }
@@ -63,14 +69,46 @@ func (f *trustedForge) setPipeline(yaml string) {
 	f.pipeline = []byte(yaml)
 }
 
+func (f *trustedForge) setLock(yaml string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lock = []byte(yaml)
+}
+
+// SetTrustedLock replaces the forge stand-in's served .kiwi/lock.json.
+// Used by the determinism-authority dogfood.
+func (s *System) SetTrustedLock(lockYAML string) {
+	if s.trustedForge == nil {
+		return
+	}
+	s.trustedForge.setLock(lockYAML)
+}
+
 func (f *trustedForge) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		switch {
 		case r.Method == http.MethodGet && strings.Contains(path, "/contents/"):
-			// Only the pipeline path is served; any other path (e.g.
-			// .kiwi/lock.json) is a genuine 404 — the real forge does not
-			// return the pipeline body for unknown files.
+			// Serve the pipeline and (optionally) the lockfile. Every other
+			// path is a genuine 404 — the real forge does not return the
+			// pipeline body for unknown files.
+			if strings.Contains(path, "lock.json") {
+				f.mu.Lock()
+				body := append([]byte(nil), f.lock...)
+				f.mu.Unlock()
+				if len(body) == 0 {
+					http.NotFound(w, r)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"name":     "lock.json",
+					"path":     ".kiwi/lock.json",
+					"encoding": "base64",
+					"content":  base64.StdEncoding.EncodeToString(body),
+				})
+				return
+			}
 			if !strings.Contains(path, "pipeline.yaml") {
 				http.NotFound(w, r)
 				return
@@ -93,6 +131,15 @@ func (f *trustedForge) handler() http.Handler {
 			// Empty but complete diff: path-less triggers stay admissible.
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{"files": []any{}})
+		case r.Method == http.MethodGet && strings.Contains(path, "/commits/"):
+			// Revision resolution (ref → full SHA): a deterministic full
+			// commit id so schedules/downstream/API submits can pin the
+			// immutable revision through the real resolveExecutionRevision
+			// path.
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			})
 		case r.Method == http.MethodGet && strings.Contains(path, "/check-runs"):
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{"check_runs": []any{}})
@@ -130,7 +177,7 @@ func (s *System) EnableTrustedWebhook(cfg TrustedWebhookConfig) error {
 	if cfg.RepoCloneURL == "" {
 		cfg.RepoCloneURL = DefaultTrustedRepoURL
 	}
-	f := &trustedForge{repo: cfg.RepoFullName, pipeline: []byte(cfg.PipelineYAML)}
+	f := &trustedForge{repo: cfg.RepoFullName, pipeline: []byte(cfg.PipelineYAML), lock: []byte(cfg.LockYAML)}
 	f.srv = httptest.NewServer(f.handler())
 	s.trustedForge = f
 	s.trustedSecret = cfg.Secret

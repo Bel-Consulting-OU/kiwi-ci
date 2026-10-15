@@ -418,17 +418,35 @@ func (s *Server) dispatchDownstream(ctx context.Context, item forge.OutboxItem) 
 		return nil
 	}
 
-	content, err := s.fetchDownstreamPipeline(ctx, forgeKind, baseURL, p.TargetRepo, p.TargetRef)
+	// Pin the immutable revision FIRST. A branch is human metadata, never
+	// execution authority: the pipeline and the lock are fetched at the
+	// SAME SHA the child will check out, so three different commits can
+	// never participate in one run (pipeline A / lock B / checkout C).
+	// An unrecognized forge host has no adapter — that deployment must pin
+	// the SHA itself.
+	var sha, lockContent string
+	if forgeKind != "" {
+		s2, serr := s.resolveExecutionRevision(ctx, forgeKind, p.TargetRepo, p.TargetRef)
+		if serr != nil {
+			s.releaseDownstreamReservation(ctx, p.ParentJobID, p.TargetRepo, p.TargetRef)
+			return fmt.Errorf("downstream: resolve revision %s@%s: %w", p.TargetRepo, p.TargetRef, serr)
+		}
+		sha = s2
+	}
+	content, err := s.fetchDownstreamPipeline(ctx, forgeKind, baseURL, p.TargetRepo, revOrRef(sha, p.TargetRef))
 	if err != nil {
 		s.releaseDownstreamReservation(ctx, p.ParentJobID, p.TargetRepo, p.TargetRef)
-		return fmt.Errorf("downstream: fetch pipeline for %s@%s: %w", p.TargetRepo, p.TargetRef, err)
+		return fmt.Errorf("downstream: fetch pipeline for %s@%s: %w", p.TargetRepo, revOrRef(sha, p.TargetRef), err)
 	}
-	// Image lock is compilation authority for the child too — fetch it at
-	// the SAME ref as the pipeline.
-	lockContent, lerr := s.fetchDownstreamImageLock(ctx, forgeKind, baseURL, p.TargetRepo, p.TargetRef)
-	if lerr != nil {
-		s.releaseDownstreamReservation(ctx, p.ParentJobID, p.TargetRepo, p.TargetRef)
-		return fmt.Errorf("downstream: fetch image lock for %s@%s: %w", p.TargetRepo, p.TargetRef, lerr)
+	// Image lock is compilation authority for the child too — fetched at
+	// the pinned SHA, never at a mutable branch.
+	if sha != "" {
+		lc, lerr := s.fetchDownstreamImageLock(ctx, forgeKind, baseURL, p.TargetRepo, sha)
+		if lerr != nil {
+			s.releaseDownstreamReservation(ctx, p.ParentJobID, p.TargetRepo, p.TargetRef)
+			return fmt.Errorf("downstream: fetch image lock for %s@%s: %w", p.TargetRepo, sha, lerr)
+		}
+		lockContent = lc
 	}
 
 	meta := map[string]string{
@@ -454,6 +472,7 @@ func (s *Server) dispatchDownstream(ctx context.Context, item forge.OutboxItem) 
 		RepoURL:         downstreamCloneURL(forgeKind, baseURL, p.TargetRepo),
 		RepoFullName:    p.TargetRepo,
 		Ref:             p.TargetRef,
+		SHA:             sha,
 		Event:           p.Event,
 		Pipeline:        content,
 		ImageLock:       lockContent,
@@ -769,6 +788,15 @@ func (s *Server) fetchDownstreamPipeline(ctx context.Context, forgeKind, baseURL
 // same ref as the pipeline. Missing lock (404) yields ""; any other failure
 // is fail-closed — a child run must never silently fall back to mutable tags
 // because the forge was flaky.
+// revOrRef prefers the pinned SHA and falls back to the mutable ref when
+// no adapter could resolve one (unrecognized host).
+func revOrRef(sha, ref string) string {
+	if sha != "" {
+		return sha
+	}
+	return ref
+}
+
 func (s *Server) fetchDownstreamImageLock(ctx context.Context, forgeKind, baseURL, targetRepo, targetRef string) (string, error) {
 	// Custom fetcher seam first: tests and deployments that replace
 	// repository reads must not have the lock fetch escape to the real

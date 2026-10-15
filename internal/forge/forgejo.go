@@ -274,3 +274,40 @@ func (f *Forgejo) CloneCredentialFor(_ string) (string, bool) {
 	}
 	return "", false
 }
+
+// ResolveRevision returns the full commit SHA for a ref via the commits API.
+func (f *Forgejo) ResolveRevision(ctx context.Context, repoFullName, ref string) (string, error) {
+	if strings.TrimSpace(ref) == "" {
+		return "", fmt.Errorf("resolve revision: empty ref")
+	}
+	u := f.apiBase() + "/repos/" + repoFullName + "/commits/" + url.QueryEscape(ref)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return "", err
+	}
+	if tok := f.apiToken(); tok != "" {
+		req.Header.Set("Authorization", "token "+tok)
+	}
+	resp, err := f.httpClient().Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return "", fmt.Errorf("resolve revision %q: not found", ref)
+	}
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, maxAPIErrorBodyBytes))
+		return "", fmt.Errorf("Forgejo API %s: %s", resp.Status, strings.TrimSpace(string(b)))
+	}
+	var v struct {
+		SHA string `json:"sha"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxPipelineJSONBytes)).Decode(&v); err != nil {
+		return "", err
+	}
+	if v.SHA == "" {
+		return "", fmt.Errorf("resolve revision %q: empty SHA", ref)
+	}
+	return v.SHA, nil
+}

@@ -329,8 +329,10 @@ func TestFlowDownstreamDispatchTargetIdentityFallback(t *testing.T) {
 	s.mu.Unlock()
 	s.DownstreamAllowlist = map[string][]string{"github.com/o/target": {}}
 	s.DownstreamPipelineFetcher = func(ctx context.Context, repo, ref string) (string, error) {
-		if repo != "o/target" || ref != "refs/heads/main" {
-			t.Fatalf("fetcher args = %q %q", repo, ref)
+		// The child pipeline is fetched at the PINNED SHA (never the mutable
+		// branch) — the resolver stub returns a deterministic 40-char id.
+		if repo != "o/target" || len(ref) != 40 {
+			t.Fatalf("fetcher args = %q %q (want repo + full SHA)", repo, ref)
 		}
 		return fcInputPipeline, nil
 	}

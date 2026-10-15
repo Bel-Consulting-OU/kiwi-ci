@@ -68,10 +68,12 @@ func (s *Server) resolvePipeline(ctx context.Context, in SubmitRun) (*pipeline.S
 }
 
 // applyImageLockContent applies a fetched lockfile document to the effective
-// spec. Empty content means "no lockfile" (authoring tags stay as written).
-// A nonempty document that is not a well-formed lockfile is FAIL-CLOSED —
-// malformed lock contents at the trust boundary must never degrade to
-// "ignore the lock".
+// spec. Empty content means "no lockfile" (authoring tags stay as written
+// under ordinary trusted policy). A nonempty document that is not a
+// well-formed lockfile is FAIL-CLOSED. Once a lockfile EXISTS it must be
+// COMPLETE: every mutable executable identity must have an entry — a lock
+// that silently omits a tag (or a component-injected image) defeats its own
+// meaning.
 func applyImageLockContent(spec *pipeline.Spec, content string) error {
 	if strings.TrimSpace(content) == "" {
 		return nil
@@ -80,9 +82,10 @@ func applyImageLockContent(spec *pipeline.Spec, content string) error {
 	if err != nil {
 		return fmt.Errorf("image lockfile: %w", err)
 	}
-	if err := lock.Validate(); err != nil {
+	m := lock.LockMap()
+	if err := spec.RequireComplete(m); err != nil {
 		return fmt.Errorf("image lockfile: %w", err)
 	}
-	spec.ApplyImageLock(lock.LockMap())
+	spec.ApplyImageLock(m)
 	return nil
 }

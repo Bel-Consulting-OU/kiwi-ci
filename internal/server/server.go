@@ -402,6 +402,14 @@ type Server struct {
 	// nil, the lock is skipped (the custom fetcher owns repository reads
 	// and has not offered a lock seam).
 	DownstreamImageLockFetcher func(ctx context.Context, targetRepo, targetRef string) (string, error)
+	// ImageLockFetcher overrides the forge-based lock fetch for API submits
+	// and schedules (tests inject a stub). Returning ( "", nil ) means "no
+	// lockfile". When nil the exact forge adapter is used.
+	ImageLockFetcher func(ctx context.Context, kind, repoFullName, sha string) (string, error)
+	// RevisionResolver overrides forge revision resolution (ref → full SHA)
+	// for schedules/downstream/API submits (tests inject a stub). When nil
+	// the exact forge adapter is used.
+	RevisionResolver func(ctx context.Context, kind, repoFullName, ref string) (string, error)
 
 	// DownstreamAllowlist is the bilateral downstream authorization map:
 	// targetRepo -> allowed source repositories. A target without an entry
@@ -682,6 +690,7 @@ func New(token string, opts ...Option) *Server {
 			opt(s)
 		}
 	}
+	s.maybeAutoStubRemoteIdentity()
 	s.sealStaging()
 	return s
 }
@@ -1151,6 +1160,7 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 		return nil, err
 	}
 	s.initTracingFromEnv()
+	s.maybeAutoStubRemoteIdentity()
 	// Construction is complete: the staging budget can no longer be changed
 	// (installStagingBudget panics), which is what makes the bound immutable
 	// for the server's lifetime.
@@ -1829,20 +1839,37 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	in.Trusted = false
 	// Image lock is compilation authority for API submits too. The client
 	// supplies the pipeline text; when the submission names a repository and
-	// revision AND a recognized forge, fetch the repo's .kiwi/lock.json at
-	// that revision so a direct submit cannot bypass the lock by skipping
-	// the webhook. Missing lock is fine; a fetch failure is fail-closed.
-	// An unrecognized host has no adapter — the client must pin digests in
-	// the pipeline itself.
-	if in.ImageLock == "" && strings.TrimSpace(in.RepoFullName) != "" && in.ForgeKind != "" {
-		ref := in.SHA
+	// revision AND a recognized forge, pin the immutable SHA and fetch the
+	// repo's .kiwi/lock.json at that SHA so a direct submit cannot bypass
+	// the lock by skipping the webhook. Missing lock is fine; a fetch
+	// failure is fail-closed. An unrecognized host has no adapter — the
+	// client must pin digests in the pipeline itself.
+	//
+	// Local parse happens FIRST: a structurally invalid pipeline is refused
+	// before any forge round-trip (never hammer the forge for garbage).
+	if _, perr := pipeline.ParseWithComponents([]byte(in.Pipeline)); perr != nil {
+		http.Error(w, "parse pipeline: "+perr.Error(), http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(in.RepoFullName) != "" && in.ForgeKind != "" {
+		ref := in.Ref
 		if ref == "" {
-			ref = in.Ref
+			ref = in.SHA
 		}
-		if lock, lerr := s.fetchImageLockByRepo(r.Context(), in.RepoFullName, ref); lerr != nil {
-			http.Error(w, "image lock unavailable", http.StatusBadGateway)
-			return
-		} else {
+		if ref != "" && in.SHA == "" {
+			sha, serr := s.resolveExecutionRevision(r.Context(), in.ForgeKind, in.RepoFullName, ref)
+			if serr != nil {
+				http.Error(w, "resolve revision: "+serr.Error(), http.StatusBadGateway)
+				return
+			}
+			in.SHA = sha
+		}
+		if in.ImageLock == "" && in.SHA != "" {
+			lock, lerr := s.fetchImageLockByForge(r.Context(), in.ForgeKind, in.RepoFullName, in.SHA)
+			if lerr != nil {
+				http.Error(w, "image lock unavailable", http.StatusBadGateway)
+				return
+			}
 			in.ImageLock = lock
 		}
 	}
@@ -6125,6 +6152,9 @@ func (s *Server) rerunRun(w http.ResponseWriter, r *http.Request) {
 	if repoID == "" {
 		repoID = policyID
 	}
+	// ImageLock is set by the resolver from the source run's already-locked
+	// canonical pipeline text (pipelineText): a rerun copies the locked
+	// identities and never re-fetches the lockfile.
 	in := SubmitRun{RepoID: repoID, PolicyRepoID: policyID, CheckoutRepoURL: checkoutURLForRun(old),
 		RepoURL: old.Repo, RepoFullName: old.RepoFullName, Ref: old.Ref, SHA: old.SHA, Event: old.Event, Pipeline: pipelineText,
 		ForgeKind: old.ForgeKind, ForgeHost: old.ForgeHost,
@@ -6201,6 +6231,9 @@ func (s *Server) rerunRunDB(w http.ResponseWriter, r *http.Request, id string) {
 	if repoID == "" {
 		repoID = policyID
 	}
+	// ImageLock is set by the resolver from the source run's already-locked
+	// canonical pipeline text (pipelineText): a rerun copies the locked
+	// identities and never re-fetches the lockfile.
 	in := SubmitRun{RepoID: repoID, PolicyRepoID: policyID, CheckoutRepoURL: checkoutURLForRun(old),
 		RepoURL: old.Repo, RepoFullName: old.RepoFullName, Ref: old.Ref, SHA: old.SHA, Event: old.Event, Pipeline: pipelineText,
 		ForgeKind: old.ForgeKind, ForgeHost: old.ForgeHost,

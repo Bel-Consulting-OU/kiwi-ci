@@ -71,6 +71,7 @@ func downstreamServer(t *testing.T, pipelineText string) (*Server, model.Run) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.StubRemoteIdentityForTest()
 	s.DownstreamAllowlist = map[string][]string{"acme/child": {"o/r"}}
 	s.Policy = &policy.Config{
 		Repositories: map[string]policy.RepoPolicy{
@@ -114,6 +115,7 @@ func TestDownstreamCapabilityRejectionAtEnqueue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.StubRemoteIdentityForTest()
 	s.Policy = &policy.Config{}
 	w := doJSON(t, s, http.MethodPost, "/api/v1/runs", "token",
 		`{"repo_url":"https://github.com/o/r.git","repo_full_name":"o/r","ref":"refs/heads/main","sha":"abc","pipeline":`+jsonString(downstreamPipeline)+`}`)
@@ -143,6 +145,7 @@ func TestDownstreamInvalidRepositoryRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.StubRemoteIdentityForTest()
 	s.Policy = &policy.Config{Repositories: map[string]policy.RepoPolicy{"o/r": {CrossRepoTrigger: boolPtr(true)}}}
 	bad := `version: 1
 jobs:
@@ -173,7 +176,8 @@ func TestDownstreamLaunchExactlyOnceAcrossRestart(t *testing.T) {
 	// (alongside the marker-guarded completion effect intents).
 	item := downstreamPendingItem(t, s)
 	s.DownstreamPipelineFetcher = func(ctx context.Context, repo, ref string) (string, error) {
-		if repo != "acme/child" || ref != "refs/heads/main" {
+		// Fetched at the PINNED SHA (never the mutable branch).
+		if repo != "acme/child" || len(ref) != 40 {
 			return "", fmt.Errorf("unexpected fetch %s@%s", repo, ref)
 		}
 		return childPipeline, nil
@@ -206,6 +210,7 @@ func TestDownstreamLaunchExactlyOnceAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s2.StubRemoteIdentityForTest()
 	s2.DownstreamAllowlist = map[string][]string{"acme/child": {"o/r"}}
 	s2.DownstreamPipelineFetcher = func(ctx context.Context, repo, ref string) (string, error) {
 		return childPipeline, nil
@@ -303,6 +308,7 @@ func TestDownstreamDBModeExactlyOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.StubRemoteIdentityForTest()
 	if err := s.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
@@ -373,6 +379,7 @@ func TestDownstreamRefusedWithoutTargetConsent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.StubRemoteIdentityForTest()
 	s.Policy = &policy.Config{Repositories: map[string]policy.RepoPolicy{"o/r": {CrossRepoTrigger: boolPtr(true)}}}
 	// No DownstreamAllowlist at all: default deny.
 	if _, err := s.enqueue(context.Background(), SubmitRun{
@@ -470,6 +477,7 @@ func TestDownstreamRefusedDBMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.StubRemoteIdentityForTest()
 	if err := s.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}

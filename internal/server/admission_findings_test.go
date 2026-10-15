@@ -23,6 +23,7 @@ func TestNoPolicyDownstreamDeclarationRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.StubRemoteIdentityForTest()
 	// s.Policy stays nil.
 	untrusted := `version: 1
 jobs:
@@ -54,6 +55,7 @@ func TestNoPolicyGenerateDeclarationRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.StubRemoteIdentityForTest()
 	untrusted := `version: 1
 jobs:
   build:
@@ -78,6 +80,7 @@ func TestPolicyFileAdmissionUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.StubRemoteIdentityForTest()
 	s.Policy = &policy.Config{
 		AllowedCloneHosts: []string{"github.com"},
 		Repositories: map[string]policy.RepoPolicy{
@@ -189,6 +192,7 @@ func TestScheduleSpecViolatingHostAllowlistRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.StubRemoteIdentityForTest()
 	s.Policy = &policy.Config{AllowedCloneHosts: []string{"github.com"}}
 	w := doJSON(t, s, http.MethodPut, "/api/v1/schedules", "token",
 		`{"repository":"acme/service","repo_url":"https://evil.example/acme/service.git","spec":`+jsonString(scheduleSpec)+`}`)
@@ -254,6 +258,7 @@ func TestContainerWithoutImageRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.StubRemoteIdentityForTest()
 	imageless := `version: 1
 jobs:
   build:
@@ -305,6 +310,7 @@ func TestRequireDigestPinsStrict(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.StubRemoteIdentityForTest()
 	s.Policy = &policy.Config{RequireDigestPins: true}
 	cases := []struct {
 		name  string

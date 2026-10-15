@@ -313,6 +313,27 @@ func (b *Bitbucket) CloneCredentialFor(repoFullName string) (string, bool) {
 	return user + ":" + b.Token, true
 }
 
+// ResolveRevision returns the full commit SHA for a ref via the commit API.
+func (b *Bitbucket) ResolveRevision(ctx context.Context, repoFullName, ref string) (string, error) {
+	if strings.TrimSpace(ref) == "" {
+		return "", fmt.Errorf("resolve revision: empty ref")
+	}
+	raw, err := b.do(ctx, "GET", fmt.Sprintf("%s/repositories/%s/commit/%s", b.apiBase(), repoFullName, url.QueryEscape(ref)))
+	if err != nil {
+		return "", err
+	}
+	var v struct {
+		Hash string `json:"hash"`
+	}
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return "", err
+	}
+	if v.Hash == "" {
+		return "", fmt.Errorf("resolve revision %q: empty SHA", ref)
+	}
+	return v.Hash, nil
+}
+
 // TokenFor resolves the API token (env fallback KIWI_BITBUCKET_TOKEN).
 func (b *Bitbucket) TokenFor() string {
 	if b.Token != "" {

@@ -1,8 +1,10 @@
 package pipeline
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -31,11 +33,20 @@ func (f ImageLockfile) LockMap() map[string]string {
 }
 
 // ParseImageLockfile parses .kiwi/lock.json content. The document is strict:
-// version, nonempty unique refs and digest-pinned targets are all required.
+// unknown fields, trailing documents, version, nonempty unique refs and
+// digest-pinned OCI targets are all required. A lockfile is an authority
+// document — malformed contents are fatal, never a silent fallback to
+// mutable tags.
 func ParseImageLockfile(raw []byte) (ImageLockfile, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
 	var f ImageLockfile
-	if err := json.Unmarshal(raw, &f); err != nil {
+	if err := dec.Decode(&f); err != nil {
 		return ImageLockfile{}, fmt.Errorf("parse lockfile: %w", err)
+	}
+	// Single-document check: trailing JSON is a corruption signal.
+	if dec.More() {
+		return ImageLockfile{}, fmt.Errorf("parse lockfile: trailing data after document")
 	}
 	if err := f.Validate(); err != nil {
 		return ImageLockfile{}, err
@@ -44,9 +55,8 @@ func ParseImageLockfile(raw []byte) (ImageLockfile, error) {
 }
 
 // Validate enforces the lockfile contract: version 1, every entry has a
-// nonempty ref and a digest-pinned target, and refs are unique. A lockfile
-// is an authority document — malformed contents are fatal, never a silent
-// fallback to mutable tags.
+// nonempty ref and a digest-pinned OCI target, and refs are unique. The
+// digest must be `name@sha256:<64 lowercase hex>` (or bare `@sha256:…`).
 func (f ImageLockfile) Validate() error {
 	if f.Version != 1 {
 		return fmt.Errorf("lockfile version = %d, want 1", f.Version)
@@ -63,14 +73,55 @@ func (f ImageLockfile) Validate() error {
 		if img.Digest == "" {
 			return fmt.Errorf("lockfile entry %q: digest is empty", img.Ref)
 		}
-		// The target must be digest-pinned (…@sha256:…) so the lock never
-		// points at a mutable tag.
-		if !strings.Contains(img.Digest, "@sha256:") {
-			return fmt.Errorf("lockfile entry %q: digest %q is not digest-pinned (@sha256:)", img.Ref, img.Digest)
+		if err := validateOCIDigestTarget(img.Digest); err != nil {
+			return fmt.Errorf("lockfile entry %q: %w", img.Ref, err)
 		}
-		if strings.Contains(img.Digest, "sha256:0000000000000000000000000000000000000000000000000000000000000000") {
-			return fmt.Errorf("lockfile entry %q: digest is the all-zero placeholder", img.Ref)
+	}
+	return nil
+}
+
+// validateOCIDigestTarget requires `…@sha256:<64 lowercase hex>`. The
+// all-zero placeholder is refused — it is not a pin.
+func validateOCIDigestTarget(target string) error {
+	i := strings.Index(target, "@sha256:")
+	if i < 0 {
+		return fmt.Errorf("digest %q is not digest-pinned (@sha256:)", target)
+	}
+	hexPart := target[i+len("@sha256:"):]
+	if len(hexPart) != 64 {
+		return fmt.Errorf("digest %q: sha256 must be 64 hex chars, got %d", target, len(hexPart))
+	}
+	for _, c := range hexPart {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return fmt.Errorf("digest %q: sha256 must be lowercase hex", target)
 		}
+	}
+	if hexPart == strings.Repeat("0", 64) {
+		return fmt.Errorf("digest %q is the all-zero placeholder", target)
+	}
+	return nil
+}
+
+// RequireComplete reports whether every mutable executable identity in the
+// spec has a lock entry. When a lockfile EXISTS, incompleteness is fatal:
+// a lock that silently omits a tag defeats the meaning of a lock. Already
+// digest-pinned refs need no mapping.
+func (s *Spec) RequireComplete(lock map[string]string) error {
+	if s == nil || len(lock) == 0 {
+		return nil
+	}
+	var missing []string
+	for _, ref := range s.ImageRefs() {
+		if strings.Contains(ref, "@sha256:") {
+			continue // already immutable
+		}
+		if _, ok := lock[ref]; !ok {
+			missing = append(missing, ref)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return fmt.Errorf("image lockfile exists but does not cover %d mutable identity(ies): %s", len(missing), strings.Join(missing, ", "))
 	}
 	return nil
 }

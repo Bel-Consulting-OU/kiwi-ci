@@ -164,6 +164,9 @@ type GitHubConfig struct {
 	PrivateKeyPath string `toml:"private_key_path"`
 	WebhookSecret  string `toml:"webhook_secret"`
 	Token          string `toml:"token"`
+	// BaseURL overrides the GitHub API root (GitHub Enterprise, or a test
+	// stand-in). Empty uses https://api.github.com.
+	BaseURL string `toml:"base_url"`
 }
 
 type GitLabConfig struct {

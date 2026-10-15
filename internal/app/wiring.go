@@ -31,6 +31,9 @@ func applyForgeConfig(srv *server.Server, cfg *config.Config) error {
 	srv.GitLabToken = cfg.GitLab.Token
 	srv.ForgejoWebhookSecret = cfg.Forgejo.WebhookSecret
 	srv.ForgejoToken = cfg.Forgejo.Token
+	if cfg.GitHub.BaseURL != "" {
+		srv.SetForgeBaseURL("github", cfg.GitHub.BaseURL)
+	}
 	if cfg.GitLab.BaseURL != "" {
 		srv.SetForgeBaseURL("gitlab", cfg.GitLab.BaseURL)
 	}

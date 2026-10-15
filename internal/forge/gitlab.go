@@ -386,6 +386,43 @@ func (g *GitLab) CloneCredentialFor(_ string) (string, bool) {
 	return "", false
 }
 
+// ResolveRevision returns the full commit SHA for a ref via the commits API.
+func (g *GitLab) ResolveRevision(ctx context.Context, repoFullName, ref string) (string, error) {
+	if strings.TrimSpace(ref) == "" {
+		return "", fmt.Errorf("resolve revision: empty ref")
+	}
+	u := g.apiBase() + "/projects/" + url.QueryEscape(repoFullName) + "/repository/commits/" + url.QueryEscape(ref)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return "", err
+	}
+	if tok := g.apiToken(); tok != "" {
+		req.Header.Set("PRIVATE-TOKEN", tok)
+	}
+	resp, err := g.httpClient().Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return "", fmt.Errorf("resolve revision %q: not found", ref)
+	}
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, maxAPIErrorBodyBytes))
+		return "", fmt.Errorf("GitLab API %s: %s", resp.Status, strings.TrimSpace(string(b)))
+	}
+	var v struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxPipelineJSONBytes)).Decode(&v); err != nil {
+		return "", err
+	}
+	if v.ID == "" {
+		return "", fmt.Errorf("resolve revision %q: empty SHA", ref)
+	}
+	return v.ID, nil
+}
+
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {
 		if v != "" {

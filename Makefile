@@ -246,7 +246,7 @@ dogfood-release-artifacts:
 # the suite cannot silently lose them.
 dogfood-system:
 	./scripts/dogfood-run.sh 180s \
-		--run 'TestSysDFBoot|TestSysDFEvid|TestSysDFLease|TestSysQuota|TestSysRootless|TestSysTrusted|TestSysDFForgeCanary' \
+		--run 'TestSysDFBoot|TestSysDFEvid|TestSysDFLease|TestSysQuota|TestSysRootless|TestSysTrusted|TestSysDFForgeCanary|TestSysDFLockAuthority' \
 		--require TestSysDFBoot001 \
 		--require TestSysDFEvid001 \
 		--require TestSysDFLease001 \
@@ -255,6 +255,8 @@ dogfood-system:
 		--require TestSysTrustedIngress \
 		--require TestSysTrustedScheduleIngress \
 		--require TestSysDFForgeCanary001 \
+		--require TestSysDFLockAuthority001 \
+		--require TestSysDFLockAuthorityFailClosed \
 		-- ./internal/dogfood/system/
 
 # Production-closure SYSTEM species: live resource-leak/soak (DF-SCALE-002),

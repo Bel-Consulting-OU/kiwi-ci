@@ -19,24 +19,24 @@ func TestApplyImageLockResolvesJobServiceVM(t *testing.T) {
 		},
 	}}
 	lock := map[string]string{
-		"golang:1.27": "golang:1.27@sha256:aaa",
-		"postgres:16": "postgres:16@sha256:bbb",
-		"macos:15":    "macos:15@sha256:ccc",
+		"golang:1.27": "golang:1.27@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"postgres:16": "postgres:16@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		"macos:15":    "macos:15@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
 	}
 	s.ApplyImageLock(lock)
 	j := s.Jobs["build"]
-	if j.Image != "golang:1.27@sha256:aaa" {
+	if j.Image != "golang:1.27@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
 		t.Fatalf("job image = %q", j.Image)
 	}
-	if j.VM != "macos:15@sha256:ccc" {
+	if j.VM != "macos:15@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" {
 		t.Fatalf("vm = %q", j.VM)
 	}
-	if j.Services[0].Image != "postgres:16@sha256:bbb" {
+	if j.Services[0].Image != "postgres:16@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" {
 		t.Fatalf("service image = %q", j.Services[0].Image)
 	}
 	// Unlocked refs stay as written (the compiled graph still records them).
 	s2 := &Spec{Jobs: map[string]Job{"b": {Image: "alpine:3.20", Steps: []Step{{Run: "x"}}}}}
-	s2.ApplyImageLock(map[string]string{"golang:1.27": "golang:1.27@sha256:aaa"})
+	s2.ApplyImageLock(map[string]string{"golang:1.27": "golang:1.27@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
 	if s2.Jobs["b"].Image != "alpine:3.20" {
 		t.Fatalf("unlocked ref must stay as written: %q", s2.Jobs["b"].Image)
 	}
@@ -60,12 +60,12 @@ func TestImageRefsCoversJobServiceVM(t *testing.T) {
 }
 
 func TestParseImageLockfile(t *testing.T) {
-	f, err := ParseImageLockfile([]byte(`{"version":1,"images":[{"ref":"golang:1.27","digest":"golang:1.27@sha256:aaa"}]}`))
+	f, err := ParseImageLockfile([]byte(`{"version":1,"images":[{"ref":"golang:1.27","digest":"golang:1.27@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	m := f.LockMap()
-	if m["golang:1.27"] != "golang:1.27@sha256:aaa" {
+	if m["golang:1.27"] != "golang:1.27@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
 		t.Fatalf("lockmap = %v", m)
 	}
 	if _, err := ParseImageLockfile([]byte(`{bad`)); err == nil {
@@ -85,5 +85,37 @@ func TestImageLockFetchSemantics(t *testing.T) {
 	s.ApplyImageLock(map[string]string{})
 	if s.Jobs["b"].Image != "alpine:3.20" {
 		t.Fatalf("empty lock must leave refs as written: %q", s.Jobs["b"].Image)
+	}
+}
+
+// Once a lockfile EXISTS it must be COMPLETE: every mutable executable
+// identity needs an entry. A lock that silently omits a tag defeats its
+// own meaning (and component-injected images are exactly the hole).
+func TestRequireCompleteLockCoversAllMutableRefs(t *testing.T) {
+	s := &Spec{Jobs: map[string]Job{
+		"a": {Image: "golang:1.27", Steps: []Step{{Run: "x"}}},
+		"b": {Image: "alpine:3.20@sha256:" + strings.Repeat("d", 64), Steps: []Step{{Run: "y"}}},
+		"c": {Image: "postgres:16", Services: []Service{{Image: "redis:7"}}, Steps: []Step{{Run: "z"}}},
+	}}
+	lock := map[string]string{
+		"golang:1.27": "golang:1.27@sha256:" + strings.Repeat("a", 64),
+	}
+	// Incomplete: postgres:16 and redis:7 are mutable and unlocked.
+	err := s.RequireComplete(lock)
+	if err == nil {
+		t.Fatal("incomplete lock must fail when a lockfile exists")
+	}
+	if !strings.Contains(err.Error(), "postgres:16") || !strings.Contains(err.Error(), "redis:7") {
+		t.Fatalf("error must name the missing refs: %v", err)
+	}
+	// Complete lock passes; already-pinned refs need no entry.
+	lock["postgres:16"] = "postgres:16@sha256:" + strings.Repeat("b", 64)
+	lock["redis:7"] = "redis:7@sha256:" + strings.Repeat("c", 64)
+	if err := s.RequireComplete(lock); err != nil {
+		t.Fatalf("complete lock = %v", err)
+	}
+	// No lock at all: ordinary trusted policy (mutable refs allowed).
+	if err := s.RequireComplete(nil); err != nil {
+		t.Fatalf("no lock = %v", err)
 	}
 }

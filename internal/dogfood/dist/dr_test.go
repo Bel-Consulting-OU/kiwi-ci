@@ -1,6 +1,7 @@
 package dist_test
 
 import (
+	"net/url"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
@@ -489,24 +490,25 @@ func dbNameFromDSN(dsn string) string {
 
 func urlToPSQLAdmin(t *testing.T, dsn string) string {
 	t.Helper()
-	// Convert postgres://user@host:port/db to host=... port=... user=...
-	u := strings.TrimPrefix(dsn, "postgres://")
-	u = strings.TrimPrefix(u, "postgresql://")
-	if i := strings.Index(u, "?"); i >= 0 {
-		u = u[:i]
+	// Parse with net/url so the password survives. Hand-splitting the URL
+	// dropped it and psql then prompted / failed on trust auth.
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parse DSN %q: %v", dsn, err)
 	}
-	user := "postgres"
-	if at := strings.Index(u, "@"); at >= 0 {
-		user = strings.SplitN(u[:at], ":", 2)[0]
-		u = u[at+1:]
-	}
-	hostPort := u
-	if slash := strings.Index(u, "/"); slash >= 0 {
-		hostPort = u[:slash]
-	}
-	host, port, _ := strings.Cut(hostPort, ":")
+	host := u.Hostname()
+	port := u.Port()
 	if port == "" {
 		port = "5432"
+	}
+	user := "postgres"
+	if u.User != nil {
+		if name := u.User.Username(); name != "" {
+			user = name
+		}
+	}
+	if pw, ok := u.User.Password(); ok && pw != "" {
+		return fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=postgres sslmode=disable", host, port, user, pw)
 	}
 	return fmt.Sprintf("host=%s port=%s user=%s dbname=postgres sslmode=disable", host, port, user)
 }

@@ -746,7 +746,14 @@ func (s *Server) triggerSchedule(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Any other fire error (invalid stored identity, ID generation, a
-		// failed durable re-read) stays the generic 500.
+		// failed durable re-read) stays the generic 500. Identity-pinning
+		// failures (resolve revision / fetch lock) are gateway conditions:
+		// surface them as 502 so a forge outage is retryable and visible.
+		var gw *gatewayError
+		if errors.As(err, &gw) {
+			http.Error(w, gw.Error(), http.StatusBadGateway)
+			return
+		}
 		s.internalError(w, r, err, "")
 		return
 	}
@@ -1135,13 +1142,29 @@ func (s *Server) fireSchedule(ctx context.Context, sc storage.Schedule, nominal 
 	// policy identity is the schedule's RepoID and the checkout URL is its
 	// stored clone URL. The submission is server-derived, so it skips the
 	// direct-submission binding.
-	// Image lock is compilation authority for scheduled runs too: fetch the
-	// repo's .kiwi/lock.json at the schedule ref. A missing lock is fine
-	// (tags stay as written); a fetch failure is fail-closed.
-	lockContent, lerr := s.fetchImageLockByRepo(ctx, scheduleRepoFullName(sc), ref)
-	if lerr != nil {
-		s.auditLocked("schedule.trigger_failed", "scheduler", "", "", "scheduled run rejected", map[string]string{"schedule": sc.ID, "error": lerr.Error()})
-		return model.Run{}, false, lerr
+	// Pin the immutable revision BEFORE anything repository-derived is
+	// fetched: a branch is human metadata, never execution authority. The
+	// pipeline and the lock are then fetched at that SHA so the compiled
+	// plan and the checkout cannot disagree. An unrecognized forge host has
+	// no adapter — that deployment must pin the SHA itself.
+	kind := forgeKindForHost(repoHost(scheduleRepoURL(sc)))
+	var sha, lockContent string
+	if kind != "" {
+		s2, serr := s.resolveExecutionRevision(ctx, kind, scheduleRepoFullName(sc), ref)
+		if serr != nil {
+			s.auditLocked("schedule.trigger_failed", "scheduler", "", "", "scheduled run rejected", map[string]string{"schedule": sc.ID, "error": serr.Error()})
+			return model.Run{}, false, &gatewayError{err: serr}
+		}
+		sha = s2
+		// Image lock is compilation authority for scheduled runs too: fetch
+		// the repo's .kiwi/lock.json at the PINNED SHA. A missing lock is
+		// fine (tags stay as written); a fetch failure is fail-closed.
+		lc, lerr := s.fetchImageLockByForge(ctx, kind, scheduleRepoFullName(sc), sha)
+		if lerr != nil {
+			s.auditLocked("schedule.trigger_failed", "scheduler", "", "", "scheduled run rejected", map[string]string{"schedule": sc.ID, "error": lerr.Error()})
+			return model.Run{}, false, &gatewayError{err: lerr}
+		}
+		lockContent = lc
 	}
 	in := SubmitRun{
 		RepoID:          scheduleRepoID(sc),
@@ -1151,6 +1174,7 @@ func (s *Server) fireSchedule(ctx context.Context, sc storage.Schedule, nominal 
 		RepoFullName:    scheduleRepoFullName(sc),
 		identityBound:   true,
 		Ref:             ref,
+		SHA:             sha,
 		Event:           "schedule",
 		Pipeline:        sanitizeScheduleSpec(sc.Spec),
 		ImageLock:       lockContent,

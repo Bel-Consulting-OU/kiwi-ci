@@ -279,6 +279,11 @@ type JobView struct {
 	LeaseRunnerID   string       `json:"lease_runner_id,omitempty"`
 	AttemptRunnerID string       `json:"attempt_runner_id,omitempty"`
 	Trusted         bool         `json:"trusted"`
+	// CompiledJobPayload is the enqueue-time compiled identity the runner
+	// executes. The determinism-authority dogfood asserts locked image
+	// identities appear HERE — the public job DTO redacts the pipeline
+	// text, so the compiled payload is the observable execution identity.
+	CompiledJobPayload *model.CompiledJobPayload `json:"compiled_job_payload,omitempty"`
 }
 
 // QueryRun fetches one run via the public API.

@@ -96,6 +96,10 @@ capabilities:
     summary: "Woodpecker import → Kiwi equivalence mapping"
     proofs: [unit, component]
     covers: [cli:import]
+  - id: adversarial.detectors
+    summary: "Every bug CLASS that has bitten this tree has an executable detector"
+    proofs: [unit]
+    covers: [pkg:internal/surfacecheck]
   - id: selfhost.release
     summary: "Self-host G1→G2, packaged artifact, release gate before tag"
     proofs: [system, release]
