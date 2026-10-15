@@ -145,13 +145,10 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 		s.serverError(w, r, http.StatusBadGateway, err, "bad gateway")
 		return
 	}
-	spec, err := pipeline.Parse([]byte(content))
+	// Trigger-level parse only (see resolvePipeline for execution authority).
+	spec, err := pipeline.ParseWithComponents([]byte(content))
 	if err != nil {
 		http.Error(w, "parse pipeline: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	if lerr := s.applyRepoImageLock(ctx, fg, ec.Repository.FullName, pipelineSHA, spec); lerr != nil {
-		http.Error(w, "image lock: "+lerr.Error(), http.StatusBadRequest)
 		return
 	}
 	ok, matched, filesKnown, terr := s.evalTriggerMatches(ctx, fg, spec, &ec)
@@ -175,6 +172,13 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 	files := ec.ChangedFiles.Files
 
 	checkout := checkoutCloneURL(ec)
+	lockContent, _, lerr := s.fetchImageLock(ctx, fg, ec.Repository.FullName, pipelineSHA)
+	if lerr != nil {
+		// A lock fetch failure is a gateway error: do not echo the raw
+		// forge/transport error on a 5xx (it can carry internal detail).
+		s.serverError(w, r, http.StatusBadGateway, lerr, "bad gateway")
+		return
+	}
 	in := SubmitRun{
 		RepoID:            repoID,
 		PolicyRepoID:      repoID,
@@ -185,6 +189,7 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 		SHA:               ec.HeadSHA,
 		Event:             ec.Event,
 		Pipeline:          content,
+		ImageLock:         lockContent,
 		Trusted:           ec.Trusted,
 		ForgeKind:         "github",
 		ForgeHost:         forgeHostFromCloneURL(checkout),
@@ -221,36 +226,64 @@ func (s *Server) pipelinePath() string {
 	return s.PipelinePath
 }
 
-// applyRepoImageLock resolves every executable identity through the repo's
-// .kiwi/lock.json BEFORE compilation. The compiled graph then carries only
-// immutable digests — a remote runner never reinterprets a mutable tag.
-// Missing lockfile (forge 404) is not an error; ANY OTHER fetch failure is
-// fail-closed — silently swallowing a 500 would let mutable tags execute.
-// A malformed JSON lockfile is also fail-closed.
-func (s *Server) applyRepoImageLock(ctx context.Context, fg forge.Forge, repoFullName, ref string, spec *pipeline.Spec) error {
+// fetchImageLock returns the raw .kiwi/lock.json content from the SAME
+// repository revision as the pipeline, and whether the file existed. It is
+// TRANSPORT only — the canonical resolver (resolvePipeline) is the
+// execution-input authority. Missing lockfile (forge 404) is ( "", false );
+// ANY OTHER fetch failure is fail-closed. A malformed lockfile is caught
+// later by the resolver's strict parser.
+func (s *Server) fetchImageLock(ctx context.Context, fg forge.Forge, repoFullName, ref string) (string, bool, error) {
 	raw, err := fg.FetchFile(ctx, repoFullName, ".kiwi/lock.json", ref)
 	if err != nil {
 		if errors.Is(err, forge.ErrFileNotFound) {
-			return nil // genuinely no lockfile
+			return "", false, nil
 		}
-		return fmt.Errorf("fetch .kiwi/lock.json: %w", err)
+		return "", false, fmt.Errorf("fetch .kiwi/lock.json: %w", err)
 	}
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return nil
+	return raw, true, nil
+}
+
+// fetchImageLockByRepo fetches the lockfile using each configured forge
+// adapter. First adapter that HAS the file wins. A 404 is "no lockfile"; a
+// 4xx from a non-matching forge is "this adapter cannot serve this repo"
+// (skip); a transport/5xx failure is fail-closed. An empty ref is refused
+// (a lock is revision-scoped; without a revision there is nothing to bind).
+func (s *Server) fetchImageLockByRepo(ctx context.Context, repoFullName, ref string) (string, error) {
+	if strings.TrimSpace(ref) == "" {
+		return "", nil // no revision to bind the lock to
 	}
-	// A forge stub may return non-JSON for an unknown path. Only a
-	// JSON-shaped document is treated as a lockfile; malformed JSON is
-	// fail-closed.
-	if trimmed[0] != '{' && trimmed[0] != '[' {
-		return nil
+	var lastHard error
+	for _, f := range []forge.Forge{s.gitHubForge(), s.gitLabForge(), s.forgejoForge()} {
+		raw, found, err := s.fetchImageLock(ctx, f, repoFullName, ref)
+		if err != nil {
+			// fetchImageLock already collapsed 404 to ( "", false ). Any
+			// error here is non-404. Distinguish wrong-forge 4xx from a
+			// genuine transport/5xx failure.
+			if isForgeClientErr(err) {
+				continue
+			}
+			lastHard = err
+			continue
+		}
+		if found {
+			return raw, nil
+		}
 	}
-	lock, err := pipeline.ParseImageLockfile([]byte(raw))
-	if err != nil {
-		return err
+	if lastHard != nil {
+		return "", lastHard
 	}
-	spec.ApplyImageLock(lock.LockMap())
-	return nil
+	return "", nil // genuinely no lockfile on any adapter
+}
+
+// isForgeClientErr reports whether err is a 4xx forge API response (wrong
+// adapter for this repo, bad ref, etc.) as opposed to a transport/5xx
+// failure. Only the latter is fail-closed for the optional lockfile.
+func isForgeClientErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "API 4") || strings.Contains(msg, "HTTP 4")
 }
 
 // errDeliveryDigestMismatch reports that a delivery ID was reused with a

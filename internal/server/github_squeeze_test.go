@@ -32,6 +32,14 @@ func (h *gitHubHookAPI) server(t *testing.T) *httptest.Server {
 		h.requests.Add(1)
 		switch {
 		case strings.Contains(r.URL.Path, "/contents/"):
+			// Only the pipeline path is known; every other path (e.g.
+			// .kiwi/lock.json) is a genuine 404 — the real forge does not
+			// return the pipeline body for unknown files.
+			if !strings.Contains(r.URL.Path, ".kiwi/pipeline.yaml") &&
+				!strings.Contains(r.URL.Path, "ci/pipeline.yaml") {
+				http.NotFound(w, r)
+				return
+			}
 			status := h.fileStatus
 			if status == 0 {
 				status = http.StatusOK

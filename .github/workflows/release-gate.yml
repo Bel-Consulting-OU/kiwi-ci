@@ -34,11 +34,11 @@ jobs:
     runs-on: ubuntu-latest
     services:
       # Pinned PostgreSQL for the production dist/DR/verification path.
-      # The system dogfood needs a real server AND the client tools
-      # (initdb/pg_dump/pg_restore/psql) on PATH — a service container alone
-      # does not provide the binaries.
+      # DIGEST-PINNED: the release trust root must not be "whatever
+      # postgres:16-alpine meant that morning". The digest matches the
+      # self-host pipeline's postgres identity.
       postgres:
-        image: postgres:16-alpine
+        image: postgres:16-alpine@sha256:3c5c8892d184f738f4fe282d14ddaa613a38f00f4189d2d94725ebe6f2909ddb
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: kiwi
@@ -61,11 +61,14 @@ jobs:
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq postgresql-client postgresql
-          # Hosted runners may ship a different major than the service; the
-          # client tools must be able to talk to the pinned server.
-          initdb --version
-          pg_dump --version
-          pg_restore --version
+          # Ubuntu ships initdb under /usr/lib/postgresql/<N>/bin, not on
+          # the generic PATH. Expose the bindir explicitly.
+          PG_BINDIR="$(pg_config --bindir)"
+          echo "PG_BINDIR=$PG_BINDIR" >> "$GITHUB_ENV"
+          echo "$PG_BINDIR" >> "$GITHUB_PATH"
+          "$PG_BINDIR/initdb" --version
+          "$PG_BINDIR/pg_dump" --version
+          "$PG_BINDIR/pg_restore" --version
           psql --version
       - name: release-gate
         env:

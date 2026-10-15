@@ -170,15 +170,12 @@ func (s *Server) gitlabWebhook(w http.ResponseWriter, r *http.Request) {
 		s.serverError(w, r, http.StatusBadGateway, err, "bad gateway")
 		return
 	}
-	spec, err := pipeline.Parse([]byte(content))
+	// Trigger-level parse only: a component-only job is valid and must
+	// survive ingress. The execution resolver (resolvePipeline) is the sole
+	// authority for whether the complete job graph is valid.
+	spec, err := pipeline.ParseWithComponents([]byte(content))
 	if err != nil {
 		http.Error(w, "parse pipeline: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	// Image lockfile is part of COMPILATION authority: resolve every
-	// executable identity to its immutable digest before the graph is built.
-	if lerr := s.applyRepoImageLock(r.Context(), fg, ec.Repository.FullName, pipelineSHA, spec); lerr != nil {
-		http.Error(w, "image lock: "+lerr.Error(), http.StatusBadRequest)
 		return
 	}
 	ok, matched, filesKnown, terr := s.evalTriggerMatches(r.Context(), fg, spec, &ec)
@@ -196,6 +193,13 @@ func (s *Server) gitlabWebhook(w http.ResponseWriter, r *http.Request) {
 	files := ec.ChangedFiles.Files
 
 	checkout := checkoutCloneURL(ec)
+	lockContent, _, lerr := s.fetchImageLock(r.Context(), fg, ec.Repository.FullName, pipelineSHA)
+	if lerr != nil {
+		// A lock fetch failure is a gateway error: do not echo the raw
+		// forge/transport error on a 5xx (it can carry internal detail).
+		s.serverError(w, r, http.StatusBadGateway, lerr, "bad gateway")
+		return
+	}
 	in := SubmitRun{
 		RepoID:            repoID,
 		PolicyRepoID:      repoID,
@@ -206,6 +210,7 @@ func (s *Server) gitlabWebhook(w http.ResponseWriter, r *http.Request) {
 		SHA:               ec.HeadSHA,
 		Event:             ec.Event,
 		Pipeline:          content,
+		ImageLock:         lockContent,
 		Trusted:           ec.Trusted,
 		ForgeKind:         "gitlab",
 		ForgeHost:         forgeHostFromCloneURL(checkout),
@@ -336,15 +341,12 @@ func (s *Server) forgejoWebhook(w http.ResponseWriter, r *http.Request) {
 		s.serverError(w, r, http.StatusBadGateway, err, "bad gateway")
 		return
 	}
-	spec, err := pipeline.Parse([]byte(content))
+	// Trigger-level parse only: a component-only job is valid and must
+	// survive ingress. The execution resolver (resolvePipeline) is the sole
+	// authority for whether the complete job graph is valid.
+	spec, err := pipeline.ParseWithComponents([]byte(content))
 	if err != nil {
 		http.Error(w, "parse pipeline: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	// Image lockfile is part of COMPILATION authority: resolve every
-	// executable identity to its immutable digest before the graph is built.
-	if lerr := s.applyRepoImageLock(r.Context(), fg, ec.Repository.FullName, pipelineSHA, spec); lerr != nil {
-		http.Error(w, "image lock: "+lerr.Error(), http.StatusBadRequest)
 		return
 	}
 	ok, matched, filesKnown, terr := s.evalTriggerMatches(r.Context(), fg, spec, &ec)
@@ -362,6 +364,13 @@ func (s *Server) forgejoWebhook(w http.ResponseWriter, r *http.Request) {
 	files := ec.ChangedFiles.Files
 
 	checkout := checkoutCloneURL(ec)
+	lockContent, _, lerr := s.fetchImageLock(r.Context(), fg, ec.Repository.FullName, pipelineSHA)
+	if lerr != nil {
+		// A lock fetch failure is a gateway error: do not echo the raw
+		// forge/transport error on a 5xx (it can carry internal detail).
+		s.serverError(w, r, http.StatusBadGateway, lerr, "bad gateway")
+		return
+	}
 	in := SubmitRun{
 		RepoID:            repoID,
 		PolicyRepoID:      repoID,
@@ -372,6 +381,7 @@ func (s *Server) forgejoWebhook(w http.ResponseWriter, r *http.Request) {
 		SHA:               ec.HeadSHA,
 		Event:             ec.Event,
 		Pipeline:          content,
+		ImageLock:         lockContent,
 		Trusted:           ec.Trusted,
 		ForgeKind:         "forgejo",
 		ForgeHost:         forgeHostFromCloneURL(checkout),

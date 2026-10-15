@@ -2,6 +2,8 @@ package app
 
 import (
 	"os"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -51,7 +53,9 @@ func TestContextLoginUseList(t *testing.T) {
 }
 
 func TestLockCollectsImageRefs(t *testing.T) {
-	src := `version: 1
+	// Refs are enumerated from the PARSED spec (job + service + VM), the
+	// same model the server resolver executes — not a line scan.
+	src := []byte(`version: 1
 jobs:
   test:
     image: golang:1.27
@@ -62,19 +66,30 @@ jobs:
   pinned:
     image: alpine:3.20@sha256:aaaa
     run: echo
-`
-	refs := collectImageRefs(src)
-	if len(refs) != 2 {
-		t.Fatalf("refs = %v, want 2 unique (golang:1.27 + pinned alpine)", refs)
+  mac:
+    vm: ghcr.io/cirruslabs/macos-sequoia-base:latest
+    run: swift test
+  svc:
+    image: alpine:3.20
+    services:
+      - name: db
+        image: postgres:16
+    run: echo
+`)
+	spec, err := pipeline.Parse(src)
+	if err != nil {
+		t.Fatal(err)
 	}
-	foundPinned := false
-	for _, r := range refs {
-		if r == "alpine:3.20@sha256:aaaa" {
-			foundPinned = true
+	refs := spec.ImageRefs()
+	// Unique: golang:1.27, alpine:3.20@sha256:aaaa, macos vm, alpine:3.20, postgres:16
+	if len(refs) != 5 {
+		t.Fatalf("refs = %v, want 5 unique (job+service+VM)", refs)
+	}
+	joined := strings.Join(refs, ",")
+	for _, want := range []string{"golang:1.27", "alpine:3.20@sha256:aaaa", "macos-sequoia-base", "postgres:16"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %s in %v", want, refs)
 		}
-	}
-	if !foundPinned {
-		t.Fatalf("pinned ref missing: %v", refs)
 	}
 }
 
@@ -141,5 +156,32 @@ func TestLockLookupUsesWorkspaceRootNotCWD(t *testing.T) {
 	got := LockLookup(ws, "golang:1.27")
 	if got != "golang:1.27@sha256:abc" {
 		t.Fatalf("LockLookup(ws) = %q, want the WORKSPACE lock (not CWD %q)", got, other)
+	}
+}
+
+// Local execution must lock EVERY executable identity (job, service, VM) —
+// not just the job image. A service running a mutable tag is the same
+// determinism hole as a mutable job image.
+func TestLockLookupCoversServiceAndVM(t *testing.T) {
+	ws := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(ws, ".kiwi"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lock := `{"version":1,"images":[
+		{"ref":"golang:1.27","digest":"golang:1.27@sha256:aaa"},
+		{"ref":"postgres:16","digest":"postgres:16@sha256:bbb"},
+		{"ref":"macos:15","digest":"macos:15@sha256:ccc"}
+	]}`
+	if err := os.WriteFile(filepath.Join(ws, ".kiwi", "lock.json"), []byte(lock), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for ref, want := range map[string]string{
+		"golang:1.27": "golang:1.27@sha256:aaa",
+		"postgres:16": "postgres:16@sha256:bbb",
+		"macos:15":    "macos:15@sha256:ccc",
+	} {
+		if got := LockLookup(ws, ref); got != want {
+			t.Fatalf("LockLookup(%s) = %q, want %q", ref, got, want)
+		}
 	}
 }

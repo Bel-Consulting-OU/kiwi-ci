@@ -1135,6 +1135,14 @@ func (s *Server) fireSchedule(ctx context.Context, sc storage.Schedule, nominal 
 	// policy identity is the schedule's RepoID and the checkout URL is its
 	// stored clone URL. The submission is server-derived, so it skips the
 	// direct-submission binding.
+	// Image lock is compilation authority for scheduled runs too: fetch the
+	// repo's .kiwi/lock.json at the schedule ref. A missing lock is fine
+	// (tags stay as written); a fetch failure is fail-closed.
+	lockContent, lerr := s.fetchImageLockByRepo(ctx, scheduleRepoFullName(sc), ref)
+	if lerr != nil {
+		s.auditLocked("schedule.trigger_failed", "scheduler", "", "", "scheduled run rejected", map[string]string{"schedule": sc.ID, "error": lerr.Error()})
+		return model.Run{}, false, lerr
+	}
 	in := SubmitRun{
 		RepoID:          scheduleRepoID(sc),
 		PolicyRepoID:    scheduleRepoID(sc),
@@ -1145,6 +1153,7 @@ func (s *Server) fireSchedule(ctx context.Context, sc storage.Schedule, nominal 
 		Ref:             ref,
 		Event:           "schedule",
 		Pipeline:        sanitizeScheduleSpec(sc.Spec),
+		ImageLock:       lockContent,
 		Trusted:         sc.Trusted,
 		Metadata:        map[string]string{"schedule_id": sc.ID, "schedule_nominal": nominal.Format(time.RFC3339)},
 		// The occurrence claim commits atomically with the run.

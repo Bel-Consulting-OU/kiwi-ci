@@ -47,6 +47,12 @@ type SubmitRun struct {
 	SHA            string `json:"sha,omitempty"`
 	Event          string `json:"event,omitempty"`
 	Pipeline       string `json:"pipeline"`
+	// ImageLock is the raw .kiwi/lock.json content from the SAME repository
+	// revision as Pipeline. It is TRANSPORT (fetched at ingress); authority
+	// lives in resolvePipeline, which applies it after component expansion
+	// and binds the resulting identities into the compiled graph. Internal
+	// ingresses set it; it is never accepted from client JSON.
+	ImageLock string `json:"-"`
 	// Trusted is deliberately never accepted from client JSON: direct API
 	// submissions are untrusted. Only forge webhook handlers and internal
 	// reruns (which copy the previous run's trust) set it in Go code.

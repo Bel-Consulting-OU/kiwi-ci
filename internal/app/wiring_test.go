@@ -304,6 +304,11 @@ func TestGitLabWebhookBaseURL(t *testing.T) {
 	var sawToken atomic.Value
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/raw") {
+			// Only the pipeline is known; .kiwi/lock.json is a genuine 404.
+			if !strings.Contains(r.URL.Path, "pipeline.yaml") {
+				http.NotFound(w, r)
+				return
+			}
 			fetchCalls.Add(1)
 			sawToken.Store(r.Header.Get("PRIVATE-TOKEN"))
 			io.WriteString(w, "version: 1\njobs:\n  build:\n    runtime: container\n    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n    steps:\n      - run: echo hi\n")

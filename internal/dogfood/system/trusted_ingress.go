@@ -68,6 +68,13 @@ func (f *trustedForge) handler() http.Handler {
 		path := r.URL.Path
 		switch {
 		case r.Method == http.MethodGet && strings.Contains(path, "/contents/"):
+			// Only the pipeline path is served; any other path (e.g.
+			// .kiwi/lock.json) is a genuine 404 — the real forge does not
+			// return the pipeline body for unknown files.
+			if !strings.Contains(path, "pipeline.yaml") {
+				http.NotFound(w, r)
+				return
+			}
 			f.mu.Lock()
 			body := append([]byte(nil), f.pipeline...)
 			f.mu.Unlock()

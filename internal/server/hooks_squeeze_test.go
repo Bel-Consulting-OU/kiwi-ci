@@ -31,6 +31,15 @@ func (h *hookAPI) server(t *testing.T) *httptest.Server {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/raw"):
+			// Only the pipeline path is known; .kiwi/lock.json is a genuine
+			// 404 (the real forge does not return the pipeline body for
+			// unknown files).
+			if !strings.Contains(r.URL.Path, ".kiwi%2Fpipeline.yaml") &&
+				!strings.Contains(r.URL.Path, ".kiwi/pipeline.yaml") &&
+				!strings.Contains(r.URL.Path, "pipeline.yaml") {
+				http.NotFound(w, r)
+				return
+			}
 			status := h.gitlabFileStatus
 			if status == 0 {
 				status = http.StatusOK
@@ -61,6 +70,11 @@ func (h *hookAPI) server(t *testing.T) *httptest.Server {
 		case strings.Contains(r.URL.Path, "/contents/"):
 			if h.forgejoFileErr {
 				http.Error(w, "nope", http.StatusNotFound)
+				return
+			}
+			if !strings.Contains(r.URL.Path, ".kiwi/pipeline.yaml") &&
+				!strings.Contains(r.URL.Path, "pipeline.yaml") {
+				http.NotFound(w, r)
 				return
 			}
 			body := webhookPipeline

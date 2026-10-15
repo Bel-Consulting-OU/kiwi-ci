@@ -323,15 +323,26 @@ func TestCapabilityManifestCoversPublicSurface(t *testing.T) {
 		for _, p := range c.Proofs {
 			kinds[p] = true
 		}
-		if kinds["system"] || kinds["adversarial"] {
-			found := false
+		// EACH claimed species must independently have evidence. One
+		// scenario cannot stand in for both system AND adversarial — when
+		// both are claimed, require at least two Implemented scenarios.
+		claimedSpecies := 0
+		for _, species := range []string{"system", "adversarial"} {
+			if !kinds[species] {
+				continue
+			}
+			claimedSpecies++
+		}
+		if claimedSpecies > 0 {
+			n := 0
 			for _, s := range c.Scenarios {
 				if implemented[s] {
-					found = true
+					n++
 				}
 			}
-			if !found {
-				t.Errorf("capability %q claims system/adversarial proof but no Implemented dogfood scenario in %v", c.ID, c.Scenarios)
+			if n < claimedSpecies {
+				t.Errorf("capability %q claims %d proof species but only %d Implemented scenarios in %v — one scenario cannot prove two species",
+					c.ID, claimedSpecies, n, c.Scenarios)
 			}
 		}
 		if kinds["release"] {

@@ -423,6 +423,13 @@ func (s *Server) dispatchDownstream(ctx context.Context, item forge.OutboxItem) 
 		s.releaseDownstreamReservation(ctx, p.ParentJobID, p.TargetRepo, p.TargetRef)
 		return fmt.Errorf("downstream: fetch pipeline for %s@%s: %w", p.TargetRepo, p.TargetRef, err)
 	}
+	// Image lock is compilation authority for the child too — fetch it at
+	// the SAME ref as the pipeline.
+	lockContent, lerr := s.fetchDownstreamImageLock(ctx, forgeKind, baseURL, p.TargetRepo, p.TargetRef)
+	if lerr != nil {
+		s.releaseDownstreamReservation(ctx, p.ParentJobID, p.TargetRepo, p.TargetRef)
+		return fmt.Errorf("downstream: fetch image lock for %s@%s: %w", p.TargetRepo, p.TargetRef, lerr)
+	}
 
 	meta := map[string]string{
 		"downstream_of":    p.ParentRunID,
@@ -449,6 +456,7 @@ func (s *Server) dispatchDownstream(ctx context.Context, item forge.OutboxItem) 
 		Ref:             p.TargetRef,
 		Event:           p.Event,
 		Pipeline:        content,
+		ImageLock:       lockContent,
 		Trusted:         trusted,
 		Metadata:        meta,
 		// The identity is derived server-side from the persisted link
@@ -755,6 +763,69 @@ func (s *Server) fetchDownstreamPipeline(ctx context.Context, forgeKind, baseURL
 		}
 		return "", lastErr
 	}
+}
+
+// fetchDownstreamImageLock fetches the target repo's .kiwi/lock.json at the
+// same ref as the pipeline. Missing lock (404) yields ""; any other failure
+// is fail-closed — a child run must never silently fall back to mutable tags
+// because the forge was flaky.
+func (s *Server) fetchDownstreamImageLock(ctx context.Context, forgeKind, baseURL, targetRepo, targetRef string) (string, error) {
+	// Custom fetcher seam first: tests and deployments that replace
+	// repository reads must not have the lock fetch escape to the real
+	// forge (it would leak requests and fail on rate limits).
+	if s.DownstreamImageLockFetcher != nil {
+		return s.DownstreamImageLockFetcher(ctx, targetRepo, targetRef)
+	}
+	if s.DownstreamPipelineFetcher != nil {
+		// A custom pipeline fetcher owns repository reads but offers no
+		// lock seam: skip the lock rather than reaching out to a forge the
+		// caller deliberately bypassed. The custom fetcher is responsible
+		// for supplying digest-pinned identities.
+		return "", nil
+	}
+	mk := func(f forge.Forge) forge.Forge {
+		switch t := f.(type) {
+		case *forge.GitHub:
+			if baseURL != "" {
+				t.BaseURL = baseURL
+			}
+		case *forge.GitLab:
+			if baseURL != "" {
+				t.BaseURL = baseURL
+			}
+		case *forge.Forgejo:
+			if baseURL != "" {
+				t.BaseURL = baseURL
+			}
+		}
+		return f
+	}
+	var adapters []forge.Forge
+	switch forgeKind {
+	case "github":
+		adapters = []forge.Forge{mk(s.gitHubForge())}
+	case "gitlab":
+		adapters = []forge.Forge{mk(s.gitLabForge())}
+	case "forgejo":
+		adapters = []forge.Forge{mk(s.forgejoForge())}
+	default:
+		adapters = []forge.Forge{mk(s.gitHubForge()), mk(s.gitLabForge()), mk(s.forgejoForge())}
+	}
+	var lastErr error
+	for _, f := range adapters {
+		raw, found, err := s.fetchImageLock(ctx, f, targetRepo, targetRef)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if found {
+			return raw, nil
+		}
+	}
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", nil
 }
 
 // forgeKindForHost maps a repository host to its forge adapter kind. This

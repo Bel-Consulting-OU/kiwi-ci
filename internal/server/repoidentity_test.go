@@ -482,6 +482,11 @@ func newGitLabHookServer(t *testing.T, secret string) *Server {
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/raw"):
+			// Only the pipeline is known; lock.json is a genuine 404.
+			if !strings.Contains(r.URL.Path, "pipeline.yaml") {
+				http.NotFound(w, r)
+				return
+			}
 			_, _ = io.WriteString(w, webhookPipeline)
 		case strings.Contains(r.URL.Path, "/repository/compare"):
 			_ = json.NewEncoder(w).Encode(map[string]any{"diffs": []any{}})

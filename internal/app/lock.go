@@ -2,11 +2,12 @@ package app
 
 import (
 	"encoding/json"
+
 	"fmt"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 )
 
 // Image lockfile (.kiwi/lock.json): human YAML keeps readable tags; the
@@ -49,7 +50,18 @@ func LockCommand(args []string) error {
 	if err != nil {
 		return fmt.Errorf("read %s: %w", pipelinePath, err)
 	}
-	refs := collectImageRefs(string(raw))
+	// Enumerate refs from the PARSED spec (job, service, VM) — the same
+	// model the server resolver executes. A line scan is not the pipeline
+	// language and would miss component-injected and VM images.
+	spec, perr := pipeline.Parse(raw)
+	if perr != nil {
+		// Component-only jobs need the component-aware parse.
+		spec, perr = pipeline.ParseWithComponents(raw)
+		if perr != nil {
+			return fmt.Errorf("parse %s: %w", pipelinePath, perr)
+		}
+	}
+	refs := spec.ImageRefs()
 	if len(refs) == 0 {
 		fmt.Println("no image references found")
 		return nil
@@ -92,31 +104,6 @@ func LockCommand(args []string) error {
 	}
 	fmt.Printf("wrote %s (%d images)\n", lockfilePath, len(out.Images))
 	return nil
-}
-
-// collectImageRefs finds image: values in a Kiwi pipeline document.
-func collectImageRefs(src string) []string {
-	seen := map[string]bool{}
-	var out []string
-	for _, line := range strings.Split(src, "\n") {
-		trim := strings.TrimSpace(line)
-		if !strings.HasPrefix(trim, "image:") {
-			continue
-		}
-		v := strings.TrimSpace(strings.TrimPrefix(trim, "image:"))
-		v = strings.Trim(v, `"'`)
-		// Strip a trailing YAML comment (`image: golang:1.27 # pin`).
-		if i := strings.Index(v, " #"); i >= 0 {
-			v = strings.TrimSpace(v[:i])
-		}
-		if v == "" || seen[v] {
-			continue
-		}
-		// Already digest-pinned refs are kept as-is (their digest IS the ref).
-		seen[v] = true
-		out = append(out, v)
-	}
-	return out
 }
 
 // LockLookup returns the digest locked for ref in the lockfile at the given

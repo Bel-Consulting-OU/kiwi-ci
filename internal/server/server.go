@@ -396,6 +396,12 @@ type Server struct {
 	// default resolves the target forge adapter from the parent run's
 	// repository host).
 	DownstreamPipelineFetcher func(ctx context.Context, targetRepo, targetRef string) (string, error)
+	// DownstreamImageLockFetcher, when non-nil, overrides the forge-based
+	// fetch for downstream target .kiwi/lock.json. Returning ( "", nil )
+	// means "no lockfile". When DownstreamPipelineFetcher is set but this is
+	// nil, the lock is skipped (the custom fetcher owns repository reads
+	// and has not offered a lock seam).
+	DownstreamImageLockFetcher func(ctx context.Context, targetRepo, targetRef string) (string, error)
 
 	// DownstreamAllowlist is the bilateral downstream authorization map:
 	// targetRepo -> allowed source repositories. A target without an entry
@@ -1821,6 +1827,25 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	// (and internal reruns of previously trusted runs) set Trusted. The
 	// `trusted` field is not accepted from client JSON (json:"-").
 	in.Trusted = false
+	// Image lock is compilation authority for API submits too. The client
+	// supplies the pipeline text; when the submission names a repository and
+	// revision AND a recognized forge, fetch the repo's .kiwi/lock.json at
+	// that revision so a direct submit cannot bypass the lock by skipping
+	// the webhook. Missing lock is fine; a fetch failure is fail-closed.
+	// An unrecognized host has no adapter — the client must pin digests in
+	// the pipeline itself.
+	if in.ImageLock == "" && strings.TrimSpace(in.RepoFullName) != "" && in.ForgeKind != "" {
+		ref := in.SHA
+		if ref == "" {
+			ref = in.Ref
+		}
+		if lock, lerr := s.fetchImageLockByRepo(r.Context(), in.RepoFullName, ref); lerr != nil {
+			http.Error(w, "image lock unavailable", http.StatusBadGateway)
+			return
+		} else {
+			in.ImageLock = lock
+		}
+	}
 	run, err := s.enqueue(r.Context(), in)
 	if err != nil {
 		var adm *admissionError

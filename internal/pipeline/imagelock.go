@@ -30,13 +30,49 @@ func (f ImageLockfile) LockMap() map[string]string {
 	return m
 }
 
-// ParseImageLockfile parses .kiwi/lock.json content.
+// ParseImageLockfile parses .kiwi/lock.json content. The document is strict:
+// version, nonempty unique refs and digest-pinned targets are all required.
 func ParseImageLockfile(raw []byte) (ImageLockfile, error) {
 	var f ImageLockfile
 	if err := json.Unmarshal(raw, &f); err != nil {
 		return ImageLockfile{}, fmt.Errorf("parse lockfile: %w", err)
 	}
+	if err := f.Validate(); err != nil {
+		return ImageLockfile{}, err
+	}
 	return f, nil
+}
+
+// Validate enforces the lockfile contract: version 1, every entry has a
+// nonempty ref and a digest-pinned target, and refs are unique. A lockfile
+// is an authority document — malformed contents are fatal, never a silent
+// fallback to mutable tags.
+func (f ImageLockfile) Validate() error {
+	if f.Version != 1 {
+		return fmt.Errorf("lockfile version = %d, want 1", f.Version)
+	}
+	seen := map[string]bool{}
+	for i, img := range f.Images {
+		if img.Ref == "" {
+			return fmt.Errorf("lockfile entry %d: ref is empty", i)
+		}
+		if seen[img.Ref] {
+			return fmt.Errorf("lockfile: duplicate ref %q", img.Ref)
+		}
+		seen[img.Ref] = true
+		if img.Digest == "" {
+			return fmt.Errorf("lockfile entry %q: digest is empty", img.Ref)
+		}
+		// The target must be digest-pinned (…@sha256:…) so the lock never
+		// points at a mutable tag.
+		if !strings.Contains(img.Digest, "@sha256:") {
+			return fmt.Errorf("lockfile entry %q: digest %q is not digest-pinned (@sha256:)", img.Ref, img.Digest)
+		}
+		if strings.Contains(img.Digest, "sha256:0000000000000000000000000000000000000000000000000000000000000000") {
+			return fmt.Errorf("lockfile entry %q: digest is the all-zero placeholder", img.Ref)
+		}
+	}
+	return nil
 }
 
 // ApplyImageLock rewrites every executable image identity (job images,

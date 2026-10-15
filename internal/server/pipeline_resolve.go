@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
@@ -16,15 +17,18 @@ const maxPipelineBytes = 2 << 20
 // keys, aliases, tags and limits are rejected on the original bytes with
 // line numbers, with the single relaxation that component-referencing jobs
 // may omit their own steps), resolves component references server-side,
-// validates and interpolates run inputs into the effective spec, and
-// renders the result into the canonical pipeline text that every job
-// carries and every runner recompiles.
+// validates and interpolates run inputs into the effective spec, applies
+// the repository image lockfile to EVERY executable identity (job, service,
+// VM — including images introduced by components), and renders the result
+// into the canonical pipeline text that every job carries and every runner
+// recompiles.
 //
-// The final pipeline.Parse on the canonical text re-applies the full
-// admission validation on the assembled (component-merged, input-resolved)
-// spec, so nothing unvalidated ever reaches compilation. The returned spec
-// carries the resolved inputs (Spec.ProvidedInputs) so the enqueue compile
-// derives digests and payloads from the effective compiled result.
+// Image locking lives HERE — not at webhook ingress. The webhook is
+// transport/trigger authority; this function is execution-input authority.
+// A lock fetched at the exact source revision is applied AFTER component
+// expansion so component-injected images are pinned too, and BEFORE the
+// canonical text/digest is produced so the compiled graph and every
+// downstream digest bind the immutable identities.
 func (s *Server) resolvePipeline(ctx context.Context, in SubmitRun) (*pipeline.Spec, string, map[string]string, error) {
 	if len(in.Pipeline) > maxPipelineBytes {
 		return nil, "", nil, fmt.Errorf("pipeline exceeds %d byte limit", maxPipelineBytes)
@@ -45,6 +49,12 @@ func (s *Server) resolvePipeline(ctx context.Context, in SubmitRun) (*pipeline.S
 	if err != nil {
 		return nil, "", nil, err
 	}
+	// Image lock is part of the compiled-graph identity: apply it to the
+	// effective (component-merged, input-resolved) spec before
+	// canonicalization so the graph digest binds the locked digests.
+	if err := applyImageLockContent(effective, in.ImageLock); err != nil {
+		return nil, "", nil, err
+	}
 	b, err := pipeline.CanonicalJSON(effective)
 	if err != nil {
 		return nil, "", nil, err
@@ -55,4 +65,24 @@ func (s *Server) resolvePipeline(ctx context.Context, in SubmitRun) (*pipeline.S
 	}
 	spec.ProvidedInputs = inputs
 	return spec, string(b), digests, nil
+}
+
+// applyImageLockContent applies a fetched lockfile document to the effective
+// spec. Empty content means "no lockfile" (authoring tags stay as written).
+// A nonempty document that is not a well-formed lockfile is FAIL-CLOSED —
+// malformed lock contents at the trust boundary must never degrade to
+// "ignore the lock".
+func applyImageLockContent(spec *pipeline.Spec, content string) error {
+	if strings.TrimSpace(content) == "" {
+		return nil
+	}
+	lock, err := pipeline.ParseImageLockfile([]byte(content))
+	if err != nil {
+		return fmt.Errorf("image lockfile: %w", err)
+	}
+	if err := lock.Validate(); err != nil {
+		return fmt.Errorf("image lockfile: %w", err)
+	}
+	spec.ApplyImageLock(lock.LockMap())
+	return nil
 }

@@ -527,14 +527,23 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			return finish(res)
 		}
 	}
-	// Image lockfile (.kiwi/lock.json in the JOB WORKSPACE): a readable tag
-	// is resolved to its locked digest before the container starts, so
-	// execution uses the immutable bytes even when the YAML kept the tag.
-	// The workspace root is required — a runner's process CWD is not the
-	// checkout. Unset resolver keeps the image as written.
+	// Image lockfile (.kiwi/lock.json in the JOB WORKSPACE): every
+	// executable identity — job image, service images and VM — is resolved
+	// to its locked digest before the runtime starts, so execution uses the
+	// immutable bytes even when the YAML kept the tag. The workspace root is
+	// required — a runner's process CWD is not the checkout. Unset resolver
+	// keeps the refs as written.
 	if ImageResolver != nil {
 		if pinned := ImageResolver(workspace, cj.Job.Image); pinned != "" {
 			cj.Job.Image = pinned
+		}
+		if pinned := ImageResolver(workspace, cj.Job.VM); pinned != "" {
+			cj.Job.VM = pinned
+		}
+		for i := range cj.Job.Services {
+			if pinned := ImageResolver(workspace, cj.Job.Services[i].Image); pinned != "" {
+				cj.Job.Services[i].Image = pinned
+			}
 		}
 	}
 	if e.Opt.WorkspaceMaxBytes > 0 && !e.Opt.WorkspaceAvailabilityChecked {

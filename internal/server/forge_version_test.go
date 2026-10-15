@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -32,7 +33,17 @@ func newForgeVersionAPI(t *testing.T) (*forgeVersionAPI, *httptest.Server) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			// No remote check exists yet: reconciliation finds nothing.
+			// File fetches: the lockfile is absent (genuine 404); any other
+			// contents path gets a minimal valid pipeline. Check-run GETs
+			// find nothing (reconciliation has no remote state).
+			if strings.Contains(r.URL.Path, "/contents/") {
+				if strings.Contains(r.URL.Path, "lock.json") {
+					http.NotFound(w, r)
+					return
+				}
+				_, _ = w.Write([]byte(`{"content":"dmVyc2lvbjogMQ==","encoding":"base64"}`))
+				return
+			}
 			_, _ = w.Write([]byte(`{"check_runs":[]}`))
 		case http.MethodPost, http.MethodPatch:
 			f.mu.Lock()
