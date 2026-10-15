@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/queue"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/scheduler"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
@@ -454,7 +455,10 @@ func (s *Server) depsReadyDB(ctx context.Context, j model.Job) bool {
 		}
 		return d.Status, true
 	})
-	return ready && (status == model.StatusSuccess || scheduler.ConditionAllows(j.Condition, status))
+	if !ready {
+		return false
+	}
+	return scheduler.ConditionAllows(j.Condition, pipeline.JobConditionContext(status, j.Ref, j.Event, nil))
 }
 
 // environmentAtCapacityDB mirrors environmentAtCapacityScoped against the

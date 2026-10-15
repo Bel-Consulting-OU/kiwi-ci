@@ -410,9 +410,20 @@ func (e *Executor) Run(ctx context.Context, g *pipeline.Graph) (map[string]model
 			if !ready {
 				continue
 			}
-			if depStatus != model.StatusSuccess && !dependencyConditionAllows(cj.Job.If, depStatus) {
-				statuses[id] = model.StatusBlocked
-				results[id] = model.JobResult{JobID: id, Status: model.StatusBlocked, Error: "dependency failed"}
+			// Condition is ALWAYS evaluated (full ctx) — never
+			// short-circuited on success. `if: failure()` after green deps
+			// is blocked here, not leased-then-skipped.
+			if !dependencyConditionAllows(cj.Job.If, e.Opt.Branch, e.Opt.Event, depStatus, cj.Job.Env) {
+				// Deps failed + condition rejects → blocked. Deps green +
+				// condition rejects (if: failure(), if: false, branch
+				// mismatch) → skipped, matching runJob and GitHub Actions.
+				if depStatus == model.StatusSuccess {
+					statuses[id] = model.StatusSkipped
+					results[id] = model.JobResult{JobID: id, Status: model.StatusSkipped, Error: "condition not satisfied"}
+				} else {
+					statuses[id] = model.StatusBlocked
+					results[id] = model.JobResult{JobID: id, Status: model.StatusBlocked, Error: "dependency failed"}
+				}
 				delete(pending, id)
 				continue
 			}
@@ -1352,7 +1363,14 @@ func (e *Executor) provisionRegistryAuth(ctx context.Context, cj pipeline.Compil
 
 func (e *Executor) saveArtifacts(cj pipeline.CompiledJob, workspace string, status model.Status, jobParent, lifecycle context.Context) {
 	for _, a := range cj.Job.Artifacts {
-		ok, err := pipeline.Eval(a.If, pipeline.EvalContext{Status: status})
+		// Artifact `if` sees the same context as job `if` — branch/event
+		// must not be dropped here either.
+		ok, err := pipeline.Eval(a.If, pipeline.EvalContext{
+			Status: status,
+			Env:    cj.Job.Env,
+			Event:  e.Opt.Event,
+			Branch: e.Opt.Branch,
+		})
 		if err != nil || !ok {
 			continue
 		}
@@ -1593,8 +1611,10 @@ func depsOutcome(needs []string, statuses map[string]model.Status) (bool, model.
 	return true, outcome
 }
 
-func dependencyConditionAllows(expr string, status model.Status) bool {
-	return pipeline.ConditionAllows(expr, status)
+func dependencyConditionAllows(expr, branch, event string, status model.Status, env map[string]string) bool {
+	// Branch is already the short name on the executor options (set from
+	// detectCurrentBranch / branchFromRef at register time).
+	return pipeline.ConditionAllows(expr, pipeline.EvalContext{Status: status, Branch: branch, Event: event, Env: env})
 }
 
 // secureWorkingDir resolves a step's working_directory against the workspace

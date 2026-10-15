@@ -452,7 +452,7 @@ func TestConditionAllowsMatrix(t *testing.T) {
 		{"success()", "cancelled", false},
 	}
 	for _, c := range cases {
-		if got := ConditionAllows(c.expr, model.Status(c.status)); got != c.want {
+		if got := ConditionAllows(c.expr, EvalContext{Status: model.Status(c.status)}); got != c.want {
 			t.Errorf("ConditionAllows(%q, %s) = %v, want %v", c.expr, c.status, got, c.want)
 		}
 	}

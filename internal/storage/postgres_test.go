@@ -597,29 +597,29 @@ func TestDependencyOutcome(t *testing.T) {
 		t.Fatalf("missing dep: ready=%v outcome=%s", ready, outcome)
 	}
 
-	if !dependencyConditionAllows("always()", model.StatusFailure) {
+	if !dependencyConditionAllows("always()", "", "", model.StatusFailure) {
 		t.Error("always() must allow failure")
 	}
-	if !dependencyConditionAllows("failure()", model.StatusFailure) || dependencyConditionAllows("failure()", model.StatusSuccess) {
+	if !dependencyConditionAllows("failure()", "", "", model.StatusFailure) || dependencyConditionAllows("failure()", "", "", model.StatusSuccess) {
 		t.Error("failure() semantics wrong")
 	}
-	if !dependencyConditionAllows("cancelled()", model.StatusCancelled) || dependencyConditionAllows("cancelled()", model.StatusFailure) {
+	if !dependencyConditionAllows("cancelled()", "", "", model.StatusCancelled) || dependencyConditionAllows("cancelled()", "", "", model.StatusFailure) {
 		t.Error("cancelled() semantics wrong")
 	}
 	// Unified semantics: an empty condition behaves like success().
-	if dependencyConditionAllows("", model.StatusFailure) {
+	if dependencyConditionAllows("", "", "", model.StatusFailure) {
 		t.Error("empty condition must not allow failure")
 	}
-	if dependencyConditionAllows("", model.StatusSuccess) != true {
+	if dependencyConditionAllows("", "", "", model.StatusSuccess) != true {
 		t.Error("empty condition must allow success")
 	}
-	if !dependencyConditionAllows("success()", model.StatusSuccess) {
+	if !dependencyConditionAllows("success()", "", "", model.StatusSuccess) {
 		t.Error("success() must allow success")
 	}
-	if dependencyConditionAllows("success()", model.StatusFailure) {
+	if dependencyConditionAllows("success()", "", "", model.StatusFailure) {
 		t.Error("success() must not allow failure")
 	}
-	if dependencyConditionAllows("garbage()", model.StatusFailure) {
+	if dependencyConditionAllows("garbage()", "", "", model.StatusFailure) {
 		t.Error("unknown conditions must not allow failure")
 	}
 }

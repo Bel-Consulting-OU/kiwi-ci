@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
@@ -1132,7 +1133,11 @@ func (w *leaseCandidateWalk) eligible(candidate model.Job) (map[string]model.Job
 		d, ok := jobs[id]
 		return d.Status, ok
 	})
-	if !ready || (outcome != model.StatusSuccess && !ConditionAllows(candidate.Condition, outcome)) {
+	// Condition is ALWAYS evaluated — never short-circuited on success.
+	// `if: failure()` / `if: false` / `if: branch == 'x'` must be honored
+	// even when the dependency outcome is success; skipping the check on
+	// success is how the server used to lease jobs the condition rejects.
+	if !ready || !ConditionAllows(candidate.Condition, pipeline.JobConditionContext(outcome, candidate.Ref, candidate.Event, nil)) {
 		return nil, false, nil
 	}
 	return jobs, true, nil

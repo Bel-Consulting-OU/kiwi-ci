@@ -2123,7 +2123,13 @@ func (s *Server) enqueueID(ctx context.Context, in SubmitRun, preRunID string) (
 	for key, cj := range g.Jobs {
 		needs := make([]string, 0, len(cj.Needs))
 		for _, dep := range cj.Needs {
-			needs = append(needs, jobIDs[dep])
+			// A missing compiled key would silently become "" and wedge the
+			// dependent forever (or worse, attach to nothing). Fail closed.
+			depID, ok := jobIDs[dep]
+			if !ok || depID == "" {
+				return model.Run{}, fmt.Errorf("enqueue: job %q needs unknown compiled job %q", key, dep)
+			}
+			needs = append(needs, depID)
 		}
 		env := cj.Job.Environment.Name
 		// `infra_retries: 0` is an explicit "never requeue after a lost
@@ -6495,11 +6501,23 @@ func (s *Server) scheduleStateLocked() {
 				continue
 			}
 			j.DependencyStatus = depStatus
-			if depStatus != model.StatusSuccess && !scheduler.ConditionAllows(j.Condition, depStatus) {
+			// Condition is ALWAYS evaluated (full branch/event ctx). The
+			// old `depStatus != success &&` short-circuit let `if: failure()`
+			// and `if: branch == …` through on green deps, and the
+			// status-only evaluator resolved branch conditions against an
+			// empty branch before blocking.
+			if !scheduler.ConditionAllows(j.Condition, pipeline.JobConditionContext(depStatus, j.Ref, j.Event, nil)) {
 				now := time.Now().UTC()
 				prev := j.Status
-				j.Status = model.StatusBlocked
-				j.Error = "dependency failed"
+				// Deps green + condition rejects → skipped (if: failure(),
+				// branch mismatch). Deps failed + rejects → blocked.
+				if depStatus == model.StatusSuccess {
+					j.Status = model.StatusSkipped
+					j.Error = "condition not satisfied"
+				} else {
+					j.Status = model.StatusBlocked
+					j.Error = "dependency failed"
+				}
 				j.FinishedAt = &now
 				s.jobs[id] = j
 				s.appendJobEventLocked(j, prev, j.Status, "scheduler", nil)
@@ -6558,7 +6576,12 @@ func dependencyOutcomeLocked(j model.Job, jobs map[string]model.Job) (bool, mode
 // gate and the SQL scheduler decide identically.
 func depsReadyLocked(j model.Job, jobs map[string]model.Job) bool {
 	ready, status := dependencyOutcomeLocked(j, jobs)
-	return ready && (status == model.StatusSuccess || scheduler.ConditionAllows(j.Condition, status))
+	if !ready {
+		return false
+	}
+	// Always evaluate the condition — never treat success as an automatic
+	// pass. `if: failure()` after green deps must NOT become ready.
+	return scheduler.ConditionAllows(j.Condition, pipeline.JobConditionContext(status, j.Ref, j.Event, nil))
 }
 
 func (s *Server) refreshRunLocked(runID string) {

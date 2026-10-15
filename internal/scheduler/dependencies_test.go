@@ -42,7 +42,7 @@ func TestConditionAllowsParityWithPipelineEval(t *testing.T) {
 	for _, expr := range exprs {
 		for _, st := range statuses {
 			want, wantErr := evalOracle(t, expr, st)
-			got := ConditionAllows(expr, st)
+			got := ConditionAllows(expr, pipeline.EvalContext{Status: st})
 			// Eval errors must map to false.
 			if wantErr != nil {
 				want = false
@@ -73,7 +73,7 @@ func TestConditionAllowsExact(t *testing.T) {
 		{"success()", model.StatusFailure, false},
 	}
 	for _, c := range cases {
-		if got := ConditionAllows(c.expr, c.status); got != c.want {
+		if got := ConditionAllows(c.expr, pipeline.EvalContext{Status: c.status}); got != c.want {
 			t.Errorf("ConditionAllows(%q, %q) = %v, want %v", c.expr, c.status, got, c.want)
 		}
 	}
@@ -89,7 +89,7 @@ func TestConditionAllowsCompositeWithBranch(t *testing.T) {
 		if err != nil {
 			t.Fatalf("oracle eval: %v", err)
 		}
-		if got := ConditionAllows(expr, st); got != want {
+		if got := ConditionAllows(expr, pipeline.EvalContext{Status: st}); got != want {
 			t.Errorf("ConditionAllows(%q, %q) = %v, want %v", expr, st, got, want)
 		}
 	}
@@ -149,10 +149,10 @@ func TestDependencyOutcomeFailureWithConditionAllows(t *testing.T) {
 	}
 	// The scheduler gate: a job with failure() proceeds on failed deps, a
 	// job with cancelled() or no condition does not.
-	if !ConditionAllows("failure()", outcome) {
+	if !ConditionAllows("failure()", pipeline.EvalContext{Status: outcome}) {
 		t.Error("failure() must allow a failed dependency outcome")
 	}
-	if ConditionAllows("cancelled()", outcome) {
+	if ConditionAllows("cancelled()", pipeline.EvalContext{Status: outcome}) {
 		t.Error("cancelled() must not allow a failed dependency outcome")
 	}
 }

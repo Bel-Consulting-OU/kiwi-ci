@@ -281,15 +281,46 @@ func stripOuterParens(s string) string {
 
 // ConditionAllows reports whether a job whose dependencies reached the given
 // status may run. This is the single unified gate used by the control plane,
-// the SQL scheduler, and the executor (audit item 7). An empty condition
-// behaves like success(): a job without an explicit condition is blocked when
-// a dependency failed, matching GitHub Actions semantics and Kiwi's DAG
-// guarantees. Evaluation errors yield false.
-func ConditionAllows(expr string, status model.Status) bool {
+// the SQL scheduler, and the executor (audit item 7).
+//
+// The FULL EvalContext is required: Branch/Event/Env must be populated from
+// the run/job, not left empty. An earlier status-only helper resolved
+// `branch == 'main'` against an empty branch (always false) and then blocked
+// the job — the server resolved the condition wrong and blocked on that
+// wrong answer. Callers must pass the same context the executor would.
+//
+// An empty condition behaves like success(): a job without an explicit
+// condition is blocked when a dependency failed, matching GitHub Actions
+// semantics and Kiwi's DAG guarantees. Evaluation errors yield false.
+func ConditionAllows(expr string, c EvalContext) bool {
 	expr = strings.TrimSpace(expr)
 	if expr == "" {
 		expr = "success()"
 	}
-	ok, err := Eval(expr, EvalContext{Status: status})
+	ok, err := Eval(expr, c)
 	return err == nil && ok
+}
+
+// JobConditionContext builds the EvalContext for a job-level `if` from the
+// job's persisted identity (Ref → branch, Event). Env is filled by the
+// caller when it is known (executor already has the job env).
+func JobConditionContext(status model.Status, ref, event string, env map[string]string) EvalContext {
+	return EvalContext{
+		Status: status,
+		Branch: ConditionBranchFromRef(ref),
+		Event:  event,
+		Env:    env,
+	}
+}
+
+// ConditionBranchFromRef derives the branch context value from a git ref,
+// matching expandConcurrency and the runner's branchFromRef.
+func ConditionBranchFromRef(ref string) string {
+	if strings.HasPrefix(ref, "refs/heads/") {
+		return strings.TrimPrefix(ref, "refs/heads/")
+	}
+	if strings.HasPrefix(ref, "refs/") {
+		return ""
+	}
+	return ref
 }

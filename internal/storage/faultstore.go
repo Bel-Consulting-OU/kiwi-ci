@@ -3091,9 +3091,14 @@ func recomputeDependentsMap(jobs map[string]model.Job, changed map[string]bool, 
 			continue
 		}
 		j.DependencyStatus = outcome
-		if outcome != model.StatusSuccess && !dependencyConditionAllows(j.Condition, outcome) {
-			j.Status = model.StatusBlocked
-			j.Error = "dependency failed"
+		if !dependencyConditionAllows(j.Condition, j.Ref, j.Event, outcome) {
+			if outcome == model.StatusSuccess {
+				j.Status = model.StatusSkipped
+				j.Error = "condition not satisfied"
+			} else {
+				j.Status = model.StatusBlocked
+				j.Error = "dependency failed"
+			}
 			j.FinishedAt = &now
 		}
 		jobs[id] = j
@@ -5489,9 +5494,14 @@ func (m *memStore) recomputeDependentsLocked(cancelled map[string]bool, now time
 			continue
 		}
 		j.DependencyStatus = outcome
-		if outcome != model.StatusSuccess && !dependencyConditionAllows(j.Condition, outcome) {
-			j.Status = model.StatusBlocked
-			j.Error = "dependency failed"
+		if !dependencyConditionAllows(j.Condition, j.Ref, j.Event, outcome) {
+			if outcome == model.StatusSuccess {
+				j.Status = model.StatusSkipped
+				j.Error = "condition not satisfied"
+			} else {
+				j.Status = model.StatusBlocked
+				j.Error = "dependency failed"
+			}
 			j.FinishedAt = &now
 		}
 		m.jobs[id] = j

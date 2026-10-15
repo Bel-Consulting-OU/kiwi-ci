@@ -2890,10 +2890,17 @@ func (s *PostgresStore) recomputeDependentTx(ctx context.Context, tx pgx.Tx, dep
 		return nil
 	}
 	d.DependencyStatus = outcome
-	if outcome != model.StatusSuccess && !dependencyConditionAllows(d.Condition, outcome) {
+	// Condition is ALWAYS evaluated (full branch/event ctx) — never
+	// short-circuited on success.
+	if !dependencyConditionAllows(d.Condition, d.Ref, d.Event, outcome) {
 		fin := now
-		d.Status = model.StatusBlocked
-		d.Error = "dependency failed"
+		if outcome == model.StatusSuccess {
+			d.Status = model.StatusSkipped
+			d.Error = "condition not satisfied"
+		} else {
+			d.Status = model.StatusBlocked
+			d.Error = "dependency failed"
+		}
 		d.FinishedAt = &fin
 	}
 	dp, err := jsonMarshal(d)
@@ -3068,9 +3075,9 @@ func dependencyOutcome(statuses map[string]model.Status, needs []string) (bool, 
 
 // dependencyConditionAllows delegates to the unified pipeline condition
 // evaluator so SQL-computed dependency outcomes match server and executor
-// semantics exactly (audit item 7).
-func dependencyConditionAllows(expr string, status model.Status) bool {
-	return pipeline.ConditionAllows(expr, status)
+// semantics exactly (audit item 7). Branch/Event come from the job row.
+func dependencyConditionAllows(expr, ref, event string, status model.Status) bool {
+	return pipeline.ConditionAllows(expr, pipeline.JobConditionContext(status, ref, event, nil))
 }
 
 // JobCancelCause selects the cancellation variant performed by cancelJobTx.

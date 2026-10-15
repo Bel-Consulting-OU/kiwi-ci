@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
@@ -320,7 +321,7 @@ func (f *fakeStore) recomputeDependentsLocked(cancelled map[string]bool, now tim
 			continue
 		}
 		j.DependencyStatus = outcome
-		if outcome != model.StatusSuccess && !ConditionAllows(j.Condition, outcome) {
+		if outcome != model.StatusSuccess && !ConditionAllows(j.Condition, pipeline.EvalContext{Status: outcome}) {
 			j.Status = model.StatusBlocked
 			j.Error = "dependency failed"
 			j.FinishedAt = &now

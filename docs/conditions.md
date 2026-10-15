@@ -24,6 +24,15 @@ any failed/blocked dependency makes the outcome `failure`; otherwise a
 cancelled dependency makes it `cancelled`; success otherwise. For steps,
 the status is the job's current status.
 
+The `if` expression is ALWAYS evaluated — including when the dependency
+outcome is `success`. `if: failure()` after green dependencies is
+`skipped`, `if: false` never runs, and `if: branch == 'x'` / `if: event ==
+'y'` see the job's real branch and event (the control plane derives the
+branch from the job's ref exactly like the runner). An earlier gate that
+short-circuited on success and resolved branch conditions against an
+empty branch both resolved the condition wrong and then blocked on that
+wrong answer; that path is gone.
+
 An empty `if` behaves like `success()`: a job without an explicit
 condition is blocked when a dependency failed, and a step without an
 explicit `if` runs only while the job status still admits `success()`.

@@ -333,7 +333,7 @@ func (w *propWorld) assertInvariants() {
 		if !ready {
 			w.t.Fatalf("running job %s has non-terminal dependencies", id)
 		}
-		if outcome != model.StatusSuccess && !ConditionAllows(j.Condition, outcome) {
+		if outcome != model.StatusSuccess && !ConditionAllows(j.Condition, pipeline.EvalContext{Status: outcome}) {
 			w.t.Fatalf("running job %s has dependency outcome %s not permitted by condition %q", id, outcome, j.Condition)
 		}
 	}

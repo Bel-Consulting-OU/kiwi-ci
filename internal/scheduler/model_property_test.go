@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
@@ -480,7 +481,7 @@ func (w *schedulerModelWorld) eligible(cand model.Job, eff model.Runner) bool {
 	if !ready {
 		return false
 	}
-	return outcome == model.StatusSuccess || ConditionAllows(cand.Condition, outcome)
+	return outcome == model.StatusSuccess || ConditionAllows(cand.Condition, pipeline.EvalContext{Status: outcome})
 }
 
 func (w *schedulerModelWorld) headFitsAlongside(head, cand model.Job, reserved model.ResourceCapacity, eff model.Runner) bool {
@@ -704,7 +705,7 @@ func (w *schedulerModelWorld) applyRecover(mj *schedulerModelJob, expectedGen in
 		if !ready {
 			continue
 		}
-		if outcome != model.StatusSuccess && !ConditionAllows("", outcome) {
+		if outcome != model.StatusSuccess && !ConditionAllows("", pipeline.EvalContext{Status: outcome}) {
 			other.status = model.StatusBlocked
 			w.stats.blocked++
 		}

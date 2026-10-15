@@ -40,9 +40,11 @@ func DependencyOutcome(deps []string, statuses map[string]model.Status, get func
 // path (audit item 7): the control plane, the SQL scheduler, and the executor
 // evaluate the exact same expression with the exact same semantics, so a
 // composite condition like `always() && branch == 'main'` can no longer
-// diverge between server and local execution. An empty condition defaults to
-// success() (failed dependencies block downstream jobs); evaluation errors
-// yield false.
-func ConditionAllows(expr string, status model.Status) bool {
-	return pipeline.ConditionAllows(expr, status)
+// diverge between server and local execution.
+//
+// ctx MUST carry the job's branch/event (see pipeline.JobConditionContext):
+// resolving `branch == 'main'` against an empty Branch always yields false
+// and the server then blocks a job that should have run.
+func ConditionAllows(expr string, ctx pipeline.EvalContext) bool {
+	return pipeline.ConditionAllows(expr, ctx)
 }
