@@ -25,9 +25,24 @@
 #   --render-formula   internal helper used by scripts/release-formula-test.sh:
 #                      renders Formula/kiwi.rb.tmpl deterministically.
 #
+#   --candidate         pre-tag release CANDIDATE. Builds the exact release
+#                       bytes from a clean tree at HEAD without requiring the
+#                       tag to exist yet, freezes them under dist/candidate
+#                       with a FREEZE manifest, and refuses to touch
+#                       Formula/kiwi.rb. Certification runs against THESE
+#                       bytes; --publish-frozen later emits them unchanged.
+#   --publish-frozen    post-tag publish of a frozen candidate. Requires HEAD
+#                       to now be an exact vX.Y.Z tag matching the candidate
+#                       VERSION and COMMIT, then verifies every frozen byte
+#                       against the FREEZE manifest and copies the bundle to
+#                       dist/release WITHOUT rebuilding. This is the "same
+#                       bytes" guarantee between certification and publish.
+#
 # Usage:
 #   scripts/release.sh [vX.Y.Z] [--allow-unsigned] [--require-signing]
 #   scripts/release.sh --snapshot [--allow-unsigned]
+#   scripts/release.sh --candidate vX.Y.Z [--allow-unsigned] [--require-signing]
+#   scripts/release.sh --publish-frozen dist/candidate [vX.Y.Z] [--require-signing]
 #   scripts/release.sh --render-formula VERSION SHA_DARWIN_ARM64 SHA_DARWIN_AMD64 [OUT]
 #
 # Signing policy: releases are signed by default. --allow-unsigned is the
@@ -201,23 +216,44 @@ if [ "${1:-}" = "--render-formula" ]; then
 fi
 
 SNAPSHOT=""
+CANDIDATE=""
+PUBLISH_FROZEN=""
 SIGNING_POLICY=""
 TAG_ARG=""
+FROZEN_DIR=""
 for arg in "$@"; do
 	case "$arg" in
 	--snapshot) SNAPSHOT=1 ;;
+	--candidate) CANDIDATE=1 ;;
+	--publish-frozen) PUBLISH_FROZEN=1 ;;
 	--require-signing) SIGNING_POLICY=require ;;
 	--allow-unsigned) SIGNING_POLICY=allow ;;
 	-*) usage "unknown option '$arg'" ;;
 	*)
-		[ -z "$TAG_ARG" ] || usage "multiple tags given: '$TAG_ARG' and '$arg'"
-		TAG_ARG="$arg"
+		if [ -n "$PUBLISH_FROZEN" ] && [ -z "$FROZEN_DIR" ]; then
+			FROZEN_DIR="$arg"
+		else
+			[ -z "$TAG_ARG" ] || usage "multiple tags given: '$TAG_ARG' and '$arg'"
+			TAG_ARG="$arg"
+		fi
 		;;
 	esac
 done
 
 if [ "$SNAPSHOT" = "1" ] && [ -n "$TAG_ARG" ]; then
 	usage "--snapshot cannot be combined with a release tag ('$TAG_ARG')"
+fi
+if [ "$SNAPSHOT" = "1" ] && [ -n "$CANDIDATE" ]; then
+	usage "--snapshot and --candidate are mutually exclusive"
+fi
+if [ "$SNAPSHOT" = "1" ] && [ -n "$PUBLISH_FROZEN" ]; then
+	usage "--snapshot and --publish-frozen are mutually exclusive"
+fi
+if [ -n "$CANDIDATE" ] && [ -n "$PUBLISH_FROZEN" ]; then
+	usage "--candidate and --publish-frozen are mutually exclusive"
+fi
+if [ -n "$PUBLISH_FROZEN" ] && [ -z "$FROZEN_DIR" ]; then
+	usage "--publish-frozen requires the frozen candidate directory (e.g. dist/candidate)"
 fi
 
 # Snapshots are never signed (no key is ever used for them), so an explicit
@@ -230,7 +266,184 @@ fi
 REPO="${REPO:-$(git remote get-url origin 2>/dev/null | sed 's/\.git$//' || true)}"
 [ -n "$REPO" ] || REPO="https://github.com/Bel-Consulting-OU/kiwi-ci"
 
-if [ "$SNAPSHOT" = "1" ]; then
+# ---------------------------------------------------------------------------
+# --publish-frozen: emit a previously frozen candidate as the release bundle.
+# NEVER rebuilds. The only operations are: verify the freeze manifest, verify
+# HEAD is the matching tagged commit, copy bytes, render the formula.
+# ---------------------------------------------------------------------------
+if [ "$PUBLISH_FROZEN" = "1" ]; then
+	[ -d "$FROZEN_DIR" ] || die "frozen candidate directory '$FROZEN_DIR' does not exist"
+	FREEZE="$FROZEN_DIR/FREEZE"
+	[ -f "$FREEZE" ] || die "missing $FREEZE — not a frozen candidate directory"
+	SHA_SUMS="$FROZEN_DIR/SHA256SUMS"
+	[ -f "$SHA_SUMS" ] || die "missing $SHA_SUMS in frozen candidate"
+
+	# Parse FREEZE (key=value). Reject anything we do not recognise so a
+	# hostile manifest cannot smuggle extra fields.
+	FREEZE_VERSION=""
+	FREEZE_COMMIT=""
+	FREEZE_DIGEST=""
+	while IFS= read -r line; do
+		case "$line" in
+		"" | \#*) continue ;;
+		version=*) FREEZE_VERSION="${line#version=}" ;;
+		commit=*) FREEZE_COMMIT="${line#commit=}" ;;
+		freeze_sha256=*) FREEZE_DIGEST="${line#freeze_sha256=}" ;;
+		*) die "unknown field in $FREEZE: $line" ;;
+		esac
+	done <"$FREEZE"
+	[ -n "$FREEZE_VERSION" ] || die "$FREEZE is missing version="
+	[ -n "$FREEZE_COMMIT" ] || die "$FREEZE is missing commit="
+	[ -n "$FREEZE_DIGEST" ] || die "$FREEZE is missing freeze_sha256="
+	require_sha256 "$FREEZE_DIGEST" "freeze_sha256"
+	case "$FREEZE_COMMIT" in
+	"" | *[!0-9a-f]*) die "freeze commit '$FREEZE_COMMIT' is not lowercase hex" ;;
+	esac
+	if [ "${#FREEZE_COMMIT}" -ne 40 ]; then
+		die "freeze commit '$FREEZE_COMMIT' is not a full 40-char SHA"
+	fi
+
+	# Recompute the freeze digest over SHA256SUMS and refuse on mismatch.
+	if command -v sha256sum >/dev/null 2>&1; then
+		GOT="$(sha256sum "$SHA_SUMS" | awk '{print $1}')"
+	else
+		GOT="$(shasum -a 256 "$SHA_SUMS" | awk '{print $1}')"
+	fi
+	[ "$GOT" = "$FREEZE_DIGEST" ] || die "freeze digest mismatch: manifest=$FREEZE_DIGEST actual=$GOT (candidate bytes were modified after freeze)"
+
+	# Verify every listed binary still hashes to its frozen digest.
+	while read -r sum name; do
+		[ -n "$sum" ] && [ -n "$name" ] || continue
+		[ "$name" = "SHA256SUMS" ] && continue
+		[ "$name" = "FREEZE" ] && continue
+		[ "$name" = "CANDIDATE" ] && continue
+		require_sha256 "$sum" "frozen digest for $name"
+		f="$FROZEN_DIR/$name"
+		[ -f "$f" ] || die "frozen candidate is missing $name"
+		if command -v sha256sum >/dev/null 2>&1; then
+			actual="$(sha256sum "$f" | awk '{print $1}')"
+		else
+			actual="$(shasum -a 256 "$f" | awk '{print $1}')"
+		fi
+		[ "$actual" = "$sum" ] || die "frozen byte mismatch for $name: manifest=$sum actual=$actual"
+	done <"$SHA_SUMS"
+
+	# HEAD must now be the exact tagged commit the candidate froze.
+	git rev-parse --git-dir >/dev/null 2>&1 || die "not a git checkout; --publish-frozen requires git metadata"
+	EXACT_TAG="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
+	[ -n "$EXACT_TAG" ] || die "HEAD is not an exact tag; certify and tag the frozen commit before --publish-frozen"
+	if [ -n "$TAG_ARG" ]; then
+		[ "$TAG_ARG" = "$EXACT_TAG" ] || die "tag '$TAG_ARG' is not the exact tag at HEAD ('$EXACT_TAG')"
+	fi
+	TAG="$EXACT_TAG"
+	if ! printf '%s\n' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+		die "tag '$TAG' is not an exact semver release tag (want vX.Y.Z)"
+	fi
+	HEAD_SHA="$(git rev-parse HEAD)"
+	[ "$HEAD_SHA" = "$FREEZE_COMMIT" ] || die "HEAD $HEAD_SHA is not the frozen commit $FREEZE_COMMIT — refuse to publish bytes certified against a different tree"
+	WANT_VERSION="${TAG#v}"
+	[ "$FREEZE_VERSION" = "$WANT_VERSION" ] || die "frozen version '$FREEZE_VERSION' does not match tag '$TAG' (want '$WANT_VERSION')"
+	if [ -n "$(git status --porcelain)" ]; then
+		die "working tree is dirty; --publish-frozen publishes frozen bytes and refuses a dirty tree"
+	fi
+
+	OUT="${OUT:-dist/release}"
+	rm -rf "$OUT"
+	mkdir -p "$OUT"
+	# Resolve both sides to absolute paths BEFORE copying: the source
+	# listing must not change our CWD-relative view of $OUT (a subshell
+	# `cd $FROZEN_DIR` would turn `dist/release` into
+	# `dist/candidate/dist/release` and silently copy nowhere).
+	case "$OUT" in
+	/*) OUT_ABS="$OUT" ;;
+	*) OUT_ABS="$PWD/$OUT" ;;
+	esac
+	case "$FROZEN_DIR" in
+	/*) SRC_ABS="$FROZEN_DIR" ;;
+	*) SRC_ABS="$PWD/$FROZEN_DIR" ;;
+	esac
+	# Copy the frozen bytes verbatim. No build, no re-link, no re-sign.
+	for f in "$SRC_ABS"/*; do
+		base="$(basename "$f")"
+		[ "$base" = "FREEZE" ] && continue
+		[ "$base" = "CANDIDATE" ] && continue
+		cp -p "$f" "$OUT_ABS/$base"
+	done
+	DARWIN_ARM64_SHA="$(awk '$2 == "kiwi-darwin-arm64" {print $1}' "$OUT/SHA256SUMS")"
+	DARWIN_AMD64_SHA="$(awk '$2 == "kiwi-darwin-amd64" {print $1}' "$OUT/SHA256SUMS")"
+	[ -n "$DARWIN_ARM64_SHA" ] || die "missing kiwi-darwin-arm64 digest in $OUT/SHA256SUMS"
+	[ -n "$DARWIN_AMD64_SHA" ] || die "missing kiwi-darwin-amd64 digest in $OUT/SHA256SUMS"
+	render_formula "$FREEZE_VERSION" "$DARWIN_ARM64_SHA" "$DARWIN_AMD64_SHA" "Formula/kiwi.rb"
+	echo "release: published FROZEN candidate to $OUT (version=$FREEZE_VERSION tag=$TAG commit=$FREEZE_COMMIT)"
+	echo "release: bytes are identical to the certified candidate (freeze_sha256=$FREEZE_DIGEST)"
+	exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# --candidate: pre-tag release build that FREEZES the exact bytes a later
+# --publish-frozen will emit. HEAD need not be tagged yet (certification and
+# tagging come after); the tree must be clean and VERSION is the planned
+# vX.Y.Z. Formula/kiwi.rb is NEVER touched here — only the publish step
+# renders it, from the frozen digests.
+# ---------------------------------------------------------------------------
+if [ "$CANDIDATE" = "1" ]; then
+	git rev-parse --git-dir >/dev/null 2>&1 || die "not a git checkout; --candidate requires git metadata"
+	[ -n "$TAG_ARG" ] || die "--candidate requires the planned version (vX.Y.Z)"
+	if ! printf '%s\n' "$TAG_ARG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+		die "candidate version '$TAG_ARG' is not an exact semver release tag (want vX.Y.Z)"
+	fi
+	HEAD_SHA="$(git rev-parse HEAD)"
+	case "$HEAD_SHA" in
+	*[!0-9a-f]*) die "HEAD SHA '$HEAD_SHA' is not lowercase hex" ;;
+	esac
+	if [ "${#HEAD_SHA}" -ne 40 ]; then
+		die "HEAD SHA '$HEAD_SHA' is not a full 40-char SHA"
+	fi
+	if [ -n "$(git status --porcelain)" ]; then
+		die "working tree is dirty; commit or stash changes before freezing a candidate"
+	fi
+	WANT_VERSION="${TAG_ARG#v}"
+	if [ -n "${VERSION:-}" ] && [ "$VERSION" != "$WANT_VERSION" ]; then
+		die "VERSION '$VERSION' does not match candidate version '$TAG_ARG' (want '$WANT_VERSION')"
+	fi
+	VERSION="$WANT_VERSION"
+	if [ -n "${COMMIT:-}" ]; then
+		if ! printf '%s\n' "$COMMIT" | grep -Eq '^[0-9a-f]{40}$'; then
+			die "COMMIT '$COMMIT' is not a full 40-char lowercase SHA"
+		fi
+		[ "$COMMIT" = "$HEAD_SHA" ] || die "COMMIT '$COMMIT' does not match HEAD $HEAD_SHA"
+	fi
+	COMMIT="$HEAD_SHA"
+	DIRTY=false
+	TAG="$TAG_ARG"
+	if [ -n "${BUILD_DATE:-}" ]; then
+		require_rfc3339 "$BUILD_DATE" "BUILD_DATE"
+	elif [ -n "${SOURCE_DATE_EPOCH:-}" ]; then
+		BUILD_DATE="$(epoch_to_rfc3339 "$SOURCE_DATE_EPOCH")"
+		require_rfc3339_shape "$BUILD_DATE" "BUILD_DATE"
+	else
+		SOURCE_DATE_EPOCH="$(git log -1 --format=%ct HEAD)"
+		BUILD_DATE="$(epoch_to_rfc3339 "$SOURCE_DATE_EPOCH")"
+		require_rfc3339_shape "$BUILD_DATE" "BUILD_DATE"
+	fi
+	echo "release: CANDIDATE freeze: version=$VERSION commit=$COMMIT source_date_epoch=${SOURCE_DATE_EPOCH:-unset}"
+	# Signing policy is the same fail-closed rule as a release build: the
+	# frozen bytes are what certification judges, so they must already carry
+	# the provenance a release would.
+	if [ -z "${KIWI_RELEASE_SIGNING_KEY:-}" ]; then
+		case "$SIGNING_POLICY" in
+		allow) ;;
+		require)
+			die "KIWI_RELEASE_SIGNING_KEY is not set and --require-signing was given; refusing to freeze an unsigned candidate."
+			;;
+		*)
+			[ "${KIWI_ALLOW_UNSIGNED_RELEASE:-}" = "1" ] || die "KIWI_RELEASE_SIGNING_KEY is not set; refusing to freeze an unsigned candidate. Set the key, or pass --allow-unsigned only for an explicit disaster path."
+			;;
+		esac
+	fi
+	SNAPSHOT=""
+	RELEASE_MODE=1
+elif [ "$SNAPSHOT" = "1" ]; then
 	SHORT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 	if [ -z "$(git status --porcelain 2>/dev/null)" ]; then
 		DIRTY=false
@@ -354,7 +567,11 @@ LDFLAGS="-X github.com/Bel-Consulting-OU/kiwi-ci/internal/version.Version=$VERSI
 -X github.com/Bel-Consulting-OU/kiwi-ci/internal/version.BuildDate=$BUILD_DATE \
 -X github.com/Bel-Consulting-OU/kiwi-ci/internal/version.Dirty=$DIRTY"
 
-OUT="${OUT:-dist/release}"
+if [ "$CANDIDATE" = "1" ]; then
+	OUT="${OUT:-dist/candidate}"
+else
+	OUT="${OUT:-dist/release}"
+fi
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
@@ -457,7 +674,27 @@ fi
 echo "release: bundle at $OUT"
 echo "release: version=$VERSION tag=$TAG commit=$COMMIT"
 
-if [ "$SNAPSHOT" = "1" ]; then
+if [ "$CANDIDATE" = "1" ]; then
+	# Freeze the FINAL versioned bytes before certification. The FREEZE
+	# digest covers SHA256SUMS, which covers every binary and buildinfo
+	# file — so any post-freeze byte change is detected at publish time.
+	if command -v sha256sum >/dev/null 2>&1; then
+		FREEZE_DIGEST="$(sha256sum "$OUT/SHA256SUMS" | awk '{print $1}')"
+	else
+		FREEZE_DIGEST="$(shasum -a 256 "$OUT/SHA256SUMS" | awk '{print $1}')"
+	fi
+	require_sha256 "$FREEZE_DIGEST" "freeze digest"
+	{
+		echo "version=$VERSION"
+		echo "commit=$COMMIT"
+		echo "freeze_sha256=$FREEZE_DIGEST"
+	} >"$OUT/FREEZE"
+	echo "candidate" >"$OUT/CANDIDATE"
+	echo "release: CANDIDATE frozen at $OUT (freeze_sha256=$FREEZE_DIGEST)"
+	echo "release: certify THESE bytes, tag $COMMIT, then"
+	echo "release:   scripts/release.sh --publish-frozen $OUT"
+	echo "release: Homebrew formula untouched (rendered only by --publish-frozen)"
+elif [ "$SNAPSHOT" = "1" ]; then
 	echo "release: snapshot bundle labeled $OUT/SNAPSHOT; Homebrew formula untouched"
 else
 	DARWIN_ARM64_SHA="$(awk '$2 == "kiwi-darwin-arm64" {print $1}' "$OUT/SHA256SUMS")"

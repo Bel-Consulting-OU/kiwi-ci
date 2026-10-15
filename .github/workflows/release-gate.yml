@@ -79,13 +79,17 @@ jobs:
           KIWI_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
         run: |
           export KIWI_REQUIRE_N_MINUS_ONE=1
-          # RC certification must exercise the PUBLISHED N-1 binary when one
-          # is supplied; source rebuild is development-only (see
-          # canonicalResolveNMinusOne). Without a published artifact the
-          # run keeps the dev fallback — the strict mode is set by the
-          # release-tool that knows the previous release digest.
-          if [ -n "${KIWI_N_MINUS_ONE_BIN:-}" ]; then
-            export KIWI_REQUIRE_RELEASED_N_MINUS_ONE=1
+          # RC certification ALWAYS uses a PUBLISHED N-1 binary. Source
+          # rebuild is development-only (see canonicalResolveNMinusOne).
+          # fetch-n-minus-one.sh resolves the previous artifact (supplied
+          # pin, KIWI_N_MINUS_ONE_URL, or GitHub Releases) and verifies its
+          # published SHA256 before the suite runs.
+          export KIWI_REQUIRE_RELEASED_N_MINUS_ONE=1
+          ./scripts/fetch-n-minus-one.sh
+          CACHE="${KIWI_N_MINUS_ONE_CACHE:-${TMPDIR:-/tmp}/kiwi-n-minus-one}"
+          if [ -f "$CACHE/n-minus-one.env" ]; then
+            . "$CACHE/n-minus-one.env"
+            export KIWI_N_MINUS_ONE_BIN KIWI_N_MINUS_ONE_SHA256 KIWI_REQUIRE_RELEASED_N_MINUS_ONE
           fi
           make release-gate
       - name: surface contracts

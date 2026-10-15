@@ -1,0 +1,7 @@
+BenchmarkAcceptanceWireSchema 1
+BenchmarkPipelineCompileMatrix 243924
+BenchmarkPipelineParse 210219
+BenchmarkSeededQueue/n=1 4
+BenchmarkSeededQueue/n=100 1337
+BenchmarkSeededQueue/n=1000 12399
+BenchmarkSeededQueue/n=10000 113970

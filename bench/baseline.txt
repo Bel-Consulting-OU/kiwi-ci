@@ -1,0 +1,9 @@
+# perf baseline contract=2 count=7 threshold=100
+# regenerate with: scripts/perf-compare.sh --update (on a QUIET machine)
+BenchmarkAcceptanceWireSchema 0.436300
+BenchmarkPipelineCompileMatrix 81308.000000
+BenchmarkPipelineParse 70073.000000
+BenchmarkSeededQueue/n=1 1.458000
+BenchmarkSeededQueue/n=100 445.700000
+BenchmarkSeededQueue/n=1000 4133.000000
+BenchmarkSeededQueue/n=10000 37990.000000

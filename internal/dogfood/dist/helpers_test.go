@@ -406,16 +406,47 @@ func (p *proc) kill() {
 	_, _ = p.cmd.Process.Wait()
 }
 
-// spawnServer starts `kiwi server` as a real OS process.
+// spawnForgeStandIn serves a deterministic GitHub-shaped API so product
+// binaries never reach api.github.com: revision resolution answers a full
+// SHA and .kiwi/lock.json is a genuine 404. Without this, submit() SHA
+// pinning (resolveExecutionRevision) hits the real forge and the dist
+// harness dies on rate limits / unknown repos.
+func spawnForgeStandIn(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/commits/"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"sha": strings.Repeat("a", 40)})
+		case strings.Contains(r.URL.Path, "/contents/"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// spawnServer starts `kiwi server` as a real OS process, pointed at a local
+// forge stand-in for identity pinning (same contract as
+// release_artifacts_test.go startBinaryServer).
 func spawnServer(t *testing.T, bin, listen, dataDir, databaseURL, runnerToken, adminToken string) *proc {
 	t.Helper()
-	cmd := exec.Command(bin, "server",
+	forge := spawnForgeStandIn(t)
+	args := []string{
+		"server",
 		"--listen", listen,
 		"--data-dir", dataDir,
 		"--database-url", databaseURL,
 		"--runner-token", runnerToken,
 		"--admin-token", adminToken,
-	)
+	}
+	// Older product binaries predate --github-api-base; probe help text.
+	if probeOut, _ := exec.Command(bin, "server", "--help").CombinedOutput(); strings.Contains(string(probeOut), "github-api-base") {
+		args = append(args, "--github-api-base", forge.URL)
+	}
+	cmd := exec.Command(bin, args...)
 	cmd.Env = append(os.Environ(), "KIWI_RUNNER_TOKEN="+runnerToken)
 	logFile := filepath.Join(dataDir, "..", "server.log")
 	_ = os.MkdirAll(filepath.Dir(logFile), 0o700)

@@ -227,8 +227,12 @@ dogfood-release-model:
 # makes a missing/unbuildable N-1 a hard failure (never a skip) so release
 # certification cannot drop DF-UPGRADE-002; a released N-1 artifact may be
 # supplied via KIWI_N_MINUS_ONE_BIN / KIWI_N_MINUS_ONE_SHA256.
+# Publish certification uses a PUBLISHED N-1, never a source rebuild.
+# with-n-minus-one.sh resolves the pin (supplied, URL, or GitHub Releases)
+# and execs the suite with it — every target that needs N-1 must go through
+# the same wrapper so one sibling cannot lose the pin.
 dogfood-release-artifacts:
-	KIWI_REQUIRE_N_MINUS_ONE=1 ./scripts/dogfood-run.sh 15m \
+	./scripts/with-n-minus-one.sh ./scripts/dogfood-run.sh 15m \
 		--run 'TestSysDFUpgrade|TestSysDFSelf|TestSysDFRelease' \
 		--require TestSysDFUpgrade002NMinusOne \
 		--require TestSysDFSelf002G1ToG2 \
@@ -270,8 +274,11 @@ dogfood-system:
 # VerificationProof verify → kill/restart → backup/destroy/restore →
 # rotate/reseal). These are name-required so the production suite cannot
 # silently lose them.
+# The canonical production scenario includes the N-1→N chain, so this
+# target must resolve the published N-1 pin exactly like
+# dogfood-release-artifacts (with-n-minus-one.sh).
 dogfood-production:
-	./scripts/dogfood-run.sh 20m \
+	./scripts/with-n-minus-one.sh ./scripts/dogfood-run.sh 20m \
 		--run 'TestSysDFScale002|TestSysUntrusted|TestSysDFDist|TestSysDFDr|TestSysDFCanonical|TestSysDFVerificationProductionPath' \
 		--require TestSysDFScale002Soak \
 		--require TestSysUntrustedContainerEvidenceLane \
@@ -301,9 +308,17 @@ dogfood-all: dogfood-local dogfood-system dogfood-production dogfood-release-art
 # the critical model/system contracts. Automation that needs "release safe"
 # uses THIS target.
 # dogfood-release-model is the faster model-only subset.
-.PHONY: release-gate
-release-gate: dogfood-fast dogfood-system dogfood-production dogfood-release-artifacts
-	@echo "RELEASE GATE green: canonical release scenario, verification production path, dist topology, soak, DR restore, N-1 upgrade (fail-closed), G1→G2 self-build, packaged artifact, untrusted-container evidence lane."
+.PHONY: release-gate perf-gate
+# perf-gate is the release performance contract: ./perf vs bench/baseline.txt
+# with a regression budget. A candidate slower than the baseline does not
+# certify. --update rewrites the baseline deliberately.
+perf-gate:
+	./scripts/perf-compare.sh
+
+# perf-gate runs FIRST so benchmarks measure a quiet machine, not the
+# tail of 15 minutes of dogfood. See scripts/perf-compare.sh noise contract.
+release-gate: perf-gate dogfood-fast dogfood-system dogfood-production dogfood-release-artifacts
+	@echo "RELEASE GATE green: canonical release scenario, verification production path, dist topology, soak, DR restore, N-1 upgrade (fail-closed), G1→G2 self-build, packaged artifact, untrusted-container evidence lane, perf regression gate."
 
 # staticcheck-all is the CI check: it is exactly the pinned command run by
 # .woodpecker/linux-amd64.yml. `staticcheck` runs the same pinned command
