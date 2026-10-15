@@ -174,3 +174,51 @@ func TestHierarchyJobStepRequireOwner(t *testing.T) {
 		t.Fatal("step-scoped ref without owner must not match any step")
 	}
 }
+
+// Explain and Resolve must be observationally equivalent: if Explain says
+// available, Resolve must return a value (and vice versa). Divergence would
+// let an operator's security UI lie about the runtime authority.
+func TestExplainResolveObservationallyEquivalent(t *testing.T) {
+	h := NewHierarchy()
+	h.Add(SecretRef{Name: "X", Value: "v", Scope: ScopeInstance})
+	h.Add(SecretRef{Name: "X", Value: "w", Scope: ScopeRepository, Owner: "r"})
+	h.Add(SecretRef{Name: "Y", Value: "a", Scope: ScopeRepository, Owner: "r"})
+	h.Add(SecretRef{Name: "Y", Value: "b", Scope: ScopeRepository, Owner: "r"}) // ambiguous
+	h.Add(SecretRef{Name: "Z", Value: "z", Scope: ScopeTeam, Owner: ""})        // no owner → no match
+
+	for _, tc := range []struct {
+		name string
+		p    Policy
+	}{
+		{"X", Policy{Repository: "r", Trusted: true, Now: time.Now()}},
+		{"Y", Policy{Repository: "r", Trusted: true, Now: time.Now()}},
+		{"Z", Policy{Team: "t", Trusted: true, Now: time.Now()}},
+		{"missing", Policy{Trusted: true, Now: time.Now()}},
+	} {
+		e := h.Explain(tc.name, tc.p)
+		_, err := h.Resolve(context.Background(), tc.name, tc.p)
+		if e.Available && err != nil {
+			t.Fatalf("%s: Explain available but Resolve failed: %v", tc.name, err)
+		}
+		if !e.Available && err == nil {
+			t.Fatalf("%s: Explain unavailable but Resolve succeeded", tc.name)
+		}
+	}
+}
+
+// GroupKey-style namespace: a job/step scope without an owner must never
+// become a wildcard (the same rule as repo/team/org/env).
+func TestHierarchyNoWildcardByOmittedOwner(t *testing.T) {
+	h := NewHierarchy()
+	for _, scope := range []Scope{ScopeRepository, ScopeTeam, ScopeOrganization, ScopeEnvironment, ScopeJob, ScopeStep} {
+		h.Add(SecretRef{Name: "W", Value: "v", Scope: scope}) // no owner
+	}
+	p := Policy{
+		Repository: "r", Team: "t", Org: "o", Environment: "e",
+		Job: "j", Step: "s", Trusted: true, Now: time.Now(),
+	}
+	e := h.Explain("W", p)
+	if e.Available {
+		t.Fatalf("omitted owner must not wildcard any scope: %+v", e)
+	}
+}

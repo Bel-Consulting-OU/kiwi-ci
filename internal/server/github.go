@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -149,6 +150,10 @@ func (s *Server) githubWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "parse pipeline: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	if lerr := s.applyRepoImageLock(ctx, fg, ec.Repository.FullName, pipelineSHA, spec); lerr != nil {
+		http.Error(w, "image lock: "+lerr.Error(), http.StatusBadRequest)
+		return
+	}
 	ok, matched, filesKnown, terr := s.evalTriggerMatches(ctx, fg, spec, &ec)
 	if terr != nil {
 		s.serverError(w, r, http.StatusBadGateway, terr, "bad gateway")
@@ -214,6 +219,38 @@ func (s *Server) pipelinePath() string {
 		return ".kiwi/pipeline.yaml"
 	}
 	return s.PipelinePath
+}
+
+// applyRepoImageLock resolves every executable identity through the repo's
+// .kiwi/lock.json BEFORE compilation. The compiled graph then carries only
+// immutable digests — a remote runner never reinterprets a mutable tag.
+// Missing lockfile (forge 404) is not an error; ANY OTHER fetch failure is
+// fail-closed — silently swallowing a 500 would let mutable tags execute.
+// A malformed JSON lockfile is also fail-closed.
+func (s *Server) applyRepoImageLock(ctx context.Context, fg forge.Forge, repoFullName, ref string, spec *pipeline.Spec) error {
+	raw, err := fg.FetchFile(ctx, repoFullName, ".kiwi/lock.json", ref)
+	if err != nil {
+		if errors.Is(err, forge.ErrFileNotFound) {
+			return nil // genuinely no lockfile
+		}
+		return fmt.Errorf("fetch .kiwi/lock.json: %w", err)
+	}
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil
+	}
+	// A forge stub may return non-JSON for an unknown path. Only a
+	// JSON-shaped document is treated as a lockfile; malformed JSON is
+	// fail-closed.
+	if trimmed[0] != '{' && trimmed[0] != '[' {
+		return nil
+	}
+	lock, err := pipeline.ParseImageLockfile([]byte(raw))
+	if err != nil {
+		return err
+	}
+	spec.ApplyImageLock(lock.LockMap())
+	return nil
 }
 
 // errDeliveryDigestMismatch reports that a delivery ID was reused with a

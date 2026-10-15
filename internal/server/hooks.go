@@ -175,6 +175,12 @@ func (s *Server) gitlabWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "parse pipeline: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	// Image lockfile is part of COMPILATION authority: resolve every
+	// executable identity to its immutable digest before the graph is built.
+	if lerr := s.applyRepoImageLock(r.Context(), fg, ec.Repository.FullName, pipelineSHA, spec); lerr != nil {
+		http.Error(w, "image lock: "+lerr.Error(), http.StatusBadRequest)
+		return
+	}
 	ok, matched, filesKnown, terr := s.evalTriggerMatches(r.Context(), fg, spec, &ec)
 	if terr != nil {
 		s.serverError(w, r, http.StatusBadGateway, terr, "bad gateway")
@@ -333,6 +339,12 @@ func (s *Server) forgejoWebhook(w http.ResponseWriter, r *http.Request) {
 	spec, err := pipeline.Parse([]byte(content))
 	if err != nil {
 		http.Error(w, "parse pipeline: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	// Image lockfile is part of COMPILATION authority: resolve every
+	// executable identity to its immutable digest before the graph is built.
+	if lerr := s.applyRepoImageLock(r.Context(), fg, ec.Repository.FullName, pipelineSHA, spec); lerr != nil {
+		http.Error(w, "image lock: "+lerr.Error(), http.StatusBadRequest)
 		return
 	}
 	ok, matched, filesKnown, terr := s.evalTriggerMatches(r.Context(), fg, spec, &ec)

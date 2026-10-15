@@ -100,19 +100,21 @@ func (r SecretRef) matches(p Policy) bool {
 	// Scope-owner matching: a scoped ref must name the matching owner.
 	switch r.Scope {
 	case ScopeRepository:
-		if r.Owner != "" && r.Owner != p.Repository {
+		// A scoped ref without an owner is a wildcard — refuse it. Global
+		// inheritance is ScopeInstance, never an omitted owner.
+		if r.Owner == "" || r.Owner != p.Repository {
 			return false
 		}
 	case ScopeTeam:
-		if r.Owner != "" && r.Owner != p.Team {
+		if r.Owner == "" || r.Owner != p.Team {
 			return false
 		}
 	case ScopeOrganization:
-		if r.Owner != "" && r.Owner != p.Org {
+		if r.Owner == "" || r.Owner != p.Org {
 			return false
 		}
 	case ScopeEnvironment:
-		if r.Owner != "" && r.Owner != p.Environment {
+		if r.Owner == "" || r.Owner != p.Environment {
 			return false
 		}
 	case ScopeJob:
@@ -156,57 +158,116 @@ type Explanation struct {
 	Consulted []string `json:"consulted"`
 }
 
-// Explain reports why a secret does or does not resolve for the policy.
-func (h *Hierarchy) Explain(name string, p Policy) Explanation {
-	e := Explanation{Name: name}
-	var hit *SecretRef
+// secretDecision is the ONE precedence mechanism. Resolve consumes it and
+// Explain renders it — the two can never disagree (an explanatory security
+// interface must be observationally equivalent to the authority decision).
+type secretDecision struct {
+	winner     *SecretRef
+	source     string
+	overridden string
+	ambiguous  bool
+	consulted  []string
+}
+
+// decide walks the hierarchy and records BOTH the definition (least
+// specific match) and the winner (most specific match). Two matches at the
+// winning scope are ambiguous — fail closed. Resolve consumes the winner;
+// Explain renders source=definition and overridden_by=winner. One engine,
+// two views.
+func (h *Hierarchy) decide(name string, p Policy) secretDecision {
+	var d secretDecision
 	byScope := map[Scope][]SecretRef{}
 	for _, r := range h.refs {
 		if r.Name == name {
 			byScope[r.Scope] = append(byScope[r.Scope], r)
 		}
 	}
-	// Explain walks LEAST-specific first: "source" is where the secret is
-	// defined; "overridden by" names the more specific ref that wins.
-	// Resolve still takes the most specific match.
+	// Consulted trail: least specific first (the audit order).
 	for i := len(HierarchyOrder) - 1; i >= 0; i-- {
-		scope := HierarchyOrder[i]
-		for _, r := range byScope[scope] {
+		for _, r := range byScope[HierarchyOrder[i]] {
 			label := string(r.Scope)
 			if r.Owner != "" {
 				label += " " + r.Owner
 			}
-			e.Consulted = append(e.Consulted, label)
+			d.consulted = append(d.consulted, label)
+		}
+	}
+	// Definition = first match walking LEAST specific first.
+	for i := len(HierarchyOrder) - 1; i >= 0; i-- {
+		for _, r := range byScope[HierarchyOrder[i]] {
 			if !r.matches(p) {
 				continue
 			}
-			if hit == nil {
-				cp := r
-				hit = &cp
-				e.Source = label
-				if !r.ExpiresAt.IsZero() {
-					e.Expires = r.ExpiresAt.UTC().Format(time.RFC3339)
-				}
-				e.Provider = r.Provider
-			} else {
-				// A MORE specific match overrides the definition.
-				e.OverriddenBy = label
-				cp := r
-				hit = &cp
-				if !r.ExpiresAt.IsZero() {
-					e.Expires = r.ExpiresAt.UTC().Format(time.RFC3339)
-				}
-				e.Provider = r.Provider
+			label := string(r.Scope)
+			if r.Owner != "" {
+				label += " " + r.Owner
 			}
+			d.source = label
+			goto winner
 		}
 	}
-	if hit == nil {
+	// No match at all.
+	return d
+winner:
+	// Winner = first match walking MOST specific first (Resolve order).
+	for _, scope := range HierarchyOrder {
+		var hits []SecretRef
+		for _, r := range byScope[scope] {
+			if r.matches(p) {
+				hits = append(hits, r)
+			}
+		}
+		if len(hits) == 0 {
+			continue
+		}
+		if len(hits) > 1 {
+			d.ambiguous = true
+			cp := hits[0]
+			d.winner = &cp
+			return d
+		}
+		cp := hits[0]
+		d.winner = &cp
+		if d.source == "" {
+			d.source = string(scope)
+			if cp.Owner != "" {
+				d.source += " " + cp.Owner
+			}
+		}
+		winLabel := string(scope)
+		if cp.Owner != "" {
+			winLabel += " " + cp.Owner
+		}
+		d.overridden = winLabel
+		return d
+	}
+	return d
+}
+
+// Explain reports why a secret does or does not resolve for the policy.
+// It renders the same decision Resolve consumes — never a second precedence
+// implementation.
+func (h *Hierarchy) Explain(name string, p Policy) Explanation {
+	d := h.decide(name, p)
+	e := Explanation{Name: name, Consulted: d.consulted}
+	if d.ambiguous {
+		e.Available = false
+		e.Reason = fmt.Sprintf("ambiguous at scope %s (%d matching refs): fail closed", d.source, 2)
+		return e
+	}
+	if d.winner == nil {
 		e.Available = false
 		e.Reason = reasonUnavailable(name, p, h.refs)
 		return e
 	}
 	e.Available = true
-	e.Reason = reasonAvailable(*hit, p)
+	e.Source = d.source
+	e.OverriddenBy = d.overridden
+	if !d.winner.ExpiresAt.IsZero() {
+		e.Expires = d.winner.ExpiresAt.UTC().Format(time.RFC3339)
+	}
+	e.Provider = d.winner.Provider
+	e.Reason = reasonAvailable(*d.winner, p)
 	return e
 }
 
@@ -256,31 +317,19 @@ func reasonUnavailable(name string, p Policy, refs []SecretRef) string {
 // first; the first policy match wins. Two matching refs at the SAME scope are
 // ambiguous authority and fail closed — resolution never depends on
 // insertion order.
-func (h *Hierarchy) Resolve(ctx context.Context, name string, p Policy) (string, error) {
-	e := h.Explain(name, p)
-	if !e.Available {
-		return "", fmt.Errorf("secret %q unavailable: %s", name, e.Reason)
+func (h *Hierarchy) Resolve(_ context.Context, name string, p Policy) (string, error) {
+	// The SAME decision Explain renders — never a second precedence path.
+	d := h.decide(name, p)
+	if d.ambiguous {
+		return "", fmt.Errorf("secret %q is ambiguous at scope %s: fail closed", name, d.source)
 	}
-	for _, scope := range HierarchyOrder {
-		var hits []SecretRef
-		for _, r := range h.refs {
-			if r.Name != name || r.Scope != scope || !r.matches(p) {
-				continue
-			}
-			hits = append(hits, r)
-		}
-		if len(hits) == 0 {
-			continue
-		}
-		if len(hits) > 1 {
-			return "", fmt.Errorf("secret %q is ambiguous at scope %s (%d matching refs): fail closed", name, scope, len(hits))
-		}
-		if hits[0].Value == "" {
-			return "", fmt.Errorf("secret %q at %s has no value", name, scope)
-		}
-		return hits[0].Value, nil
+	if d.winner == nil {
+		return "", fmt.Errorf("secret %q unavailable: %s", name, reasonUnavailable(name, p, h.refs))
 	}
-	return "", fmt.Errorf("secret %q unavailable: %s", name, e.Reason)
+	if d.winner.Value == "" {
+		return "", fmt.Errorf("secret %q at %s has no value", name, d.source)
+	}
+	return d.winner.Value, nil
 }
 
 // Provider adapts the hierarchy to the secrets.Provider seam.

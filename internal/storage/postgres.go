@@ -2005,19 +2005,23 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 	groupLimit := claim.ConcurrencyLimit
 	if groupName == "" {
 		// Fall back to the job row (the claim job was already locked above).
-		if err := tx.QueryRow(ctx, `SELECT COALESCE(payload->>'concurrency_group',''), COALESCE((payload->>'concurrency_limit')::int, 0) FROM jobs WHERE id=$1`, claim.JobID).
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(payload->>'concurrency_group',''), COALESCE(NULLIF(payload->>'concurrency_limit',''),'0')::int FROM jobs WHERE id=$1`, claim.JobID).
 			Scan(&groupName, &groupLimit); err != nil {
 			return model.Job{}, err
 		}
 	}
 	// Derive the group key from the EFFECTIVE group name (claim, else job),
-	// matching LeaseClaim.GroupKey's namespace rule.
+	// matching LeaseClaim.GroupKey's namespace rule. GroupKey() itself
+	// falls back to a "noid" namespace when the claim carries no repo id —
+	// the limit still enforces rather than silently skipping.
 	groupKey := ""
 	if groupName != "" {
 		if claim.ConcurrencyScope == "global" {
 			groupKey = "global\x1f" + groupName
 		} else if claim.CanonRepoID != "" {
 			groupKey = claim.CanonRepoID + "\x1f" + groupName
+		} else {
+			groupKey = "noid\x1f" + groupName
 		}
 	}
 	if groupKey != "" && groupLimit > 0 {

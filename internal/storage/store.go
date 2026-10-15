@@ -1760,10 +1760,10 @@ func (c LeaseClaim) EnvKey() string {
 	return c.CanonRepoID + "\x1f" + c.Environment
 }
 
-// GroupKey names the concurrency-group key: the CANONICAL repository
-// identity plus the group name (scope "repo", the default), or the bare
-// group name under scope "global". Two repositories with the same group
-// name never share a slot under the repo scope.
+// GroupKey names the concurrency-group key. Scope "global" keys on the bare
+// group name. Otherwise the key is (canonical repository identity, group);
+// when the claim carries no repo identity the group still enforces under a
+// "noid" namespace rather than silently skipping the limit.
 func (c LeaseClaim) GroupKey() string {
 	if c.ConcurrencyGroup == "" {
 		return ""
@@ -1772,7 +1772,7 @@ func (c LeaseClaim) GroupKey() string {
 		return "global\x1f" + c.ConcurrencyGroup
 	}
 	if c.CanonRepoID == "" {
-		return ""
+		return "noid\x1f" + c.ConcurrencyGroup
 	}
 	return c.CanonRepoID + "\x1f" + c.ConcurrencyGroup
 }

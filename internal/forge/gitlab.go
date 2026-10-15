@@ -230,6 +230,9 @@ func (g *GitLab) FetchFile(ctx context.Context, repoFullName, path, ref string) 
 		return "", err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return "", ErrFileNotFound
+	}
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, maxAPIErrorBodyBytes))
 		return "", fmt.Errorf("GitLab API %s: %s", resp.Status, strings.TrimSpace(string(b)))

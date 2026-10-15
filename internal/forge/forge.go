@@ -9,12 +9,20 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"path"
 	"strings"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
+
+// ErrFileNotFound is returned by FetchFile when the forge reports the path
+// does not exist (HTTP 404). Callers that treat "no file" as a soft default
+// (e.g. an optional .kiwi/lock.json) must match THIS sentinel — any other
+// error is a transport/API failure and must fail closed. Silently swallowing
+// a 500 as "no lockfile" would let mutable tags execute.
+var ErrFileNotFound = errors.New("forge: file not found")
 
 // Repository is the minimal forge repository coordinate needed by the
 // control plane. FullName is the canonical owner/name pair used for policy

@@ -195,6 +195,9 @@ func (b *Bitbucket) do(ctx context.Context, method, urlStr string) ([]byte, erro
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, ErrFileNotFound
+	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return nil, fmt.Errorf("bitbucket %s %s: HTTP %d", method, urlStr, resp.StatusCode)
 	}

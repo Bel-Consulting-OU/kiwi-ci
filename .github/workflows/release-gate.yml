@@ -32,6 +32,23 @@ jobs:
   production-closure:
     name: release-gate (production dogfood closure)
     runs-on: ubuntu-latest
+    services:
+      # Pinned PostgreSQL for the production dist/DR/verification path.
+      # The system dogfood needs a real server AND the client tools
+      # (initdb/pg_dump/pg_restore/psql) on PATH — a service container alone
+      # does not provide the binaries.
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: kiwi
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -39,9 +56,34 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
+      - name: install PostgreSQL client tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client postgresql
+          # Hosted runners may ship a different major than the service; the
+          # client tools must be able to talk to the pinned server.
+          initdb --version
+          pg_dump --version
+          pg_restore --version
+          psql --version
       - name: release-gate
+        env:
+          # Production dist/DR tests connect to the pinned service. The
+          # in-test initdb path is used when KIWI_TEST_POSTGRES_URL is unset;
+          # pointing at the service exercises the same code without relying
+          # on whatever the runner image happens to carry.
+          KIWI_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
         run: |
           export KIWI_REQUIRE_N_MINUS_ONE=1
+          # RC certification must exercise the PUBLISHED N-1 binary when one
+          # is supplied; source rebuild is development-only (see
+          # canonicalResolveNMinusOne). Without a published artifact the
+          # run keeps the dev fallback — the strict mode is set by the
+          # release-tool that knows the previous release digest.
+          if [ -n "${KIWI_N_MINUS_ONE_BIN:-}" ]; then
+            export KIWI_REQUIRE_RELEASED_N_MINUS_ONE=1
+          fi
           make release-gate
       - name: surface contracts
         run: |

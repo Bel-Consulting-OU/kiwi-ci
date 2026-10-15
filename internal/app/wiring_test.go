@@ -334,8 +334,12 @@ func TestGitLabWebhookBaseURL(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &run); err != nil || run.ID == "" {
 		t.Fatalf("run = %s", w.Body.String())
 	}
-	if fetchCalls.Load() != 1 {
-		t.Fatalf("pipeline fetch calls = %d, want 1 (base URL not used)", fetchCalls.Load())
+	// One fetch for the pipeline, one optional fetch for .kiwi/lock.json
+	// (image-lock compilation authority). Both must go to the configured
+	// forge — the point of the test is that the base URL is not a second
+	// fetch target.
+	if n := fetchCalls.Load(); n != 1 && n != 2 {
+		t.Fatalf("fetch calls = %d, want 1–2 (pipeline + optional lock)", n)
 	}
 	if tok, _ := sawToken.Load().(string); tok != "gl-token" {
 		t.Fatalf("fetch PRIVATE-TOKEN = %q, want gl-token", tok)

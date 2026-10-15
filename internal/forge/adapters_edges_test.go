@@ -2,6 +2,7 @@ package forge
 
 import (
 	"context"
+	"errors"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -131,11 +132,14 @@ func TestGitHubFetchFileErrors(t *testing.T) {
 		status  int
 		body    string
 		wantSub string
+		wantErr error
 	}{
-		"status":     {http.StatusNotFound, "missing", "GitHub API 404"},
-		"decode":     {http.StatusOK, "{nope", ""},
-		"encoding":   {http.StatusOK, `{"content":"aGk=","encoding":"utf-8"}`, "unsupported GitHub content encoding"},
-		"bad base64": {http.StatusOK, `{"content":"!!!","encoding":"base64"}`, ""},
+		// 404 is the "file absent" sentinel — callers may treat it as a
+		// soft default (optional lockfile). Any other status is a hard error.
+		"status":     {http.StatusNotFound, "missing", "", ErrFileNotFound},
+		"decode":     {http.StatusOK, "{nope", "", nil},
+		"encoding":   {http.StatusOK, `{"content":"aGk=","encoding":"utf-8"}`, "unsupported GitHub content encoding", nil},
+		"bad base64": {http.StatusOK, `{"content":"!!!","encoding":"base64"}`, "", nil},
 	}
 	for name, tc := range cases {
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -147,6 +151,9 @@ func TestGitHubFetchFileErrors(t *testing.T) {
 		if err == nil {
 			t.Errorf("%s: expected an error", name)
 			continue
+		}
+		if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
+			t.Errorf("%s: error = %v, want %v", name, err, tc.wantErr)
 		}
 		if tc.wantSub != "" && !strings.Contains(err.Error(), tc.wantSub) {
 			t.Errorf("%s: error = %v, want %q", name, err, tc.wantSub)
