@@ -112,3 +112,68 @@ func TestBitbucketChangedFilesPaginationFailsClosed(t *testing.T) {
 func TestBitbucketImplementsForge(t *testing.T) {
 	var _ Forge = &Bitbucket{}
 }
+
+// Bitbucket states / event-key suffixes must normalize to the canonical
+// GitHub-style vocabulary trigger matching already speaks.
+func TestBitbucketActionNormalization(t *testing.T) {
+	for raw, want := range map[string]string{
+		"created":   "opened",
+		"updated":   "synchronize",
+		"OPEN":      "opened",
+		"open":      "opened",
+		"update":    "synchronize",
+		"reopen":    "reopened",
+		"fulfilled": "closed",
+		"rejected":  "closed",
+		"MERGED":    "closed",
+		"":          "",
+	} {
+		if got := bitBucketAction(raw); got != want {
+			t.Fatalf("bitBucketAction(%q) = %q, want %q", raw, got, want)
+		}
+	}
+	// ParseEvent must not leak raw state vocabulary.
+	b := &Bitbucket{}
+	pr := []byte(`{"repository":{"full_name":"ws/repo"},"pullrequest":{"id":7,"state":"OPEN","kiwi_action":"created","source":{"branch":{"name":"feat"},"commit":{"hash":"head"}},"destination":{"branch":{"name":"main"},"commit":{"hash":"base"}}}}`)
+	ec, err := b.ParseEvent(pr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ec.Action != "opened" {
+		t.Fatalf("action = %q, want opened", ec.Action)
+	}
+	if !ec.Trusted {
+		t.Fatal("same-repo PR must be trusted")
+	}
+	// Fork PR is untrusted.
+	pr = []byte(`{"repository":{"full_name":"ws/repo"},"pullrequest":{"id":7,"state":"OPEN","kiwi_action":"updated","source":{"branch":{"name":"feat"},"commit":{"hash":"head"},"repository":{"full_name":"fork/repo"}},"destination":{"branch":{"name":"main"},"commit":{"hash":"base"},"repository":{"full_name":"ws/repo"}}}}`)
+	ec, err = b.ParseEvent(pr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ec.Action != "synchronize" {
+		t.Fatalf("action = %q, want synchronize", ec.Action)
+	}
+	if ec.Trusted {
+		t.Fatal("fork PR must not be trusted")
+	}
+	if ec.HeadRepository.FullName != "fork/repo" {
+		t.Fatalf("head repo = %q", ec.HeadRepository.FullName)
+	}
+}
+
+// FetchFile binds identity exactly once (path) and refuses a mutable
+// default-branch fetch with an empty ref.
+func TestBitbucketFetchFileRejectsEmptyRef(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("yaml"))
+	}))
+	defer srv.Close()
+	b := &Bitbucket{BaseURL: srv.URL, Token: "t", Client: srv.Client()}
+	if _, err := b.FetchFile(context.Background(), "ws/repo", ".kiwi/pipeline.yaml", ""); err == nil {
+		t.Fatal("empty ref must fail closed")
+	}
+	if raw, err := b.FetchFile(context.Background(), "ws/repo", ".kiwi/pipeline.yaml", "abc123"); err != nil || raw != "yaml" {
+		t.Fatalf("fetch = %q %v", raw, err)
+	}
+}

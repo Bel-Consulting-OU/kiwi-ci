@@ -96,9 +96,14 @@ type Server struct {
 	GitLabToken          string
 	ForgejoWebhookSecret string
 	ForgejoToken         string
-	PipelinePath         string
-	ExternalURL          string
-	LeaseDuration        time.Duration
+	// Bitbucket Cloud: webhook HMAC secret (X-Hub-Signature) and app
+	// password / API token. Username pairs with Token for Basic auth.
+	BitbucketWebhookSecret string
+	BitbucketToken         string
+	BitbucketUsername      string
+	PipelinePath           string
+	ExternalURL            string
+	LeaseDuration          time.Duration
 	// leaseClock, when set (tests only), replaces time.Now for lease
 	// liveness decisions of single-process stores. DB-mode liveness uses the
 	// database clock and never consults it, so a test can install an
@@ -274,9 +279,10 @@ type Server struct {
 
 	// Forge API base overrides, used by tests to point adapters at local
 	// HTTP servers; empty means the public API endpoints.
-	gitHubAPIBase  string
-	gitLabAPIBase  string
-	forgejoAPIBase string
+	gitHubAPIBase    string
+	gitLabAPIBase    string
+	forgejoAPIBase   string
+	bitbucketAPIBase string
 
 	// ComponentRegistry resolves job component references server-side at
 	// enqueue time (see resolvePipeline). A nil registry rejects pipelines
@@ -1255,6 +1261,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /hooks/github", s.githubWebhook)
 	mux.HandleFunc("POST /hooks/gitlab", s.gitlabWebhook)
 	mux.HandleFunc("POST /hooks/forgejo", s.forgejoWebhook)
+	mux.HandleFunc("POST /hooks/bitbucket", s.bitbucketWebhook)
 	mux.HandleFunc("GET /metrics", s.metrics)
 	mux.HandleFunc("GET /.well-known/openid-configuration", s.oidcConfiguration)
 	mux.HandleFunc("GET /api/v1/oidc/jwks", s.oidcJWKS)
@@ -1852,22 +1859,32 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.TrimSpace(in.RepoFullName) != "" && in.ForgeKind != "" {
-		ref := in.Ref
-		if ref == "" {
-			ref = in.SHA
+		// A client-supplied SHA is NEVER trusted as authority: the forge
+		// resolves whatever the client named (ref or SHA) to the canonical
+		// full commit id. A garbage SHA fails to resolve and the submit is
+		// refused — better than admitting a run that cannot check out.
+		target := in.SHA
+		if target == "" {
+			target = in.Ref
 		}
-		if ref != "" && in.SHA == "" {
-			sha, serr := s.resolveExecutionRevision(r.Context(), in.ForgeKind, in.RepoFullName, ref)
+		if target != "" {
+			sha, serr := s.resolveExecutionRevision(r.Context(), in.ForgeKind, in.RepoFullName, target)
 			if serr != nil {
-				http.Error(w, "resolve revision: "+serr.Error(), http.StatusBadGateway)
+				s.serverError(w, r, http.StatusBadGateway, serr, "resolve revision")
 				return
 			}
 			in.SHA = sha
 		}
+		// Whitespace-only ImageLock is NOT a document and NOT "already
+		// pinned": it must go fetch the repo lock (or stay empty = no lock).
+		// A client must not smuggle "no lock" past the fetch via " ".
+		if strings.TrimSpace(in.ImageLock) == "" {
+			in.ImageLock = ""
+		}
 		if in.ImageLock == "" && in.SHA != "" {
 			lock, lerr := s.fetchImageLockByForge(r.Context(), in.ForgeKind, in.RepoFullName, in.SHA)
 			if lerr != nil {
-				http.Error(w, "image lock unavailable", http.StatusBadGateway)
+				s.serverError(w, r, http.StatusBadGateway, lerr, "image lock unavailable")
 				return
 			}
 			in.ImageLock = lock

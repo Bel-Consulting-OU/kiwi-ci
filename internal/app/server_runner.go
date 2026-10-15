@@ -759,6 +759,7 @@ func Server(ctx context.Context, args []string) error {
 	adminToken := fs.String("admin-token", "", "admin bearer token (defaults to runner token)")
 	webhookSecret := fs.String("github-webhook-secret", "", "GitHub webhook HMAC secret")
 	githubToken := fs.String("github-token", "", "GitHub token for private pipeline fetches")
+	githubAPIBase := fs.String("github-api-base", "", "GitHub API base URL (GitHub Enterprise or test stand-in; default https://api.github.com)")
 	pipelinePath := fs.String("pipeline-path", ".kiwi/pipeline.yaml", "pipeline path in repositories")
 	dataDir := fs.String("data-dir", "", "persistent state directory (default: in-memory; production deployments should always set this)")
 	externalURL := fs.String("external-url", "", "public base URL (required for OIDC)")
@@ -791,6 +792,10 @@ func Server(ctx context.Context, args []string) error {
 	forgejoToken := fs.String("forgejo-token", "", "Forgejo API token for pipeline fetches and status publishing")
 	forgejoWebhookSecret := fs.String("forgejo-webhook-secret", "", "Forgejo webhook HMAC secret")
 	forgejoBaseURL := fs.String("forgejo-base-url", "", "self-managed Forgejo instance root (default https://codeberg.org)")
+	bitbucketWebhookSecret := fs.String("bitbucket-webhook-secret", "", "Bitbucket webhook HMAC secret")
+	bitbucketToken := fs.String("bitbucket-token", "", "Bitbucket app password / API token")
+	bitbucketUsername := fs.String("bitbucket-username", "", "Bitbucket username for basic auth with the app password")
+	bitbucketBaseURL := fs.String("bitbucket-base-url", "", "Bitbucket API base (default https://api.bitbucket.org/2.0)")
 	tokensFile := fs.String("tokens-file", "", "JSON token-store file for fine-grained principal tokens")
 	runnerTokensFile := fs.String("runner-tokens-file", "", "JSON file of per-runner bearer credentials (runner ID -> SHA-256 token digest); production accepts runner mTLS or these per-runner tokens")
 	databaseMaxConnections := fs.String("database-max-connections", "", "PostgreSQL pool max connections")
@@ -866,7 +871,7 @@ func Server(ctx context.Context, args []string) error {
 	// The flag pointers exist only to register the flags; their values are
 	// read back through config.OverrideFromFlags (which inspects only
 	// explicitly set flags).
-	discard(listen, token, adminToken, webhookSecret, githubToken, externalURL, tlsCert, tlsKey, runnerCACert, runnerCAKey, runnerEnrollToken, databaseURL, singleReplica, blobShared, mode, rateLimitPerSecond, rateLimitBurst, otelEndpoint, drainOnSigterm, githubAppID, githubAppPrivateKey, gitlabToken, gitlabWebhookSecret, gitlabBaseURL, forgejoToken, forgejoWebhookSecret, forgejoBaseURL, tokensFile, runnerTokensFile, databaseMaxConnections, metricsListen, secretBroker, vaultAddr, vaultToken, awsRegion, awsAccessKey, awsSecretKey, awsToken, gcpCredentials, gcpProject, azureTenant, azureClientID, azureClientSecret, azureVaultURL, onePasswordHost, onePasswordToken, onePasswordVault, componentRegistryDir, componentRemote, componentRemoteToken, stagingDir, stagingMaxBytes, stagingInstanceID, repoConcurrency, teamConcurrency, repoQueueDepth, teamQueueDepth, dailyCostLimit, dailyEnergyLimit, quotaFailOpen, untrustedCPUCeiling, untrustedMemoryCeiling, untrustedDiskCeiling, untrustedPIDsCeiling)
+	discard(listen, token, adminToken, webhookSecret, githubToken, githubAPIBase, externalURL, tlsCert, tlsKey, runnerCACert, runnerCAKey, runnerEnrollToken, databaseURL, singleReplica, blobShared, mode, rateLimitPerSecond, rateLimitBurst, otelEndpoint, drainOnSigterm, githubAppID, githubAppPrivateKey, gitlabToken, gitlabWebhookSecret, gitlabBaseURL, forgejoToken, forgejoWebhookSecret, forgejoBaseURL, bitbucketWebhookSecret, bitbucketToken, bitbucketUsername, bitbucketBaseURL, tokensFile, runnerTokensFile, databaseMaxConnections, metricsListen, secretBroker, vaultAddr, vaultToken, awsRegion, awsAccessKey, awsSecretKey, awsToken, gcpCredentials, gcpProject, azureTenant, azureClientID, azureClientSecret, azureVaultURL, onePasswordHost, onePasswordToken, onePasswordVault, componentRegistryDir, componentRemote, componentRemoteToken, stagingDir, stagingMaxBytes, stagingInstanceID, repoConcurrency, teamConcurrency, repoQueueDepth, teamQueueDepth, dailyCostLimit, dailyEnergyLimit, quotaFailOpen, untrustedCPUCeiling, untrustedMemoryCeiling, untrustedDiskCeiling, untrustedPIDsCeiling)
 
 	// Effective values after the precedence merge.
 	listenV := cfg.Server.Listen

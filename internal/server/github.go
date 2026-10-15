@@ -240,6 +240,12 @@ func (s *Server) fetchImageLock(ctx context.Context, fg forge.Forge, repoFullNam
 		}
 		return "", false, fmt.Errorf("fetch .kiwi/lock.json: %w", err)
 	}
+	// A lockfile that EXISTS but pins nothing is not "no lockfile": it is
+	// an incomplete authority document. Fail closed the same way a parse
+	// error would — empty content is reserved for the 404/no-document case.
+	if strings.TrimSpace(raw) == "" {
+		return "", false, fmt.Errorf("image lockfile exists at %s@%s but is empty", repoFullName, ref)
+	}
 	return raw, true, nil
 }
 
@@ -263,6 +269,8 @@ func (s *Server) fetchImageLockByForge(ctx context.Context, kind, repoFullName, 
 		fg = s.gitLabForge()
 	case "forgejo":
 		fg = s.forgejoForge()
+	case "bitbucket":
+		fg = s.bitbucketForge()
 	default:
 		return "", fmt.Errorf("image lock: unknown forge kind %q for %s", kind, repoFullName)
 	}
@@ -299,6 +307,8 @@ func (s *Server) resolveExecutionRevision(ctx context.Context, kind, repoFullNam
 		fg = s.gitLabForge()
 	case "forgejo":
 		fg = s.forgejoForge()
+	case "bitbucket":
+		fg = s.bitbucketForge()
 	default:
 		return "", fmt.Errorf("resolve revision: unknown forge kind %q for %s", kind, repoFullName)
 	}
@@ -310,43 +320,6 @@ func (s *Server) resolveExecutionRevision(ctx context.Context, kind, repoFullNam
 		return "", fmt.Errorf("resolve revision %q: SHA %q is not a full commit id", ref, sha)
 	}
 	return sha, nil
-}
-
-// fetchImageLockByRepo is the legacy multi-adapter helper. It is retained
-// only for tests; authority-sensitive paths use fetchImageLockByForge.
-func (s *Server) fetchImageLockByRepo(ctx context.Context, repoFullName, ref string) (string, error) {
-	if strings.TrimSpace(ref) == "" {
-		return "", nil
-	}
-	var lastHard error
-	for _, f := range []forge.Forge{s.gitHubForge(), s.gitLabForge(), s.forgejoForge()} {
-		raw, found, err := s.fetchImageLock(ctx, f, repoFullName, ref)
-		if err != nil {
-			if isForgeClientErr(err) {
-				continue
-			}
-			lastHard = err
-			continue
-		}
-		if found {
-			return raw, nil
-		}
-	}
-	if lastHard != nil {
-		return "", lastHard
-	}
-	return "", nil
-}
-
-// isForgeClientErr reports whether err is a 4xx forge API response (wrong
-// adapter for this repo, bad ref, etc.) as opposed to a transport/5xx
-// failure. Only the latter is fail-closed for the optional lockfile.
-func isForgeClientErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "API 4") || strings.Contains(msg, "HTTP 4")
 }
 
 // errDeliveryDigestMismatch reports that a delivery ID was reused with a

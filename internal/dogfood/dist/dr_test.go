@@ -1,12 +1,12 @@
 package dist_test
 
 import (
-	"net/url"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"

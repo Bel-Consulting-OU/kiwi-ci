@@ -236,6 +236,8 @@ func (s *Server) SetForgeBaseURL(forgeName, baseURL string) {
 		s.gitLabAPIBase = baseURL
 	case "forgejo":
 		s.forgejoAPIBase = baseURL
+	case "bitbucket":
+		s.bitbucketAPIBase = baseURL
 	}
 }
 
@@ -751,6 +753,10 @@ func (s *Server) fetchDownstreamPipeline(ctx context.Context, forgeKind, baseURL
 		return s.DownstreamPipelineFetcher(ctx, targetRepo, targetRef)
 	}
 	path := s.pipelinePath()
+	// EXACT adapter only. "Try every forge" would accept a pipeline fetched
+	// from a DIFFERENT repository that happens to share an owner/name on
+	// another host — that is forged execution input, same class as the
+	// lock. An unrecognized kind has no adapter and therefore no pipeline.
 	switch forgeKind {
 	case "github":
 		f := s.gitHubForge()
@@ -770,17 +776,14 @@ func (s *Server) fetchDownstreamPipeline(ctx context.Context, forgeKind, baseURL
 			f.BaseURL = baseURL
 		}
 		return f.FetchFile(ctx, targetRepo, path, targetRef)
-	default:
-		// Unknown forge: try the adapters in order; the first success wins.
-		var lastErr error
-		for _, f := range []forge.Forge{s.gitHubForge(), s.gitLabForge(), s.forgejoForge()} {
-			content, err := f.FetchFile(ctx, targetRepo, path, targetRef)
-			if err == nil {
-				return content, nil
-			}
-			lastErr = err
+	case "bitbucket":
+		f := s.bitbucketForge()
+		if baseURL != "" {
+			f.BaseURL = baseURL
 		}
-		return "", lastErr
+		return f.FetchFile(ctx, targetRepo, path, targetRef)
+	default:
+		return "", fmt.Errorf("downstream: unknown forge kind %q for %s", forgeKind, targetRepo)
 	}
 }
 
@@ -825,35 +828,39 @@ func (s *Server) fetchDownstreamImageLock(ctx context.Context, forgeKind, baseUR
 			if baseURL != "" {
 				t.BaseURL = baseURL
 			}
+		case *forge.Bitbucket:
+			if baseURL != "" {
+				t.BaseURL = baseURL
+			}
 		}
 		return f
 	}
-	var adapters []forge.Forge
+	// EXACT adapter only — never "try every forge". github.com/acme/app and
+	// gitlab.com/acme/app are different repositories; a lock fetched from
+	// the wrong adapter is forged execution authority. An unrecognized kind
+	// has no adapter and therefore no lock (the child pipeline must pin
+	// digests itself), matching submit's unrecognized-host contract.
+	var fg forge.Forge
 	switch forgeKind {
 	case "github":
-		adapters = []forge.Forge{mk(s.gitHubForge())}
+		fg = mk(s.gitHubForge())
 	case "gitlab":
-		adapters = []forge.Forge{mk(s.gitLabForge())}
+		fg = mk(s.gitLabForge())
 	case "forgejo":
-		adapters = []forge.Forge{mk(s.forgejoForge())}
+		fg = mk(s.forgejoForge())
+	case "bitbucket":
+		fg = mk(s.bitbucketForge())
 	default:
-		adapters = []forge.Forge{mk(s.gitHubForge()), mk(s.gitLabForge()), mk(s.forgejoForge())}
+		return "", nil
 	}
-	var lastErr error
-	for _, f := range adapters {
-		raw, found, err := s.fetchImageLock(ctx, f, targetRepo, targetRef)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if found {
-			return raw, nil
-		}
+	raw, found, err := s.fetchImageLock(ctx, fg, targetRepo, targetRef)
+	if err != nil {
+		return "", err
 	}
-	if lastErr != nil {
-		return "", lastErr
+	if !found {
+		return "", nil
 	}
-	return "", nil
+	return raw, nil
 }
 
 // forgeKindForHost maps a repository host to its forge adapter kind. This
@@ -866,6 +873,8 @@ func forgeKindForHost(host string) string {
 		return "gitlab"
 	case strings.Contains(host, "forgejo") || strings.Contains(host, "codeberg"):
 		return "forgejo"
+	case host == "bitbucket.org" || strings.HasSuffix(host, ".bitbucket.org"):
+		return "bitbucket"
 	default:
 		return ""
 	}

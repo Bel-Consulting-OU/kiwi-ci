@@ -31,6 +31,9 @@ func applyForgeConfig(srv *server.Server, cfg *config.Config) error {
 	srv.GitLabToken = cfg.GitLab.Token
 	srv.ForgejoWebhookSecret = cfg.Forgejo.WebhookSecret
 	srv.ForgejoToken = cfg.Forgejo.Token
+	srv.BitbucketWebhookSecret = cfg.Bitbucket.WebhookSecret
+	srv.BitbucketToken = cfg.Bitbucket.Token
+	srv.BitbucketUsername = cfg.Bitbucket.Username
 	if cfg.GitHub.BaseURL != "" {
 		srv.SetForgeBaseURL("github", cfg.GitHub.BaseURL)
 	}
@@ -39,6 +42,9 @@ func applyForgeConfig(srv *server.Server, cfg *config.Config) error {
 	}
 	if cfg.Forgejo.BaseURL != "" {
 		srv.SetForgeBaseURL("forgejo", cfg.Forgejo.BaseURL)
+	}
+	if cfg.Bitbucket.BaseURL != "" {
+		srv.SetForgeBaseURL("bitbucket", cfg.Bitbucket.BaseURL)
 	}
 	if cfg.GitHub.AppID != 0 {
 		keyPEM, err := os.ReadFile(cfg.GitHub.PrivateKeyPath)

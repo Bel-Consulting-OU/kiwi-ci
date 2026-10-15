@@ -99,6 +99,26 @@ func (h *hookAPI) server(t *testing.T) *httptest.Server {
 				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"files": []any{}})
+		case strings.Contains(r.URL.Path, "/src/"):
+			// Bitbucket Cloud src API: raw file bytes. lock.json is a
+			// genuine 404 so the empty-lock fail-closed path is testable.
+			if strings.Contains(r.URL.Path, "lock.json") {
+				http.NotFound(w, r)
+				return
+			}
+			if !strings.Contains(r.URL.Path, "pipeline.yaml") {
+				http.NotFound(w, r)
+				return
+			}
+			body := webhookPipeline
+			if h.gitlabFileBody != "" {
+				body = h.gitlabFileBody
+			}
+			_, _ = io.WriteString(w, body)
+		case strings.Contains(r.URL.Path, "/diffstat"):
+			_, _ = io.WriteString(w, `{"values":[]}`)
+		case strings.Contains(r.URL.Path, "/commit/"):
+			_, _ = io.WriteString(w, `{"hash":"`+strings.Repeat("a", 40)+`"}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -715,4 +735,40 @@ func TestWebhookRunsCarryForgeIdentity(t *testing.T) {
 	if !s.forgePublishingConfigured(run.ForgeKind) {
 		t.Fatalf("forge publishing not configured for %q", run.ForgeKind)
 	}
+}
+
+func newBitbucketSqueezeServer(t *testing.T, api *httptest.Server, secret string) *Server {
+	t.Helper()
+	s := New("runner-secret")
+	s.BitbucketWebhookSecret = secret
+	s.bitbucketAPIBase = api.URL
+	s.PipelinePath = ".kiwi/pipeline.yaml"
+	return s
+}
+
+func bitbucketPushPayload(sha string) string {
+	return `{"repository":{"full_name":"ws/repo"},"push":{"changes":[{"new":{"name":"refs/heads/main","target":{"hash":"` + sha + `"}}}]},"actor":{"username":"alice"}}`
+}
+
+func bitbucketPRPayload(state string) string {
+	return `{"repository":{"full_name":"ws/repo"},"pullrequest":{"id":7,"state":"` + state + `","author":{"username":"bob"},"source":{"branch":{"name":"feat"},"commit":{"hash":"headsha"}},"destination":{"branch":{"name":"main"},"commit":{"hash":"basesha"}}}}`
+}
+
+func postBitbucket(t *testing.T, s *Server, secret, eventKey, delivery, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/hooks/bitbucket", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if eventKey != "" {
+		req.Header.Set("X-Event-Key", eventKey)
+	}
+	if secret != "" {
+		req.Header.Set("X-Hub-Signature-256", signForgejo(secret, []byte(body)))
+	}
+	if delivery == "" {
+		delivery = nextTestDelivery()
+	}
+	req.Header.Set("X-Request-UUID", delivery)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	return w
 }

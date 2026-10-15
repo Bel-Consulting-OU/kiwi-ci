@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -71,6 +72,217 @@ func (s *Server) gitLabForge() *forge.GitLab {
 
 func (s *Server) forgejoForge() *forge.Forgejo {
 	return &forge.Forgejo{Secret: s.ForgejoWebhookSecret, Token: s.ForgejoToken, BaseURL: s.forgejoAPIBase}
+}
+
+func (s *Server) bitbucketForge() *forge.Bitbucket {
+	return &forge.Bitbucket{
+		Secret:   s.BitbucketWebhookSecret,
+		Token:    s.BitbucketToken,
+		Username: s.BitbucketUsername,
+		BaseURL:  s.bitbucketAPIBase,
+	}
+}
+
+// bitbucketWebhook is the Bitbucket Cloud ingress: HMAC/token verification,
+// trigger-level parse, delivery replay identity, and the same enqueue path
+// as every other forge. The adapter normalizes push/PR payloads to the
+// common EventContext.
+
+// injectBitbucketAction copies the X-Event-Key suffix into a kiwi_action
+// field the Bitbucket adapter understands. Callers pass a PARSE-ONLY copy:
+// the delivery digest must stay over the original HMAC-authenticated body.
+func injectBitbucketAction(body []byte, eventKey string) []byte {
+	key := strings.TrimSpace(eventKey)
+	if key == "" {
+		return body
+	}
+	parts := strings.SplitN(key, ":", 2)
+	if len(parts) != 2 || parts[0] != "pullrequest" {
+		return body
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return body
+	}
+	pr, ok := doc["pullrequest"]
+	if !ok {
+		return body
+	}
+	var prDoc map[string]json.RawMessage
+	if err := json.Unmarshal(pr, &prDoc); err != nil {
+		return body
+	}
+	quoted, _ := json.Marshal(parts[1])
+	prDoc["kiwi_action"] = quoted
+	prRaw, err := json.Marshal(prDoc)
+	if err != nil {
+		return body
+	}
+	doc["pullrequest"] = prRaw
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+func (s *Server) bitbucketWebhook(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4<<20))
+	if err != nil {
+		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+	if s.BitbucketWebhookSecret == "" {
+		http.Error(w, "Bitbucket webhook secret is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	fg := s.bitbucketForge()
+	if err := fg.VerifyWebhook(body, s.BitbucketWebhookSecret, r.Header); err != nil {
+		http.Error(w, "invalid webhook signature", http.StatusUnauthorized)
+		return
+	}
+	if !s.requireSchemaCompatible(w, r) {
+		return
+	}
+	// Bitbucket puts the action in X-Event-Key (pullrequest:created,
+	// pullrequest:updated, …), not in the body. Inject the suffix into a
+	// PARSE-ONLY copy so ParseEvent and trigger matching share one
+	// normalized action vocabulary with every other forge. The authenticated
+	// `body` bytes stay untouched: the delivery digest and replay identity
+	// are computed over exactly what HMAC covered.
+	parseBody := injectBitbucketAction(body, r.Header.Get("X-Event-Key"))
+	ec, err := fg.ParseEvent(parseBody)
+	if err != nil {
+		http.Error(w, "bad webhook payload: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := validateWebhookRepoBinding(ec.Repository); err != nil {
+		http.Error(w, "webhook repository identity mismatch: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := validateWebhookRepoBinding(ec.HeadRepository); err != nil {
+		http.Error(w, "webhook head repository identity mismatch: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if ec.Event == "" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if ec.Event == "push" {
+		if ec.HeadSHA == "" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	} else if ec.Event == "pull_request" {
+		// Canonical vocabulary (opened / reopened / synchronize /
+		// ready_for_review), identical to the GitHub ingress filter.
+		switch ec.Action {
+		case "opened", "reopened", "synchronize", "ready_for_review":
+		default:
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
+
+	repoID := s.forgeRepoID("bitbucket", webhookRepoCoordinate(ec))
+	if !s.allowAuthenticatedWebhook(w, r, "bitbucket", repoID) {
+		return
+	}
+	delivery := strings.TrimSpace(r.Header.Get("X-Request-UUID"))
+	if delivery == "" {
+		delivery = strings.TrimSpace(r.Header.Get("X-Hook-UUID"))
+	}
+	if delivery == "" {
+		http.Error(w, "missing X-Request-UUID", http.StatusBadRequest)
+		return
+	}
+	digest := webhookPayloadDigest(body)
+	if prior, enqueued, ignored, derr := s.webhookDeliveryRun(r.Context(), "bitbucket", delivery, digest, repoID); derr != nil {
+		if errors.Is(derr, errDeliveryDigestMismatch) {
+			http.Error(w, "delivery id was already used with different content", http.StatusConflict)
+			return
+		}
+		s.internalError(w, r, derr, "")
+		return
+	} else if ignored {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	} else if enqueued {
+		writeJSON(w, http.StatusOK, prior)
+		return
+	}
+
+	pipelineSHA := ec.HeadSHA
+	if !ec.Trusted {
+		pipelineSHA = ec.BaseSHA
+	}
+	if pipelineSHA == "" {
+		pipelineSHA = ec.HeadSHA
+	}
+	content, err := fg.FetchFile(r.Context(), ec.Repository.FullName, s.pipelinePath(), pipelineSHA)
+	if err != nil {
+		s.serverError(w, r, http.StatusBadGateway, err, "bad gateway")
+		return
+	}
+	spec, err := pipeline.ParseWithComponents([]byte(content))
+	if err != nil {
+		http.Error(w, "parse pipeline: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	ok, matched, filesKnown, terr := s.evalTriggerMatches(r.Context(), fg, spec, &ec)
+	if terr != nil {
+		s.serverError(w, r, http.StatusBadGateway, terr, "bad gateway")
+		return
+	}
+	if !ok {
+		log.Printf("webhook: bitbucket %s %s ignored (trigger %q)", ec.Event, ec.Repository.FullName, matched)
+		s.recordIgnoredWebhook(r.Context(), "bitbucket", repoID, delivery, digest)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	checkout := checkoutCloneURL(ec)
+	lockContent, _, lerr := s.fetchImageLock(r.Context(), fg, ec.Repository.FullName, pipelineSHA)
+	if lerr != nil {
+		s.serverError(w, r, http.StatusBadGateway, lerr, "bad gateway")
+		return
+	}
+	in := SubmitRun{
+		RepoID:            repoID,
+		PolicyRepoID:      repoID,
+		CheckoutRepoURL:   checkout,
+		RepoURL:           checkout,
+		RepoFullName:      ec.Repository.FullName,
+		Ref:               ec.Ref,
+		SHA:               ec.HeadSHA,
+		Event:             ec.Event,
+		Pipeline:          content,
+		ImageLock:         lockContent,
+		Trusted:           ec.Trusted,
+		ForgeKind:         "bitbucket",
+		ForgeHost:         forgeHostFromCloneURL(checkout),
+		ChangedFiles:      ec.ChangedFiles.Files,
+		ChangedFilesKnown: filesKnown,
+		Metadata:          map[string]string{"bitbucket_delivery": delivery, webhookDeliveryDigestKey("bitbucket"): digest},
+		deliveryDigest:    digest,
+		identityBound:     true,
+	}
+	run, err := s.enqueue(r.Context(), in)
+	if err != nil {
+		if errors.Is(err, errDeliveryDigestMismatch) {
+			http.Error(w, "delivery id was already used with different content", http.StatusConflict)
+			return
+		}
+		var nd *stateNotDurableError
+		if errors.As(err, &nd) {
+			s.serverError(w, r, http.StatusServiceUnavailable, nd, "state not durable")
+			return
+		}
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.recordWebhookDelivery(r.Context(), "bitbucket", repoID, delivery, digest, run.ID)
+	writeJSON(w, http.StatusAccepted, run)
 }
 
 func (s *Server) gitlabWebhook(w http.ResponseWriter, r *http.Request) {

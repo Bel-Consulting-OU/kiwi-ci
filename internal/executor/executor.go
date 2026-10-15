@@ -527,25 +527,11 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			return finish(res)
 		}
 	}
-	// Image lockfile (.kiwi/lock.json in the JOB WORKSPACE): every
-	// executable identity — job image, service images and VM — is resolved
-	// to its locked digest before the runtime starts, so execution uses the
-	// immutable bytes even when the YAML kept the tag. The workspace root is
-	// required — a runner's process CWD is not the checkout. Unset resolver
-	// keeps the refs as written.
-	if ImageResolver != nil {
-		if pinned := ImageResolver(workspace, cj.Job.Image); pinned != "" {
-			cj.Job.Image = pinned
-		}
-		if pinned := ImageResolver(workspace, cj.Job.VM); pinned != "" {
-			cj.Job.VM = pinned
-		}
-		for i := range cj.Job.Services {
-			if pinned := ImageResolver(workspace, cj.Job.Services[i].Image); pinned != "" {
-				cj.Job.Services[i].Image = pinned
-			}
-		}
-	}
+	// Image identity is COMPILATION authority (applyImageLockContent /
+	// applyLocalImageLock before Compile). The executor must not rewrite
+	// images at runtime: a second, workspace-dependent resolver would be a
+	// divergent dual implementation of the lock, and the compiled graph
+	// would no longer describe what actually executes.
 	if e.Opt.WorkspaceMaxBytes > 0 && !e.Opt.WorkspaceAvailabilityChecked {
 		if err := WorkspaceDiskAvailable(workspace, e.Opt.WorkspaceMaxBytes); err != nil {
 			infra := &RunError{Kind: ErrorInfra, Err: fmt.Errorf("workspace quota: %v", err)}
@@ -1229,12 +1215,6 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 // working directory has been removed (getcwd ENOENT on Linux) but cannot be
 // reproduced on darwin, where getcwd keeps resolving an unlinked directory.
 var absWorkspacePath = filepath.Abs
-
-// ImageResolver, when set, maps (workspaceRoot, container image reference)
-// to its immutable digest form (the kiwi lockfile at workspaceRoot).
-// Returning "" keeps the ref as wired by local/run to LockLookup; nil in
-// tests and when no lockfile exists.
-var ImageResolver func(workspaceRoot, image string) string
 
 // backendForNetwork is a test-only seam over BackendForNetwork. Production
 // behavior is unchanged; it lets runJob's backend lifecycle error paths

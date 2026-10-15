@@ -107,7 +107,12 @@ func validateOCIDigestTarget(target string) error {
 // a lock that silently omits a tag defeats the meaning of a lock. Already
 // digest-pinned refs need no mapping.
 func (s *Spec) RequireComplete(lock map[string]string) error {
-	if s == nil || len(lock) == 0 {
+	// nil means "no lockfile document at all" (ordinary trusted policy).
+	// A non-nil map — including an empty one — means a lockfile EXISTS:
+	// every mutable identity must be covered. An empty images list is a
+	// lock that claims authority while pinning nothing, which is exactly
+	// the incompleteness this function exists to refuse.
+	if s == nil || lock == nil {
 		return nil
 	}
 	var missing []string

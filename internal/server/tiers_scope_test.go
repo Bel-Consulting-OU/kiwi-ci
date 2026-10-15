@@ -98,6 +98,7 @@ var expectedRouteTiers = map[string]routeTier{
 	"POST /api/v1/logout":                                      tierPublic,
 	"GET /readiness":                                           tierPublic,
 	"GET /readiness/lease":                                     tierPublic,
+	"POST /hooks/bitbucket":                                    tierPublic,
 	"GET /liveness":                                            tierPublic,
 	"GET /version":                                             tierPublic,
 	"POST /hooks/github":                                       tierPublic,

@@ -184,6 +184,15 @@ type ForgejoConfig struct {
 	BaseURL string `toml:"base_url"`
 }
 
+type BitbucketConfig struct {
+	WebhookSecret string `toml:"webhook_secret"`
+	// Token pairs with Username for Basic auth (app password).
+	Token    string `toml:"token"`
+	Username string `toml:"username"`
+	// BaseURL is the Bitbucket API root (default https://api.bitbucket.org/2.0).
+	BaseURL string `toml:"base_url"`
+}
+
 type PolicyConfig struct {
 	File string `toml:"file"`
 }
@@ -396,6 +405,7 @@ type Config struct {
 	GitHub        GitHubConfig        `toml:"github"`
 	GitLab        GitLabConfig        `toml:"gitlab"`
 	Forgejo       ForgejoConfig       `toml:"forgejo"`
+	Bitbucket     BitbucketConfig     `toml:"bitbucket"`
 	Policy        PolicyConfig        `toml:"policy"`
 	Observability ObservabilityConfig `toml:"observability"`
 	RateLimit     RateLimitConfig     `toml:"rate_limit"`
@@ -1127,6 +1137,8 @@ func (c *Config) OverrideFromFlags(fs *flag.FlagSet) error {
 			c.GitHub.WebhookSecret = f.Value.String()
 		case "github-token":
 			c.GitHub.Token = f.Value.String()
+		case "github-api-base":
+			c.GitHub.BaseURL = f.Value.String()
 		case "github-app-id":
 			if f.Value.String() != "" {
 				v, perr := strconv.ParseInt(f.Value.String(), 10, 64)
@@ -1150,6 +1162,14 @@ func (c *Config) OverrideFromFlags(fs *flag.FlagSet) error {
 			c.Forgejo.WebhookSecret = f.Value.String()
 		case "forgejo-base-url":
 			c.Forgejo.BaseURL = f.Value.String()
+		case "bitbucket-webhook-secret":
+			c.Bitbucket.WebhookSecret = f.Value.String()
+		case "bitbucket-token":
+			c.Bitbucket.Token = f.Value.String()
+		case "bitbucket-username":
+			c.Bitbucket.Username = f.Value.String()
+		case "bitbucket-base-url":
+			c.Bitbucket.BaseURL = f.Value.String()
 		case "tokens-file":
 			c.Auth.TokensFile = f.Value.String()
 		case "runner-tokens-file":

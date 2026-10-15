@@ -75,8 +75,14 @@ func (s *Server) resolvePipeline(ctx context.Context, in SubmitRun) (*pipeline.S
 // that silently omits a tag (or a component-injected image) defeats its own
 // meaning.
 func applyImageLockContent(spec *pipeline.Spec, content string) error {
-	if strings.TrimSpace(content) == "" {
+	// Only a truly absent document ("" from a 404) is "no lockfile".
+	// Whitespace-only content is a present-but-empty authority document
+	// and must fail closed — the same rule as a local empty lock.json.
+	if content == "" {
 		return nil
+	}
+	if strings.TrimSpace(content) == "" {
+		return fmt.Errorf("image lockfile exists but is empty")
 	}
 	lock, err := pipeline.ParseImageLockfile([]byte(content))
 	if err != nil {

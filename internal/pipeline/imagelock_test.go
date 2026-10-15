@@ -119,3 +119,27 @@ func TestRequireCompleteLockCoversAllMutableRefs(t *testing.T) {
 		t.Fatalf("no lock = %v", err)
 	}
 }
+
+// An empty images list is a lockfile that CLAIMS authority while pinning
+// nothing. RequireComplete must treat a non-nil empty map as "lockfile
+// exists" and refuse every mutable ref — only a missing document (nil)
+// is ordinary trusted policy.
+func TestEmptyLockfileIsStillIncomplete(t *testing.T) {
+	s := &Spec{Jobs: map[string]Job{
+		"a": {Image: "golang:1.27", Steps: []Step{{Run: "x"}}},
+	}}
+	if err := s.RequireComplete(map[string]string{}); err == nil {
+		t.Fatal("empty lock map must be incomplete when mutable refs exist")
+	}
+	// No document at all remains ordinary policy.
+	if err := s.RequireComplete(nil); err != nil {
+		t.Fatalf("nil lock = %v", err)
+	}
+	// All-digest spec is complete even under an empty lock map.
+	pinned := &Spec{Jobs: map[string]Job{
+		"b": {Image: "alpine:3.20@sha256:" + strings.Repeat("f", 64), Steps: []Step{{Run: "y"}}},
+	}}
+	if err := pinned.RequireComplete(map[string]string{}); err != nil {
+		t.Fatalf("digest-only spec under empty lock = %v", err)
+	}
+}

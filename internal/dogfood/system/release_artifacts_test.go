@@ -4,8 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -273,18 +276,42 @@ func startBinaryServer(t *testing.T, bin, dataDir, adminToken, runnerToken strin
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		t.Fatalf("mkdir data dir: %v", err)
 	}
+	// Minimal forge stand-in so the product binary never reaches a real
+	// forge API: revision resolution answers a deterministic full SHA and
+	// lock.json is a genuine 404 (no lockfile). The self-build schedule
+	// lives on a github.com coordinate, so without this the binary would
+	// hit api.github.com and fail on rate limits.
+	forgeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/commits/"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"sha": strings.Repeat("a", 40)})
+		case strings.Contains(r.URL.Path, "/contents/"):
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(forgeSrv.Close)
 	logPath := filepath.Join(t.TempDir(), "server.log")
 	logFile, err := os.Create(logPath)
 	if err != nil {
 		t.Fatalf("create server log: %v", err)
 	}
-	cmd := exec.Command(bin, "server",
+	// An older product binary predates --github-api-base. Probe the help
+	// text rather than Wait() on a long-running server.
+	args := []string{
 		"--data-dir", dataDir,
 		"--listen", "127.0.0.1:0",
 		"--admin-token", adminToken,
 		"--runner-token", runnerToken,
 		"--mode", "dev",
-	)
+	}
+	probeOut, _ := exec.Command(bin, "server", "--help").CombinedOutput()
+	if strings.Contains(string(probeOut), "github-api-base") {
+		args = append(args, "--github-api-base", forgeSrv.URL)
+	}
+	cmd := exec.Command(bin, append([]string{"server"}, args...)...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.Env = os.Environ()

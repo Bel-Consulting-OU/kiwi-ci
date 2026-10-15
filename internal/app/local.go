@@ -47,11 +47,16 @@ func RunLocal(ctx context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	// Resolve image tags through .kiwi/lock.json so a local run uses the
-	// locked digests even when the YAML kept readable tags.
-	executor.ImageResolver = LockLookup
 	spec, err := pipeline.Load(*file)
 	if err != nil {
+		return err
+	}
+	// Image lock is COMPILATION authority, identical to the server
+	// resolver: the lockfile is parsed strictly, applied to the effective
+	// spec, and completeness is enforced BEFORE compile. Executor-time
+	// rewrites are not authority — the compiled graph's identity must
+	// describe what actually executes.
+	if err := applyLocalImageLock(spec, lockRootFor(*file)); err != nil {
 		return err
 	}
 	// The same input contract the server enforces at enqueue: defaults are
@@ -167,6 +172,9 @@ func Validate(args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := applyLocalImageLock(s, lockRootFor(*file)); err != nil {
+		return err
+	}
 	g, err := pipeline.Compile(s)
 	if err != nil {
 		return err
@@ -188,6 +196,9 @@ func Explain(args []string) error {
 	}
 	s, err := pipeline.Load(*file)
 	if err != nil {
+		return err
+	}
+	if err := applyLocalImageLock(s, lockRootFor(*file)); err != nil {
 		return err
 	}
 	var inputsMap map[string]string

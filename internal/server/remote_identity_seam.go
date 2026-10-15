@@ -58,7 +58,7 @@ func (s *Server) maybeAutoStubRemoteIdentity() {
 	if !runningUnderTest() {
 		return
 	}
-	if s.gitHubAPIBase != "" || s.gitLabAPIBase != "" || s.forgejoAPIBase != "" {
+	if s.gitHubAPIBase != "" || s.gitLabAPIBase != "" || s.forgejoAPIBase != "" || s.bitbucketAPIBase != "" {
 		return
 	}
 	s.StubRemoteIdentityForTest()

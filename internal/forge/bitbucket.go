@@ -78,6 +78,33 @@ func (b *Bitbucket) VerifyWebhook(body []byte, signatureOrToken string, headers 
 	return fmt.Errorf("invalid webhook signature")
 }
 
+// bitBucketActionMap normalizes Bitbucket pull-request states and event-key
+// suffixes to the canonical GitHub-style action vocabulary used by trigger
+// matching (opened / synchronize / reopened / closed).
+var bitBucketActionMap = map[string]string{
+	"created":   "opened",
+	"updated":   "synchronize",
+	"open":      "opened",
+	"update":    "synchronize",
+	"reopen":    "reopened",
+	"reopened":  "reopened",
+	"fulfilled": "closed",
+	"rejected":  "closed",
+	"merged":    "closed",
+	"declined":  "closed",
+}
+
+func bitBucketAction(raw string) string {
+	key := strings.ToLower(strings.TrimSpace(raw))
+	if key == "" {
+		return ""
+	}
+	if mapped, ok := bitBucketActionMap[key]; ok {
+		return mapped
+	}
+	return key
+}
+
 // ParseEvent normalizes a Bitbucket push/pull-request payload.
 func (b *Bitbucket) ParseEvent(body []byte) (EventContext, error) {
 	var env struct {
@@ -96,37 +123,57 @@ func (b *Bitbucket) ParseEvent(body []byte) (EventContext, error) {
 		ch := env.Push.Changes[0]
 		sha := ""
 		ref := ""
+		base := ""
 		if ch.New != nil {
 			sha = ch.New.Target.Hash
 			ref = ch.New.Name
 		}
-		if sha == "" && ch.Old != nil {
-			sha = ch.Old.Target.Hash
-			ref = ch.Old.Name
+		if ch.Old != nil {
+			base = ch.Old.Target.Hash
+			if ref == "" {
+				ref = ch.Old.Name
+			}
 		}
 		return EventContext{
 			Forge:          "bitbucket",
 			Event:          "push",
 			Ref:            ref,
 			HeadSHA:        sha,
+			BaseSHA:        base,
 			Repository:     repo,
 			HeadRepository: repo,
+			// Push events on the hooked repository carry its own refs;
+			// same trust model as every other forge adapter.
+			Trusted: true,
 		}, nil
 	}
 	if env.PullReq != nil {
 		srcRef := "refs/heads/" + env.PullReq.Source.Branch.Name
 		dstRef := "refs/heads/" + env.PullReq.Destination.Branch.Name
+		head := repo
+		if env.PullReq.Source.Repository.FullName != "" {
+			head = Repository{Forge: "bitbucket", FullName: env.PullReq.Source.Repository.FullName}
+		}
+		// Prefer the webhook action (X-Event-Key suffix) when present;
+		// otherwise normalize the PR state. Never leak Bitbucket's raw
+		// state vocabulary into trigger matching.
+		action := bitBucketAction(env.PullReq.Action)
+		if action == "" {
+			action = bitBucketAction(env.PullReq.State)
+		}
 		return EventContext{
 			Forge:          "bitbucket",
 			Event:          "pull_request",
-			Action:         env.PullReq.State,
+			Action:         action,
 			Ref:            srcRef,
 			BaseRef:        dstRef,
 			HeadSHA:        env.PullReq.Source.Commit.Hash,
 			BaseSHA:        env.PullReq.Destination.Commit.Hash,
 			PullRequest:    env.PullReq.ID,
 			Repository:     repo,
-			HeadRepository: repo,
+			HeadRepository: head,
+			Trusted:        head.FullName == repo.FullName,
+			Draft:          env.PullReq.Draft,
 		}, nil
 	}
 	return EventContext{}, nil
@@ -150,8 +197,13 @@ type bitbucketPush struct {
 }
 
 type bitbucketPR struct {
-	ID     int    `json:"id"`
-	State  string `json:"state"`
+	ID    int    `json:"id"`
+	State string `json:"state"`
+	// Action is not a Bitbucket field; the webhook layer injects the
+	// X-Event-Key suffix here before ParseEvent so adapters and trigger
+	// matching share one normalized vocabulary.
+	Action string `json:"kiwi_action"`
+	Draft  bool   `json:"draft"`
 	Author struct {
 		Username string `json:"username"`
 	} `json:"author"`
@@ -162,6 +214,9 @@ type bitbucketPR struct {
 		Commit struct {
 			Hash string `json:"hash"`
 		} `json:"commit"`
+		Repository struct {
+			FullName string `json:"full_name"`
+		} `json:"repository"`
 	} `json:"source"`
 	Destination struct {
 		Branch struct {
@@ -170,6 +225,9 @@ type bitbucketPR struct {
 		Commit struct {
 			Hash string `json:"hash"`
 		} `json:"commit"`
+		Repository struct {
+			FullName string `json:"full_name"`
+		} `json:"repository"`
 	} `json:"destination"`
 }
 
@@ -205,14 +263,13 @@ func (b *Bitbucket) do(ctx context.Context, method, urlStr string) ([]byte, erro
 }
 
 func (b *Bitbucket) FetchFile(ctx context.Context, repoFullName, path, ref string) (string, error) {
-	q := url.Values{}
-	if ref != "" {
-		q.Set("at", ref)
+	if strings.TrimSpace(ref) == "" {
+		return "", fmt.Errorf("bitbucket fetch file: empty ref (mutable default branch is not execution authority)")
 	}
-	u := fmt.Sprintf("%s/repositories/%s/src/%s/%s", b.apiBase(), repoFullName, ref, strings.TrimPrefix(path, "/"))
-	if len(q) > 0 {
-		u += "?" + q.Encode()
-	}
+	// One identity in the path. The `at` query is a second, weaker binding
+	// that some clients set inconsistently — never both.
+	u := fmt.Sprintf("%s/repositories/%s/src/%s/%s",
+		b.apiBase(), repoFullName, url.PathEscape(ref), strings.TrimPrefix(path, "/"))
 	raw, err := b.do(ctx, "GET", u)
 	if err != nil {
 		return "", err

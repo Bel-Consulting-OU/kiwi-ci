@@ -748,10 +748,11 @@ func (s *Server) triggerSchedule(w http.ResponseWriter, r *http.Request) {
 		// Any other fire error (invalid stored identity, ID generation, a
 		// failed durable re-read) stays the generic 500. Identity-pinning
 		// failures (resolve revision / fetch lock) are gateway conditions:
-		// surface them as 502 so a forge outage is retryable and visible.
+		// surface them as 502 so a forge outage is retryable and visible,
+		// with an opaque body (the raw forge error is not a client fact).
 		var gw *gatewayError
 		if errors.As(err, &gw) {
-			http.Error(w, gw.Error(), http.StatusBadGateway)
+			s.serverError(w, r, http.StatusBadGateway, gw, "identity pinning")
 			return
 		}
 		s.internalError(w, r, err, "")

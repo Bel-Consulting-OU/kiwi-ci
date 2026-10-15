@@ -512,7 +512,10 @@ func TestFlowDownstreamAppendRunDB(t *testing.T) {
 	}
 }
 
-func TestFlowDownstreamFetchPipelineDefaultForgeSuccess(t *testing.T) {
+// An unknown forge kind must NEVER fall through to "try every adapter":
+// a pipeline fetched from a same-named repo on a different host is forged
+// execution input. The child has no adapter and therefore no fetch.
+func TestFlowDownstreamFetchPipelineUnknownForgeIsNotTried(t *testing.T) {
 	payload, _ := json.Marshal(map[string]string{"content": base64.StdEncoding.EncodeToString([]byte("pipeline body")), "encoding": "base64"})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -522,8 +525,16 @@ func TestFlowDownstreamFetchPipelineDefaultForgeSuccess(t *testing.T) {
 	s := New("tok")
 	s.SetForgeBaseURL("github", srv.URL)
 	got, err := s.fetchDownstreamPipeline(context.Background(), "mystery", "", "o/r", "refs/heads/main")
+	if err == nil {
+		t.Fatalf("unknown forge must fail closed, got %q", got)
+	}
+	if !strings.Contains(err.Error(), "unknown forge") {
+		t.Fatalf("error must name the unknown kind: %v", err)
+	}
+	// The named adapter still works.
+	got, err = s.fetchDownstreamPipeline(context.Background(), "github", "", "o/r", "refs/heads/main")
 	if err != nil || got != "pipeline body" {
-		t.Fatalf("default forge fetch = %q %v", got, err)
+		t.Fatalf("github fetch = %q %v", got, err)
 	}
 }
 
@@ -891,5 +902,28 @@ func TestFlowDownstreamIntentIDConflictNotSwallowed(t *testing.T) {
 	}
 	if got.LaunchToken != "token-A" || got.Inputs["variant"] != "A" {
 		t.Fatalf("recorded intent after the conflict = %+v; want the original A content", got)
+	}
+}
+
+// The image-lock fetch is forge-bound exactly like the pipeline fetch:
+// an unknown kind must never "try every adapter" and pick up a lock from
+// a same-named repo on a different host.
+func TestFlowDownstreamImageLockUnknownForgeIsNotTried(t *testing.T) {
+	s := New("tok", WithGitHubAPIBase("http://127.0.0.1:1"))
+	// Constructor-option base skips auto-stub; also clear any seam so the
+	// real adapter path is exercised (stub would short-circuit to "", nil).
+	s.RevisionResolver = nil
+	s.ImageLockFetcher = nil
+	s.DownstreamImageLockFetcher = nil
+	got, err := s.fetchDownstreamImageLock(context.Background(), "mystery", "", "o/r", strings.Repeat("a", 40))
+	if err != nil {
+		t.Fatalf("unknown kind is 'no adapter, no lock', not a transport error: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("unknown kind must not return a lock, got %q", got)
+	}
+	// Known kind against a dead endpoint is fail-closed (transport error).
+	if _, err := s.fetchDownstreamImageLock(context.Background(), "github", "", "o/r", strings.Repeat("a", 40)); err == nil {
+		t.Fatal("known kind + transport failure must fail closed")
 	}
 }

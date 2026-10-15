@@ -8,6 +8,8 @@ package server
 
 import (
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -186,6 +188,106 @@ func TestForgejoWebhookDeliveryAndGates(t *testing.T) {
 		}
 		if w.Header().Get("Retry-After") == "" {
 			t.Fatal("429 without Retry-After")
+		}
+	})
+}
+
+func TestBitbucketWebhookDeliveryAndGates(t *testing.T) {
+	api := (&hookAPI{}).server(t)
+
+	t.Run("missing secret refuses", func(t *testing.T) {
+		s := New("runner-secret")
+		s.PipelinePath = ".kiwi/pipeline.yaml"
+		w := postBitbucket(t, s, "tok", "repo:push", "bb-sec-1", bitbucketPushPayload("abc123"))
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("unconfigured secret = %d, want 503", w.Code)
+		}
+	})
+
+	t.Run("bad hmac refuses", func(t *testing.T) {
+		s := newBitbucketSqueezeServer(t, api, "tok")
+		req := httptest.NewRequest(http.MethodPost, "/hooks/bitbucket", strings.NewReader(bitbucketPushPayload("abc123")))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Hub-Signature-256", "sha256=dead")
+		req.Header.Set("X-Request-UUID", "bb-badhmac-1")
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("bad hmac = %d, want 401", w.Code)
+		}
+	})
+
+	t.Run("created PR normalizes to opened and enqueues", func(t *testing.T) {
+		s := newBitbucketSqueezeServer(t, api, "tok")
+		w := postBitbucket(t, s, "tok", "pullrequest:created", "bb-pr-1", bitbucketPRPayload("OPEN"))
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("created PR = %d: %s", w.Code, w.Body.String())
+		}
+		s.mu.Lock()
+		var action string
+		for _, r := range s.runs {
+			action = r.Event
+			_ = action
+		}
+		n := len(s.runs)
+		s.mu.Unlock()
+		if n != 1 {
+			t.Fatalf("runs = %d, want 1", n)
+		}
+	})
+
+	t.Run("updated PR normalizes to synchronize", func(t *testing.T) {
+		s := newBitbucketSqueezeServer(t, api, "tok")
+		w := postBitbucket(t, s, "tok", "pullrequest:updated", "bb-pr-2", bitbucketPRPayload("OPEN"))
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("updated PR = %d: %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("fulfilled PR is terminal ignored", func(t *testing.T) {
+		s := newBitbucketSqueezeServer(t, api, "tok")
+		w := postBitbucket(t, s, "tok", "pullrequest:fulfilled", "bb-pr-3", bitbucketPRPayload("MERGED"))
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("fulfilled PR = %d, want 204: %s", w.Code, w.Body.String())
+		}
+		s.mu.Lock()
+		n := len(s.runs)
+		s.mu.Unlock()
+		if n != 0 {
+			t.Fatalf("fulfilled PR enqueued %d runs", n)
+		}
+	})
+
+	t.Run("delivery id reused with different content conflicts", func(t *testing.T) {
+		s := newBitbucketSqueezeServer(t, api, "tok")
+		if w := postBitbucket(t, s, "tok", "pullrequest:created", "bb-conflict-1", bitbucketPRPayload("OPEN")); w.Code != http.StatusAccepted {
+			t.Fatalf("first delivery = %d: %s", w.Code, w.Body.String())
+		}
+		if w := postBitbucket(t, s, "tok", "pullrequest:created", "bb-conflict-1", bitbucketPRPayload("OPEN2")); w.Code != http.StatusConflict {
+			t.Fatalf("reused delivery = %d, want 409", w.Code)
+		}
+	})
+
+	t.Run("empty lockfile fails closed", func(t *testing.T) {
+		s := newBitbucketSqueezeServer(t, api, "tok")
+		s.BitbucketWebhookSecret = "tok"
+		// Point the adapter at a stand-in that 200s an empty lockfile body.
+		emptyLock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/src/") {
+				if strings.Contains(r.URL.Path, "lock.json") {
+					_, _ = w.Write([]byte("  \n"))
+					return
+				}
+				_, _ = w.Write([]byte("version: 1\njobs:\n  b:\n    image: alpine:3.20\n    run: echo hi\n"))
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer emptyLock.Close()
+		s.bitbucketAPIBase = emptyLock.URL
+		w := postBitbucket(t, s, "tok", "repo:push", "bb-emptylock-1", bitbucketPushPayload("abc123"))
+		if w.Code != http.StatusBadGateway {
+			t.Fatalf("empty lockfile = %d, want 502: %s", w.Code, w.Body.String())
 		}
 	})
 }

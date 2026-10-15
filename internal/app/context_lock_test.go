@@ -97,7 +97,7 @@ func TestLockCommandWritesFile(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 	ResolveImageDigest = func(ref string) (string, error) {
-		return ref + "@sha256:deadbeef", nil
+		return ref + "@sha256:" + strings.Repeat("d", 64), nil
 	}
 	t.Cleanup(func() { ResolveImageDigest = resolveImageDigestCLI })
 	p := filepath.Join(dir, "p.yaml")
@@ -111,12 +111,12 @@ func TestLockCommandWritesFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(raw), "golang:1.27@sha256:deadbeef") {
+	if !strings.Contains(string(raw), "golang:1.27@sha256:"+strings.Repeat("d", 64)) {
 		t.Fatalf("lockfile = %s", raw)
 	}
 	// A digest change without --update must refuse.
 	ResolveImageDigest = func(ref string) (string, error) {
-		return ref + "@sha256:cafebabe", nil
+		return ref + "@sha256:" + strings.Repeat("c", 64), nil
 	}
 	if err := LockCommand([]string{"-f", p}); err == nil {
 		t.Fatal("digest change without --update must be refused")
@@ -139,7 +139,7 @@ func TestLockLookupUsesWorkspaceRootNotCWD(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(ws, ".kiwi"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	lock := `{"version":1,"images":[{"ref":"golang:1.27","digest":"golang:1.27@sha256:abc"}]}`
+	lock := `{"version":1,"images":[{"ref":"golang:1.27","digest":"golang:1.27@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}`
 	if err := os.WriteFile(filepath.Join(ws, ".kiwi", "lock.json"), []byte(lock), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -149,12 +149,12 @@ func TestLockLookupUsesWorkspaceRootNotCWD(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(other, ".kiwi"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	otherLock := `{"version":1,"images":[{"ref":"golang:1.27","digest":"golang:1.27@sha256:WRONG"}]}`
+	otherLock := `{"version":1,"images":[{"ref":"golang:1.27","digest":"golang:1.27@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]}`
 	if err := os.WriteFile(filepath.Join(other, ".kiwi", "lock.json"), []byte(otherLock), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	got := LockLookup(ws, "golang:1.27")
-	if got != "golang:1.27@sha256:abc" {
+	if got != "golang:1.27@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
 		t.Fatalf("LockLookup(ws) = %q, want the WORKSPACE lock (not CWD %q)", got, other)
 	}
 }
@@ -168,20 +168,185 @@ func TestLockLookupCoversServiceAndVM(t *testing.T) {
 		t.Fatal(err)
 	}
 	lock := `{"version":1,"images":[
-		{"ref":"golang:1.27","digest":"golang:1.27@sha256:aaa"},
-		{"ref":"postgres:16","digest":"postgres:16@sha256:bbb"},
-		{"ref":"macos:15","digest":"macos:15@sha256:ccc"}
+		{"ref":"golang:1.27","digest":"golang:1.27@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+		{"ref":"postgres:16","digest":"postgres:16@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
+		{"ref":"macos:15","digest":"macos:15@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}
 	]}`
 	if err := os.WriteFile(filepath.Join(ws, ".kiwi", "lock.json"), []byte(lock), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	for ref, want := range map[string]string{
-		"golang:1.27": "golang:1.27@sha256:aaa",
-		"postgres:16": "postgres:16@sha256:bbb",
-		"macos:15":    "macos:15@sha256:ccc",
+		"golang:1.27": "golang:1.27@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+		"postgres:16": "postgres:16@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+		"macos:15":    "macos:15@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
 	} {
 		if got := LockLookup(ws, ref); got != want {
 			t.Fatalf("LockLookup(%s) = %q, want %q", ref, got, want)
 		}
+	}
+}
+
+// Local execution applies the lock at COMPILE time via the same strict
+// algorithm as the server (ParseImageLockfile + RequireComplete +
+// ApplyImageLock). A malformed lock is fail-closed; an incomplete lock
+// (lock exists, mutable ref missing) is fail-closed.
+func TestApplyLocalImageLockStrictAndComplete(t *testing.T) {
+	ws := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(ws, ".kiwi"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	spec, err := pipeline.Parse([]byte("version: 1\njobs:\n  b:\n    image: golang:1.27\n    run: echo hi\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No lockfile: fine.
+	if err := applyLocalImageLock(spec, ws); err != nil {
+		t.Fatalf("no lock = %v", err)
+	}
+	// Malformed lock: fail closed.
+	if err := os.WriteFile(filepath.Join(ws, ".kiwi", "lock.json"), []byte("not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyLocalImageLock(spec, ws); err == nil {
+		t.Fatal("malformed lock must fail closed")
+	}
+	// Incomplete lock: fail closed (mutable ref has no entry).
+	lock := `{"version":1,"images":[{"ref":"other:1","digest":"other:1@sha256:` + strings.Repeat("a", 64) + `"}]}`
+	if err := os.WriteFile(filepath.Join(ws, ".kiwi", "lock.json"), []byte(lock), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyLocalImageLock(spec, ws); err == nil {
+		t.Fatal("incomplete lock must fail closed")
+	}
+	// Present-but-empty lockfile is NOT "no lockfile" — fail closed.
+	if err := os.WriteFile(filepath.Join(ws, ".kiwi", "lock.json"), []byte("  \n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyLocalImageLock(spec, ws); err == nil {
+		t.Fatal("empty lockfile must fail closed")
+	}
+	// Empty images list claims authority while pinning nothing — fail closed.
+	if err := os.WriteFile(filepath.Join(ws, ".kiwi", "lock.json"), []byte(`{"version":1,"images":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyLocalImageLock(spec, ws); err == nil {
+		t.Fatal("empty images lock must fail closed")
+	}
+	// Complete lock: applied.
+	lock = `{"version":1,"images":[{"ref":"golang:1.27","digest":"golang:1.27@sha256:` + strings.Repeat("b", 64) + `"}]}`
+	if err := os.WriteFile(filepath.Join(ws, ".kiwi", "lock.json"), []byte(lock), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyLocalImageLock(spec, ws); err != nil {
+		t.Fatalf("complete lock = %v", err)
+	}
+	if !strings.Contains(spec.Jobs["b"].Image, "@sha256:") {
+		t.Fatalf("image not locked: %q", spec.Jobs["b"].Image)
+	}
+}
+
+// Default -f .kiwi/pipeline.yaml must read/write .kiwi/lock.json at the
+// project root — never .kiwi/.kiwi/lock.json.
+func TestLockRootForDefaultPipelinePath(t *testing.T) {
+	if got := lockRootFor(".kiwi/pipeline.yaml"); got != "." && got != "" {
+		// filepath.Dir(".kiwi/pipeline.yaml") = ".kiwi", parent = "."
+		if got != filepath.Dir(".kiwi") {
+			t.Fatalf("lockRootFor(.kiwi/pipeline.yaml) = %q", got)
+		}
+	}
+	if got := lockRootFor("ci/pipeline.yaml"); got != "ci" {
+		t.Fatalf("lockRootFor(ci/pipeline.yaml) = %q", got)
+	}
+	if got := lockRootFor("pipeline.yaml"); got != "." {
+		t.Fatalf("lockRootFor(pipeline.yaml) = %q", got)
+	}
+}
+
+// kiwi lock must write next to the pipeline's project root, not CWD.
+func TestLockCommandWritesBesidePipelineProjectRoot(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	ResolveImageDigest = func(ref string) (string, error) {
+		return ref + "@sha256:" + strings.Repeat("e", 64), nil
+	}
+	t.Cleanup(func() { ResolveImageDigest = resolveImageDigestCLI })
+	p := filepath.Join(dir, ".kiwi", "pipeline.yaml")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte("version: 1\njobs:\n  b:\n    image: golang:1.27\n    run: echo hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := LockCommand([]string{"-f", p}); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(dir, ".kiwi", "lock.json")
+	if _, err := os.Stat(lockPath); err != nil {
+		t.Fatalf("lock must land at %s: %v", lockPath, err)
+	}
+	nested := filepath.Join(dir, ".kiwi", ".kiwi", "lock.json")
+	if _, err := os.Stat(nested); err == nil {
+		t.Fatal("lock must NOT nest at .kiwi/.kiwi/lock.json")
+	}
+	// applyLocalImageLock must find that same document.
+	spec, err := pipeline.Parse([]byte("version: 1\njobs:\n  b:\n    image: golang:1.27\n    run: echo hi\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applyLocalImageLock(spec, lockRootFor(p)); err != nil {
+		t.Fatalf("applyLocalImageLock = %v", err)
+	}
+	if !strings.Contains(spec.Jobs["b"].Image, "@sha256:") {
+		t.Fatalf("image not locked: %q", spec.Jobs["b"].Image)
+	}
+}
+
+// kiwi lock cannot see component-injected images. Writing a lock that
+// omits them would be an incomplete authority document; refuse instead.
+func TestLockCommandRefusesComponentJobs(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	ResolveImageDigest = func(ref string) (string, error) {
+		return ref + "@sha256:" + strings.Repeat("e", 64), nil
+	}
+	t.Cleanup(func() { ResolveImageDigest = resolveImageDigestCLI })
+	p := filepath.Join(dir, "p.yaml")
+	body := "version: 1\njobs:\n  b:\n    component: build@sha256:" + strings.Repeat("a", 64) + "\n    with:\n      environment: staging\n"
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := LockCommand([]string{"-f", p})
+	if err == nil {
+		t.Fatal("component pipeline must be refused by kiwi lock")
+	}
+	if !strings.Contains(err.Error(), "component") {
+		t.Fatalf("error must name the component gap: %v", err)
+	}
+}
+
+// A component job's injected images are invisible to the local spec, so
+// once a lockfile exists a local completeness check can never cover them.
+// No lockfile remains ordinary trusted policy (components still need the
+// control plane at run time).
+func TestApplyLocalImageLockRefusesComponents(t *testing.T) {
+	ws := t.TempDir()
+	spec, err := pipeline.ParseWithComponents([]byte("version: 1\njobs:\n  b:\n    component: build@sha256:" + strings.Repeat("a", 64) + "\n    with:\n      environment: staging\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No lockfile: ordinary policy, not a lock-completeness error.
+	if err := applyLocalImageLock(spec, ws); err != nil {
+		t.Fatalf("no lockfile = %v", err)
+	}
+	// Present lockfile: must refuse rather than under-count ImageRefs.
+	if err := os.MkdirAll(filepath.Join(ws, ".kiwi"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lock := `{"version":1,"images":[{"ref":"x:1","digest":"x:1@sha256:` + strings.Repeat("c", 64) + `"}]}`
+	if err := os.WriteFile(filepath.Join(ws, ".kiwi", "lock.json"), []byte(lock), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyLocalImageLock(spec, ws); err == nil {
+		t.Fatal("component pipeline + lockfile must be refused")
 	}
 }
