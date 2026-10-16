@@ -16,22 +16,145 @@ import (
 	"time"
 )
 
-// Doctor is the diagnostic engine (`kiwi doctor [--server URL]`). Local
-// checks cover the execution substrate; --server checks cover the control
-// plane. Every finding prints an exact fix, not just a red X.
+// Doctor is the diagnostic engine (`kiwi doctor [--server URL] [--job ID]`).
+// Local checks cover the execution substrate; --server checks cover the
+// control plane; --job answers "can this job run here?" against live runner
+// eligibility. Every finding prints an exact fix, not just a red X.
 func Doctor(args []string) error {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	server := fs.String("server", "", "also diagnose a Kiwi control plane URL")
+	job := fs.String("job", "", "explain why a job can/cannot run: name the missing runner capability")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	fmt.Printf("OS: %s/%s  Go: %s\n", runtime.GOOS, runtime.GOARCH, runtime.Version())
 	localDoctor()
-	if *server != "" {
+	// One endpoint resolution for the server and job probes.
+	base := *server
+	if base == "" {
+		if ep, err := ResolveEndpoint("", ""); err == nil {
+			base = ep.Server
+		}
+	}
+	if *server != "" || *job != "" {
 		fmt.Println()
-		serverDoctor(*server)
+		serverDoctor(base)
+	}
+	if *job != "" {
+		fmt.Println()
+		if err := jobDoctor(base, *job); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// jobDoctor answers the audit's operator question: "this job cannot run
+// because no online runner satisfies: linux + arm64 + container + …". It
+// reads the job's required labels from the API and compares them with every
+// online runner's capabilities.
+func jobDoctor(base, jobID string) error {
+	fmt.Println("== job " + jobID + " ==")
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(base, "/")+"/api/v1/jobs/"+jobID, nil)
+	if err != nil {
+		return err
+	}
+	if tok, err := (&Endpoint{Server: base}).tokenForProbe(); err == nil && tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Printf("job          FAIL (%v)\n", err)
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Printf("job          FAIL (HTTP %d)\n", resp.StatusCode)
+		return nil
+	}
+	var j struct {
+		Key            string   `json:"key"`
+		Status         string   `json:"status"`
+		RequiredLabels []string `json:"required_labels"`
+		Placement      struct {
+			Regions []string `json:"regions"`
+		} `json:"placement"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&j); err != nil {
+		fmt.Printf("job          FAIL (decode: %v)\n", err)
+		return nil
+	}
+	fmt.Printf("key          %s\n", j.Key)
+	fmt.Printf("status       %s\n", j.Status)
+	fmt.Printf("requires     %s\n", strings.Join(j.RequiredLabels, " + "))
+	if len(j.Placement.Regions) > 0 {
+		fmt.Printf("regions      %s\n", strings.Join(j.Placement.Regions, ", "))
+	}
+
+	// Runner eligibility.
+	rreq, err := http.NewRequest(http.MethodGet, strings.TrimRight(base, "/")+"/api/v1/runners", nil)
+	if err != nil {
+		return err
+	}
+	if tok, err := (&Endpoint{Server: base}).tokenForProbe(); err == nil && tok != "" {
+		rreq.Header.Set("Authorization", "Bearer "+tok)
+	}
+	rresp, err := client.Do(rreq)
+	if err != nil {
+		fmt.Printf("runners      FAIL (%v)\n", err)
+		return nil
+	}
+	defer rresp.Body.Close()
+	var runners struct {
+		Runners []struct {
+			ID       string   `json:"id"`
+			Name     string   `json:"name"`
+			Labels   []string `json:"labels"`
+			Status   string   `json:"status"`
+			Capacity struct {
+				CPU    int64 `json:"cpu"`
+				Memory int64 `json:"memory"`
+			} `json:"capacity"`
+		} `json:"runners"`
+	}
+	_ = json.NewDecoder(rresp.Body).Decode(&runners)
+
+	matched := 0
+	for _, r := range runners.Runners {
+		if !runnerSatisfies(r.Labels, j.RequiredLabels) {
+			continue
+		}
+		matched++
+		fmt.Printf("✓ runner     %s (labels: %s)\n", r.Name, strings.Join(r.Labels, ","))
+	}
+	if matched == 0 {
+		fmt.Printf("✗ no online runner satisfies: %s\n", strings.Join(j.RequiredLabels, " + "))
+		fmt.Println("  → provision a runner carrying those labels (`kiwi runner register --labels …`)")
+	} else {
+		fmt.Printf("eligible     %d runner(s)\n", matched)
+	}
+	return nil
+}
+
+// runnerSatisfies reports whether a runner's labels are a superset of the
+// job's required labels — the scheduler's eligibility rule, stated once.
+func runnerSatisfies(have, need []string) bool {
+	set := map[string]bool{}
+	for _, l := range have {
+		set[l] = true
+	}
+	for _, l := range need {
+		if !set[l] {
+			return false
+		}
+	}
+	return true
+}
+
+// tokenForProbe is the doctor's credential lookup (never prints the token).
+func (e Endpoint) tokenForProbe() (string, error) {
+	return e.RequireToken()
 }
 
 func localDoctor() {

@@ -689,6 +689,10 @@ func (s *Server) issueSecret(w http.ResponseWriter, r *http.Request) {
 	// explainSecret never touches the broker (a decision is not a
 	// resolution), so this stays before any store or broker work.
 	d := s.explainSecret(r.Context(), j, in.Name)
+	// Stamp the audit id on the decision BEFORE the verdict is consumed so
+	// the durable secret.issued audit and the operator explain share one
+	// identity for this delivery attempt.
+	d.AuditID = "secret.decision." + j.ID + "." + in.Name
 	if !d.Allowed {
 		status := http.StatusForbidden
 		switch d.Stage {

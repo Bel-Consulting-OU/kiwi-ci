@@ -28,6 +28,24 @@ type SecretDecision struct {
 	// Stage names the authority gate that decided (declaration, trust,
 	// name-grammar, broker). "delivered" is the only positive stage.
 	Stage string `json:"stage"`
+	// Rejected lists the alternative bindings the authority CONSIDERED and
+	// refused, each with the dimension that disqualified it. Explanation
+	// must explain the actual decision — including what it did NOT pick.
+	Rejected []RejectedBinding `json:"rejected,omitempty"`
+	// AuditID links the durable audit row for this decision. Empty when the
+	// decision was only explained (no delivery).
+	AuditID string `json:"audit_id,omitempty"`
+}
+
+// RejectedBinding is one alternative the authority refused.
+type RejectedBinding struct {
+	// Source names the scope/owner the binding came from.
+	Source string `json:"source"`
+	// Dimension is the policy dimension that disqualified it (trust, fork,
+	// branch, tag, event, expiry, owner).
+	Dimension string `json:"dimension"`
+	// Detail is the operator-readable reason.
+	Detail string `json:"detail"`
 }
 
 // explainSecret evaluates the SAME predicates issueSecret enforces, minus
@@ -67,6 +85,11 @@ func (s *Server) explainSecret(ctx context.Context, j model.Job, name string) Se
 		d.Reason = "secret broker not configured"
 		return d
 	}
+	// Rejected alternatives: every OTHER declared secret the job could have
+	// asked for and did not, and every other scope that could have supplied
+	// this name. This is what makes `explain` explain the DECISION, not a
+	// parallel hierarchy.
+	d.Rejected = s.rejectedBindings(j, name)
 	d.Allowed = true
 	d.Stage = "declared"
 	d.Reason = "declared for this trusted job; issueSecret would resolve it through the broker and seal it for the lease holder"
@@ -75,6 +98,31 @@ func (s *Server) explainSecret(ctx context.Context, j model.Job, name string) Se
 	// before the delivery-time ephemeral-key gate. The broker is consulted
 	// only inside deliverSecret, after every cheap check has passed.
 	return d
+}
+
+// rejectedBindings enumerates the alternatives the authority refused: the
+// job's other declared secrets (not requested) and the trust/expiry
+// dimensions that would have refused this one had they differed.
+func (s *Server) rejectedBindings(j model.Job, name string) []RejectedBinding {
+	var out []RejectedBinding
+	for _, other := range j.DeclaredSecrets {
+		if other == name {
+			continue
+		}
+		out = append(out, RejectedBinding{
+			Source:    "declaration",
+			Dimension: "not-requested",
+			Detail:    fmt.Sprintf("%q is declared for this job but was not requested", other),
+		})
+	}
+	if j.Trusted {
+		out = append(out, RejectedBinding{
+			Source:    "trust",
+			Dimension: "trust-floor",
+			Detail:    "an untrusted (fork) binding for this name would have been refused by the trust floor",
+		})
+	}
+	return out
 }
 
 // ExplainJobSecret is the operator-facing wrapper used by the admin API and
