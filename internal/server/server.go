@@ -5264,6 +5264,12 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 			s.logError("forge status enqueue failed", "run", run.ID, "error", err.Error())
 		}
 	}
+	// Flush the outbox NOW instead of waiting for the next Maintain tick:
+	// the execution attestation is a completion effect, and leaving it
+	// queued for up to the 5s housekeeping interval made evidence appear
+	// seconds after the job finished. Bounded and idempotent; the Maintain
+	// loop still retries anything this flush cannot finish.
+	s.flushOutboxKind(r.Context(), storage.OutboxKindExecutionAttest)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -5399,6 +5405,14 @@ func (s *Server) completeDB(w http.ResponseWriter, r *http.Request, jobID string
 		s.internalError(w, r, derr, "")
 		return
 	}
+	// Flush the outbox NOW instead of waiting for the next Maintain tick.
+	// The execution attestation is a completion effect: leaving it queued
+	// for up to the 5s housekeeping interval made evidence appear seconds
+	// after the job finished — the audit's "evidence overhead" row was
+	// measuring scheduler cadence, not evidence cost. A flush here is
+	// bounded (outboxFlushTimeout) and idempotent; a failure is retried by
+	// the Maintain loop as before.
+	s.flushOutboxKind(ctx, storage.OutboxKindExecutionAttest)
 	w.WriteHeader(http.StatusNoContent)
 }
 

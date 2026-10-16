@@ -1064,9 +1064,18 @@ func (o *Outbox) compactLocked() error {
 // ack → local pop.
 func (o *Outbox) flushLocal(ctx context.Context, dispatch func(context.Context, forge.OutboxItem) error) (int, error) {
 	dispatched := 0
+	// skipped counts consecutive intents the dispatch filter refused to
+	// handle this pass. After one full rotation of unhandled intents the
+	// pass ends so a kind-filtered flush cannot spin forever on a queue
+	// that contains only out-of-scope kinds.
+	skipped := 0
 	for {
 		o.mu.Lock()
 		if len(o.items) == 0 {
+			o.mu.Unlock()
+			return dispatched, nil
+		}
+		if skipped > 0 && skipped >= len(o.items) {
 			o.mu.Unlock()
 			return dispatched, nil
 		}
@@ -1099,8 +1108,22 @@ func (o *Outbox) flushLocal(ctx context.Context, dispatch func(context.Context, 
 		}
 
 		if err := dispatch(ctx, it); err != nil {
+			if errors.Is(err, errOutboxSkipIntent) {
+				// Kind-filtered flush: this intent stays queued for the
+				// regular flush. Rotate it past the others handled this
+				// pass so the scan can reach later intents of the wanted
+				// kind without spinning.
+				o.mu.Lock()
+				if len(o.items) > 0 && o.items[0].ID == it.ID {
+					o.items = append(o.items[1:], it)
+				}
+				o.mu.Unlock()
+				skipped++
+				continue
+			}
 			return dispatched, err
 		}
+		skipped = 0
 		// Durable ack BEFORE the local removal: a failed ack leaves the
 		// intent queued and it is retried (idempotently) next tick.
 		if o.store != nil {
@@ -1299,11 +1322,15 @@ func (o *Outbox) flushDBBatch(ctx context.Context, dispatch func(context.Context
 		}
 		o.releaseOutboxClaimsCleanup(ctx, unacked, claimer)
 	}()
+	// skipped marks intents this pass refused to handle (kind filter). They
+	// stay pending, but the scan must move past them or the loop spins on
+	// the same head forever.
+	skipped := make(map[string]bool, len(claimed))
 	for {
 		o.mu.Lock()
 		idx := -1
 		for i, it := range o.items {
-			if owned[it.ID] {
+			if owned[it.ID] && !skipped[it.ID] {
 				idx = i
 				break
 			}
@@ -1316,6 +1343,16 @@ func (o *Outbox) flushDBBatch(ctx context.Context, dispatch func(context.Context
 		o.mu.Unlock()
 
 		if derr := dispatch(ctx, it); derr != nil {
+			if errors.Is(derr, errOutboxSkipIntent) {
+				// Kind-filtered flush: this row stays PENDING (locally and
+				// durably) for the regular flush. No retry record (nothing
+				// failed), no ACK (not handled), and the deferred sweep
+				// releases the claim. Do NOT drop it from the local queue —
+				// callers inspect Pending() to assert intents survive until
+				// the flush that owns their kind runs.
+				skipped[it.ID] = true
+				continue
+			}
 			// Record the attempt with bounded backoff (dead-letter after
 			// maxOutboxAttempts) instead of hot-looping, then CONTINUE with
 			// the other independent rows in this batch. Internal
@@ -1489,6 +1526,34 @@ func (s *Server) flushOutbox(ctx context.Context) {
 		log.Printf("outbox: flush stopped: %v", err)
 	}
 }
+
+// flushOutboxKind dispatches ONLY the named intent kinds now. It exists for
+// the completion path: the execution attestation must not wait for the next
+// Maintain tick (evidence latency), but downstream/forge intents keep their
+// own outbox cadence and retry semantics. A kind filter is applied at
+// dispatch time so untargeted intents stay queued for the normal flush.
+func (s *Server) flushOutboxKind(ctx context.Context, kinds ...string) {
+	allow := make(map[string]bool, len(kinds))
+	for _, k := range kinds {
+		allow[k] = true
+	}
+	filtered := func(ctx context.Context, item forge.OutboxItem) error {
+		if !allow[item.Kind] {
+			// Not ours: keep it queued for the regular flush.
+			return errOutboxSkipIntent
+		}
+		return s.dispatchOutbox(ctx, item)
+	}
+	flushCtx, cancel := boundedDetach(ctx, outboxFlushTimeout)
+	defer cancel()
+	if _, err := s.outbox.Flush(flushCtx, filtered); err != nil {
+		log.Printf("outbox: kind flush stopped: %v", err)
+	}
+}
+
+// errOutboxSkipIntent tells Flush to leave an intent queued (dispatch was
+// not attempted). It is a control-flow sentinel, not a failure.
+var errOutboxSkipIntent = errors.New("outbox: intent skipped by kind filter")
 
 func (s *Server) dispatchOutbox(ctx context.Context, item forge.OutboxItem) error {
 	switch item.Kind {

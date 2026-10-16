@@ -52,7 +52,13 @@ CEILINGS="bench/ceilings.txt"
 trap 'rm -f "$OUT" "$OUT.ns"' EXIT INT TERM
 
 echo "perf-compare: running ./perf benchmarks (count=$COUNT, median-of-N, threshold=${THRESHOLD}%)"
-go test -run '^$' -bench . -benchmem -benchtime=150ms -count="$COUNT" ./perf/ | tee "$OUT"
+# Two passes: micro benchmarks get the full sample count; e2e/scale
+# benchmarks (which spin up real control planes) run a bounded wave so a
+# loaded machine cannot pin a worker for minutes per sample.
+{
+	go test -run '^$' -bench 'Pipeline|Acceptance|SeededQueue' -benchmem -benchtime=150ms -count="$COUNT" ./perf/
+	PERF_QUEUE_WAVE="${PERF_QUEUE_WAVE:-200}" go test -run '^$' -bench 'E2E|Scale' -benchmem -benchtime=1x -count="${PERF_HEAVY_COUNT:-3}" ./perf/
+} | tee "$OUT"
 
 # Median-of-N per benchmark. Output: name ns/op (float).
 parse_median() {

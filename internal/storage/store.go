@@ -410,6 +410,19 @@ func CompletionEffectKinds() []string {
 	}
 }
 
+// CompletionEffectIDs returns the deterministic outbox IDs of every
+// completion-effect intent for one (job, generation). Enqueue is
+// all-or-nothing over exactly these IDs; a dispatch/ACK may remove one from
+// the pending set without violating that INSERT invariant.
+func CompletionEffectIDs(jobID string, generation int64) []string {
+	kinds := NewCompletionEffectKinds()
+	out := make([]string, 0, len(kinds))
+	for _, kind := range kinds {
+		out = append(out, CompletionEffectID(jobID, generation, kind))
+	}
+	return out
+}
+
 // CompletionEffectIntentCount is how many intents a NEW completion persists
 // (completion_reconcile + forge_delivery + execution_attest). Legacy rows
 // persist the five per-kind intents listed by CompletionEffectKinds.

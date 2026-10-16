@@ -355,9 +355,23 @@ func TestHACancelVersusCompleteNoDoubleEffects(t *testing.T) {
 					receipts++
 				}
 			}
+			// All-or-nothing is an ENQUEUE invariant: the three effect
+			// intents are inserted in one transaction. Count pending PLUS
+			// acked — a kind-filtered flush (execution_attest) legitimately
+			// dispatches and ACKs one of them, which would otherwise make
+			// a correct 3-row insert look like a 2-row partial.
 			effects := 0
 			for _, it := range c.f.outboxItems {
 				if isCompletionEffectKind(it.Kind) {
+					effects++
+				}
+			}
+			wantIDs := map[string]bool{}
+			for _, id := range storage.CompletionEffectIDs(task.Job.ID, task.LeaseGeneration) {
+				wantIDs[id] = true
+			}
+			for _, id := range c.f.outboxAcked {
+				if wantIDs[id] {
 					effects++
 				}
 			}

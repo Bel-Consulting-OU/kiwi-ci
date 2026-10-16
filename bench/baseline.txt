@@ -1,13 +1,21 @@
 # perf baseline contract=2 count=7 threshold=100
 # regenerate with: scripts/perf-compare.sh --update (on a QUIET machine)
-BenchmarkAcceptanceWireSchema 0.389200
-BenchmarkE2EFullJobCycle 86023521.000000
-BenchmarkE2EParallelSubmit 22792530.000000
-BenchmarkE2ESubmitThenLease 89496104.000000
-BenchmarkE2ESubmitToPersistedRun 22557756.000000
-BenchmarkPipelineCompileMatrix 53380.000000
-BenchmarkPipelineParse 48203.000000
-BenchmarkSeededQueue/n=1 1.637000
-BenchmarkSeededQueue/n=100 316.600000
-BenchmarkSeededQueue/n=1000 2839.000000
-BenchmarkSeededQueue/n=10000 29728.000000
+BenchmarkAcceptanceWireSchema 0.235300
+BenchmarkE2EFullJobCycle 92814542.000000
+BenchmarkE2EParallelSubmit 19586083.000000
+BenchmarkE2ESubmitThenLease 152776000.000000
+BenchmarkE2ESubmitToPersistedRun 55829458.000000
+BenchmarkPipelineCompileMatrix 30940.000000
+BenchmarkPipelineParse 24111.000000
+BenchmarkScaleCacheOverhead 101896875.000000
+BenchmarkScaleEvidenceOverhead 101843833.000000
+BenchmarkScaleLease100 102289417.000000
+BenchmarkScaleQueue10000 4295454375.000000
+BenchmarkScaleSubmit1 19636333.000000
+BenchmarkScaleSubmit10 19613125.000000
+BenchmarkScaleSubmit100 20174750.000000
+BenchmarkScaleSubmit1000 20492417.000000
+BenchmarkSeededQueue/n=1 0.982300
+BenchmarkSeededQueue/n=100 151.700000
+BenchmarkSeededQueue/n=1000 1362.000000
+BenchmarkSeededQueue/n=10000 16897.000000

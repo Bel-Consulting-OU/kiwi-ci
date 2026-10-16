@@ -10,7 +10,10 @@
 #      independent release metadata (KIWI_N_MINUS_ONE_SHA256 or
 #      KIWI_N_MINUS_ONE_SUMS) — a self-computed digest is refused.
 #   2. KIWI_N_MINUS_ONE_URL + KIWI_N_MINUS_ONE_SHA256 (download + verify)
-#   3. GitHub Releases latest asset (download + verify against the release's
+#   3. KIWI_RELEASE_STORE — the published artifact store (see
+#      scripts/release-store.sh). The store generates SHA256SUMS itself, so
+#      the digest is independent metadata.
+#   4. GitHub Releases latest asset (download + verify against the release's
 #      published SHA256SUMS — independent metadata)
 #
 # Fail-closed: a missing or unverifiable artifact is fatal. Source rebuild is
@@ -115,6 +118,33 @@ if [ -n "${KIWI_N_MINUS_ONE_URL:-}" ]; then
 	export KIWI_N_MINUS_ONE_BIN="$out"
 	export KIWI_N_MINUS_ONE_SHA256
 	echo "fetch-n-minus-one: fetched $KIWI_N_MINUS_ONE_URL -> $out"
+	write_env
+	exit 0
+fi
+
+# ---- 3a. PUBLISHED artifact store (the independent trust anchor) --------
+# KIWI_RELEASE_STORE is a directory of published releases whose SHA256SUMS
+# the store itself generated (scripts/release-store.sh publish). Resolving
+# from the store is independent metadata: the digest comes from the store,
+# not from hashing the file we were handed.
+if [ -n "${KIWI_RELEASE_STORE:-}" ]; then
+	command -v shasum >/dev/null 2>&1 || command -v sha256sum >/dev/null 2>&1 || die "sha256 tool required"
+	case "$(uname -s)-$(uname -m)" in
+	Darwin-arm64) platform="darwin-arm64" ;;
+	Darwin-x86_64) platform="darwin-amd64" ;;
+	Linux-aarch64|Linux-arm64) platform="linux-arm64" ;;
+	Linux-x86_64|Linux-amd64) platform="linux-amd64" ;;
+	*) die "unsupported host for store resolve" ;;
+	esac
+	resolved="$(./scripts/release-store.sh resolve "$KIWI_RELEASE_STORE" "$platform")" || die "release-store resolve failed"
+	bin="$(echo "$resolved" | awk '{print $1}')"
+	want="$(echo "$resolved" | awk '{print $2}')"
+	require_sha256 "$want" "store-published digest for kiwi-$platform"
+	got="$(sha256_of "$bin")"
+	[ "$got" = "$want" ] || die "store binary sha256 $got != published $want"
+	export KIWI_N_MINUS_ONE_BIN="$bin"
+	export KIWI_N_MINUS_ONE_SHA256="$want"
+	echo "fetch-n-minus-one: store-published kiwi-$platform sha256=$want -> $bin"
 	write_env
 	exit 0
 fi
