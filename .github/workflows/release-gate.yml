@@ -78,12 +78,11 @@ jobs:
           # on whatever the runner image happens to carry.
           KIWI_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
         run: |
+          # RC certification is ONE causal chain:
+          #   freeze candidate bytes → resolve published N-1 → test the
+          #   FROZEN bytes (never a fresh source build) → tag → publish the
+          #   SAME bytes. scripts/certify-candidate.sh is that chain.
           export KIWI_REQUIRE_N_MINUS_ONE=1
-          # RC certification ALWAYS uses a PUBLISHED N-1 binary. Source
-          # rebuild is development-only (see canonicalResolveNMinusOne).
-          # fetch-n-minus-one.sh resolves the previous artifact (supplied
-          # pin, KIWI_N_MINUS_ONE_URL, or GitHub Releases) and verifies its
-          # published SHA256 before the suite runs.
           export KIWI_REQUIRE_RELEASED_N_MINUS_ONE=1
           ./scripts/fetch-n-minus-one.sh
           CACHE="${KIWI_N_MINUS_ONE_CACHE:-${TMPDIR:-/tmp}/kiwi-n-minus-one}"
@@ -91,22 +90,33 @@ jobs:
             . "$CACHE/n-minus-one.env"
             export KIWI_N_MINUS_ONE_BIN KIWI_N_MINUS_ONE_SHA256 KIWI_REQUIRE_RELEASED_N_MINUS_ONE
           fi
-          make release-gate
+          # Accept both "1.2.3" and "v1.2.3".
+          VERSION_INPUT="${{ inputs.version }}"
+          case "$VERSION_INPUT" in
+            v*) CERT_VERSION="$VERSION_INPUT" ;;
+            *) CERT_VERSION="v$VERSION_INPUT" ;;
+          esac
+          ./scripts/certify-candidate.sh "$CERT_VERSION"
       - name: surface contracts
         run: |
           go run ./cmd/filemap --check
           ./scripts/docs-lint.sh --source --baseline scripts/docs-lint-baseline.txt
           ./scripts/docs-links-check.sh
-      - name: tag after certification
+      - name: push certified tag
         if: github.event_name == 'workflow_dispatch' && inputs.create_tag
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION_INPUT: ${{ inputs.version }}
         run: |
           set -euo pipefail
+          case "$VERSION_INPUT" in
+            v*) VERSION="$VERSION_INPUT" ;;
+            *) VERSION="v$VERSION_INPUT" ;;
+          esac
           echo "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || {
             echo "version must look like v1.2.3" >&2
             exit 1
           }
-          git tag -a "$VERSION" -m "release $VERSION (certified by release-gate)"
+          # certify-candidate.sh already tagged the FROZEN commit after the
+          # gate passed. This step only publishes that tag.
           git push origin "$VERSION"
-          echo "tag $VERSION created AFTER certification"
+          echo "tag $VERSION pushed (frozen bytes already certified)"

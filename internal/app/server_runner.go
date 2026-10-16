@@ -1466,7 +1466,7 @@ func Runner(ctx context.Context, args []string) error {
 		}
 	}
 	fs := flag.NewFlagSet("runner", flag.ContinueOnError)
-	url := fs.String("server", "http://127.0.0.1:8080", "Kiwi server URL")
+	url := fs.String("server", "", "Kiwi server URL (defaults to the active context / KIWI_SERVER)")
 	token := fs.String("token", os.Getenv("KIWI_RUNNER_TOKEN"), "runner token")
 	name := fs.String("name", "", "runner name")
 	labels := fs.String("labels", "", "comma-separated labels")
@@ -1517,8 +1517,12 @@ func Runner(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	runEp, runEpErr := ResolveEndpoint(*url, "")
+	if runEpErr != nil {
+		return runEpErr
+	}
 	cfg := runner.Config{
-		Server:               strings.TrimRight(*url, "/"),
+		Server:               strings.TrimRight(runEp.Server, "/"),
 		Token:                *token,
 		Name:                 *name,
 		CACert:               *runnerCACert,
@@ -1695,12 +1699,16 @@ func loadEd25519PublicKey(v string) (ed25519.PublicKey, error) {
 // These are admin-tier server operations; --token must be an admin token.
 func RunnerAdmin(ctx context.Context, sub string, args []string) error {
 	fs := flag.NewFlagSet("runner "+sub, flag.ContinueOnError)
-	url := fs.String("server", "http://127.0.0.1:8080", "Kiwi server URL")
+	url := fs.String("server", "", "Kiwi server URL (defaults to the active context / KIWI_SERVER)")
 	token := fs.String("token", os.Getenv("KIWI_ADMIN_TOKEN"), "admin bearer token")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	base := strings.TrimRight(*url, "/")
+	ep, epErr := ResolveEndpoint(*url, "")
+	if epErr != nil {
+		return epErr
+	}
+	base := strings.TrimRight(ep.Server, "/")
 	client := &http.Client{Timeout: 30 * time.Second}
 	do := func(method, path string, out any) error {
 		var body io.Reader

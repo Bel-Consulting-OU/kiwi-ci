@@ -10,12 +10,25 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Woodpecker extinction is AUTHORITATIVE: .kiwi/ must actually execute the
-// work the Woodpecker tree still owns. A lane name appearing in an echo is
-// not coverage — every `make <target>` and every `go test ... <packages>`
-// command in .woodpecker/*.yml must appear verbatim (as a step run) in
-// .kiwi/pipeline.yaml. When .woodpecker/ is gone the gate is trivially
-// satisfied (the goal state).
+// Woodpecker CONFIG TRANSFER gate (NOT an operational-replacement test).
+//
+// This test proves one narrow thing: every `make <target>` and every
+// `go test ...` command that appears in .woodpecker/*.yml also appears as
+// a real step run in .kiwi/pipeline.yaml. That is config/string coverage
+// of the self-hosted migration.
+//
+// It is NOT a Woodpecker extinction test and must not be mistaken for one.
+// Real operational replacement — push → webhook → compile → queue → runner
+// → services/cache/secrets → artifacts → forge status → scheduled/manual →
+// approval → runner failure/recovery → server restart → DB recovery →
+// N-1→N upgrade → Kiwi builds and certifies its own frozen release, run
+// against a fresh install with Woodpecker shut down — is the
+// TestSysDFCanonicalReleaseScenarioIntegration + dogfood system/dist
+// chain. Those are the operational proof; this file is only the config
+// transfer checklist.
+//
+// When .woodpecker/ is gone this gate is trivially satisfied (the goal
+// state).
 
 var (
 	makeCmdRe = regexp.MustCompile(`(?m)^\s*(?:-\s*)?(?:env\s+\S+\s+)?make\s+([a-z0-9][a-z0-9-]*)`)
@@ -105,10 +118,11 @@ func kiwiStepRuns(t *testing.T) string {
 	return b.String()
 }
 
-// TestKiwiPipelineExecutesEveryWoodpeckerLaneWorkItem: the self-hosted Kiwi
-// pipeline must RUN the work the Woodpecker tree still owns. Matching is on
-// the actual command text (make targets and go test invocations), never on a
-// lane name appearing in an echo or a comment.
+// TestKiwiPipelineExecutesEveryWoodpeckerLaneWorkItem: config-transfer
+// coverage — the self-hosted Kiwi pipeline must RUN the work the Woodpecker
+// tree still owns. Matching is on the actual command text (make targets and
+// go test invocations), never on a lane name appearing in an echo or a
+// comment. See the package comment: this is not operational replacement.
 func TestKiwiPipelineExecutesEveryWoodpeckerLaneWorkItem(t *testing.T) {
 	makes, goTests := woodpeckerCommands(t)
 	if len(makes) == 0 && len(goTests) == 0 {

@@ -295,6 +295,15 @@ dogfood-production:
 # DF0 is .kiwi/pipeline.yaml.
 dogfood-all: dogfood-local dogfood-system dogfood-production dogfood-release-artifacts dogfood-distributed dogfood-adversarial dogfood-upgrade dogfood-scale dogfood-release-model
 
+# certify-candidate is the ONE release-certification chain:
+#   freeze candidate bytes → resolve published N-1 → test the FROZEN bytes
+#   → tag → publish the same bytes. scripts/certify-candidate.sh is that
+#   chain; CI release-gate invokes it. Kept as a Make target so the script
+#   is discoverable and so script-inventory sees it wired.
+.PHONY: certify-candidate
+certify-candidate:
+	./scripts/certify-candidate.sh $(VERSION)
+
 # release-gate is the production dogfood closure: the single canonical
 # production release scenario (N-1→N, live dist topology with >=2 runners,
 # high-assurance controls, signed evidence, kill/failover/retry, backup→
@@ -506,7 +515,10 @@ run:
 	go run ./cmd/kiwi run -f examples/kiwi.yaml
 
 clean:
-	rm -rf dist coverage.out .kiwi/cache .kiwi/artifacts .kiwi/runs .kiwi/workspaces
+	# Always the ROOT-LEVEL build output. A bare `rm -rf dist` is
+	# ambiguous in a recursive make and can take out source trees that
+	# happen to be named dist (internal/dogfood/dist is source).
+	rm -rf ./dist ./coverage.out ./.kiwi/cache ./.kiwi/artifacts ./.kiwi/runs ./.kiwi/workspaces
 
 # Applies main-branch protection (required PRs, required CI matrix,
 # up-to-date branches, admins not exempt). Idempotent; requires repo

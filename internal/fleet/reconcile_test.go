@@ -84,7 +84,7 @@ func pool(min, max, warm int) Profile {
 func TestReconcileCapacityFailureIsFailClosed(t *testing.T) {
 	p := &recProvider{name: "p1", capErr: errors.New("api down")}
 	m := NewManager()
-	m.Register(p)
+	_ = m.Register(p)
 	rep := m.Reconcile(context.Background(), []Target{{Provider: "p1", Profile: pool(0, 10, 1), Want: 5}})
 	if rep.Errors == 0 {
 		t.Fatal("capacity failure must be an error")
@@ -99,7 +99,7 @@ func TestReconcileCapacityFailureIsFailClosed(t *testing.T) {
 func TestReconcileProvisionsGapAndCountsPending(t *testing.T) {
 	p := &recProvider{name: "p1", cap: map[string]Capacity{"pool": {Ready: 1, Pending: 2, Max: 10}}}
 	m := NewManager()
-	m.Register(p)
+	_ = m.Register(p)
 	rep := m.Reconcile(context.Background(), []Target{{Provider: "p1", Profile: pool(0, 10, 0), Want: 5}})
 	if p.provisionN != 2 {
 		t.Fatalf("provisioned %d, want 2 (5 - 1 ready - 2 pending)", p.provisionN)
@@ -125,7 +125,7 @@ func TestReconcileProvisionsGapAndCountsPending(t *testing.T) {
 func TestReconcileClampsToMax(t *testing.T) {
 	p := &recProvider{name: "p1", cap: map[string]Capacity{"pool": {Ready: 0, Max: 3}}}
 	m := NewManager()
-	m.Register(p)
+	_ = m.Register(p)
 	m.Reconcile(context.Background(), []Target{{Provider: "p1", Profile: pool(0, 50, 0), Want: 50}})
 	if p.provisionN != 3 {
 		t.Fatalf("provisioned %d, want 3 (provider Max)", p.provisionN)
@@ -136,7 +136,7 @@ func TestReconcileClampsToMax(t *testing.T) {
 func TestReconcileScaleToZero(t *testing.T) {
 	p := &recProvider{name: "p1", cap: map[string]Capacity{"pool": {Ready: 4, Max: 10}}}
 	m := NewManager()
-	m.Register(p)
+	_ = m.Register(p)
 	rep := m.Reconcile(context.Background(), []Target{{Provider: "p1", Profile: pool(0, 10, 0), Want: 4, Idle: true, DrainIdle: true}})
 	if p.drainN != 4 {
 		t.Fatalf("drained %d, want 4", p.drainN)
@@ -153,7 +153,7 @@ func TestReconcileScaleToZero(t *testing.T) {
 func TestReconcileIdleKeepsWarmFloor(t *testing.T) {
 	p := &recProvider{name: "p1", cap: map[string]Capacity{"pool": {Ready: 6, Max: 10}}}
 	m := NewManager()
-	m.Register(p)
+	_ = m.Register(p)
 	m.Reconcile(context.Background(), []Target{{Provider: "p1", Profile: pool(3, 10, 3), Want: 6, Idle: true}})
 	if p.drainN != 3 {
 		t.Fatalf("drained %d, want 3 (down to Min=3)", p.drainN)
@@ -169,7 +169,7 @@ func TestReconcileQuarantinesBeforeScale(t *testing.T) {
 		unhealthy: []string{"bad-1", "bad-2"},
 	}
 	m := NewManager()
-	m.Register(p)
+	_ = m.Register(p)
 	// Want 5: after quarantining 2, ready=3, so it provisions 2.
 	m.Reconcile(context.Background(), []Target{{Provider: "p1", Profile: pool(0, 10, 0), Want: 5}})
 	if p.quarantine != 2 {
@@ -186,8 +186,8 @@ func TestReconcileDoesNotCrossProviders(t *testing.T) {
 	a := &recProvider{name: "a", cap: map[string]Capacity{"pool": {Ready: 0, Max: 10}}}
 	b := &recProvider{name: "b", cap: map[string]Capacity{"pool": {Ready: 9, Max: 10}}}
 	m := NewManager()
-	m.Register(a)
-	m.Register(b)
+	_ = m.Register(a)
+	_ = m.Register(b)
 	m.Reconcile(context.Background(), []Target{{Provider: "a", Profile: pool(0, 10, 0), Want: 2}})
 	if a.provisionN != 2 {
 		t.Fatalf("a provisioned %d, want 2", a.provisionN)
@@ -202,8 +202,8 @@ func TestReconcileContinuesPastFailure(t *testing.T) {
 	a := &recProvider{name: "a", capErr: errors.New("down")}
 	b := &recProvider{name: "b", cap: map[string]Capacity{"pool": {Ready: 0, Max: 10}}}
 	m := NewManager()
-	m.Register(a)
-	m.Register(b)
+	_ = m.Register(a)
+	_ = m.Register(b)
 	rep := m.Reconcile(context.Background(), []Target{
 		{Provider: "a", Profile: pool(0, 10, 0), Want: 1},
 		{Provider: "b", Profile: pool(0, 10, 0), Want: 1},
@@ -220,7 +220,7 @@ func TestReconcileContinuesPastFailure(t *testing.T) {
 func TestReconcileProvisionFailureRecorded(t *testing.T) {
 	p := &recProvider{name: "p1", cap: map[string]Capacity{"pool": {Ready: 0, Max: 10}}, provisionE: errors.New("quota")}
 	m := NewManager()
-	m.Register(p)
+	_ = m.Register(p)
 	rep := m.Reconcile(context.Background(), []Target{{Provider: "p1", Profile: pool(0, 10, 0), Want: 3}})
 	if rep.Errors == 0 {
 		t.Fatal("provision failure must be an error")

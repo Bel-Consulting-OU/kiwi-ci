@@ -671,18 +671,7 @@ func (s *Server) issueSecret(w http.ResponseWriter, r *http.Request) {
 	if !s.requireCurrentRunnerIncarnation(w, r, in.RunnerID) {
 		return
 	}
-	// Defense in depth: admission already strips secrets from untrusted
-	// pipelines, and the declared allowlist is compiled at enqueue time. The
-	// commit re-checks both against the locked job.
-	if !j.Trusted || !containsString(j.DeclaredSecrets, in.Name) {
-		http.Error(w, "secret not declared for this job", http.StatusForbidden)
-		return
-	}
-	if s.SecretBroker == nil {
-		http.Error(w, "secret broker not configured", http.StatusServiceUnavailable)
-		return
-	}
-	// Reject malformed requests before any store or broker work: an invalid
+	// Reject malformed requests BEFORE any store or broker work: an invalid
 	// name must never select a broker lookup or touch the claim store, and an
 	// invalid ephemeral key must never trigger a resolution.
 	if !secretNameRequestRegexp.MatchString(in.Name) {
@@ -692,6 +681,26 @@ func (s *Server) issueSecret(w http.ResponseWriter, r *http.Request) {
 	pubRaw, err := base64.StdEncoding.DecodeString(in.EphemeralPublic)
 	if err != nil || len(pubRaw) != 32 {
 		http.Error(w, "invalid ephemeral_public: want base64-encoded 32 bytes", http.StatusBadRequest)
+		return
+	}
+	// ONE authority for "may this secret be delivered": the same
+	// SecretDecision `kiwi secret explain` renders. Lease liveness and the
+	// once-only claim stay delivery-time gates on top of this verdict.
+	// explainSecret never touches the broker (a decision is not a
+	// resolution), so this stays before any store or broker work.
+	d := s.explainSecret(r.Context(), j, in.Name)
+	if !d.Allowed {
+		status := http.StatusForbidden
+		switch d.Stage {
+		case "name-grammar":
+			status = http.StatusBadRequest
+		case "broker":
+			status = http.StatusServiceUnavailable
+		}
+		// Opaque to the client: the decision detail goes to the server log
+		// and the audit trail, not the wire.
+		s.logError("secret delivery refused", "job", j.ID, "name", in.Name, "stage", d.Stage, "reason", d.Reason)
+		http.Error(w, "secret not available for this job", status)
 		return
 	}
 	s.deliverSecret(w, r, j, in, pubRaw)

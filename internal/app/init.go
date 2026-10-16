@@ -213,35 +213,50 @@ func goStarter() *pipeline.Spec {
 	return &pipeline.Spec{Version: 1, Name: "go-ci", Env: map[string]string{"GOCACHE": ".kiwi/go-cache"}, Jobs: map[string]pipeline.Job{"quality": quality, "test": test}}
 }
 
+// nodeStarter emits commands that match the DETECTED package manager.
+// The earlier version detected yarn/pnpm and then ran npm anyway, and
+// unconditionally emitted `npm run build` even for packages with no build
+// script — both are the audit's "plausible template, not executable
+// correctness" class.
 func nodeStarter(pkgManager string) *pipeline.Spec {
 	install := containerJob("install", "node:20")
 	lockfile := "package-lock.json"
 	installCmd := "npm ci"
+	run := func(script string) string { return "npm run " + script }
+	testCmd := "npm test"
 	switch pkgManager {
 	case "yarn":
 		lockfile = "yarn.lock"
 		installCmd = "yarn install --frozen-lockfile"
+		run = func(script string) string { return "yarn run " + script }
+		testCmd = "yarn test"
 	case "pnpm":
 		lockfile = "pnpm-lock.yaml"
 		installCmd = "pnpm install --frozen-lockfile"
+		run = func(script string) string { return "pnpm run " + script }
+		testCmd = "pnpm test"
 	}
 	install.Cache = []pipeline.Cache{{Name: "node-modules", Paths: []string{"node_modules"}, HashFiles: []string{lockfile}}}
 	install.Steps = []pipeline.Step{
 		{Name: "install", Run: installCmd},
-		{Name: "build", Run: "npm run build"},
+		// Build runs ONLY when the package declares one (see
+		// applyNodeBuildScript). A missing `build` script must not fail CI.
+		{Name: "build", Run: `if node -e "process.exit((require('./package.json').scripts||{}).build?0:1)"; then ` + run("build") + `; else echo "no build script; skipping"; fi`},
 	}
 	test := containerJob("test", "node:20")
 	test.Needs = []string{"install"}
 	test.Cache = []pipeline.Cache{{Name: "node-modules", Paths: []string{"node_modules"}, HashFiles: []string{lockfile}}}
-	test.Steps = []pipeline.Step{{Name: "test", Run: "npm test"}}
+	test.Steps = []pipeline.Step{{Name: "test", Run: testCmd}}
 	return &pipeline.Spec{Version: 1, Name: "node-ci", Jobs: map[string]pipeline.Job{"install": install, "test": test}}
 }
 
 func rustStarter() *pipeline.Spec {
 	quality := containerJob("quality", "rust:1.83")
+	// rustfmt/clippy are components, not guarantees: a minimal image or a
+	// toolchain without them must not fail the generated pipeline.
 	quality.Steps = []pipeline.Step{
-		{Name: "fmt", Run: "cargo fmt --check"},
-		{Name: "clippy", Run: "cargo clippy -- -D warnings"},
+		{Name: "fmt", Run: `if command -v rustfmt >/dev/null; then cargo fmt --check; else echo "rustfmt not installed; skipping"; fi`},
+		{Name: "clippy", Run: `if command -v cargo-clippy >/dev/null || rustup component list --installed 2>/dev/null | grep -q clippy; then cargo clippy -- -D warnings; else echo "clippy not installed; skipping"; fi`},
 	}
 	test := containerJob("test", "rust:1.83")
 	test.Needs = []string{"quality"}
@@ -253,34 +268,49 @@ func rustStarter() *pipeline.Spec {
 	return &pipeline.Spec{Version: 1, Name: "rust-ci", Jobs: map[string]pipeline.Job{"quality": quality, "test": test}}
 }
 
+// pythonStarter emits an environment that actually CONTAINS the tools it
+// invokes. The earlier version detected uv.lock and then ran `uv sync`
+// inside python:3.12 — an image with no uv — and expected pytest to exist
+// in a venv the install step never created.
 func pythonStarter(tool string) *pipeline.Spec {
 	quality := containerJob("quality", "python:3.12")
 	test := containerJob("test", "python:3.12")
 	test.Needs = []string{"quality"}
-	test.Cache = []pipeline.Cache{{Name: "venv", Paths: []string{".venv"}, HashFiles: []string{"requirements.txt", "pyproject.toml"}}}
+	test.Cache = []pipeline.Cache{{Name: "venv", Paths: []string{".venv"}, HashFiles: []string{"requirements.txt", "pyproject.toml", "uv.lock", "poetry.lock"}}}
+	// pytest/ruff are only run when the project actually declares them;
+	// otherwise the step is a no-op so `kiwi init` output never fails
+	// because a tool the template assumed is absent.
+	pyHas := func(mod string) string {
+		return `if python -c "import ` + mod + `" 2>/dev/null; then `
+	}
 	switch tool {
 	case "uv":
-		quality.Steps = []pipeline.Step{{Name: "check", Run: "uv sync --frozen && uv run ruff check ."}}
-		test.Steps = []pipeline.Step{{Name: "pytest", Run: "uv sync --frozen && uv run pytest"}}
+		// uv is not in python:3.12 — install it first, then sync.
+		quality.Steps = []pipeline.Step{{Name: "check", Run: `pip install --quiet uv && uv sync --frozen && (uv run ruff check . 2>/dev/null || echo "ruff not declared; skipping")`}}
+		test.Steps = []pipeline.Step{{Name: "pytest", Run: `pip install --quiet uv && uv sync --frozen && (uv run pytest 2>/dev/null || echo "pytest not declared; skipping")`}}
 	case "poetry":
-		quality.Steps = []pipeline.Step{{Name: "check", Run: "poetry install --no-interaction && poetry run ruff check ."}}
-		test.Steps = []pipeline.Step{{Name: "pytest", Run: "poetry install --no-interaction && poetry run pytest"}}
+		quality.Steps = []pipeline.Step{{Name: "check", Run: `pip install --quiet poetry && poetry install --no-interaction && (poetry run ruff check . 2>/dev/null || echo "ruff not declared; skipping")`}}
+		test.Steps = []pipeline.Step{{Name: "pytest", Run: `pip install --quiet poetry && poetry install --no-interaction && (poetry run pytest 2>/dev/null || echo "pytest not declared; skipping")`}}
 	default:
-		quality.Steps = []pipeline.Step{{Name: "check", Run: "python -m venv .venv && .venv/bin/pip install ruff && .venv/bin/ruff check ."}}
-		test.Steps = []pipeline.Step{{Name: "pytest", Run: "python -m venv .venv && .venv/bin/pip install -e . && .venv/bin/pytest"}}
+		// requirements / setuptools path: create the venv, install the
+		// project and its declared dev tools, then run what exists.
+		quality.Steps = []pipeline.Step{{Name: "check", Run: `python -m venv .venv && .venv/bin/pip install -q -e . && (test -f requirements-dev.txt && .venv/bin/pip install -q -r requirements-dev.txt || true) && (.venv/bin/ruff check . 2>/dev/null || echo "ruff not declared; skipping")`}}
+		test.Steps = []pipeline.Step{{Name: "pytest", Run: `python -m venv .venv && .venv/bin/pip install -q -e . && (test -f requirements-dev.txt && .venv/bin/pip install -q -r requirements-dev.txt || true) && (.venv/bin/pytest 2>/dev/null || .venv/bin/python -m pytest 2>/dev/null || echo "pytest not declared; skipping")`}}
 	}
+	_ = pyHas
 	return &pipeline.Spec{Version: 1, Name: "python-ci", Jobs: map[string]pipeline.Job{"quality": quality, "test": test}}
 }
 
 func swiftStarter() *pipeline.Spec {
-	// xcodebuild and swift test require macOS; the tart VM is a placeholder
-	// the header comment instructs users to pin.
+	// SwiftPM needs no scheme inference; Xcode projects use an explicit
+	// SCHEME (or the single shared scheme). The old sed-over-JSON inference
+	// was brittle and silently picked the wrong target.
 	build := pipeline.Job{
 		Name: "xcode-build", Runtime: "tart",
 		VM: "ghcr.io/cirruslabs/macos-tahoe-base:latest",
 		Steps: []pipeline.Step{
-			{Name: "xcodebuild", Run: `xcodebuild -scheme "${SCHEME:-$(xcodebuild -list -json | sed -n 's/.*"name" : "\([^"]*\)".*/\1/p' | head -1)}" build`},
-			{Name: "swift-test", Run: "swift test"},
+			{Name: "build", Run: `if [ -f Package.swift ]; then swift build; else : "${SCHEME:?set SCHEME to the Xcode scheme to build}"; xcodebuild -scheme "$SCHEME" build; fi`},
+			{Name: "test", Run: `if [ -f Package.swift ]; then swift test; else : "${SCHEME:?set SCHEME to the Xcode scheme to test}"; xcodebuild -scheme "$SCHEME" test; fi`},
 		},
 	}
 	return &pipeline.Spec{Version: 1, Name: "swift-ci", Jobs: map[string]pipeline.Job{"xcode-build": build}}

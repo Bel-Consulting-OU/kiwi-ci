@@ -8,6 +8,12 @@ package fleet
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"reflect"
+	"sort"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -93,7 +99,13 @@ type Capacity struct {
 // Manager drives providers toward pool targets (scale-to-zero, warm pools,
 // queue-aware provisioning, drain-on-upgrade, quarantine of unhealthy
 // instances). It never executes work itself — the scheduler does.
+//
+// Registration is initialization-only: mu guards the map because a manager
+// may be read from reconciler goroutines while an operator installs a
+// provider. A nil provider is refused rather than dereferenced through
+// Name().
 type Manager struct {
+	mu        sync.RWMutex
 	providers map[string]Provisioner
 }
 
@@ -102,23 +114,72 @@ func NewManager() *Manager {
 	return &Manager{providers: map[string]Provisioner{}}
 }
 
-// Register installs a provider under its Name().
-func (m *Manager) Register(p Provisioner) {
-	m.providers[p.Name()] = p
+// Register installs a provider under its Name(). A nil provider is refused:
+// calling Name() on it would panic at registration, and a nil entry would
+// panic later inside Reconcile. Duplicate names fail closed — silently
+// replacing a live provider would change capacity decisions underneath a
+// reconciler pass.
+func (m *Manager) Register(p Provisioner) error {
+	if p == nil {
+		return errors.New("fleet: refuse to register a nil provider")
+	}
+	if isNilProvider(p) {
+		return errors.New("fleet: refuse to register a typed-nil provider")
+	}
+	name := p.Name()
+	if strings.TrimSpace(name) == "" {
+		return errors.New("fleet: refuse to register a provider with an empty name")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.providers == nil {
+		m.providers = map[string]Provisioner{}
+	}
+	if _, exists := m.providers[name]; exists {
+		return fmt.Errorf("fleet: provider %q is already registered", name)
+	}
+	m.providers[name] = p
+	return nil
+}
+
+// isNilProvider reports a typed-nil interface value (e.g.
+// (*myProvider)(nil) stored as Provisioner), which passes p == nil but
+// panics on the first method call.
+func isNilProvider(p Provisioner) bool {
+	v := reflect.ValueOf(p)
+	switch v.Kind() {
+	case reflect.Ptr, reflect.Interface, reflect.Map, reflect.Slice:
+		return v.IsNil()
+	}
+	return false
 }
 
 // Provider returns a registered provider.
 func (m *Manager) Provider(name string) (Provisioner, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	p, ok := m.providers[name]
-	return p, ok
+	if !ok || p == nil {
+		return nil, false
+	}
+	return p, true
 }
 
-// Providers lists registered provider names (sorted by registration map
-// iteration is avoided by the caller's own ordering when it matters).
+// Providers lists registered providers in name order so callers never
+// depend on map iteration.
 func (m *Manager) Providers() []Provisioner {
-	out := make([]Provisioner, 0, len(m.providers))
-	for _, p := range m.providers {
-		out = append(out, p)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	names := make([]string, 0, len(m.providers))
+	for n := range m.providers {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	out := make([]Provisioner, 0, len(names))
+	for _, n := range names {
+		if p := m.providers[n]; p != nil {
+			out = append(out, p)
+		}
 	}
 	return out
 }

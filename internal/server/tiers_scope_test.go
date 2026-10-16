@@ -116,6 +116,7 @@ var expectedRouteTiers = map[string]routeTier{
 	"POST /api/v1/jobs/{id}/complete":                          tierRunner,
 	"POST /api/v1/jobs/{id}/generated":                         tierRunner,
 	"POST /api/v1/jobs/{id}/secrets":                           tierRunner,
+	"GET /api/v1/jobs/{id}/secrets/{name}/explain":             tierAdmin,
 	"POST /api/v1/jobs/{id}/tests":                             tierRunner,
 	"POST /api/v1/jobs/{id}/snapshots":                         tierRunner,
 	"GET /api/v1/jobs/{id}/test-shards":                        tierRunner,

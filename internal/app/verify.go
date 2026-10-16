@@ -40,7 +40,7 @@ import (
 // printed).
 func VerifyArtifact(args []string) error {
 	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
-	serverURL := fs.String("server", "http://127.0.0.1:8080", "Kiwi server URL")
+	serverURL := fs.String("server", "", "Kiwi server URL (defaults to the active context / KIWI_SERVER)")
 	token := fs.String("token", os.Getenv("KIWI_ADMIN_TOKEN"), "admin token")
 	repository := fs.String("repository", "", "required provenance repository (constraint)")
 	commit := fs.String("commit", "", "required provenance commit (constraint)")
@@ -69,7 +69,11 @@ func VerifyArtifact(args []string) error {
 		if *generation < 0 {
 			return fmt.Errorf("--generation must not be negative")
 		}
-		return verifyExecutionAttestation(*serverURL, *token, *attestation, *attestationFile, *generation, *trustedKey, provenance.VerifyOptions{
+		ep, epErr := ResolveEndpoint(*serverURL, *token)
+		if epErr != nil {
+			return epErr
+		}
+		return verifyExecutionAttestation(ep.Server, ep.Token, *attestation, *attestationFile, *generation, *trustedKey, provenance.VerifyOptions{
 			AttemptID:              *attempt,
 			CapsuleDigest:          *capsuleDigest,
 			ExecutionCapsuleDigest: *executionCapsuleDigest,

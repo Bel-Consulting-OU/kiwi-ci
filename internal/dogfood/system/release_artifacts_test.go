@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/dogfood/candidate"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/dogfood/system"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
@@ -176,6 +177,14 @@ func moduleRoot(t *testing.T) string {
 // toolchain. This is the real `go build` of the product binary.
 func buildKiwi(t *testing.T, srcDir, outPath string) {
 	t.Helper()
+	// Frozen-candidate seam: release certification tests the exact bytes
+	// `release.sh --candidate` froze, never a fresh source build.
+	if sha, frozen, err := candidate.Resolve(outPath); err != nil {
+		t.Fatalf("frozen candidate: %v", err)
+	} else if frozen {
+		t.Logf("using FROZEN candidate bytes sha256=%s", sha)
+		return
+	}
 	goBin := goTool(t)
 	cmd := exec.Command(goBin, "build", "-o", outPath, "./cmd/kiwi")
 	cmd.Dir = srcDir

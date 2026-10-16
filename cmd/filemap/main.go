@@ -12,6 +12,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -31,7 +32,10 @@ func main() {
 // the package-level flag.CommandLine so that, as before, an invalid flag
 // exits with status 2 (ExitOnError) in production.
 func run(args []string, stdout, stderr io.Writer) int {
-	flags := flag.CommandLine
+	// A fresh FlagSet per invocation: tests call run() more than once, and
+	// re-registering on flag.CommandLine panics.
+	flags := flag.NewFlagSet("filemap", flag.ContinueOnError)
+	flags.SetOutput(stderr)
 	root := flags.String("root", ".", "repository root to walk")
 	out := flags.String("out", "", "output path (default: <root>/FILE_MAP.md)")
 	check := flags.Bool("check", false, "fail if FILE_MAP.md is stale instead of writing")
@@ -49,45 +53,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 		dest = filepath.Join(abs, outputName)
 	}
 
-	var paths []string
-	err = filepath.WalkDir(abs, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, rerr := filepath.Rel(abs, p)
-		if rerr != nil {
-			return rerr
-		}
-		if rel == "." {
-			return nil
-		}
-		if d.IsDir() {
-			switch d.Name() {
-			case ".git", "dist", "tmp", "vendor", "testdata",
-				".kilo", ".cache", "node_modules", ".venv", "bin":
-				return filepath.SkipDir
-			}
-			// A nested .git (Agent Manager worktree or vendored checkout)
-			// means a second repository lives inside this tree; never index it.
-			if _, err := os.Stat(filepath.Join(p, ".git")); err == nil {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if d.Name() == outputName && rel == outputName {
-			return nil
-		}
-		if skipFile(abs, rel, d) {
-			return nil
-		}
-		paths = append(paths, rel)
-		return nil
-	})
+	paths, err := inventory(abs)
 	if err != nil {
 		fmt.Fprintln(stderr, "filemap:", err)
 		return 1
 	}
-	sort.Strings(paths)
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Kiwi CI file map\n\n")
@@ -105,6 +75,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return 0
 		}
 		fmt.Fprintf(stderr, "filemap: %s is stale; run `go run ./cmd/filemap` to regenerate\n", dest)
+		// Show the delta so a failing CI job is actionable without a
+		// developer reproducing the walk locally.
+		fmt.Fprintf(stderr, "filemap: --- stale vs generated diff ---\n")
+		writeInventoryDiff(stderr, string(existing), generated)
 		return 1
 	}
 	if err := os.WriteFile(dest, []byte(generated), 0o644); err != nil {
@@ -113,6 +87,128 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stdout, "filemap: wrote %s (%d files)\n", dest, len(paths))
 	return 0
+}
+
+// inventory returns the sorted repository file list that FILE_MAP.md
+// describes. When the root is a git checkout the list is EXACTLY the
+// git-tracked text files: that is the only set that is identical on every
+// machine, so `--check` can never go stale because a developer laptop has
+// extra untracked files (.mimocode/, scratch dirs, OS junk). Without git it
+// falls back to a filesystem walk with the same filters.
+func inventory(abs string) ([]string, error) {
+	if paths, ok := gitTrackedPaths(abs); ok {
+		return paths, nil
+	}
+	return walkPaths(abs)
+}
+
+// gitTrackedPaths lists git-tracked files under abs, filtered to the same
+// text/known-kind set the walker keeps. Returns ok=false when this is not a
+// git checkout or git is unavailable.
+func gitTrackedPaths(abs string) ([]string, bool) {
+	cmd := exec.Command("git", "-C", abs, "ls-files", "-z")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, false
+	}
+	var paths []string
+	for _, rel := range strings.Split(string(out), "\x00") {
+		if rel == "" || rel == outputName {
+			continue
+		}
+		if skipRel(rel) {
+			continue
+		}
+		full := filepath.Join(abs, filepath.FromSlash(rel))
+		fi, err := os.Stat(full)
+		if err != nil || !fi.Mode().IsRegular() {
+			continue
+		}
+		b, err := os.ReadFile(full)
+		if err != nil || !isText(b) {
+			continue
+		}
+		paths = append(paths, filepath.ToSlash(rel))
+	}
+	sort.Strings(paths)
+	return paths, true
+}
+
+// walkPaths is the non-git fallback: a filesystem walk with the historical
+// directory/file filters. Root-level build output is skipped by exact
+// top-level name so a nested package directory named dist/ or bin/ is never
+// silently dropped from the inventory (internal/dogfood/dist is source).
+func walkPaths(abs string) ([]string, error) {
+	var paths []string
+	err := filepath.WalkDir(abs, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, rerr := filepath.Rel(abs, p)
+		if rerr != nil {
+			return rerr
+		}
+		rel = filepath.ToSlash(rel)
+		if rel == "." {
+			return nil
+		}
+		if d.IsDir() {
+			name := d.Name()
+			// Root-scoped build/output dirs only.
+			if (rel == "dist" || rel == "tmp" || rel == "bin") ||
+				name == ".git" || name == "vendor" || name == "testdata" ||
+				name == ".kilo" || name == ".cache" || name == "node_modules" ||
+				name == ".venv" || name == ".mimocode" {
+				return filepath.SkipDir
+			}
+			// A nested .git (Agent Manager worktree or vendored checkout)
+			// means a second repository lives inside this tree; never index it.
+			if _, err := os.Stat(filepath.Join(p, ".git")); err == nil {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if rel == outputName {
+			return nil
+		}
+		if skipRel(rel) {
+			return nil
+		}
+		if skipFile(abs, rel, d) {
+			return nil
+		}
+		paths = append(paths, rel)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+// skipRel applies the path-level exclusions shared by both inventory modes.
+func skipRel(rel string) bool {
+	if rel == outputName || rel == ".git" {
+		return true
+	}
+	// testdata corpora and OS junk are never inventory content.
+	for _, part := range strings.Split(rel, "/") {
+		if part == "testdata" {
+			return true
+		}
+	}
+	base := rel
+	if i := strings.LastIndex(rel, "/"); i >= 0 {
+		base = rel[i+1:]
+	}
+	if base == ".DS_Store" || base == "Thumbs.db" || base == "desktop.ini" {
+		return true
+	}
+	if strings.HasSuffix(base, ".tmp") || strings.HasSuffix(base, ".prof") || strings.HasSuffix(base, ".out") {
+		return true
+	}
+	return false
 }
 
 // skipFile filters out generated metadata and non-source artifacts that must
@@ -323,4 +419,53 @@ func fallbackDescription(rel string) string {
 	default:
 		return "Repository file."
 	}
+}
+
+// writeInventoryDiff prints the set difference between the committed and
+// generated inventories so a stale check names the offending paths.
+func writeInventoryDiff(w io.Writer, existing, generated string) {
+	oldSet := inventoryRows(existing)
+	newSet := inventoryRows(generated)
+	for _, p := range sortedKeys(newSet) {
+		if _, ok := oldSet[p]; !ok {
+			fmt.Fprintf(w, "filemap: + %s\n", p)
+		}
+	}
+	for _, p := range sortedKeys(oldSet) {
+		if _, ok := newSet[p]; !ok {
+			fmt.Fprintf(w, "filemap: - %s\n", p)
+		}
+	}
+	for _, p := range sortedKeys(newSet) {
+		if o, ok := oldSet[p]; ok && o != newSet[p] {
+			fmt.Fprintf(w, "filemap: ~ %s\n", p)
+		}
+	}
+}
+
+func inventoryRows(md string) map[string]string {
+	out := map[string]string{}
+	for _, line := range strings.Split(md, "\n") {
+		if !strings.HasPrefix(line, "| `") {
+			continue
+		}
+		// | `path` | desc |
+		rest := line[3:]
+		i := strings.Index(rest, "`")
+		if i < 0 {
+			continue
+		}
+		path := rest[:i]
+		out[path] = line
+	}
+	return out
+}
+
+func sortedKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

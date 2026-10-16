@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"runtime"
@@ -96,16 +97,25 @@ func serverDoctor(base string) {
 	base = strings.TrimRight(base, "/")
 	client := &http.Client{Timeout: 5 * time.Second}
 
-	// TLS chain / certificate expiry.
+	// TLS chain / certificate expiry. The dial address comes from
+	// net/url — never host+":443" string concatenation, which breaks on
+	// explicit ports and IPv6 literals.
 	if strings.HasPrefix(base, "https://") {
-		host := strings.TrimPrefix(base, "https://")
-		if i := strings.Index(host, "/"); i >= 0 {
-			host = host[:i]
-		}
-		if _, err := tls.DialWithDialer(&net.Dialer{Timeout: 3 * time.Second}, "tcp", host+":443", &tls.Config{ServerName: host}); err != nil {
-			fmt.Printf("tls            FAIL (%v)\n", err)
+		u, err := url.Parse(base)
+		if err != nil {
+			fmt.Printf("tls            FAIL (invalid URL %q: %v)\n", base, err)
 		} else {
-			fmt.Println("tls            ok")
+			host := u.Hostname()
+			port := u.Port()
+			if port == "" {
+				port = "443"
+			}
+			addr := net.JoinHostPort(host, port)
+			if _, err := tls.DialWithDialer(&net.Dialer{Timeout: 3 * time.Second}, "tcp", addr, &tls.Config{ServerName: host}); err != nil {
+				fmt.Printf("tls            FAIL (%v)\n", err)
+			} else {
+				fmt.Println("tls            ok")
+			}
 		}
 	}
 

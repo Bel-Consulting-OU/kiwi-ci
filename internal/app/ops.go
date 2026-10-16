@@ -173,13 +173,17 @@ func (c *opsClient) doIdempotent(ctx context.Context, method, path string, in, o
 
 func opsFlags(name string, args []string) (serverURL, token string, rest []string, err error) {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
-	srv := fs.String("server", "http://127.0.0.1:8080", "Kiwi server URL")
+	srv := fs.String("server", "", "Kiwi server URL (defaults to the active context / KIWI_SERVER)")
 	tok := fs.String("token", os.Getenv("KIWI_ADMIN_TOKEN"), "admin bearer token")
 	rest, err = parseFlagsAndPositionals(fs, args)
 	if err != nil {
 		return "", "", nil, err
 	}
-	return *srv, *tok, rest, nil
+	ep, epErr := ResolveEndpoint(*srv, *tok)
+	if epErr != nil {
+		return "", "", nil, epErr
+	}
+	return ep.Server, ep.Token, rest, nil
 }
 
 // parseFlagsAndPositionals parses fs over args in any order: Go's flag
@@ -280,7 +284,7 @@ func opsJobs(ctx context.Context, args []string) error {
 
 func opsLogs(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("logs", flag.ContinueOnError)
-	srv := fs.String("server", "http://127.0.0.1:8080", "Kiwi server URL")
+	srv := fs.String("server", "", "Kiwi server URL (defaults to the active context / KIWI_SERVER)")
 	tok := fs.String("token", os.Getenv("KIWI_ADMIN_TOKEN"), "admin bearer token")
 	job := fs.String("job", "", "only print entries for this job key")
 	follow := fs.Bool("follow", false, "follow the SSE log stream after the backlog")
@@ -292,16 +296,20 @@ func opsLogs(ctx context.Context, args []string) error {
 	if len(rest) != 1 {
 		return fmt.Errorf("kiwi logs requires a run ID")
 	}
+	ep, epErr := ResolveEndpoint(*srv, *tok)
+	if epErr != nil {
+		return epErr
+	}
 	runID := rest[0]
 	if *interactive {
-		tuiArgs := []string{"--server", *srv, "--token", *tok, "--job", *job}
+		tuiArgs := []string{"--server", ep.Server, "--token", ep.Token, "--job", *job}
 		if *follow {
 			tuiArgs = append(tuiArgs, "--follow")
 		}
 		tuiArgs = append(tuiArgs, runID)
 		return tuiWithIO(ctx, tuiArgs, os.Stdout, os.Stdin)
 	}
-	c := newOpsClient(*srv, *tok)
+	c := newOpsClient(ep.Server, ep.Token)
 
 	var entries []model.LogEntry
 	if err := c.do(ctx, http.MethodGet, "/api/v1/runs/"+runID+"/logs?after=0&limit=100000", nil, &entries); err != nil {

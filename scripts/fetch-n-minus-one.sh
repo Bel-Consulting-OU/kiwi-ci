@@ -5,12 +5,17 @@
 # source rebuild.
 #
 # Resolution order:
-#   1. KIWI_N_MINUS_ONE_BIN (already supplied) + optional KIWI_N_MINUS_ONE_SHA256
+#   1. KIWI_N_MINUS_ONE_BIN (already supplied). Under
+#      KIWI_REQUIRE_RELEASED_N_MINUS_ONE=1 the expected digest must come from
+#      independent release metadata (KIWI_N_MINUS_ONE_SHA256 or
+#      KIWI_N_MINUS_ONE_SUMS) — a self-computed digest is refused.
 #   2. KIWI_N_MINUS_ONE_URL + KIWI_N_MINUS_ONE_SHA256 (download + verify)
-#   3. GitHub Releases latest asset (download + verify against SHA256SUMS)
+#   3. GitHub Releases latest asset (download + verify against the release's
+#      published SHA256SUMS — independent metadata)
 #
 # Fail-closed: a missing or unverifiable artifact is fatal. Source rebuild is
-# never performed here.
+# never performed here, and a supplied binary is never trusted on its own
+# hash.
 set -eu
 
 die() {
@@ -62,7 +67,25 @@ if [ -n "${KIWI_N_MINUS_ONE_BIN:-}" ]; then
 		got="$(sha256_of "$KIWI_N_MINUS_ONE_BIN")"
 		[ "$got" = "$KIWI_N_MINUS_ONE_SHA256" ] || die "supplied N-1 sha256 $got != pinned $KIWI_N_MINUS_ONE_SHA256"
 	elif [ "${KIWI_REQUIRE_RELEASED_N_MINUS_ONE:-}" = "1" ]; then
-		export KIWI_N_MINUS_ONE_SHA256="$(sha256_of "$KIWI_N_MINUS_ONE_BIN")"
+		# Release certification refuses a SELF-AUTHENTICATING N-1: hashing
+		# whatever file we were handed proves only "this is the same bytes",
+		# not "this is the authentic previously published Kiwi". The
+		# expected digest must come from independent release metadata:
+		#   * KIWI_N_MINUS_ONE_SHA256 already set by the release tool, or
+		#   * KIWI_N_MINUS_ONE_SUMS pointing at the published SHA256SUMS.
+		# Anything else is a source-rebuild-class shortcut and is refused.
+		if [ -n "${KIWI_N_MINUS_ONE_SUMS:-}" ]; then
+			[ -f "$KIWI_N_MINUS_ONE_SUMS" ] || die "KIWI_N_MINUS_ONE_SUMS '$KIWI_N_MINUS_ONE_SUMS' is not a readable file"
+			base="$(basename "$KIWI_N_MINUS_ONE_BIN")"
+			want="$(awk -v n="$base" '$2==n{print $1; exit}' "$KIWI_N_MINUS_ONE_SUMS")"
+			[ -n "$want" ] || die "KIWI_N_MINUS_ONE_SUMS does not list $base"
+			require_sha256 "$want" "published digest for $base"
+			export KIWI_N_MINUS_ONE_SHA256="$want"
+			got="$(sha256_of "$KIWI_N_MINUS_ONE_BIN")"
+			[ "$got" = "$KIWI_N_MINUS_ONE_SHA256" ] || die "supplied N-1 sha256 $got != published $KIWI_N_MINUS_ONE_SHA256"
+		else
+			die "KIWI_REQUIRE_RELEASED_N_MINUS_ONE=1 refuses a self-authenticating N-1: set KIWI_N_MINUS_ONE_SHA256 (from trusted release metadata) or KIWI_N_MINUS_ONE_SUMS (the published SHA256SUMS). Computing the digest of the supplied file proves nothing about its provenance."
+		fi
 	fi
 	export KIWI_N_MINUS_ONE_BIN
 	echo "fetch-n-minus-one: using supplied $KIWI_N_MINUS_ONE_BIN sha256=${KIWI_N_MINUS_ONE_SHA256:-unset}"

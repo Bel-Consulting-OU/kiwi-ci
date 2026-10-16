@@ -1267,6 +1267,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/oidc/jwks", s.oidcJWKS)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/oidc", s.issueOIDC)
 	mux.HandleFunc("POST /api/v1/jobs/{id}/secrets", s.issueSecret)
+	mux.HandleFunc("GET /api/v1/jobs/{id}/secrets/{name}/explain", s.explainJobSecretHTTP)
 	mux.HandleFunc("GET /api/v1/runs", s.listRuns)
 	mux.HandleFunc("POST /api/v1/runs", s.submit)
 	mux.HandleFunc("GET /api/v1/runs/{id}", s.getRun)

@@ -51,7 +51,7 @@ func (k *kvFlags) Set(v string) error {
 // server-side at enqueue.
 func Dispatch(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("dispatch", flag.ContinueOnError)
-	serverURL := fs.String("server", "http://127.0.0.1:8080", "Kiwi server URL")
+	serverURL := fs.String("server", "", "Kiwi server URL (defaults to the active context / KIWI_SERVER)")
 	token := fs.String("token", os.Getenv("KIWI_ADMIN_TOKEN"), "admin/API bearer token")
 	repo := fs.String("repo", "", "repository: owner/name (GitHub default) or a full clone URL")
 	ref := fs.String("ref", "main", "git ref to dispatch")
@@ -110,7 +110,11 @@ func Dispatch(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	endpoint := strings.TrimRight(*serverURL, "/") + "/api/v1/runs"
+	ep, epErr := ResolveEndpoint(*serverURL, "")
+	if epErr != nil {
+		return epErr
+	}
+	endpoint := strings.TrimRight(ep.Server, "/") + "/api/v1/runs"
 	client := &http.Client{Timeout: 60 * time.Second}
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {

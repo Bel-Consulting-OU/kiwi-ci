@@ -1,7 +1,11 @@
 BenchmarkAcceptanceWireSchema 1
-BenchmarkPipelineCompileMatrix 243924
-BenchmarkPipelineParse 210219
-BenchmarkSeededQueue/n=1 4
-BenchmarkSeededQueue/n=100 1337
-BenchmarkSeededQueue/n=1000 12399
-BenchmarkSeededQueue/n=10000 113970
+BenchmarkE2EFullJobCycle 258070563
+BenchmarkE2EParallelSubmit 68377590
+BenchmarkE2ESubmitThenLease 268488312
+BenchmarkE2ESubmitToPersistedRun 67673268
+BenchmarkPipelineCompileMatrix 160140
+BenchmarkPipelineParse 144609
+BenchmarkSeededQueue/n=1 5
+BenchmarkSeededQueue/n=100 950
+BenchmarkSeededQueue/n=1000 8517
+BenchmarkSeededQueue/n=10000 89184

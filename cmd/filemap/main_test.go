@@ -6,6 +6,7 @@ import (
 	"flag"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -538,5 +539,119 @@ func TestFirstNonEmpty(t *testing.T) {
 		if got := firstNonEmpty(in); got != want {
 			t.Errorf("firstNonEmpty(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// Regression: the generator used to walk the working tree, so local-only
+// files (.mimocode/, scratch dirs) entered FILE_MAP.md and every CI run
+// reported the map stale. The inventory must be git-tracked text only.
+func TestInventoryIgnoresUntrackedLocalFiles(t *testing.T) {
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("init")
+	if err := os.WriteFile(filepath.Join(dir, "keep.go"), []byte("package keep\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "keep.go")
+	run("commit", "-m", "init")
+	// Local-only junk that must never enter the inventory.
+	if err := os.MkdirAll(filepath.Join(dir, ".mimocode"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".mimocode", "scratch.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "untracked.go"), []byte("package u\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	paths, err := inventory(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range paths {
+		if strings.Contains(p, ".mimocode") || p == "untracked.go" {
+			t.Fatalf("inventory leaked untracked path %q", p)
+		}
+	}
+	found := false
+	for _, p := range paths {
+		if p == "keep.go" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("tracked keep.go missing from inventory: %v", paths)
+	}
+}
+
+// Regression: the walk skipped every directory named "dist", silently
+// dropping source like internal/dogfood/dist from the inventory. Only the
+// ROOT-LEVEL build output directory is skipped.
+func TestWalkKeepsNestedDistPackage(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "internal", "dogfood", "dist"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "internal", "dogfood", "dist", "doc.go"), []byte("package dist\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "dist"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "dist", "kiwi"), []byte("binaryish\x00"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	paths, err := walkPaths(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(paths, "\n")
+	if !strings.Contains(joined, "internal/dogfood/dist/doc.go") {
+		t.Fatalf("nested dist package dropped from inventory: %v", paths)
+	}
+	for _, p := range paths {
+		if p == "dist/kiwi" || strings.HasPrefix(p, "dist/") {
+			t.Fatalf("root-level dist/ must be skipped, got %q", p)
+		}
+	}
+}
+
+// --check must name the offending paths so a failing CI job is actionable.
+func TestCheckPrintsInventoryDiff(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errBuf bytes.Buffer
+	code := run([]string{"-root", dir, "-out", filepath.Join(dir, "FILE_MAP.md")}, &out, &errBuf)
+	if code != 0 {
+		t.Fatalf("generate = %d: %s", code, errBuf.String())
+	}
+	// Corrupt the committed map so check fails and must print a diff.
+	mapPath := filepath.Join(dir, "FILE_MAP.md")
+	raw, err := os.ReadFile(mapPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mapPath, []byte(string(raw)+"| `ghost.go` | gone |\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	errBuf.Reset()
+	code = run([]string{"-root", dir, "-out", mapPath, "-check"}, &out, &errBuf)
+	if code != 1 {
+		t.Fatalf("check on stale map = %d, want 1", code)
+	}
+	if !strings.Contains(errBuf.String(), "ghost.go") {
+		t.Fatalf("check must name stale paths, got:\n%s", errBuf.String())
 	}
 }

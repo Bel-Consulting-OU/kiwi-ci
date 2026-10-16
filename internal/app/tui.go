@@ -21,7 +21,7 @@ func TUI(ctx context.Context, args []string) error {
 
 func tuiWithIO(ctx context.Context, args []string, out io.Writer, in io.Reader) error {
 	fs := flag.NewFlagSet("tui", flag.ContinueOnError)
-	serverURL := fs.String("server", "http://127.0.0.1:8080", "Kiwi server URL")
+	serverURL := fs.String("server", "", "Kiwi server URL (defaults to the active context / KIWI_SERVER)")
 	token := fs.String("token", os.Getenv("KIWI_ADMIN_TOKEN"), "admin bearer token")
 	job := fs.String("job", "", "only render entries for this job key")
 	follow := fs.Bool("follow", false, "follow the live log stream")
@@ -34,7 +34,7 @@ func tuiWithIO(ctx context.Context, args []string, out io.Writer, in io.Reader) 
 		return fmt.Errorf("kiwi tui requires a run ID")
 	}
 	return tui.Run(ctx, tui.Config{
-		Server: *serverURL,
+		Server: mustResolveServer(*serverURL),
 		Token:  *token,
 		RunID:  rest[0],
 		JobKey: *job,

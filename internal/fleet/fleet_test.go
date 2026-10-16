@@ -52,7 +52,7 @@ func (f *fakeProvider) Attestation(context.Context, string) ([]byte, error) {
 func TestManagerRegistersProvisioner(t *testing.T) {
 	m := NewManager()
 	p := &fakeProvider{name: "fake", inst: map[string]Instance{}}
-	m.Register(p)
+	_ = m.Register(p)
 	got, ok := m.Provider("fake")
 	if !ok || got.Name() != "fake" {
 		t.Fatal("provider not registered")

@@ -142,3 +142,156 @@ func TestInitRejectsUnknownLanguage(t *testing.T) {
 		t.Fatalf("Init succeeded in an empty directory")
 	}
 }
+
+// TestInitGenerateValidateRunFixtures is the executable-correctness
+// contract the audit requires: for every project fixture kiwi init
+// recognizes, the generated pipeline must pass `kiwi validate` (and the
+// job graph must compile). A plausible-looking template that fails
+// validation is a product defect, not a documentation issue.
+func TestInitGenerateValidateRunFixtures(t *testing.T) {
+	fixtures := []struct {
+		name  string
+		files map[string]string
+		lang  string
+		tool  string
+		// wantIn is a substring that must appear in the generated pipeline
+		// (pins the command/toolchain pairing).
+		wantIn string
+		// wantAbsent is a substring that must NOT appear (the old bug).
+		wantAbsent string
+	}{
+		{
+			name:   "go",
+			files:  map[string]string{"go.mod": "module example.com/x\n\ngo 1.22\n"},
+			lang:   "go",
+			wantIn: "go test",
+		},
+		{
+			name:   "cargo",
+			files:  map[string]string{"Cargo.toml": "[package]\nname = \"x\"\nversion = \"0.1.0\"\n"},
+			lang:   "rust",
+			wantIn: "cargo test",
+		},
+		{
+			name:  "npm",
+			files: map[string]string{"package.json": `{"name":"x","version":"1.0.0"}`},
+			lang:  "node", tool: "npm",
+			wantIn:     "npm test",
+			wantAbsent: "yarn run",
+		},
+		{
+			name:  "yarn",
+			files: map[string]string{"package.json": `{"name":"x"}`, "yarn.lock": "# yarn lockfile v1\n"},
+			lang:  "node", tool: "yarn",
+			wantIn:     "yarn install",
+			wantAbsent: "npm ci",
+		},
+		{
+			name:  "pnpm",
+			files: map[string]string{"package.json": `{"name":"x"}`, "pnpm-lock.yaml": "lockfileVersion: 9\n"},
+			lang:  "node", tool: "pnpm",
+			wantIn:     "pnpm install",
+			wantAbsent: "npm ci",
+		},
+		{
+			name:  "python-setuptools",
+			files: map[string]string{"pyproject.toml": "[project]\nname = \"x\"\n"},
+			lang:  "python", tool: "pip",
+			wantIn:     "python -m venv",
+			wantAbsent: "uv sync",
+		},
+		{
+			name:  "python-poetry",
+			files: map[string]string{"pyproject.toml": "[project]\nname = \"x\"\n", "poetry.lock": "[]\n"},
+			lang:  "python", tool: "poetry",
+			wantIn:     "poetry install",
+			wantAbsent: "uv sync",
+		},
+		{
+			name:  "python-uv",
+			files: map[string]string{"pyproject.toml": "[project]\nname = \"x\"\n", "uv.lock": "version = 1\n"},
+			lang:  "python", tool: "uv",
+			// uv is not in python:3.12: the generated pipeline must
+			// install it before calling it.
+			wantIn:     "pip install",
+			wantAbsent: "uv sync --frozen && uv run ruff",
+		},
+		{
+			name:   "swift-package",
+			files:  map[string]string{"Package.swift": "// swift-tools-version:5.9\n"},
+			lang:   "swift",
+			wantIn: "swift build",
+		},
+		{
+			name:  "xcodeproj",
+			files: map[string]string{"App.xcodeproj/project.pbxproj": "// !$*UTF8*$!\n"},
+			lang:  "swift",
+			// The old sed-over-JSON scheme inference is gone; SCHEME is
+			// explicit.
+			wantIn:     "SCHEME",
+			wantAbsent: "xcodebuild -list",
+		},
+		{
+			name:  "maven",
+			files: map[string]string{"pom.xml": "<project/>\n"},
+			lang:  "jvm", tool: "maven",
+			wantIn: "mvn",
+		},
+		{
+			name:  "gradle",
+			files: map[string]string{"build.gradle": "plugins {}\n"},
+			lang:  "jvm", tool: "gradle",
+			wantIn: "gradlew",
+		},
+	}
+	for _, tc := range fixtures {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for name, body := range tc.files {
+				full := filepath.Join(dir, name)
+				if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Detection must agree with the fixture.
+			lang, tool := detectLanguage(dir)
+			if lang != tc.lang || tool != tc.tool {
+				t.Fatalf("detectLanguage = (%q, %q), want (%q, %q)", lang, tool, tc.lang, tc.tool)
+			}
+			// init must succeed.
+			if err := Init([]string{"-dir", dir}); err != nil {
+				t.Fatalf("Init: %v", err)
+			}
+			raw, err := os.ReadFile(filepath.Join(dir, ".kiwi", "pipeline.yaml"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := string(raw)
+			if tc.wantIn != "" && !strings.Contains(body, tc.wantIn) {
+				t.Fatalf("generated pipeline missing %q:\n%s", tc.wantIn, body)
+			}
+			if tc.wantAbsent != "" && strings.Contains(body, tc.wantAbsent) {
+				t.Fatalf("generated pipeline must NOT contain %q:\n%s", tc.wantAbsent, body)
+			}
+			// THE contract: the generated pipeline must validate.
+			if err := Validate([]string{"-f", filepath.Join(dir, ".kiwi", "pipeline.yaml")}); err != nil {
+				t.Fatalf("kiwi validate failed for fixture %s: %v\n%s", tc.name, err, body)
+			}
+			// And compile to a non-empty graph.
+			spec, err := pipeline.Parse(raw)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			g, err := pipeline.Compile(spec)
+			if err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+			if len(g.Jobs) == 0 {
+				t.Fatal("compiled graph is empty")
+			}
+		})
+	}
+}
