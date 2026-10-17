@@ -238,15 +238,17 @@ func (i *Importer) Import(src string) (*importer.Result, error) {
 			}
 			if optional && len(names) > 0 {
 				// Optional depends_on: the dependent must still run when the
-				// dependency is skipped/filtered. Kiwi expresses that as the
-				// need (graph order) plus an always() gate (keeps the
-				// dependent from being skipped with its dependency).
+				// dependency is skipped/failed. Kiwi expresses that as the
+				// need (graph order) plus always() — which bypasses the
+				// implicit success() dependency gate. An EXISTING when
+				// condition is AND-ed, not OR-ed: `(orig) || always()` is
+				// unconditionally true and erases branch/event filters.
 				if j.If == "" {
 					j.If = "always()"
 					res.AddMapped("step %q optional depends_on → needs + if: always()", s.name)
 				} else {
-					j.If = "(" + j.If + ") || always()"
-					res.AddMapped("step %q optional depends_on → needs + widened if", s.name)
+					j.If = "always() && (" + j.If + ")"
+					res.AddMapped("step %q optional depends_on → needs + if: always() && (orig)", s.name)
 				}
 			}
 		} else if !dagMode && idx > 0 {

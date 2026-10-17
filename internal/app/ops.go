@@ -248,9 +248,12 @@ func opsRuns(ctx context.Context, args []string) error {
 	var out []model.Run
 	c := newOpsClient(serverURL, token)
 	cursor := ""
+	seenCursor := map[string]bool{}
 	// Follow X-Kiwi-Next-Cursor so the listing is not silently capped at
-	// one page (the server pages; a single decode hid the rest of the runs).
-	for page := 0; page < 64; page++ {
+	// one page. The walk is bounded and fail-closed: a stuck cursor or a
+	// runaway server must not produce a truncated list that looks complete.
+	const maxRunPages = 64
+	for page := 0; page < maxRunPages; page++ {
 		var batch []model.Run
 		path := "/api/v1/runs"
 		if cursor != "" {
@@ -276,9 +279,17 @@ func opsRuns(ctx context.Context, args []string) error {
 			return err
 		}
 		out = append(out, batch...)
-		cursor = resp.Header.Get("X-Kiwi-Next-Cursor")
-		if cursor == "" || len(batch) == 0 {
+		next := resp.Header.Get("X-Kiwi-Next-Cursor")
+		if next == "" || len(batch) == 0 {
 			break
+		}
+		if seenCursor[next] {
+			return fmt.Errorf("kiwi runs: server pagination returned a repeated cursor %q; refusing to claim a complete listing", next)
+		}
+		seenCursor[next] = true
+		cursor = next
+		if page == maxRunPages-1 && cursor != "" {
+			return fmt.Errorf("kiwi runs: server pagination did not terminate after %d pages (%d runs so far); refusing to claim a complete listing", maxRunPages, len(out))
 		}
 	}
 	if len(out) == 0 {

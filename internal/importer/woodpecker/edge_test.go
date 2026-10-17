@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/importer"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 	"gopkg.in/yaml.v3"
 )
@@ -263,4 +264,76 @@ func hasNote(list []string, sub string) bool {
 		}
 	}
 	return false
+}
+
+// TestOptionalDependsOnPreservesExistingWhen pins the optional-depends_on
+// composition. `always()` bypasses the implicit success() dependency gate;
+// an existing when/condition must stay MANDATORY. The old
+// `(orig) || always()` form is unconditionally true and erases branch/event
+// filters — a job meant for main only would run on every branch.
+func TestOptionalDependsOnPreservesExistingWhen(t *testing.T) {
+	src := `steps:
+  lint:
+    image: golang:1.23
+    commands: [go vet ./...]
+  test:
+    image: golang:1.23
+    commands: [go test ./...]
+    depends_on:
+      - name: lint
+        optional: true
+    when:
+      branch: [main]
+`
+	res, err := New().Import(src)
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	spec, err := pipeline.Parse([]byte(res.PipelineYAML))
+	if err != nil {
+		t.Fatalf("generated pipeline does not parse: %v\n%s", err, res.PipelineYAML)
+	}
+	test, ok := spec.Jobs["test"]
+	if !ok {
+		t.Fatalf("missing test job in %v", spec.Jobs)
+	}
+	if len(test.Needs) != 1 || test.Needs[0] != "lint" {
+		t.Fatalf("test.Needs = %v, want [lint]", test.Needs)
+	}
+	// Must NOT be `(orig) || always()` — that is always true.
+	if strings.Contains(test.If, "|| always()") {
+		t.Fatalf("optional depends_on erased the when condition: if=%q", test.If)
+	}
+	// Must preserve the branch filter and still bypass the success() gate.
+	if !strings.Contains(test.If, "always()") {
+		t.Fatalf("optional depends_on must add always() to bypass dep gate: if=%q", test.If)
+	}
+	if !strings.Contains(test.If, "branch == 'main'") {
+		t.Fatalf("optional depends_on dropped the branch filter: if=%q", test.If)
+	}
+	// Evaluating on a non-main branch must refuse the job even with always().
+	okIf, err := pipeline.Eval(test.If, pipeline.EvalContext{
+		Status: model.StatusSuccess,
+		Branch: "feature",
+		Event:  "push",
+	})
+	if err != nil {
+		t.Fatalf("eval if: %v", err)
+	}
+	if okIf {
+		t.Fatalf("if=%q must be false on feature, but allowed the job", test.If)
+	}
+	// On main, with a failed dependency (status=failure), always() && orig
+	// still admits the job (optional dep).
+	okIf, err = pipeline.Eval(test.If, pipeline.EvalContext{
+		Status: model.StatusFailure,
+		Branch: "main",
+		Event:  "push",
+	})
+	if err != nil {
+		t.Fatalf("eval if: %v", err)
+	}
+	if !okIf {
+		t.Fatalf("if=%q must be true on main even when the optional dep failed", test.If)
+	}
 }

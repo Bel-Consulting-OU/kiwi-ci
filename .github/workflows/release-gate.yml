@@ -70,25 +70,33 @@ jobs:
           "$PG_BINDIR/pg_dump" --version
           "$PG_BINDIR/pg_restore" --version
           psql --version
-      - name: release-gate
+      - name: release-gate (push = verify-only, no tag)
+        if: github.event_name == 'push'
         env:
-          # Production dist/DR tests connect to the pinned service. The
-          # in-test initdb path is used when KIWI_TEST_POSTGRES_URL is unset;
-          # pointing at the service exercises the same code without relying
-          # on whatever the runner image happens to carry.
           KIWI_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
-          # Hermetic: no api.github.com from inside the certification chain.
           KIWI_ALLOW_GITHUB_RELEASE_FETCH: "0"
         run: |
-          # Lean release gate: freeze/test the candidate. N-1 compatibility
-          # is NOT part of the frozen acceptance contract and is not resolved
-          # here (no published predecessor required).
+          # Push to main is a DRY-RUN of the closure: lean release-gate on
+          # the current tree. No version, no freeze, no tag, no publish.
+          make release-gate
+      - name: release-gate (dispatch = freeze + certify + tag + publish)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          KIWI_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+          KIWI_ALLOW_GITHUB_RELEASE_FETCH: "0"
+        run: |
+          # Named version: freeze candidate bytes, certify those bytes, tag
+          # and publish the SAME bytes. N-1 is not part of the contract.
+          set -euo pipefail
           VERSION_INPUT="${{ inputs.version }}"
           case "$VERSION_INPUT" in
             v*) CERT_VERSION="$VERSION_INPUT" ;;
             *) CERT_VERSION="v$VERSION_INPUT" ;;
           esac
-          export KIWI_ALLOW_SOURCE_N_MINUS_ONE=1
+          echo "$CERT_VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || {
+            echo "version must look like v1.2.3" >&2
+            exit 1
+          }
           ./scripts/certify-candidate.sh "$CERT_VERSION"
       - name: surface contracts
         run: |
@@ -110,6 +118,6 @@ jobs:
             exit 1
           }
           # certify-candidate.sh already tagged the FROZEN commit after the
-          # gate passed. This step only publishes that tag.
+          # dispatch gate passed. This step only publishes that tag.
           git push origin "$VERSION"
           echo "tag $VERSION pushed (frozen bytes already certified)"
