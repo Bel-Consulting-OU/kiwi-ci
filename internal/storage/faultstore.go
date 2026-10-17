@@ -318,6 +318,10 @@ func (f *FaultyStore) ListQueuedJobs(ctx context.Context) ([]model.Job, error) {
 	return f.Inner.ListQueuedJobs(ctx)
 }
 
+func (f *FaultyStore) ListRunningJobs(ctx context.Context) ([]model.Job, error) {
+	return f.Inner.ListRunningJobs(ctx)
+}
+
 // ListQueuedJobsPage delegates the bounded keyset-paged queued-candidate read
 // to Inner when it implements QueuedJobPageStore, and fails closed with a
 // diagnosable capability error otherwise. Like ListRunsPage it is a READ: the
@@ -2524,6 +2528,18 @@ func (m *memStore) ListQueuedJobs(ctx context.Context) ([]model.Job, error) {
 	out := []model.Job{}
 	for _, j := range m.jobs {
 		if j.Status == model.StatusQueued {
+			out = append(out, j)
+		}
+	}
+	return out, nil
+}
+
+func (m *memStore) ListRunningJobs(ctx context.Context) ([]model.Job, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []model.Job{}
+	for _, j := range m.jobs {
+		if j.Status == model.StatusRunning {
 			out = append(out, j)
 		}
 	}

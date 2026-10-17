@@ -474,9 +474,11 @@ func TestOutboxReplayDBMirrorsOnlyDueRows(t *testing.T) {
 	f.outboxMeta["delayed"] = fakeOutboxMeta{attempts: 2, lastError: "boom", nextAt: time.Now().UTC().Add(time.Hour)}
 	f.mu.Unlock()
 	s.outbox.mu.Lock()
-	s.outbox.items = append(s.outbox.items,
-		forge.OutboxItem{ID: "delayed", Kind: forge.OutboxKindGitHubCheck},
-		forge.OutboxItem{ID: "delayed-2", Kind: forge.OutboxKindGitHubCheck},
+	s.outbox.appendItemLocked(
+		forge.OutboxItem{ID: "delayed", Kind: forge.OutboxKindGitHubCheck})
+	s.outbox.appendItemLocked(
+		forge.OutboxItem{ID: "delayed-2", Kind: forge.OutboxKindGitHubCheck})
+	s.outbox.appendItemLocked(
 		forge.OutboxItem{ID: "no-durable-row", Kind: "local_kind"})
 	s.outbox.mu.Unlock()
 	f.mu.Lock()

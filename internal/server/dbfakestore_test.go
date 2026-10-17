@@ -654,6 +654,18 @@ func (f *dbFakeStore) ListQueuedJobs(ctx context.Context) ([]model.Job, error) {
 	return out, nil
 }
 
+func (f *dbFakeStore) ListRunningJobs(ctx context.Context) ([]model.Job, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []model.Job{}
+	for _, j := range f.jobs {
+		if j.Status == model.StatusRunning {
+			out = append(out, j)
+		}
+	}
+	return out, nil
+}
+
 func (f *dbFakeStore) ListJobsByRunner(ctx context.Context, runnerID string) ([]model.Job, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -98,29 +98,19 @@ func (s *Server) quotaCountsLocked(run model.Run) (repoRunning, repoQueued, team
 				}
 			}
 		}
-		runs, err := s.DB.ListRuns(ctx, 10000)
+		// One query for every running job. Listing each non-terminal run and
+		// then its jobs was O(runs) round trips per quota check.
+		running, err := s.DB.ListRunningJobs(ctx)
 		if err != nil {
 			return
 		}
-		for _, r := range runs {
-			if r.Status.Terminal() {
-				continue
+		for _, j := range running {
+			repo, teamKey := count(j)
+			if repo == repoID {
+				repoRunning++
 			}
-			jobs, err := s.DB.ListJobsByRun(ctx, r.ID)
-			if err != nil {
-				continue
-			}
-			for _, j := range jobs {
-				if j.Status != model.StatusRunning {
-					continue
-				}
-				repo, teamKey := count(j)
-				if repo == repoID {
-					repoRunning++
-				}
-				if teamKey == team {
-					teamRunning++
-				}
+			if teamKey == team {
+				teamRunning++
 			}
 		}
 		return

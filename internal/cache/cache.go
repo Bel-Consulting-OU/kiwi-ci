@@ -64,6 +64,11 @@ type Store struct {
 	// saves and remote restores reserve capacity through it before writing
 	// bytes, and Prune delegates to its shared lock.
 	Manager *Manager
+	// hashDigestCache memoizes hash_files content digests per
+	// (workspace, patterns) so restore-key cascades and the save path share
+	// one workspace read. Guarded by hashDigestMu; set up lazily.
+	hashDigestMu    sync.Mutex
+	hashDigestCache map[string][]byte
 	// ReportCleanupDebt, when non-nil, receives one report for every cache
 	// filesystem artifact whose removal could not be proven: a restore
 	// rollback that could not remove a path it had already published (the
@@ -358,50 +363,117 @@ func (s *Store) Key(base string, workspace string, hashFiles []string) (string, 
 // the task goroutine hash gigabytes past its own lifetime. The context is
 // checked at entry, between glob patterns and between matched files, and the
 // reader handed to the digest copy is context-aware.
+//
+// Key derivation (stable):
+//   - no hash_files: sha256(base || 0x00) — unchanged from the historical
+//     formula so key-less caches keep their hits;
+//   - with hash_files: sha256(base || 0x00 || filesDigest) where filesDigest
+//     is the sha256 of the sorted (rel || content) stream. Mixing a digest
+//     instead of the raw file bytes lets restore-key cascades and the
+//     post-run save share ONE workspace read/hash instead of re-reading the
+//     same files once per base. A digest mix is a one-time cache miss for
+//     hash_files keys upgraded across this change (safe: a miss recomputes).
 func (s *Store) KeyContext(ctx context.Context, base string, workspace string, hashFiles []string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	h := sha256.New()
-	io.WriteString(h, base)
-	io.WriteString(h, "\x00")
+	// The workspace root is opened even with no hash_files: a missing
+	// workspace must fail the key computation (callers treat it as a hard
+	// cache error), never silently hash a well-known constant.
 	root, err := safefs.OpenWorkspaceRoot(workspace)
 	if err != nil {
 		return "", err
 	}
 	defer root.Close()
+	h := sha256.New()
+	io.WriteString(h, base)
+	io.WriteString(h, "\x00")
+	if len(hashFiles) == 0 {
+		return hex.EncodeToString(h.Sum(nil)), nil
+	}
+	fd, err := s.hashFilesDigest(ctx, workspace, hashFiles)
+	if err != nil {
+		return "", err
+	}
+	h.Write(fd)
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// hashFilesDigest returns the sha256 of the sorted (rel || content) stream
+// for the workspace's hash_files matches. Results are memoized per
+// (workspace, patterns, file fingerprint) so a job that probes several
+// restore keys and then saves does not re-read the same inputs, while a
+// changed lockfile (mtime/size bump) invalidates the entry. The memo is
+// process-local; pattern sets are short and job-scoped in practice.
+func (s *Store) hashFilesDigest(ctx context.Context, workspace string, hashFiles []string) ([]byte, error) {
+	root, err := safefs.OpenWorkspaceRoot(workspace)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
 	var files []string
+	var fp strings.Builder
 	for _, p := range hashFiles {
 		if err := ctx.Err(); err != nil {
-			return "", err
+			return nil, err
 		}
 		matches, err := filepath.Glob(filepath.Join(root.Canonical, p))
 		if err != nil {
-			return "", fmt.Errorf("cache hash_files %q: %w", p, err)
+			return nil, fmt.Errorf("cache hash_files %q: %w", p, err)
 		}
 		files = append(files, matches...)
 	}
 	sort.Strings(files)
 	for _, f := range files {
+		if fi, err := os.Stat(f); err == nil {
+			fmt.Fprintf(&fp, "%s\x00%d\x00%d\x00", f, fi.Size(), fi.ModTime().UnixNano())
+		} else {
+			fmt.Fprintf(&fp, "%s\x00?\x00", f)
+		}
+	}
+	cacheKey := workspace + "\x00" + strings.Join(hashFiles, "\x00") + "\x00" + fp.String()
+	s.hashDigestMu.Lock()
+	if s.hashDigestCache == nil {
+		s.hashDigestCache = map[string][]byte{}
+	}
+	if sum, ok := s.hashDigestCache[cacheKey]; ok {
+		s.hashDigestMu.Unlock()
+		return sum, nil
+	}
+	s.hashDigestMu.Unlock()
+
+	sum, err := s.computeHashFilesDigest(ctx, root, files)
+	if err != nil {
+		return nil, err
+	}
+	s.hashDigestMu.Lock()
+	s.hashDigestCache[cacheKey] = sum
+	s.hashDigestMu.Unlock()
+	return sum, nil
+}
+
+func (s *Store) computeHashFilesDigest(ctx context.Context, root *safefs.WorkspaceRoot, files []string) ([]byte, error) {
+	h := sha256.New()
+	for _, f := range files {
 		if err := ctx.Err(); err != nil {
-			return "", err
+			return nil, err
 		}
 		rel, err := filepath.Rel(root.Canonical, f)
 		if err != nil {
-			return "", fmt.Errorf("cache hash_files: %w", err)
+			return nil, fmt.Errorf("cache hash_files: %w", err)
 		}
 		fh, err := root.OpenRel(filepath.ToSlash(rel))
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 		io.WriteString(h, rel)
 		_, cpErr := copyCacheDigest(h, safefs.NewContextReader(ctx, fh))
 		fh.Close()
 		if cpErr != nil {
-			return "", cpErr
+			return nil, cpErr
 		}
 	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return h.Sum(nil), nil
 }
 
 // Restore is RestoreContext with the Store's default context. That context

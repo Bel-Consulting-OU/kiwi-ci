@@ -679,7 +679,8 @@ func (storeOnlyInner) ListJobsByConcurrencyGroup(context.Context, string) ([]mod
 	return nil, nil
 }
 
-func (storeOnlyInner) ListQueuedJobs(context.Context) ([]model.Job, error) { return nil, nil }
+func (storeOnlyInner) ListQueuedJobs(context.Context) ([]model.Job, error)  { return nil, nil }
+func (storeOnlyInner) ListRunningJobs(context.Context) ([]model.Job, error) { return nil, nil }
 
 func (storeOnlyInner) UpdateJob(context.Context, model.Job) error { return nil }
 

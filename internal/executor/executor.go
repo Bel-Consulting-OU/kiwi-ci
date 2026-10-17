@@ -242,16 +242,28 @@ type artifactRegistry struct {
 	mu    sync.Mutex
 	paths map[string]string
 	bases map[string]string
+	// byName indexes recorded paths by artifact name so a base-id fallback
+	// lookup does not scan every artifact in the run (O(downloads × artifacts)
+	// on large matrices).
+	byName map[string][]string // name -> path keys "jobID\x00name"
 }
 
 func newArtifactRegistry() *artifactRegistry {
-	return &artifactRegistry{paths: map[string]string{}, bases: map[string]string{}}
+	return &artifactRegistry{
+		paths:  map[string]string{},
+		bases:  map[string]string{},
+		byName: map[string][]string{},
+	}
 }
 
 func (r *artifactRegistry) record(jobID, baseID, name, path string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.paths[jobID+"\x00"+name] = path
+	key := jobID + "\x00" + name
+	if _, exists := r.paths[key]; !exists {
+		r.byName[name] = append(r.byName[name], key)
+	}
+	r.paths[key] = path
 	if baseID != "" {
 		r.bases[jobID] = baseID
 	}
@@ -268,13 +280,13 @@ func (r *artifactRegistry) lookup(producer, name string) (string, bool, error) {
 		return p, true, nil
 	}
 	matches := make([]string, 0, 2)
-	for key, p := range r.paths {
+	for _, key := range r.byName[name] {
 		id, n, ok := strings.Cut(key, "\x00")
 		if !ok || n != name {
 			continue
 		}
 		if r.bases[id] == producer {
-			matches = append(matches, p)
+			matches = append(matches, r.paths[key])
 		}
 	}
 	switch len(matches) {
@@ -392,14 +404,25 @@ func (e *Executor) Run(ctx context.Context, g *pipeline.Graph) (map[string]model
 	sem := make(chan struct{}, e.Opt.MaxParallel)
 	done := make(chan completion, len(g.Jobs))
 	running := 0
+	// pendingOrder is the stable iteration order of the pending set. It is
+	// rebuilt ONLY when the set changes; re-sorting every tick was
+	// O(P log P) per scheduling pass.
+	var pendingOrder []string
+	rebuildOrder := func() {
+		pendingOrder = make([]string, 0, len(pending))
+		for id := range pending {
+			pendingOrder = append(pendingOrder, id)
+		}
+		sort.Strings(pendingOrder)
+	}
+	rebuildOrder()
 	for len(pending) > 0 || running > 0 {
 		scheduled := false
-		ids := make([]string, 0, len(pending))
-		for id := range pending {
-			ids = append(ids, id)
+		// Rebuild only when the pending set shrank since the last pass.
+		if len(pendingOrder) != len(pending) {
+			rebuildOrder()
 		}
-		sort.Strings(ids)
-		for _, id := range ids {
+		for _, id := range pendingOrder {
 			cj := g.Jobs[id]
 			if e.Opt.OnlyJob != "" && cj.BaseID != e.Opt.OnlyJob && cj.ID != e.Opt.OnlyJob {
 				statuses[id] = model.StatusSkipped
@@ -437,6 +460,17 @@ func (e *Executor) Run(ctx context.Context, g *pipeline.Graph) (map[string]model
 				<-sem
 				done <- completion{id: cj.ID, result: res}
 			}(cj, depStatus, needsOutputs)
+		}
+		// Drop resolved ids from the order so the next pass does not
+		// revisit them; the len check above is the safety net.
+		if len(pendingOrder) != len(pending) {
+			kept := pendingOrder[:0]
+			for _, id := range pendingOrder {
+				if pending[id] {
+					kept = append(kept, id)
+				}
+			}
+			pendingOrder = kept
 		}
 		if running > 0 {
 			c := <-done

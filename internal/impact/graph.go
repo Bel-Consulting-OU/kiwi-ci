@@ -201,13 +201,18 @@ func (g *Graph) findCycle() ([]string, bool) {
 			switch state[dep] {
 			case visiting:
 				// dep is on the current stack: build the chain from dep back
-				// up to the top for a readable cycle description.
+				// up to the top for a readable cycle description. Collect
+				// backwards then reverse once — prepending on every step was
+				// O(n²) copies on a long chain.
 				chain := []string{dep}
 				for i := len(stack) - 1; i >= 0; i-- {
-					chain = append([]string{stack[i].name}, chain...)
+					chain = append(chain, stack[i].name)
 					if stack[i].name == dep {
 						break
 					}
+				}
+				for i, j := 0, len(chain)-1; i < j; i, j = i+1, j-1 {
+					chain[i], chain[j] = chain[j], chain[i]
 				}
 				return chain, true
 			case unvisited:

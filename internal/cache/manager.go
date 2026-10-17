@@ -543,6 +543,12 @@ func (m *Manager) Reserve(ctx context.Context, expected int64) (*Reservation, er
 	if m.policy.MaxEntries > 0 && m.inflightCount+1 > m.policy.MaxEntries {
 		return nil, fmt.Errorf("%w: every entry slot is reserved", ErrCacheBudgetExceeded)
 	}
+	// List+sort ONCE and drain victims from that ranking. Re-listing and
+	// re-sorting the whole directory per victim made a K-entry eviction
+	// O(K·E log E) under the manager lock (blocking every cache op).
+	// Freshness-fence skips and concurrent publishes are handled by a
+	// single re-list only when the ranked set is exhausted while still
+	// over budget.
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -551,18 +557,45 @@ func (m *Manager) Reserve(ctx context.Context, expected int64) (*Reservation, er
 		if err != nil {
 			return nil, err
 		}
+		sortLocalEntriesOldestFirst(entries)
 		var used int64
 		for _, e := range entries {
 			used += e.size
 		}
-		overBytes := m.policy.MaxBytes > 0 && used+m.inflight+expected > m.policy.MaxBytes
-		overEntries := m.policy.MaxEntries > 0 && len(entries)+m.inflightCount+1 > m.policy.MaxEntries
-		if !overBytes && !overEntries {
-			m.inflight += expected
-			m.inflightCount++
-			return &Reservation{m: m, n: expected}, nil
+		n := len(entries)
+		for {
+			overBytes := m.policy.MaxBytes > 0 && used+m.inflight+expected > m.policy.MaxBytes
+			overEntries := m.policy.MaxEntries > 0 && n+m.inflightCount+1 > m.policy.MaxEntries
+			if !overBytes && !overEntries {
+				m.inflight += expected
+				m.inflightCount++
+				return &Reservation{m: m, n: expected}, nil
+			}
+			if len(entries) == 0 {
+				break
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			e := entries[0]
+			entries = entries[1:]
+			if managerEvictHook != nil {
+				managerEvictHook(e.key)
+			}
+			var res PruneResult
+			if evictLocalEntry(m.root, e, &res) {
+				used -= e.size
+				n--
+				continue
+			}
+			// Skipped/failed: the entry still occupies disk and stays in
+			// accounting (same contract as pruneLocalDir), so a later
+			// candidate is judged against a total that includes it.
 		}
-		if !m.evictOldestLocked(entries) {
+		// Ranked set exhausted while still over budget: a concurrent save
+		// may have published new entries, or every victim failed the fence.
+		// One re-list per outer iteration, not per victim.
+		if !m.evictAnyOldestLocked() {
 			return nil, fmt.Errorf("%w: no colder entry could be evicted", ErrCacheBudgetExceeded)
 		}
 	}
@@ -573,17 +606,25 @@ func (m *Manager) Reserve(ctx context.Context, expected int64) (*Reservation, er
 // reservation chose as its victim.
 var managerEvictHook func(key string)
 
-// evictOldestLocked evicts the oldest retained entry and reports whether one
-// was removed. Entries that fail the freshness fence or the physical removal
-// are skipped in favor of the next-oldest, so one undeletable file cannot
-// wedge the whole cache. Callers hold m.mu.
-func (m *Manager) evictOldestLocked(entries []localCacheEntry) bool {
+func sortLocalEntriesOldestFirst(entries []localCacheEntry) {
 	sort.Slice(entries, func(i, j int) bool {
 		if !entries[i].modTime.Equal(entries[j].modTime) {
 			return entries[i].modTime.Before(entries[j].modTime)
 		}
 		return entries[i].key < entries[j].key
 	})
+}
+
+// evictAnyOldestLocked re-lists the store and evicts one removable entry
+// (oldest first). Used only when a ranked pass could not free enough room,
+// so the directory is scanned once per gap rather than once per victim.
+// Callers hold m.mu.
+func (m *Manager) evictAnyOldestLocked() bool {
+	entries, err := listLocalEntriesAt(m.root)
+	if err != nil {
+		return false
+	}
+	sortLocalEntriesOldestFirst(entries)
 	var res PruneResult
 	for _, e := range entries {
 		if managerEvictHook != nil {

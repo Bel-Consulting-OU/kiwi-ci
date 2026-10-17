@@ -90,15 +90,45 @@ type RunAuthzPolicy struct {
 	// identityRead holds the canonical identity IDs ("host/full name") whose
 	// effective entry grants Read. The remaining sets encode presence and
 	// conflict so an explicit entry suppresses the alias/global fallback.
-	identityRead     []string
-	identityPresent  []string
-	identityConflict []string
+	// The slices stay sorted for deterministic SQL binding; the maps are the
+	// O(1) membership tests used by Allows on every memory-mode page row.
+	identityRead        []string
+	identityPresent     []string
+	identityConflict    []string
+	identityReadSet     map[string]struct{}
+	identityPresentSet  map[string]struct{}
+	identityConflictSet map[string]struct{}
 
 	// aliasRead holds the bare full names whose effective entry grants Read;
 	// aliasPresent/aliasConflict mirror the identity sets for bare grants.
-	aliasRead     []string
-	aliasPresent  []string
-	aliasConflict []string
+	aliasRead        []string
+	aliasPresent     []string
+	aliasConflict    []string
+	aliasReadSet     map[string]struct{}
+	aliasPresentSet  map[string]struct{}
+	aliasConflictSet map[string]struct{}
+}
+
+func toSet(in []string) map[string]struct{} {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(in))
+	for _, v := range in {
+		out[v] = struct{}{}
+	}
+	return out
+}
+
+// setHas reports membership in the O(1) set, falling back to the sorted
+// slice when a test double built the policy without sets (Allows must keep
+// deciding the same way).
+func setHas(set map[string]struct{}, list []string, v string) bool {
+	if set != nil {
+		_, ok := set[v]
+		return ok
+	}
+	return containsString(list, v)
 }
 
 // RunAuthzPolicyForPrincipal normalizes a principal's repository grants into
@@ -171,6 +201,12 @@ func RunAuthzPolicyForPrincipal(p *auth.Principal) RunAuthzPolicy {
 	sort.Strings(pol.aliasRead)
 	sort.Strings(pol.aliasPresent)
 	sort.Strings(pol.aliasConflict)
+	pol.identityReadSet = toSet(pol.identityRead)
+	pol.identityPresentSet = toSet(pol.identityPresent)
+	pol.identityConflictSet = toSet(pol.identityConflict)
+	pol.aliasReadSet = toSet(pol.aliasRead)
+	pol.aliasPresentSet = toSet(pol.aliasPresent)
+	pol.aliasConflictSet = toSet(pol.aliasConflict)
 	return pol
 }
 
@@ -249,28 +285,28 @@ func (p RunAuthzPolicy) Allows(repoID string) bool {
 	canonical, fullName := splitRepoCandidate(repoID)
 	if canonical {
 		id := canonicalCandidateID(repoID, fullName)
-		if containsString(p.identityConflict, id) {
+		if setHas(p.identityConflictSet, p.identityConflict, id) {
 			return false
 		}
-		if containsString(p.identityPresent, id) {
-			return containsString(p.identityRead, id)
+		if setHas(p.identityPresentSet, p.identityPresent, id) {
+			return setHas(p.identityReadSet, p.identityRead, id)
 		}
-		if containsString(p.aliasConflict, fullName) {
+		if setHas(p.aliasConflictSet, p.aliasConflict, fullName) {
 			return false
 		}
-		if containsString(p.aliasPresent, fullName) {
-			return containsString(p.aliasRead, fullName)
+		if setHas(p.aliasPresentSet, p.aliasPresent, fullName) {
+			return setHas(p.aliasReadSet, p.aliasRead, fullName)
 		}
 		return p.globalRead
 	}
 	// Bare/alias candidate: splitRepoCandidate already folded the value onto
 	// the canonical path case (untagged only), so the alias entry comparison
 	// is case-insensitive exactly like the SQL full-name predicate.
-	if containsString(p.aliasConflict, fullName) {
+	if setHas(p.aliasConflictSet, p.aliasConflict, fullName) {
 		return false
 	}
-	if containsString(p.aliasPresent, fullName) {
-		return containsString(p.aliasRead, fullName)
+	if setHas(p.aliasPresentSet, p.aliasPresent, fullName) {
+		return setHas(p.aliasReadSet, p.aliasRead, fullName)
 	}
 	return p.globalRead
 }

@@ -10,6 +10,10 @@ import (
 // AWSProvider runs fleet capacity as EC2 instances. It speaks the EC2
 // Query API shape through the cloud.go seam (base URL is the regional
 // endpoint); the instance-id is the fleet ID.
+// EXPERIMENTAL — not production cloud support. The provider speaks the
+// real API shape but has not been certified against live disposable
+// resources. Frozen scope: cloud/fleet autoscaling is optional and does
+// not block a core release. Do not advertise this as production-ready.
 type AWSProvider struct {
 	name        string
 	region      string
@@ -127,12 +131,15 @@ func (a *AWSProvider) createInstance(ctx context.Context, p Profile, n int) ([]c
 		if err := a.client.do(ctx, "POST", "/?Action=RunInstances&Version=2016-11-15", body, &resp); err != nil {
 			return out, err
 		}
-		id := fmt.Sprintf("aws-%d", time.Now().UnixNano())
-		if len(resp.Instances) > 0 {
-			id = resp.Instances[0].InstanceID
+		// A create that reports success WITHOUT a provider-native instance
+		// id is unknown, not success. Fabricating an internal id would
+		// produce a phantom instance the pool tracks but the cloud never
+		// created. Fail closed.
+		if len(resp.Instances) == 0 || resp.Instances[0].InstanceID == "" {
+			return out, fmt.Errorf("fleet/aws: RunInstances succeeded without an instance id; refusing to fabricate one")
 		}
 		out = append(out, cloudInstance{
-			ID: id, Profile: p.Name, Labels: p.Labels,
+			ID: resp.Instances[0].InstanceID, Profile: p.Name, Labels: p.Labels,
 			Region: p.Region, Arch: p.Architecture,
 			State: StatePending, Started: time.Now().UTC(),
 			Provider: "aws",

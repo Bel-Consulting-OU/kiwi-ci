@@ -493,6 +493,8 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 	}
 	created := make(map[string]model.Job, len(keys))
 	jobContracts := map[string]map[string]storage.ArtifactContract{}
+	// Priority (downstream depth) for every fragment job in ONE sweep.
+	depths := scheduler.DownstreamDepths(g, keys)
 	ids := make([]string, 0, len(keys))
 	oidcAudiences := policy.OIDCFromCapabilities(childCaps).AllowedAudiences
 	for _, key := range keys {
@@ -547,7 +549,7 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 			Event: parent.Event, Condition: cj.Job.If, DependencyStatus: model.StatusSuccess, Pipeline: string(canonical), Trusted: parent.Trusted, ChangedFiles: append([]string{}, parent.ChangedFiles...), ChangedFilesKnown: parent.ChangedFilesKnown, Needs: needs,
 			RequiredLabels: labelsForJob(cj.Job), Network: effectiveNetwork, Environment: env, ApprovalRequired: cj.Job.Environment.Approval, EnvironmentBranches: append([]string{}, cj.Job.Environment.Branches...), EnvironmentConcurrency: cj.Job.Environment.Concurrency, OIDCAllowed: cj.Job.Permissions.IDToken, OIDCAudiences: cloneStrings(oidcAudiences),
 			DeclaredSecrets: declaredSecrets(strictSpec, cj.Job),
-			Status:          model.StatusQueued, Priority: scheduler.DownstreamDepth(g, key), MaxInfraRetries: infraRetries, CreatedAt: now,
+			Status:          model.StatusQueued, Priority: depths[key], MaxInfraRetries: infraRetries, CreatedAt: now,
 			DynamicDepth:     childDepth,
 			PlacementRegions: append([]string{}, cj.Job.Placement.Regions...),
 			// Generated children belong to the parent's run and inherit its

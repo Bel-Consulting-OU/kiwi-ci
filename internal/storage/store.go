@@ -192,6 +192,10 @@ type Store interface {
 	// concurrency group, for group-limit accounting (spec.concurrency.limit).
 	ListJobsByConcurrencyGroup(ctx context.Context, group string) ([]model.Job, error)
 	ListQueuedJobs(ctx context.Context) ([]model.Job, error)
+	// ListRunningJobs returns every job currently holding a running lease,
+	// in creation order. Quota accounting and fleet views use it instead of
+	// listing every run and then every job per run (N+1).
+	ListRunningJobs(ctx context.Context) ([]model.Job, error)
 	UpdateJob(ctx context.Context, job model.Job) error
 
 	// leases

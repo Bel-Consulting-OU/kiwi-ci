@@ -176,11 +176,39 @@ func (s *Server) applyQueueReasonsDB(ctx context.Context, ri model.Runner) {
 	}
 	fleet, fleetComplete := s.fleetQueueRunnerViewsDB(ctx, ri)
 	reasons := map[string]string{}
+	// One pass-level GetJob / ListJobsByEnvironment cache. Calling the store
+	// once per dependency (and once per environment) per candidate was
+	// O(candidates × deps) round trips on a full queue.
+	jobByID := map[string]model.Job{}
+	envJobs := map[string][]model.Job{}
+	getJob := func(id string) (model.Job, bool) {
+		if j, ok := jobByID[id]; ok {
+			return j, true
+		}
+		d, err := s.DB.GetJob(ctx, id)
+		if err != nil {
+			return model.Job{}, false
+		}
+		jobByID[id] = d
+		return d, true
+	}
+	listEnv := func(repoID, env string) []model.Job {
+		key := repoID + "\x00" + env
+		if v, ok := envJobs[key]; ok {
+			return v
+		}
+		others, err := s.DB.ListJobsByEnvironment(ctx, repoID, env)
+		if err != nil {
+			return nil
+		}
+		envJobs[key] = others
+		return others
+	}
 	for _, j := range jobs {
 		if j.Status != model.StatusQueued {
 			continue
 		}
-		reason := queueReasonForJob(j, fleet, s.depsReadyDB(ctx, j), s.environmentAtCapacityDB(ctx, j))
+		reason := queueReasonForJob(j, fleet, s.depsReadyDBLookup(j, getJob), s.environmentAtCapacityDBLookup(j, listEnv))
 		if !fleetComplete && !jobScopedQueueReason(reason) {
 			// Unknown fleet: do not replace a fleet-level diagnostic with a
 			// runner-local one (the next successful pass will).
@@ -448,9 +476,19 @@ func (s *Server) fleetQueueRunnerViewsLocked(ri model.Runner, reserved map[strin
 // depsReadyDB evaluates a queued job's dependency gate against the SQL
 // store using the same unified condition evaluator as the in-memory path.
 func (s *Server) depsReadyDB(ctx context.Context, j model.Job) bool {
-	ready, status := scheduler.DependencyOutcome(j.Needs, nil, func(id string) (model.Status, bool) {
+	return s.depsReadyDBLookup(j, func(id string) (model.Job, bool) {
 		d, err := s.DB.GetJob(ctx, id)
 		if err != nil {
+			return model.Job{}, false
+		}
+		return d, true
+	})
+}
+
+func (s *Server) depsReadyDBLookup(j model.Job, getJob func(string) (model.Job, bool)) bool {
+	ready, status := scheduler.DependencyOutcome(j.Needs, nil, func(id string) (model.Status, bool) {
+		d, ok := getJob(id)
+		if !ok {
 			return "", false
 		}
 		return d.Status, true
@@ -468,13 +506,20 @@ func (s *Server) depsReadyDB(ctx context.Context, j model.Job) bool {
 // URL and never the authorization-side PolicyRepoID. The DB and memory modes
 // therefore make the same repo-scoped decision for one candidate.
 func (s *Server) environmentAtCapacityDB(ctx context.Context, j model.Job) bool {
+	return s.environmentAtCapacityDBLookup(j, func(repoID, env string) []model.Job {
+		others, err := s.DB.ListJobsByEnvironment(ctx, repoID, env)
+		if err != nil {
+			return nil
+		}
+		return others
+	})
+}
+
+func (s *Server) environmentAtCapacityDBLookup(j model.Job, listEnv func(repoID, env string) []model.Job) bool {
 	if j.Environment == "" || j.EnvironmentConcurrency <= 0 {
 		return false
 	}
-	others, err := s.DB.ListJobsByEnvironment(ctx, storage.RepoIDForJob(j), j.Environment)
-	if err != nil {
-		return false
-	}
+	others := listEnv(storage.RepoIDForJob(j), j.Environment)
 	active := 0
 	for _, other := range others {
 		if other.ID == j.ID || other.Status != model.StatusRunning {

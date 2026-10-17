@@ -79,7 +79,7 @@ func TestOutboxDeliveredWatermarkBookkeeping(t *testing.T) {
 	}
 	// A newer pending item supersedes an older legacy publication.
 	o.mu.Lock()
-	o.items = append(o.items, forge.OutboxItem{ID: "newer", LogicalKey: "pending", StateVersion: 5})
+	o.appendItemLocked(forge.OutboxItem{ID: "newer", LogicalKey: "pending", StateVersion: 5})
 	o.mu.Unlock()
 	if !o.Superseded("pending", 4) {
 		t.Fatal("newer pending item did not supersede an older version")
@@ -142,7 +142,7 @@ func TestOutboxDeliveredWatermarkBookkeeping(t *testing.T) {
 		t.Fatal("done id reported as a queued intent")
 	}
 	o.mu.Lock()
-	o.items = append(o.items, forge.OutboxItem{ID: "queued-1"})
+	o.appendItemLocked(forge.OutboxItem{ID: "queued-1"})
 	o.mu.Unlock()
 	if !o.HasIntent("queued-1") {
 		t.Fatal("queued intent reported absent")

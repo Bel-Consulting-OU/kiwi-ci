@@ -19,6 +19,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/provenance"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/runner"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secretbroker"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
 )
 
@@ -36,6 +37,10 @@ type SystemConfig struct {
 	DataDir string
 	// Extra PersistentOptions are forwarded to server.NewPersistent.
 	Extra []server.PersistentOption
+	// Secrets is an optional static secret store: declared secrets resolve
+	// to these values for trusted jobs. Without it the broker is nil and
+	// every secret delivery is refused (the correct fail-closed default).
+	Secrets map[string]string
 }
 
 // System is one live production-path dogfood installation: a persistent
@@ -78,6 +83,27 @@ func Start(t testingT) *System {
 		RunnerToken: "sys-runner-token",
 		AdminToken:  "sys-admin-token",
 		DataDir:     t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("system.Launch: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	if err := s.EnableTrustedWebhook(TrustedWebhookConfig{}); err != nil {
+		t.Fatalf("system.EnableTrustedWebhook: %v", err)
+	}
+	return s
+}
+
+// StartWithSecrets is Start plus a static secret store: declared secrets
+// resolve for trusted jobs. The ordinary CI secret path needs this; without
+// it every secret delivery is refused (the fail-closed default).
+func StartWithSecrets(t testingT, secrets map[string]string) *System {
+	t.Helper()
+	s, err := Launch(SystemConfig{
+		RunnerToken: "sys-runner-token",
+		AdminToken:  "sys-admin-token",
+		DataDir:     t.TempDir(),
+		Secrets:     secrets,
 	})
 	if err != nil {
 		t.Fatalf("system.Launch: %v", err)
@@ -139,6 +165,11 @@ func Launch(cfg SystemConfig) (*System, error) {
 	}
 	if cfg.DataDir == "" {
 		return nil, fmt.Errorf("system: DataDir is required")
+	}
+	if len(cfg.Secrets) > 0 {
+		cfg.Extra = append(cfg.Extra, func(s *server.Server) {
+			s.SecretBroker = secretbroker.StaticBroker(cfg.Secrets)
+		})
 	}
 	srv, err := server.NewPersistent(cfg.RunnerToken, cfg.AdminToken, cfg.DataDir, cfg.Extra...)
 	if err != nil {
@@ -284,6 +315,98 @@ type JobView struct {
 	// identities appear HERE — the public job DTO redacts the pipeline
 	// text, so the compiled payload is the observable execution identity.
 	CompiledJobPayload *model.CompiledJobPayload `json:"compiled_job_payload,omitempty"`
+	// DeclaredSecrets is the enqueue-time allowlist (run secrets ∪ step
+	// secrets). Its presence is the observable proof that a secret
+	// declaration survived admission.
+	DeclaredSecrets []string `json:"declared_secrets,omitempty"`
+	// Cache declarations live inside CompiledJobPayload.EffectiveJob —
+	// the public job DTO has no cache_keys field. Read the compiled
+	// payload for cache assertions.
+}
+
+// JobLogs returns the accumulated log text for one job (empty when none).
+// Logs are ordinary CI output the operator reads to see what happened.
+func (s *System) JobLogs(ctx context.Context, runID, jobKey string) string {
+	// Logs are fetched run-scoped (GET /api/v1/runs/{id}/logs) but this
+	// helper is named for ONE job. Without the filter it would return every
+	// job's output and a job that produced nothing would look like it had
+	// logs. Filter by the job's key (the DTO's stable identity).
+	j, err := s.JobByKey(ctx, runID, jobKey)
+	if err != nil {
+		return ""
+	}
+	var entries []model.LogEntry
+	if err := s.getJSON(ctx, s.AdminToken, "/api/v1/runs/"+runID+"/logs?after=0&limit=100000", &entries); err != nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, e := range entries {
+		if e.JobKey != j.Key && e.JobID != j.ID {
+			continue
+		}
+		b.WriteString(e.Line)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// JobArtifact returns the content of one uploaded artifact ("" when absent).
+// This is the ordinary CI artifact download path: list the run's artifacts,
+// find the named one, then GET /api/v1/artifacts/{id}.
+func (s *System) JobArtifact(ctx context.Context, runID, jobKey, name string) string {
+	if _, err := s.JobByKey(ctx, runID, jobKey); err != nil {
+		return ""
+	}
+	var arts []struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	if err := s.getJSON(ctx, s.AdminToken, "/api/v1/runs/"+runID+"/artifacts", &arts); err != nil {
+		return ""
+	}
+	artID := ""
+	for _, a := range arts {
+		if a.Name == name {
+			artID = a.ID
+			break
+		}
+	}
+	if artID == "" {
+		return ""
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.BaseURL+"/api/v1/artifacts/"+artID, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Authorization", "Bearer "+s.AdminToken)
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return ""
+	}
+	return string(raw)
+}
+
+// ForgeStatusPublished reports whether the completion outbox published an
+// SCM status for this job — the "commit / PR status" link in the ordinary
+// CI chain.
+func (s *System) ForgeStatusPublished(ctx context.Context, runID string) bool {
+	// The forge stand-in counts SCM status/check publications (the
+	// completion outbox's forge_delivery intent). There is no
+	// /runs/{id}/forge-status endpoint — do not probe one.
+	_ = ctx
+	_ = runID
+	if s.trustedForge == nil {
+		return false
+	}
+	return s.trustedForge.statuses() > 0
 }
 
 // QueryRun fetches one run via the public API.

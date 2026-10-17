@@ -186,9 +186,16 @@ type Server struct {
 	// the incarnation fence exists to stop).
 	runnerProto map[string]runnerRegInfo
 	artifacts   map[string]model.ArtifactRecord
-	reports     map[string]model.TestReport
-	deliveries  map[string]string
-	completions map[string]model.CompletionReceipt
+	// artifactByKey indexes artifacts by their (job, generation, name)
+	// uniqueness key → artifact id, so insertArtifactMemoryLocked is O(1)
+	// per insert instead of scanning every artifact. artifactIndexCard is
+	// the len(s.artifacts) the index was last built against; a mismatch
+	// (tests seeding the map) triggers one rebuild.
+	artifactByKey     map[string]string
+	artifactIndexCard int
+	reports           map[string]model.TestReport
+	deliveries        map[string]string
+	completions       map[string]model.CompletionReceipt
 	// idempotency holds the fs-mode run-idempotency receipts keyed by
 	// canonical repository scope + client key (runIdempotencyReceiptKey).
 	// Guarded by s.mu; persisted in the SAME snapshot write as the run it
@@ -1121,25 +1128,35 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 			}
 		}
 	}
+	s.artifactByKey = make(map[string]string, len(s.artifacts))
 	for id, a := range s.artifacts {
 		a.Path = filepath.Join(dataDir, "artifacts", a.RunID, a.JobID, id+".tar.gz")
 		if a.ProvenanceSHA256 != "" {
 			a.ProvenancePath = a.Path + ".intoto.json"
 		}
 		s.artifacts[id] = a
+		// Rebuild the uniqueness index on load so a restart cannot admit a
+		// duplicate (job, generation, name) insert.
+		if a.JobID != "" {
+			s.artifactByKey[a.JobID+"\x00"+fmt.Sprint(a.LeaseGeneration)+"\x00"+a.Name] = id
+		}
 	}
+	s.artifactIndexCard = len(s.artifacts)
 	// A restarted control plane must not blindly assume an old process is
 	// still polling, but it also must not duplicate jobs whose leases are
 	// still valid: rebuild each runner's ActiveJobs from the jobs whose
 	// unexpired running leases it actually still holds.
 	now := time.Now().UTC()
-	for id, r := range s.runners {
-		var active []string
-		for _, j := range s.jobs {
-			if j.LeaseRunnerID == id && j.Status == model.StatusRunning && j.LeaseExpiresAt != nil && j.LeaseExpiresAt.After(now) {
-				active = append(active, j.ID)
-			}
+	// One pass over jobs groups live leases by runner. Scanning s.jobs
+	// inside the runner loop was O(R*J) at every restart.
+	activeByRunner := make(map[string][]string)
+	for _, j := range s.jobs {
+		if j.LeaseRunnerID != "" && j.Status == model.StatusRunning && j.LeaseExpiresAt != nil && j.LeaseExpiresAt.After(now) {
+			activeByRunner[j.LeaseRunnerID] = append(activeByRunner[j.LeaseRunnerID], j.ID)
 		}
+	}
+	for id, r := range s.runners {
+		active := activeByRunner[id]
 		if r.Capacity < 1 && !s.RequireProfiles {
 			r.Capacity = 1
 		}
@@ -2121,6 +2138,10 @@ func (s *Server) enqueueID(ctx context.Context, in SubmitRun, preRunID string) (
 	}
 	created := make(map[string]model.Job, len(g.Jobs))
 	jobContracts := map[string]map[string]storage.ArtifactContract{}
+	// Priority (downstream depth) for every job in ONE reverse-topological
+	// sweep. Calling DownstreamDepth per job rescanned the whole graph each
+	// time — O(N*E) per job, O(N^2*E) per enqueue.
+	depths := scheduler.DownstreamDepths(g, jobKeys(g))
 	for key, cj := range g.Jobs {
 		needs := make([]string, 0, len(cj.Needs))
 		for _, dep := range cj.Needs {
@@ -2181,7 +2202,7 @@ func (s *Server) enqueueID(ctx context.Context, in SubmitRun, preRunID string) (
 			RequiredLabels: labelsForJob(cj.Job), Network: effectiveNetwork, Environment: env, ApprovalRequired: cj.Job.Environment.Approval, EnvironmentBranches: append([]string{}, cj.Job.Environment.Branches...), EnvironmentConcurrency: cj.Job.Environment.Concurrency, OIDCAllowed: cj.Job.Permissions.IDToken, OIDCAudiences: cloneStrings(oidcAudiences),
 			ConcurrencyGroup: group, ConcurrencyLimit: spec.Concurrency.Limit,
 			DeclaredSecrets: declaredSecrets(spec, cj.Job),
-			Status:          model.StatusQueued, Priority: scheduler.DownstreamDepth(g, key), MaxInfraRetries: infraRetries, CreatedAt: now,
+			Status:          model.StatusQueued, Priority: depths[key], MaxInfraRetries: infraRetries, CreatedAt: now,
 			PlacementRegions: append([]string{}, cj.Job.Placement.Regions...),
 			ComponentDigest:  componentDigests[cj.BaseID],
 			// Every job inherits the run's stamped semantics, so a run's
@@ -2920,6 +2941,19 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 func redactJob(j model.Job) model.Job { j.Pipeline = ""; j.LeaseTokenHash = nil; return j }
+
+// jobKeys returns the compiled-graph keys, one per job, so a single
+// DownstreamDepths sweep can answer every job's priority.
+func jobKeys(g *pipeline.Graph) []string {
+	if g == nil {
+		return nil
+	}
+	out := make([]string, 0, len(g.Jobs))
+	for k := range g.Jobs {
+		out = append(out, k)
+	}
+	return out
+}
 
 func (s *Server) getLogs(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
@@ -4241,6 +4275,12 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	// against quota_reservations inside its transaction).
 	repoRunning := map[string]int{}
 	teamRunning := map[string]int{}
+	// Precompute the RUNNING population by environment and by concurrency
+	// group in ONE pass. The old code re-scanned s.jobs inside the queued
+	// loop for every candidate that declared an env or group limit —
+	// O(J^2) per lease attempt on a busy control plane.
+	envRunningTotals := map[string]int{} // key: env\x00repoID
+	groupRunningTotals := map[string]int{}
 	for _, other := range s.jobs {
 		if other.Status != model.StatusRunning {
 			continue
@@ -4248,6 +4288,12 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 		otherRepo := repoIDForJob(other)
 		repoRunning[otherRepo]++
 		teamRunning[repoTeamKey(otherRepo)]++
+		if other.Environment != "" {
+			envRunningTotals[other.Environment+"\x00"+storage.RepoIDForJob(other)]++
+		}
+		if other.ConcurrencyGroup != "" {
+			groupRunningTotals[other.ConcurrencyGroup]++
+		}
 	}
 	for _, j := range s.jobs {
 		if j.Status != model.StatusQueued || !depsReadyLocked(j, s.jobs) {
@@ -4294,28 +4340,16 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 		// SCHEDULING identity of the checkout repository
 		// (storage.RepoIDForJob, the same resolver scheduler.EnvironmentAtCapacity
 		// and the SQL claim use), not on the authorization-side PolicyRepoID.
+		// O(1) lookups into the precomputed running totals. The candidate
+		// itself is never running (it is queued), so no self-subtraction is
+		// needed.
 		envRunning := 0
 		if j.Environment != "" && j.EnvironmentConcurrency > 0 {
-			jobRepoID := storage.RepoIDForJob(j)
-			for _, other := range s.jobs {
-				if other.ID == j.ID || other.Status != model.StatusRunning {
-					continue
-				}
-				if other.Environment == j.Environment && storage.RepoIDForJob(other) == jobRepoID {
-					envRunning++
-				}
-			}
+			envRunning = envRunningTotals[j.Environment+"\x00"+storage.RepoIDForJob(j)]
 		}
 		groupRunning := 0
 		if j.ConcurrencyGroup != "" && j.ConcurrencyLimit > 0 {
-			for _, other := range s.jobs {
-				if other.ID == j.ID || other.Status != model.StatusRunning {
-					continue
-				}
-				if other.ConcurrencyGroup == j.ConcurrencyGroup {
-					groupRunning++
-				}
-			}
+			groupRunning = groupRunningTotals[j.ConcurrencyGroup]
 		}
 		policyRuntimes, policyEnforced := storage.LeasePolicyRuntimes(j)
 		if !(storage.LeasePredicate{

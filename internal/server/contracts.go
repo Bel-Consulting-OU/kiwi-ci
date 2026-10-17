@@ -229,20 +229,29 @@ func (s *Server) requiredArtifactsMissingLocked(j model.Job) string {
 			contracts = buildJobContracts(cj)
 		}
 	}
+	if len(contracts) == 0 {
+		return ""
+	}
+	// Bucket this job's artifacts once. A per-contract scan of the whole
+	// artifact map was O(contracts × all artifacts) on every completion.
+	byName := map[string][]model.ArtifactRecord{}
+	for _, a := range s.artifacts {
+		if a.JobID == j.ID {
+			byName[a.Name] = append(byName[a.Name], a)
+		}
+	}
 	for name, c := range contracts {
 		if !c.Required {
 			continue
 		}
 		provenanceRequired := c.Provenance == storage.ArtifactProvenanceRequired
 		found := false
-		for _, a := range s.artifacts {
-			if a.JobID == j.ID && a.Name == name {
-				if provenanceRequired && a.ProvenanceSHA256 == "" {
-					continue
-				}
-				found = true
-				break
+		for _, a := range byName[name] {
+			if provenanceRequired && a.ProvenanceSHA256 == "" {
+				continue
 			}
+			found = true
+			break
 		}
 		if !found {
 			return name

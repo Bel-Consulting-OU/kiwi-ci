@@ -68,6 +68,7 @@ type fcStore struct {
 	expireReservationsErr   error
 	parentRunIDsErr         error
 	listQueuedErr           error
+	listRunningErr          error
 	listJobsByEnvErr        error
 	setQueueReasonsErr      error
 	listRunsErr             error
@@ -320,6 +321,13 @@ func (f *fcStore) ListQueuedJobs(ctx context.Context) ([]model.Job, error) {
 		return append([]model.Job(nil), f.queuedOverride...), nil
 	}
 	return f.dbFakeStore.ListQueuedJobs(ctx)
+}
+
+func (f *fcStore) ListRunningJobs(ctx context.Context) ([]model.Job, error) {
+	if f.listRunningErr != nil {
+		return nil, f.listRunningErr
+	}
+	return f.dbFakeStore.ListRunningJobs(ctx)
 }
 
 func (f *fcStore) ListJobsByEnvironment(ctx context.Context, repoID, environment string) ([]model.Job, error) {

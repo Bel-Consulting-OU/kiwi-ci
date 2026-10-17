@@ -142,6 +142,15 @@ type Outbox struct {
 	// are evicted first.
 	delivered      map[string]int64
 	deliveredOrder []string
+	// pendingMax is the highest StateVersion currently queued per
+	// LogicalKey. flushLocal's defense-in-depth supersede check is O(1)
+	// against this instead of scanning every queued item per dispatch
+	// (O(N²) on a status-update backlog). Maintained under mu on every
+	// enqueue/remove/rebuild.
+	pendingMax map[string]int64
+	// queuedIDs is the set of item IDs currently in items, so HasIntent and
+	// duplicate-enqueue checks are O(1) instead of a full queue scan.
+	queuedIDs map[string]bool
 	// claimer uniquely identifies this process in the durable outbox claim
 	// lease. Lazily initialized.
 	claimer string
@@ -240,7 +249,7 @@ func (o *Outbox) ReplayDB(ctx context.Context) error {
 		if seen[it.ID] {
 			continue
 		}
-		o.items = append(o.items, forge.OutboxItem{
+		o.appendItemLocked(forge.OutboxItem{
 			ID: it.ID, Kind: it.Kind, Payload: it.Payload, CreatedAt: it.CreatedAt,
 			LogicalKey: it.LogicalKey, StateVersion: it.StateVersion,
 		})
@@ -329,8 +338,9 @@ func (o *Outbox) loadLocked() error {
 		if it.LogicalKey != "" && it.StateVersion > 0 && o.delivered[it.LogicalKey] >= it.StateVersion {
 			continue
 		}
-		o.items = append(o.items, it)
+		o.appendItemLocked(it)
 	}
+	o.recomputeIndexLocked()
 	// Bound the watermark cardinality now that BOTH evidence sources (the
 	// retained done IDs and the pending items) are loaded: ineligible keys
 	// keep their watermark even past the cap, eligible keys are evicted
@@ -507,17 +517,17 @@ func (o *Outbox) Enqueue(ctx context.Context, item forge.OutboxItem) error {
 		}); err != nil {
 			return err
 		}
-		o.items = append(o.items, item)
+		o.appendItemLocked(item)
 		return nil
 	}
 	if o.store == nil {
-		o.items = append(o.items, item)
+		o.appendItemLocked(item)
 		return nil
 	}
 	if err := appendOutboxJSONL(o, outboxFile, item); err != nil {
 		return err
 	}
-	o.items = append(o.items, item)
+	o.appendItemLocked(item)
 	return nil
 }
 
@@ -555,7 +565,7 @@ func (o *Outbox) enqueueVersionedLocked(ctx context.Context, item forge.OutboxIt
 		if outcome == storage.VersionedSuperseded {
 			return nil
 		}
-		o.items = append(o.items, item)
+		o.appendItemLocked(item)
 		return nil
 	}
 	// fs mode: the local queue is the durable store. Drop a version at or
@@ -583,7 +593,7 @@ func (o *Outbox) enqueueVersionedLocked(ctx context.Context, item forge.OutboxIt
 	// still surfaces as an error, and a caller retry (deterministic IDs)
 	// re-attempts the idempotent retirement records.
 	o.removeLocked(item.ID)
-	o.items = append(o.items, item)
+	o.appendItemLocked(item)
 	if o.store != nil {
 		// The supersede is durable: the superseded lines are retired through
 		// the done file so a restart can never replay an older state. Done
@@ -653,6 +663,7 @@ func (o *Outbox) supersedeLocked(logicalKey string, version int64) {
 		kept = append(kept, it)
 	}
 	o.items = kept
+	o.recomputeIndexLocked()
 }
 
 // touchOrderedKey moves key to the most-recent end of a recency order,
@@ -788,6 +799,12 @@ func (o *Outbox) Superseded(logicalKey string, version int64) bool {
 	if o.delivered[logicalKey] >= version {
 		return true
 	}
+	// pendingMax is the live highest queued version per key (O(1)). Fall
+	// back to a scan only if the index has not seen this key while items
+	// still exist — the invariant path always indexes.
+	if max, ok := o.pendingMax[logicalKey]; ok {
+		return max > version
+	}
 	for _, it := range o.items {
 		if it.LogicalKey == logicalKey && it.StateVersion > version {
 			return true
@@ -833,12 +850,10 @@ func (o *Outbox) MarkDelivered(logicalKey string, version int64) error {
 func (o *Outbox) QueueKnownDurable(item forge.OutboxItem) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	for _, it := range o.items {
-		if it.ID == item.ID {
-			return
-		}
+	if item.ID != "" && o.queuedIDs[item.ID] {
+		return
 	}
-	o.items = append(o.items, item)
+	o.appendItemLocked(item)
 }
 
 // EnqueueLocal queues one intent in memory only, without touching the
@@ -859,12 +874,7 @@ func (o *Outbox) HasIntent(id string) bool {
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	for _, it := range o.items {
-		if it.ID == id {
-			return true
-		}
-	}
-	return false
+	return o.queuedIDs[id]
 }
 
 func (o *Outbox) EnqueueLocal(item forge.OutboxItem) {
@@ -873,12 +883,10 @@ func (o *Outbox) EnqueueLocal(item forge.OutboxItem) {
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	for _, it := range o.items {
-		if it.ID == item.ID {
-			return
-		}
+	if item.ID != "" && o.queuedIDs[item.ID] {
+		return
 	}
-	o.items = append(o.items, item)
+	o.appendItemLocked(item)
 }
 
 // appendOutboxJSONL is a test-only seam over the fs journal append:
@@ -1086,18 +1094,12 @@ func (o *Outbox) flushLocal(ctx context.Context, dispatch func(context.Context, 
 		// below the delivered watermark, and never publish an older version
 		// while a newer one of the same logical key is still queued (a stale
 		// line replayed from a previous process, or an older version that
-		// lost a supersede race).
+		// lost a supersede race). pendingMax makes the live supersede check
+		// O(1) instead of scanning the whole queue per dispatch.
 		if it.LogicalKey != "" && it.StateVersion > 0 {
 			o.mu.Lock()
-			stale := o.delivered[it.LogicalKey] >= it.StateVersion
-			if !stale {
-				for _, other := range o.items {
-					if other.LogicalKey == it.LogicalKey && other.StateVersion > it.StateVersion {
-						stale = true
-						break
-					}
-				}
-			}
+			stale := o.delivered[it.LogicalKey] >= it.StateVersion ||
+				o.pendingMax[it.LogicalKey] > it.StateVersion
 			if stale {
 				o.removeLocked(it.ID)
 				o.markDoneLocked(it.ID)
@@ -1284,10 +1286,19 @@ func (o *Outbox) flushDBBatch(ctx context.Context, dispatch func(context.Context
 	for _, it := range claimed {
 		owned[it.ID] = true
 		if !known[it.ID] {
-			o.items = append(o.items, forge.OutboxItem{
+			o.appendItemLocked(forge.OutboxItem{
 				ID: it.ID, Kind: it.Kind, Payload: it.Payload, CreatedAt: it.CreatedAt,
 				LogicalKey: it.LogicalKey, StateVersion: it.StateVersion,
 			})
+		}
+	}
+	// Snapshot the resident copies this batch may dispatch. Walking the
+	// claim slice with O(1) maps is O(claimed); rescanning o.items per row
+	// was O(claimed × queue).
+	localByID := make(map[string]forge.OutboxItem, len(claimed))
+	for _, it := range o.items {
+		if owned[it.ID] {
+			localByID[it.ID] = it
 		}
 	}
 	o.mu.Unlock()
@@ -1326,21 +1337,16 @@ func (o *Outbox) flushDBBatch(ctx context.Context, dispatch func(context.Context
 	// stay pending, but the scan must move past them or the loop spins on
 	// the same head forever.
 	skipped := make(map[string]bool, len(claimed))
-	for {
-		o.mu.Lock()
-		idx := -1
-		for i, it := range o.items {
-			if owned[it.ID] && !skipped[it.ID] {
-				idx = i
-				break
-			}
+	finished := make(map[string]bool, len(claimed))
+	for _, cit := range claimed {
+		if skipped[cit.ID] || finished[cit.ID] {
+			continue
 		}
-		if idx < 0 {
-			o.mu.Unlock()
-			break
+		it, ok := localByID[cit.ID]
+		if !ok {
+			finished[cit.ID] = true
+			continue
 		}
-		it := o.items[idx]
-		o.mu.Unlock()
 
 		if derr := dispatch(ctx, it); derr != nil {
 			if errors.Is(derr, errOutboxSkipIntent) {
@@ -1377,6 +1383,7 @@ func (o *Outbox) flushDBBatch(ctx context.Context, dispatch func(context.Context
 			o.removeLocked(it.ID)
 			o.mu.Unlock()
 			failed = append(failed, it.ID)
+			finished[it.ID] = true
 			continue
 		}
 		// Durable ACK BEFORE the local removal (and before the claim is
@@ -1390,6 +1397,7 @@ func (o *Outbox) flushDBBatch(ctx context.Context, dispatch func(context.Context
 		// Durable ACK succeeded: this claim is satisfied and must not be
 		// released by the deferred cleanup.
 		acked[it.ID] = true
+		finished[it.ID] = true
 		o.mu.Lock()
 		o.removeLocked(it.ID)
 		o.markDoneLocked(it.ID)
@@ -1461,11 +1469,79 @@ func (o *Outbox) retryOutboxRow(ctx context.Context, it forge.OutboxItem, dispat
 }
 
 // removeLocked drops one item from the local queue. The caller holds o.mu.
+// appendItemLocked queues one item and updates the local indexes. Caller
+// holds o.mu.
+func (o *Outbox) appendItemLocked(it forge.OutboxItem) {
+	o.items = append(o.items, it)
+	o.noteQueuedLocked(it)
+}
+
 func (o *Outbox) removeLocked(id string) {
 	for i, it := range o.items {
 		if it.ID == id {
 			o.items = append(o.items[:i], o.items[i+1:]...)
+			o.unindexLocked(it)
 			return
+		}
+	}
+}
+
+// noteQueuedLocked indexes one newly queued item. Caller holds o.mu.
+func (o *Outbox) noteQueuedLocked(it forge.OutboxItem) {
+	if o.queuedIDs == nil {
+		o.queuedIDs = map[string]bool{}
+	}
+	if it.ID != "" {
+		o.queuedIDs[it.ID] = true
+	}
+	if it.LogicalKey == "" || it.StateVersion <= 0 {
+		return
+	}
+	if o.pendingMax == nil {
+		o.pendingMax = map[string]int64{}
+	}
+	if it.StateVersion > o.pendingMax[it.LogicalKey] {
+		o.pendingMax[it.LogicalKey] = it.StateVersion
+	}
+}
+
+// unindexLocked drops one item from the ID set and refreshes its logical
+// key's pending max after a removal. Caller holds o.mu and has already
+// removed the item from items.
+func (o *Outbox) unindexLocked(it forge.OutboxItem) {
+	if it.ID != "" && o.queuedIDs != nil {
+		delete(o.queuedIDs, it.ID)
+	}
+	if it.LogicalKey == "" || it.StateVersion <= 0 || o.pendingMax == nil {
+		return
+	}
+	if o.pendingMax[it.LogicalKey] != it.StateVersion {
+		return
+	}
+	var max int64
+	for _, other := range o.items {
+		if other.LogicalKey == it.LogicalKey && other.StateVersion > max {
+			max = other.StateVersion
+		}
+	}
+	if max == 0 {
+		delete(o.pendingMax, it.LogicalKey)
+		return
+	}
+	o.pendingMax[it.LogicalKey] = max
+}
+
+// recomputeIndexLocked rebuilds queuedIDs and pendingMax from items after a
+// bulk rewrite (supersede, prune, load). Caller holds o.mu.
+func (o *Outbox) recomputeIndexLocked() {
+	o.queuedIDs = make(map[string]bool, len(o.items))
+	o.pendingMax = make(map[string]int64)
+	for _, it := range o.items {
+		if it.ID != "" {
+			o.queuedIDs[it.ID] = true
+		}
+		if it.LogicalKey != "" && it.StateVersion > o.pendingMax[it.LogicalKey] {
+			o.pendingMax[it.LogicalKey] = it.StateVersion
 		}
 	}
 }
@@ -1495,6 +1571,7 @@ func (o *Outbox) pruneDB(ctx context.Context) {
 		}
 	}
 	o.items = kept
+	o.recomputeIndexLocked()
 }
 
 // claimerID lazily derives this process's unique outbox claim identity.

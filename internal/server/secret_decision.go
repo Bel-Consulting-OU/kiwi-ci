@@ -7,7 +7,6 @@ import (
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/secretbroker"
-	"github.com/Bel-Consulting-OU/kiwi-ci/internal/storage"
 )
 
 // SecretDecision is the ONE secret-authority record. Execution
@@ -153,10 +152,6 @@ func (d SecretDecision) ScopeString() string {
 	return fmt.Sprintf("repo=%s env=%s trusted=%t checkout=%s",
 		d.Scope.Repository, d.Scope.Environment, d.Scope.Trusted, d.Scope.CheckoutRepositoryURL)
 }
-
-// Repository identity helper kept next to the decision so explain and
-// issueSecret cannot drift on which repo id they use.
-func secretDecisionRepoID(j model.Job) string { return storage.RepoIDForJob(j) }
 
 // explainJobSecretHTTP is the operator-facing read of the SAME decision
 // issueSecret consumes. It never returns a value, only the verdict.

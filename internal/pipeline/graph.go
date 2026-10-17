@@ -101,8 +101,15 @@ func CompileWithInputs(s *Spec, inputs map[string]string) (*Graph, error) {
 			combos = []map[string]string{{}}
 		}
 		for _, m := range combos {
-			for _, v := range shardVariants(m, j.Tests.Shards) {
-				cid := id + matrixSuffix(v)
+			variants := shardVariants(m, j.Tests.Shards)
+			var keys []string
+			if len(variants) > 0 {
+				// Every shard variant of one combination shares the same
+				// dimension keys (the combination plus test_shard).
+				keys = sortedMatrixKeys(variants[0])
+			}
+			for _, v := range variants {
+				cid := id + matrixSuffixWithKeys(v, keys)
 				cj := CompiledJob{ID: cid, BaseID: id, Job: interpolateJob(j, v, inputs), Matrix: v}
 				cj.Job.Env = mergeStringMaps(cj.Job.Env, matrixEnv(v))
 				if inputs != nil {
@@ -167,14 +174,17 @@ func shardVariants(m map[string]string, shards int) []map[string]string {
 //     whole suffix collapses to "[~<sha256(raw)[:16 bytes]>]", keeping long
 //     matrix values out of job keys while staying deterministic.
 func matrixSuffix(m map[string]string) string {
+	return matrixSuffixWithKeys(m, sortedMatrixKeys(m))
+}
+
+// matrixSuffixWithKeys is matrixSuffix for a compile pass that already
+// knows the job's matrix dimension order: every shard/variant of one job
+// shares the same sorted key set, so the sort runs once per job instead of
+// once per compiled variant.
+func matrixSuffixWithKeys(m map[string]string, keys []string) string {
 	if len(m) == 0 {
 		return ""
 	}
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
 	raw := make([]string, 0, len(keys))
 	for _, k := range keys {
 		raw = append(raw, k+"="+m[k])
@@ -193,6 +203,19 @@ func matrixSuffix(m map[string]string) string {
 		parts = append(parts, k+"="+v)
 	}
 	return "[" + strings.Join(parts, ",") + "]"
+}
+
+// sortedMatrixKeys returns the stable dimension order for a job matrix.
+func sortedMatrixKeys(m map[string]string) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // matrixValueSafe reports whether a matrix value may appear literally in a

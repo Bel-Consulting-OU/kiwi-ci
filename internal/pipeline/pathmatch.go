@@ -3,6 +3,7 @@ package pipeline
 import (
 	"regexp"
 	"strings"
+	"sync"
 )
 
 func PathsMatch(changed, include, exclude []string) bool {
@@ -30,8 +31,30 @@ func matchesAny(path string, patterns []string) bool {
 	return false
 }
 
+// globReCache memoizes compiled glob regexes. PathsMatch runs the same
+// pattern against every changed file (and impact analysis repeats that per
+// package/job); compiling RE2 on each call is O(patterns × files) regex
+// compiles on monorepo pushes. Cache is unbounded in theory but pattern
+// strings are short and pipeline-declared; a hostile spec is already capped
+// by admission limits.
+var globReCache sync.Map // pattern string -> *regexp.Regexp (nil entry = compile failed)
+
 func globMatch(pattern, value string) bool {
 	pattern = strings.TrimPrefix(strings.ReplaceAll(pattern, "\\", "/"), "./")
+	var re *regexp.Regexp
+	if v, ok := globReCache.Load(pattern); ok {
+		re, _ = v.(*regexp.Regexp)
+	} else {
+		re = compileGlob(pattern)
+		globReCache.Store(pattern, re) // nil ok: caches the failed compile too
+	}
+	if re == nil {
+		return false
+	}
+	return re.MatchString(value)
+}
+
+func compileGlob(pattern string) *regexp.Regexp {
 	var b strings.Builder
 	b.WriteByte('^')
 	for i := 0; i < len(pattern); i++ {
@@ -57,5 +80,8 @@ func globMatch(pattern, value string) bool {
 	}
 	b.WriteByte('$')
 	re, err := regexp.Compile(b.String())
-	return err == nil && re.MatchString(value)
+	if err != nil {
+		return nil
+	}
+	return re
 }

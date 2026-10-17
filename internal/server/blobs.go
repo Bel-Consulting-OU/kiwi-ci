@@ -721,12 +721,21 @@ func (s *Server) uploadArtifactPayload(w http.ResponseWriter, r *http.Request, j
 	}
 	s.auditLocked("artifact.uploaded", runnerID, j.RunID, j.ID, "artifact uploaded", map[string]string{"name": name, "sha256": rec.SHA256, "provenance_kid": signer.KID})
 	if perr := s.persistCheckedErrLocked("artifact.upload"); perr != nil {
-		// The record never became durable: roll back the in-memory record,
-		// leave the pending-sidecar bookkeeping untouched, drop the staged
-		// payload and fail closed. A 201 here would acknowledge an artifact
-		// the snapshot does not contain, and the retry would replay from the
-		// ghost without ever writing it.
+		// The record never became durable: roll back the in-memory record
+		// AND its uniqueness-index entry, leave the pending-sidecar
+		// bookkeeping untouched, drop the staged payload and fail closed. A
+		// 201 here would acknowledge an artifact the snapshot does not
+		// contain, and the retry would replay from the ghost without ever
+		// writing it. Leaving the index entry behind made the next insert
+		// see a phantom conflict against a rolled-back record.
 		delete(s.artifacts, rec.ID)
+		if s.artifactByKey != nil && rec.JobID != "" {
+			key := rec.JobID + "\x00" + fmt.Sprint(rec.LeaseGeneration) + "\x00" + rec.Name
+			if s.artifactByKey[key] == rec.ID {
+				delete(s.artifactByKey, key)
+			}
+		}
+		s.artifactIndexCard = len(s.artifacts)
 		s.mu.Unlock()
 		_ = os.Remove(dst)
 		_ = os.Remove(dst + ".intoto.json")
@@ -755,19 +764,52 @@ func (s *Server) insertArtifactMemoryLocked(rec model.ArtifactRecord) (model.Art
 	if rec.JobID == "" {
 		// Matches SQL NULL semantics: rows without a job never join the key.
 		s.artifacts[rec.ID] = rec
+		s.artifactIndexCard = len(s.artifacts)
 		return rec, true, nil
 	}
-	for _, existing := range s.artifacts {
-		if existing.JobID != rec.JobID || existing.LeaseGeneration != rec.LeaseGeneration || existing.Name != rec.Name {
-			continue
+	s.ensureArtifactIndexLocked()
+	key := rec.JobID + "\x00" + fmt.Sprint(rec.LeaseGeneration) + "\x00" + rec.Name
+	if existingID, ok := s.artifactByKey[key]; ok {
+		existing, exists := s.artifacts[existingID]
+		if exists {
+			if existing.SHA256 != rec.SHA256 {
+				return existing, false, storage.ErrArtifactDigestConflict
+			}
+			return existing, false, nil
 		}
-		if existing.SHA256 != rec.SHA256 {
-			return existing, false, storage.ErrArtifactDigestConflict
-		}
-		return existing, false, nil
+		// Stale index entry (rolled-back insert): repair and admit.
+		delete(s.artifactByKey, key)
 	}
 	s.artifacts[rec.ID] = rec
+	s.artifactByKey[key] = rec.ID
+	s.artifactIndexCard = len(s.artifacts)
 	return rec, true, nil
+}
+
+// ensureArtifactIndexLocked keeps the (job, generation, name) uniqueness
+// index in sync with s.artifacts. Production inserts and rollbacks maintain
+// it in O(1); a size mismatch (tests seeding the map directly) triggers one
+// rebuild instead of scanning on every insert.
+func (s *Server) ensureArtifactIndexLocked() {
+	if s.artifactByKey != nil && s.artifactIndexCard == len(s.artifacts) {
+		return
+	}
+	s.artifactByKey = make(map[string]string, len(s.artifacts))
+	for id, a := range s.artifacts {
+		if a.JobID == "" {
+			continue
+		}
+		s.artifactByKey[a.JobID+"\x00"+fmt.Sprint(a.LeaseGeneration)+"\x00"+a.Name] = id
+	}
+	s.artifactIndexCard = len(s.artifacts)
+}
+
+// noteArtifactExternalLocked is the test seam for writers that assign
+// s.artifacts without insertArtifactMemoryLocked. The size-based rebuild in
+// ensureArtifactIndexLocked already catches this; the seam exists so tests
+// can be explicit.
+func (s *Server) noteArtifactExternalLocked() {
+	s.artifactIndexCard = -1
 }
 
 // removeStagedArtifact cleans up the local staging artifacts of a lost or

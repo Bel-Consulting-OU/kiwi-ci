@@ -112,6 +112,14 @@ type Masker struct {
 	rawReplacer   *strings.Replacer
 	multiReplacer *strings.Replacer
 	multiForms    []string
+	// formIndex buckets multiForms by first byte so the whitespace-
+	// insensitive pass does not scan every form at every position.
+	formIndex map[byte][]string
+	// dirty marks a pending rebuild after Add; the replacers/forms are
+	// rebuilt once on the next mask/contains call instead of on every
+	// secret registration (O(n²) form generation when adding a job's
+	// secret set one value at a time).
+	dirty bool
 }
 
 // Add registers a secret for masking. Secrets shorter than 3 or longer than
@@ -137,10 +145,30 @@ func (m *Masker) AddStrict(v string) error {
 	}
 	m.values = append(m.values, v)
 	sort.Slice(m.values, func(i, j int) bool { return len(m.values[i]) > len(m.values[j]) })
+	m.dirty = true
+	return nil
+}
+
+// rebuildLocked refreshes the replacers and form index after values change.
+// Caller holds m.mu for writing (or has exclusive access via dirty).
+func (m *Masker) rebuildLocked() {
 	m.rawReplacer = newMaskReplacer(m.values)
 	m.multiForms = maskForms(m.values)
 	m.multiReplacer = newMaskReplacer(m.multiForms)
-	return nil
+	m.formIndex = make(map[byte][]string, 64)
+	for _, f := range m.multiForms {
+		if f == "" {
+			continue
+		}
+		m.formIndex[f[0]] = append(m.formIndex[f[0]], f)
+	}
+	m.dirty = false
+}
+
+func (m *Masker) ensureFreshLocked() {
+	if m.dirty {
+		m.rebuildLocked()
+	}
 }
 
 // Capacity reports the maximum number of secret values the masker holds
@@ -166,20 +194,28 @@ func (m *Masker) Len() int {
 // the second, wrapped-form comparison.
 func (m *Masker) ContainsSecret(s string) bool {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	for _, f := range m.multiForms {
-		if strings.Contains(s, f) {
-			return true
-		}
+	dirty := m.dirty
+	multi := m.multiReplacer
+	m.mu.RUnlock()
+	if dirty {
+		m.mu.Lock()
+		m.ensureFreshLocked()
+		multi = m.multiReplacer
+		m.mu.Unlock()
 	}
-	if stripped := stripASCIIWhitespace(s); stripped != s {
-		for _, f := range m.multiForms {
-			if strings.Contains(stripped, f) {
-				return true
-			}
-		}
+	if multi == nil {
+		return false
 	}
-	return false
+	// One Replacer pass is the same O(|s|) multi-pattern search as N
+	// strings.Contains calls, without the N factor (forms ≈ secrets × encodings).
+	if multi.Replace(s) != s {
+		return true
+	}
+	stripped := stripASCIIWhitespace(s)
+	if stripped == s {
+		return false
+	}
+	return multi.Replace(stripped) != stripped
 }
 
 // TaintCheck validates persisted job outputs against the registered
@@ -205,11 +241,19 @@ func (m *Masker) TaintCheck(outputs map[string]string, stepOutputs map[string]ma
 // Mask replaces occurrences of the raw registered secret values.
 func (m *Masker) Mask(s string) string {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.rawReplacer == nil {
+	dirty := m.dirty
+	repl := m.rawReplacer
+	m.mu.RUnlock()
+	if dirty {
+		m.mu.Lock()
+		m.ensureFreshLocked()
+		repl = m.rawReplacer
+		m.mu.Unlock()
+	}
+	if repl == nil {
 		return s
 	}
-	return m.rawReplacer.Replace(s)
+	return repl.Replace(s)
 }
 
 // MaskMulti replaces occurrences of the raw secret values and all derived
@@ -218,28 +262,44 @@ func (m *Masker) Mask(s string) string {
 // whitespace by line wrapping (MIME/base64(1)) or indentation.
 func (m *Masker) MaskMulti(s string) string {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.multiReplacer == nil {
+	dirty := m.dirty
+	multi := m.multiReplacer
+	var forms []string
+	var index map[byte][]string
+	if !dirty {
+		forms, index = m.multiForms, m.formIndex
+	}
+	m.mu.RUnlock()
+	if dirty {
+		m.mu.Lock()
+		m.ensureFreshLocked()
+		multi = m.multiReplacer
+		forms, index = m.multiForms, m.formIndex
+		m.mu.Unlock()
+	}
+	if multi == nil {
 		return s
 	}
-	out := m.multiReplacer.Replace(s)
+	out := multi.Replace(s)
 	stripped := stripASCIIWhitespace(out)
 	if stripped == out {
 		return out
 	}
 	// A form may span whitespace (wrapped/indented output). Only pay for the
 	// whitespace-insensitive pass when the collapsed text still holds a form.
-	if m.multiReplacer.Replace(stripped) == stripped {
+	if multi.Replace(stripped) == stripped {
 		return out
 	}
-	return m.maskAcrossWhitespace(out, stripped)
+	return maskAcrossWhitespace(out, stripped, forms, index)
 }
 
 // maskAcrossWhitespace rewrites s so that every masked form match in the
 // ASCII-whitespace-collapsed text is replaced in place, preserving the
 // original whitespace outside each match. Forms are sorted longest-first by
 // maskForms, so the first prefix match at each position is the longest one.
-func (m *Masker) maskAcrossWhitespace(s, stripped string) string {
+// formIndex buckets forms by first byte so a position only considers
+// candidates that can match there (was O(|s| × forms)).
+func maskAcrossWhitespace(s, stripped string, forms []string, formIndex map[byte][]string) string {
 	origIdx := make([]int, 0, len(stripped))
 	for i := 0; i < len(s); i++ {
 		if !isASCIIWhitespace(s[i]) {
@@ -251,7 +311,11 @@ func (m *Masker) maskAcrossWhitespace(s, stripped string) string {
 	last := 0
 	for p := 0; p < len(stripped); {
 		matched := ""
-		for _, f := range m.multiForms {
+		candidates := forms
+		if formIndex != nil {
+			candidates = formIndex[stripped[p]]
+		}
+		for _, f := range candidates {
 			if len(f) <= len(stripped)-p && stripped[p:p+len(f)] == f {
 				matched = f
 				break

@@ -11,6 +11,10 @@ import (
 // to the API server over HTTPS with a bearer token (a service account or an
 // operator token); no client-go dependency — the shapes it needs are small
 // and the cloud.go seam covers the transport.
+// EXPERIMENTAL — not production cloud support. The provider speaks the
+// real API shape but has not been certified against live disposable
+// resources. Frozen scope: cloud/fleet autoscaling is optional and does
+// not block a core release. Do not advertise this as production-ready.
 type KubernetesProvider struct {
 	name   string
 	ns     string

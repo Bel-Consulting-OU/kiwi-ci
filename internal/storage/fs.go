@@ -151,6 +151,35 @@ type Snapshot struct {
 	GeneratedFragments map[string]GeneratedFragmentReceipt `json:"generated_fragments,omitempty"`
 }
 
+// jsonlSeekPos is a resume point in an append-only JSONL journal: the file
+// offset immediately after the last record whose Seq equaled afterSeq.
+type jsonlSeekPos struct {
+	afterSeq int64
+	offset   int64
+}
+
+// seekKey identifies one journal cursor cache entry.
+func seekKey(name, cursorKey string, afterSeq int64) string {
+	return name + "\x00" + cursorKey + "\x00" + strconv.FormatInt(afterSeq, 10)
+}
+
+// noteSeek records a resume point for the next identical cursor.
+func (r *Repository) noteSeek(name, cursorKey string, afterSeq, offset int64) {
+	if r.jsonlSeek == nil {
+		r.jsonlSeek = map[string]jsonlSeekPos{}
+	}
+	r.jsonlSeek[seekKey(name, cursorKey, afterSeq)] = jsonlSeekPos{afterSeq: afterSeq, offset: offset}
+}
+
+// takeSeek returns a cached resume offset for this (file, cursor), if any.
+func (r *Repository) takeSeek(name, cursorKey string, afterSeq int64) (int64, bool) {
+	p, ok := r.jsonlSeek[seekKey(name, cursorKey, afterSeq)]
+	if !ok {
+		return 0, false
+	}
+	return p.offset, true
+}
+
 type Repository struct {
 	Root string
 	mu   sync.Mutex
@@ -158,6 +187,13 @@ type Repository struct {
 	// pre-per-run flat committed layout (logbatches/committed/<key>.json)
 	// into logbatches/committed/<runID>/<key>.json. Guarded by mu.
 	legacyLogBatchesChecked bool
+
+	// jsonlSeek caches the byte offset just past the last decoded JSONL
+	// record for a (file, cursor) pair. A cursor poll (SSE log tail,
+	// execution-event stream) with the same afterSeq seeks there instead of
+	// re-decoding the journal from byte 0 — O(new lines) instead of
+	// O(entire journal) per poll. Guarded by mu.
+	jsonlSeek map[string]jsonlSeekPos
 
 	// Log-batch sequence watermark state. All fields are guarded by mu.
 	//
@@ -301,8 +337,29 @@ func (r *Repository) Save(s Snapshot) error {
 	return AtomicWriteFile(filepath.Join(r.Root, "state.json"), b, 0o600)
 }
 
+// runLogJSONLPath is the per-run single-line log stream. Logs are sharded by
+// run so ReadLogs(runID) and the SSE tail only decode that run's lines; the
+// legacy global logs.jsonl remains readable for pre-migration entries.
+func (r *Repository) runLogJSONLPath(runID string) (string, error) {
+	if err := validateLogBatchRunID(runID); err != nil {
+		return "", err
+	}
+	return filepath.Join("logs", runID+".jsonl"), nil
+}
+
 func (r *Repository) AppendLog(e model.LogEntry) error {
-	return r.appendJSONL("logs.jsonl", e)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e.RunID != "" {
+		if rel, err := r.runLogJSONLPath(e.RunID); err == nil {
+			if err := os.MkdirAll(filepath.Join(r.Root, "logs"), 0o700); err != nil {
+				return err
+			}
+			return r.appendJSONLLocked(rel, e)
+		}
+	}
+	// Legacy / empty-run stream: keeps older stores and tests working.
+	return r.appendJSONLLocked("logs.jsonl", e)
 }
 func (r *Repository) AppendAudit(e model.AuditEvent) error {
 	return r.appendJSONL("audit.jsonl", e)
@@ -771,10 +828,22 @@ func (r *Repository) ReadLogs(runID string, after int64, limit int) ([]model.Log
 	if limit <= 0 || limit > 10000 {
 		limit = 2000
 	}
-	out, err := readJSONL[model.LogEntry](filepath.Join(r.Root, "logs.jsonl"), limit, func(e model.LogEntry) bool { return e.RunID == runID && e.Seq > after })
+	keep := func(e model.LogEntry) bool { return e.RunID == runID && e.Seq > after }
+	var out []model.LogEntry
+	if rel, err := r.runLogJSONLPath(runID); err == nil {
+		part, rerr := r.readJSONLSeekable(filepath.Join(r.Root, rel), "runlog", runID, after, limit, keep)
+		if rerr != nil {
+			return nil, rerr
+		}
+		out = append(out, part...)
+	}
+	// Legacy global stream: pre-migration lines only (new appends are
+	// per-run), but still scanned so upgrades do not lose history.
+	legacy, err := readJSONL[model.LogEntry](filepath.Join(r.Root, "logs.jsonl"), limit, keep)
 	if err != nil {
 		return nil, err
 	}
+	out = append(out, legacy...)
 	batched, err := r.committedLogBatchEntriesLocked(runID, after)
 	if err != nil {
 		return nil, err
@@ -934,7 +1003,8 @@ func (r *Repository) ReadExecutionEvents(afterSeq int64, limit int, runID string
 // an unknown repository belongs to no repository scope.
 func (r *Repository) readExecutionEventsScopeLocked(afterSeq int64, limit int, scope ExecutionEventScope) ([]model.ExecutionEvent, int64, error) {
 	limit = ClampExecutionEventLimit(limit)
-	f, err := os.Open(filepath.Join(r.Root, executionEventsFile))
+	path := filepath.Join(r.Root, executionEventsFile)
+	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return []model.ExecutionEvent{}, afterSeq, nil
 	}
@@ -942,6 +1012,12 @@ func (r *Repository) readExecutionEventsScopeLocked(afterSeq int64, limit int, s
 		return nil, afterSeq, err
 	}
 	defer f.Close()
+	cursorKey := fmt.Sprintf("ev:%d:%s/%s", int(scope.Kind), scope.RunID, scope.RepoID)
+	if off, ok := r.takeSeek(executionEventsFile, cursorKey, afterSeq); ok && off > 0 {
+		if _, serr := f.Seek(off, io.SeekStart); serr != nil {
+			return nil, afterSeq, serr
+		}
+	}
 	dec := json.NewDecoder(f)
 	out := []model.ExecutionEvent{}
 	cursor := afterSeq
@@ -949,6 +1025,9 @@ func (r *Repository) readExecutionEventsScopeLocked(afterSeq int64, limit int, s
 		var e model.ExecutionEvent
 		if err := dec.Decode(&e); err != nil {
 			if jsonlStreamFinished(err) {
+				// Only cache a resume point for a cursor we actually
+				// delivered. A request afterSeq that saw a full empty tail
+				// must still be able to re-read a non-empty backlog later.
 				return out, cursor, nil
 			}
 			return nil, afterSeq, err
@@ -962,6 +1041,7 @@ func (r *Repository) readExecutionEventsScopeLocked(afterSeq int64, limit int, s
 		out = append(out, e)
 		cursor = e.Seq
 		if len(out) >= limit {
+			r.noteSeek(executionEventsFile, cursorKey, e.Seq, dec.InputOffset())
 			return out, cursor, nil
 		}
 	}
@@ -1201,6 +1281,8 @@ func (r *Repository) PruneExecutionEvents(ctx context.Context, olderThan time.Ti
 	if err := AtomicWriteFile(path, b.Bytes(), 0o600); err != nil {
 		return 0, 0, err
 	}
+	// The journal was rewritten: every cached resume offset is stale.
+	r.jsonlSeek = nil
 	if highest > retainedFrom {
 		if err := AtomicWriteFile(filepath.Join(r.Root, executionEventsRetainedFile), []byte(strconv.FormatInt(highest, 10)+"\n"), 0o600); err != nil {
 			return 0, 0, err
@@ -1277,6 +1359,56 @@ func maxExecutionEventSeqLocked(root string) (int64, error) {
 		}
 	}
 }
+
+// readJSONLSeekable is readJSONL with a resume-offset cache: a poll that
+// repeats the previous afterSeq seeks to the offset just past the last
+// matching record instead of re-decoding the journal from byte 0.
+func (r *Repository) readJSONLSeekable(path, name, cursorKey string, after int64, limit int, keep func(model.LogEntry) bool) ([]model.LogEntry, error) {
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if off, ok := r.takeSeek(name, cursorKey, after); ok && off > 0 {
+		if _, serr := f.Seek(off, io.SeekStart); serr != nil {
+			return nil, serr
+		}
+	}
+	dec := json.NewDecoder(f)
+	out := make([]model.LogEntry, 0)
+	lastSeq := int64(0)
+	var lastOff int64
+	for {
+		var e model.LogEntry
+		if err := dec.Decode(&e); err != nil {
+			if jsonlStreamFinished(err) {
+				// Resume only after the last DELIVERED seq. Caching a
+				// resume point for the request cursor would make a later
+				// full re-read of the same afterSeq skip the backlog.
+				if lastSeq > 0 {
+					r.noteSeek(name, cursorKey, lastSeq, lastOff)
+				}
+				return out, nil
+			}
+			return nil, err
+		}
+		if keep(e) {
+			out = append(out, e)
+			lastSeq = e.Seq
+			lastOff = dec.InputOffset()
+			if len(out) > limit {
+				out = out[len(out)-limit:]
+			}
+		}
+	}
+}
+
+// readJSONL decodes a JSON-lines file and returns the newest limit records
+// accepted by keep. It is the shared scan helper for callers that do not
+// hold a resume cursor.
 func readJSONL[T any](path string, limit int, keep func(T) bool) ([]T, error) {
 	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -1646,28 +1778,58 @@ func (r *Repository) maxLogSeqJSONL() (int64, error) {
 
 // maxRunLogSeqJSONL returns the highest Seq in the single-line log stream,
 // restricted to one run when runID is non-empty (the empty runID scans every
-// run, the process-global watermark MaxLogSeq reports).
+// run, the process-global watermark MaxLogSeq reports). Per-run streams are
+// preferred; the legacy global file is still consulted so a watermark is
+// never behind pre-migration lines.
 func (r *Repository) maxRunLogSeqJSONL(runID string) (int64, error) {
-	f, err := os.Open(filepath.Join(r.Root, "logs.jsonl"))
-	if errors.Is(err, os.ErrNotExist) {
-		return 0, nil
+	maxSeq := int64(0)
+	scan := func(path string) error {
+		f, err := os.Open(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		dec := json.NewDecoder(f)
+		for {
+			var e model.LogEntry
+			if err := dec.Decode(&e); err != nil {
+				if errors.Is(err, io.EOF) {
+					return nil
+				}
+				return err
+			}
+			if e.Seq > maxSeq && (runID == "" || e.RunID == runID) {
+				maxSeq = e.Seq
+			}
+		}
 	}
-	if err != nil {
+	if runID != "" {
+		if rel, err := r.runLogJSONLPath(runID); err == nil {
+			if err := scan(filepath.Join(r.Root, rel)); err != nil {
+				return 0, err
+			}
+			// One run's own stream is authoritative for that run when no
+			// legacy lines are needed; still scan legacy below for upgrades.
+		}
+	} else {
+		// Global watermark: every per-run stream plus the legacy file.
+		logsDir := filepath.Join(r.Root, "logs")
+		if ents, err := os.ReadDir(logsDir); err == nil {
+			for _, ent := range ents {
+				if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".jsonl") {
+					continue
+				}
+				if err := scan(filepath.Join(logsDir, ent.Name())); err != nil {
+					return 0, err
+				}
+			}
+		}
+	}
+	if err := scan(filepath.Join(r.Root, "logs.jsonl")); err != nil {
 		return 0, err
 	}
-	defer f.Close()
-	dec := json.NewDecoder(f)
-	var maxSeq int64
-	for {
-		var e model.LogEntry
-		if err := dec.Decode(&e); err != nil {
-			if errors.Is(err, io.EOF) {
-				return maxSeq, nil
-			}
-			return 0, err
-		}
-		if e.Seq > maxSeq && (runID == "" || e.RunID == runID) {
-			maxSeq = e.Seq
-		}
-	}
+	return maxSeq, nil
 }

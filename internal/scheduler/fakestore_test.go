@@ -938,6 +938,18 @@ func (f *fakeStore) ListQueuedJobs(ctx context.Context) ([]model.Job, error) {
 	return out, nil
 }
 
+func (f *fakeStore) ListRunningJobs(ctx context.Context) ([]model.Job, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []model.Job{}
+	for _, j := range f.jobs {
+		if j.Status == model.StatusRunning {
+			out = append(out, j)
+		}
+	}
+	return out, nil
+}
+
 // ListJobsByEnvironment mirrors the real store: jobs are matched on the
 // CANONICAL repository identity (stored RepoID, legacy URL + full-name
 // fallback), so HTTPS and SSH spellings of one repository share one key.

@@ -130,8 +130,10 @@ func detectCurrentBranch(workspace string) string {
 // by its content, in sorted path order. It is deterministic and matches the
 // digest the executor derives for a cache entry with an empty key base.
 func lockfileDigest(workspace string, hashFiles []string) (string, error) {
-	h := sha256.New()
-	io.WriteString(h, "\x00")
+	// Mirrors cache.Store.KeyContext with an empty base: sha256(base||0x00||
+	// filesDigest) where filesDigest is the sha256 of the sorted
+	// (rel||content) stream. Keep this formula in lockstep with
+	// cache.Store.Key — TestLockfileDigest* pins the parity.
 	var files []string
 	for _, p := range hashFiles {
 		matches, err := filepath.Glob(filepath.Join(workspace, p))
@@ -141,6 +143,7 @@ func lockfileDigest(workspace string, hashFiles []string) (string, error) {
 		files = append(files, matches...)
 	}
 	sort.Strings(files)
+	fh := sha256.New()
 	for _, f := range files {
 		b, err := os.ReadFile(f)
 		if err != nil {
@@ -150,8 +153,13 @@ func lockfileDigest(workspace string, hashFiles []string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("hash_files: %w", err)
 		}
-		io.WriteString(h, rel)
-		h.Write(b)
+		io.WriteString(fh, rel)
+		fh.Write(b)
+	}
+	h := sha256.New()
+	io.WriteString(h, "\x00")
+	if len(hashFiles) > 0 {
+		h.Write(fh.Sum(nil))
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }

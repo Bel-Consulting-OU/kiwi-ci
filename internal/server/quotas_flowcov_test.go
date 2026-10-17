@@ -114,8 +114,8 @@ func TestFlowQuotaCountsDB(t *testing.T) {
 	if repoRunning != 1 || repoQueued != 1 || teamRunning != 2 || teamQueued != 2 {
 		t.Fatalf("counts = running %d queued %d teamRunning %d teamQueued %d", repoRunning, repoQueued, teamRunning, teamQueued)
 	}
-	// Unreadable job rows for one run are skipped entirely.
-	s2.DB = &fcStore{dbFakeStore: f2, listJobsErr: errors.New("jobs down")}
+	// Unreadable running-job rows degrade running counts; queued still counts.
+	s2.DB = &fcStore{dbFakeStore: f2, listRunningErr: errors.New("jobs down")}
 	if r, q, _, _ := s2.quotaCountsLocked(run); r != 0 || q != 1 {
 		t.Fatalf("degraded run counts = %d %d", r, q)
 	}

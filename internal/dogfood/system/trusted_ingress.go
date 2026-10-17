@@ -61,6 +61,21 @@ type trustedForge struct {
 	lock     []byte
 	repo     string
 	srv      *httptest.Server
+	// statusCount counts SCM status/check publications received. It is the
+	// observable proof that the completion outbox reached the forge.
+	statusCount int
+}
+
+func (f *trustedForge) recordStatus() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.statusCount++
+}
+
+func (f *trustedForge) statuses() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.statusCount
 }
 
 func (f *trustedForge) setPipeline(yaml string) {
@@ -147,6 +162,11 @@ func (f *trustedForge) handler() http.Handler {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{})
 		case r.Method == http.MethodPost || r.Method == http.MethodPatch:
+			// A POST/PATCH to the forge stand-in IS an SCM status/check
+			// publication (the completion outbox's forge_delivery intent).
+			// Count it so the ordinary CI chain can prove "result → commit /
+			// PR status" happened.
+			f.recordStatus()
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(map[string]any{"id": 1, "node_id": "dogfood-1"})

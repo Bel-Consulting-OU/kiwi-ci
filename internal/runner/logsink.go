@@ -317,7 +317,17 @@ func (s *asyncLogSink) run() {
 		for _, l := range batch.Lines {
 			removed += l.spoolCost
 		}
-		s.spool = append([]logLine(nil), s.spool[n:]...)
+		// Dequeue in place. Copying the live tail on every batch made a
+		// full spool drain O(S²) logLine copies under s.mu, stalling every
+		// WriteLine. Compact only when the dropped head is at least as
+		// large as the remaining tail (amortized O(1) per line).
+		s.spool = s.spool[n:]
+		if n > 0 && n >= len(s.spool) {
+			s.spool = append([]logLine(nil), s.spool...)
+		}
+		if len(s.spool) == 0 {
+			s.spool = nil
+		}
 		s.spoolBytes -= removed
 		s.inFlight++
 		s.mem.release(removed)

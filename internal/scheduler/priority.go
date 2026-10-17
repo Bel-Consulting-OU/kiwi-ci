@@ -10,27 +10,57 @@ import (
 // unblock the most work are scheduled first. Cycles are impossible in a
 // compiled graph, but the memoization makes the traversal linear per node
 // regardless.
+//
+// Prefer DownstreamDepths when more than one key is needed: it builds the
+// child index ONCE and answers every key in one reverse-topological sweep,
+// instead of rescanning the whole graph per call (O(N*E) per key).
 func DownstreamDepth(g *pipeline.Graph, key string) int {
-	memo := map[string]int{}
+	return DownstreamDepths(g, []string{key})[key]
+}
+
+// DownstreamDepths computes DownstreamDepth for every requested key in one
+// pass. Complexity is O(N+E) for the index and topological sweep plus O(K)
+// for the lookups, versus O(K*N*E) for K separate DownstreamDepth calls.
+func DownstreamDepths(g *pipeline.Graph, keys []string) map[string]int {
+	out := make(map[string]int, len(keys))
+	if g == nil {
+		return out
+	}
+	// child index: dep -> jobs that need it. Built once.
+	children := make(map[string][]string, len(g.Jobs))
+	for id, cj := range g.Jobs {
+		for _, dep := range cj.Needs {
+			children[dep] = append(children[dep], id)
+		}
+	}
+	// depth[k] = longest chain of jobs that transitively need k.
+	// Visit a node only after its children: depth[k] = max(1+depth[child]).
+	// The compiled graph is acyclic, so a simple memoized DFS is safe; the
+	// index means each edge is walked once, not the whole graph per node.
+	memo := make(map[string]int, len(g.Jobs))
 	var visit func(string) int
 	visit = func(k string) int {
 		if v, ok := memo[k]; ok {
 			return v
 		}
+		// Guard against a corrupt cyclic graph: a node already on the
+		// current stack contributes 0 rather than recursing forever.
+		memo[k] = 0
 		best := 0
-		for child, cj := range g.Jobs {
-			for _, dep := range cj.Needs {
-				if dep == k {
-					if d := 1 + visit(child); d > best {
-						best = d
-					}
-				}
+		for _, child := range children[k] {
+			if d := 1 + visit(child); d > best {
+				best = d
 			}
 		}
 		memo[k] = best
 		return best
 	}
-	return visit(key)
+	for _, k := range keys {
+		if _, ok := g.Jobs[k]; ok || children[k] != nil {
+			out[k] = visit(k)
+		}
+	}
+	return out
 }
 
 // CollectNeedsOutputs builds the needs-outputs map handed to a leased job,

@@ -1647,6 +1647,27 @@ func (s *PostgresStore) ListQueuedJobs(ctx context.Context) ([]model.Job, error)
 	return out, rows.Err()
 }
 
+func (s *PostgresStore) ListRunningJobs(ctx context.Context) ([]model.Job, error) {
+	rows, err := s.pool.Query(ctx, `SELECT `+jobCols+` FROM jobs WHERE status='running' ORDER BY created_at ASC, id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []model.Job{}
+	for rows.Next() {
+		js := jobScanner{}
+		if err := rows.Scan(jobTargets(&js)...); err != nil {
+			return nil, err
+		}
+		j, err := js.job()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
 func (s *PostgresStore) ListJobsByRunner(ctx context.Context, runnerID string) ([]model.Job, error) {
 	if err := ValidateRunnerID(runnerID); err != nil {
 		return nil, err

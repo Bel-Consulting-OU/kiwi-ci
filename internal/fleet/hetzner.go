@@ -8,6 +8,10 @@ import (
 )
 
 // HetznerProvider runs fleet capacity as Hetzner Cloud servers.
+// EXPERIMENTAL — not production cloud support. The provider speaks the
+// real API shape but has not been certified against live disposable
+// resources. Frozen scope: cloud/fleet autoscaling is optional and does
+// not block a core release. Do not advertise this as production-ready.
 type HetznerProvider struct {
 	name   string
 	region string
