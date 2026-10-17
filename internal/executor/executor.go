@@ -67,6 +67,12 @@ type Options struct {
 	OnCleanupDebt func(CleanupDebt)
 	MaxParallel   int
 	OnlyJob       string
+	// RunnerLabels and RunnerRegions describe the local runner's placement
+	// identity. A job whose runner/placement labels or regions are non-empty
+	// must match or it is skipped (no runner), matching the server's
+	// lease filter. Empty runner identity only runs unconstrained jobs.
+	RunnerLabels  []string
+	RunnerRegions []string
 	// OnlyStep, when set, executes just the named step (by step ID or by
 	// resolved name, including canary./verify./rollback. prefixes) of the
 	// selected job. Used by `kiwi replay RUN JOB STEP`. Steps that do not
@@ -448,6 +454,13 @@ func (e *Executor) Run(ctx context.Context, g *pipeline.Graph) (map[string]model
 				pushDeps(id)
 				continue
 			}
+			if reason := e.placementMismatch(cj); reason != "" {
+				statuses[id] = model.StatusSkipped
+				results[id] = model.JobResult{JobID: id, Status: model.StatusSkipped, Error: reason}
+				delete(pending, id)
+				pushDeps(id)
+				continue
+			}
 			ready, depStatus := depsOutcome(cj.Needs, statuses)
 			if !ready {
 				continue
@@ -503,6 +516,41 @@ func (e *Executor) Run(ctx context.Context, g *pipeline.Graph) (map[string]model
 	}
 	return results, errors.Join(errs...)
 }
+// placementMismatch reports why this runner cannot host cj (empty = can run).
+// Required labels and placement labels/regions must all be carried by the
+// runner, matching the server's lease filter. Local kiwi run advertises
+// ["native","local"]; a job asking for "custom" is skipped, not silently run.
+func (e *Executor) placementMismatch(cj pipeline.CompiledJob) string {
+	want := append([]string(nil), cj.Job.Runner...)
+	want = append(want, cj.Job.Placement.Labels...)
+	for _, l := range want {
+		if l == "" {
+			continue
+		}
+		if !containsString(e.Opt.RunnerLabels, l) {
+			return "no runner with required label " + l
+		}
+	}
+	for _, r := range cj.Job.Placement.Regions {
+		if r == "" {
+			continue
+		}
+		if !containsString(e.Opt.RunnerRegions, r) {
+			return "no runner in required region " + r
+		}
+	}
+	return ""
+}
+
+func containsString(list []string, v string) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
 func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.CompiledJob, dependencyStatus model.Status, needsOutputs map[string]map[string]string) model.JobResult {
 	if e.Opt.LogMaxBytes > 0 {
 		// The log quota is scoped per job: wrap the shared sink in a

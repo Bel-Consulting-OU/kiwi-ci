@@ -122,6 +122,10 @@ func RunLocal(ctx context.Context, args []string) error {
 	} else {
 		opts.InheritEnv = *inheritEnv && !*noInheritEnv
 	}
+	// Local runner identity: jobs that require other labels/regions are
+	// skipped (no matching runner) instead of running everywhere.
+	opts.RunnerLabels = []string{"native", "local"}
+	opts.RunnerRegions = []string{"local"}
 	ex := executor.Executor{Opt: opts, Masker: masker}
 	res, runErr := ex.Run(ctx, g)
 	if *jsonOut {
@@ -136,12 +140,17 @@ func RunLocal(ctx context.Context, args []string) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return fmt.Errorf("run cancelled: %w", ctxErr)
 	}
-	// A job-level cancellation (its own timeout, cancel_job_on_failure) is a
-	// job outcome, not a run-wide abort. Exit non-zero (a cancelled job is
-	// not success) but do not claim the RUN was cancelled.
+	// Aggregate gate: every job must be success or skipped. Failure,
+	// cancelled and blocked are all non-success outcomes; a run that still
+	// contains one is not a green gate even if later jobs passed.
 	for id, r := range res {
-		if r.Status == model.StatusCancelled {
+		switch r.Status {
+		case model.StatusFailure:
+			// surfaced via runErr
+		case model.StatusCancelled:
 			return fmt.Errorf("job %s cancelled (timeout or cancel_job_on_failure)", id)
+		case model.StatusBlocked:
+			return fmt.Errorf("job %s blocked (dependency failed or condition rejected)", id)
 		}
 	}
 	return runErr

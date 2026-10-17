@@ -386,20 +386,35 @@ func Interpolate(s string, m map[string]string) string {
 // when all their referenced keys resolve. Unresolvable holes stay literal:
 // callers that provided inputs (CompileWithInputs) reject leftover inputs
 // holes as compile errors.
+// holeEscapeSentinel protects a literal "${{" written as "$${{".
+const holeEscapeSentinel = "\x00kiwi-hole-escape\x00"
+
+// escapeHoleOpeners turns "$${{" into a sentinel so interpolation leaves a
+// literal "${{" in the output (GitHub-Actions-style dollar escaping). A
+// bare "$$" is left alone: it is shell PID, not an interpolation escape.
+func escapeHoleOpeners(s string) string {
+	return strings.ReplaceAll(s, "$${{", holeEscapeSentinel)
+}
+
+func unescapeHoleOpeners(s string) string {
+	return strings.ReplaceAll(s, holeEscapeSentinel, "${{")
+}
+
 func InterpolateWithInputs(s string, m map[string]string, inputs map[string]string) string {
 	if !strings.Contains(s, "${{") {
 		return s
 	}
+	s = escapeHoleOpeners(s)
 	holes, err := expr.Holes(s)
 	if err != nil || len(holes) == 0 {
-		return s
+		return unescapeHoleOpeners(s)
 	}
 	c := expr.Context{Matrix: m, Inputs: inputs}
 	allowed := map[string]bool{"matrix": true}
 	if inputs != nil {
 		allowed["inputs"] = true
 	}
-	return interpolateLenient(s, holes, c, allowed)
+	return unescapeHoleOpeners(interpolateLenient(s, holes, c, allowed))
 }
 
 // interpolateLenient substitutes the holes that reference only the allowed
@@ -628,15 +643,16 @@ func InterpolateOutputs(v string, needs, steps map[string]map[string]string) str
 	if !strings.Contains(v, "${{") {
 		return v
 	}
+	v = escapeHoleOpeners(v)
 	holes, err := expr.Holes(v)
 	if err != nil || len(holes) == 0 {
-		return v
+		return unescapeHoleOpeners(v)
 	}
 	c := expr.Context{
 		Needs: flattenOutputs(needs),
 		Steps: flattenOutputs(steps),
 	}
-	return interpolateLenient(v, holes, c, map[string]bool{"needs": true, "steps": true})
+	return unescapeHoleOpeners(interpolateLenient(v, holes, c, map[string]bool{"needs": true, "steps": true}))
 }
 
 // flattenOutputs rewrites a nested outputs map ("job" -> "name" -> value)
