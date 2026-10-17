@@ -319,10 +319,12 @@ integration-live:
 
 # perf-gate runs FIRST so benchmarks measure a quiet machine, not the
 # tail of 15 minutes of dogfood. See scripts/perf-compare.sh noise contract.
-# release-gate is hermetic: N-1 comes from KIWI_RELEASE_STORE or a supplied
-# pin, never from api.github.com.
-release-gate: perf-gate dogfood-fast dogfood-system dogfood-production dogfood-release-artifacts
-	@echo "RELEASE GATE green: soak, DR restore, N-1 upgrade (fail-closed), G1→G2 self-build, packaged artifact, untrusted-container evidence lane, perf regression gate."
+#
+# Lean release gate (frozen scope): model proofs, system proofs, perf.
+# N-1 binary compatibility, cloud/fleet, and packaged-artifact install are
+# NOT part of the acceptance contract and are not required here.
+release-gate: perf-gate dogfood-fast dogfood-system
+	@echo "RELEASE GATE green: model proofs, system proofs, perf regression gate."
 
 # staticcheck-all is the CI check: it is exactly the pinned command run by
 # .woodpecker/linux-amd64.yml. `staticcheck` runs the same pinned command

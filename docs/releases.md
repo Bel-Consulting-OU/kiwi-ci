@@ -429,4 +429,4 @@ version, and detected license per dependency). Commit the regenerated
 `.woodpecker/linux-amd64.yml` regenerates it and fails on drift.
 `./scripts/license-check.sh --selftest` exercises the classifier against
 embedded fixtures without network access. The contributor-facing policy is
-in [contributing.md](../contributing.md).
+in [CONTRIBUTING.md](../CONTRIBUTING.md).

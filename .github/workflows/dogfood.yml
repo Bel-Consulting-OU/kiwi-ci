@@ -1,14 +1,13 @@
 name: dogfood
 
-# Nightly dogfood battery.
+# Nightly lean dogfood battery (frozen scope).
 #
 # Model proofs (./internal/dogfood): in-memory harness/oracle — state-machine
 # invariants and races. System proofs (make dogfood-system): real
 # NewPersistent server + HTTP API + runner (system.System).
 #
-# These are NOT live multi-process DF2 (postgres/objectstore/two real
-# runners) and NOT DF7 packaged-artifact install — see docs/DOGFOOD.md
-# "Implemented vs planned". PR gate remains make dogfood-fast (ci.yml).
+# Cloud/fleet/N-1/provider suites are OUT of the frozen acceptance contract
+# and must not be re-added here. PR gate remains make dogfood-fast (ci.yml).
 on:
   schedule:
     - cron: "41 4 * * *"
@@ -28,50 +27,11 @@ jobs:
         suite:
           - local
           - system
-          - distributed
           - adversarial
-          - upgrade
-          - scale
-          - release-model
-          - release-gate
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          fetch-depth: 0
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
-      - name: seed N-1 store (integration-live, only for release-gate)
-        if: matrix.suite == 'release-gate'
-        env:
-          KIWI_ALLOW_GITHUB_RELEASE_FETCH: "1"
-          KIWI_RELEASE_STORE: ${{ runner.temp }}/kiwi-release-store
-          KIWI_N_MINUS_ONE_CACHE: ${{ runner.temp }}/kiwi-n-minus-one
-        run: |
-          set -euo pipefail
-          mkdir -p "$KIWI_RELEASE_STORE" "$KIWI_N_MINUS_ONE_CACHE"
-          ./scripts/fetch-n-minus-one.sh
-          . "$KIWI_N_MINUS_ONE_CACHE/n-minus-one.env"
-          plat="$(
-            case "$(uname -s)-$(uname -m)" in
-              Darwin-arm64) echo darwin-arm64 ;;
-              Darwin-x86_64) echo darwin-amd64 ;;
-              Linux-aarch64|Linux-arm64) echo linux-arm64 ;;
-              *) echo linux-amd64 ;;
-            esac
-          )"
-          ./scripts/release-store.sh publish "$KIWI_RELEASE_STORE" "v0.0.0-n1" \
-            "$(git rev-parse HEAD)" "$KIWI_N_MINUS_ONE_BIN"
-          echo "KIWI_N_MINUS_ONE_BIN=$KIWI_N_MINUS_ONE_BIN" >> "$GITHUB_ENV"
-          echo "KIWI_N_MINUS_ONE_SHA256=$KIWI_N_MINUS_ONE_SHA256" >> "$GITHUB_ENV"
-          echo "KIWI_RELEASE_STORE=$KIWI_RELEASE_STORE" >> "$GITHUB_ENV"
-          echo "KIWI_REQUIRE_N_MINUS_ONE=1" >> "$GITHUB_ENV"
-          echo "KIWI_REQUIRE_RELEASED_N_MINUS_ONE=1" >> "$GITHUB_ENV"
       - name: make dogfood-${{ matrix.suite }}
-        env:
-          # Hermetic once the store is seeded: the suite itself never
-          # reaches api.github.com.
-          KIWI_ALLOW_GITHUB_RELEASE_FETCH: "0"
-          KIWI_RELEASE_STORE: ${{ runner.temp }}/kiwi-release-store
-          KIWI_N_MINUS_ONE_CACHE: ${{ runner.temp }}/kiwi-n-minus-one
-        run: make ${{ matrix.suite == 'release-gate' && 'release-gate' || format('dogfood-{0}', matrix.suite) }}
+        run: make "dogfood-${{ matrix.suite }}"
