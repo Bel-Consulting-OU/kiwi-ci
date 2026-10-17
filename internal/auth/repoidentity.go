@@ -499,10 +499,19 @@ func ParseRepoGrant(s string) (RepoGrant, error) {
 // the first segment is a dotless host or part of a bare nested name), so it is
 // rejected with ErrRepoGrantAmbiguous naming the string and both accepted
 // spellings. This is the parser behind TokenStore.Load and the repository
-// grant validation exported by internal/config.
+// grant validation exported by internal/config. Results are memoized: policy
+// lookup re-parses every config key per repository query.
 func ParseRepoGrantConfig(s string) (RepoGrant, error) {
-	return parseRepoGrant(s, false)
+	if v, ok := parsedRepoGrantConfig.Load(s); ok {
+		c := v.(parsedStoredRepoIDEntry)
+		return c.grant, c.err
+	}
+	g, err := parseRepoGrant(s, false)
+	parsedRepoGrantConfig.Store(s, parsedStoredRepoIDEntry{grant: g, err: err})
+	return g, err
 }
+
+var parsedRepoGrantConfig sync.Map
 
 // parseRepoGrant is the shared implementation; allowLegacyCanonical selects
 // rule 5 (in-process migration) versus the strict configuration schema.

@@ -232,13 +232,18 @@ func (s *Server) requiredArtifactsMissingLocked(j model.Job) string {
 	if len(contracts) == 0 {
 		return ""
 	}
-	// Bucket this job's artifacts once. A per-contract scan of the whole
-	// artifact map was O(contracts × all artifacts) on every completion.
+	// Bucket this job's artifacts once (via the job index). A per-contract
+	// scan of the whole artifact map was O(contracts × all artifacts) on
+	// every completion. Generation is not filtered here: a required name is
+	// satisfied by any generation that published it.
 	byName := map[string][]model.ArtifactRecord{}
-	for _, a := range s.artifacts {
-		if a.JobID == j.ID {
-			byName[a.Name] = append(byName[a.Name], a)
+	s.ensureArtifactsByJobLocked()
+	for _, id := range s.artifactsByJob[j.ID] {
+		a, ok := s.artifacts[id]
+		if !ok {
+			continue
 		}
+		byName[a.Name] = append(byName[a.Name], a)
 	}
 	for name, c := range contracts {
 		if !c.Required {
@@ -280,10 +285,13 @@ func (s *Server) findArtifactByJobName(ctx context.Context, runID, jobID, name s
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var matches []model.ArtifactRecord
-	for _, a := range s.artifacts {
-		if a.JobID == jobID && a.Name == name {
-			matches = append(matches, a)
+	s.ensureArtifactsByJobLocked()
+	for _, id := range s.artifactsByJob[jobID] {
+		a, ok := s.artifacts[id]
+		if !ok || a.Name != name {
+			continue
 		}
+		matches = append(matches, a)
 	}
 	return matches, nil
 }

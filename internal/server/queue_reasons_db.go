@@ -354,6 +354,12 @@ func (s *Server) applyQueueReasonsMemoryLocked(ri model.Runner) {
 func (s *Server) applyQueueReasonsMemoryLockedWithSums(ri model.Runner, reserved map[string]model.ResourceCapacity) {
 	fleet := s.fleetQueueRunnerViewsLocked(ri, reserved)
 	for _, j := range s.jobs {
+		// Only non-terminal jobs carry a queue reason. Walking the full
+		// history on every lease miss still touches every map entry; the
+		// status check is first so terminal history is a cheap skip.
+		if j.Status != model.StatusQueued && j.Status != model.StatusWaitingApproval {
+			continue
+		}
 		reason := queue.None
 		switch j.Status {
 		case model.StatusWaitingApproval:

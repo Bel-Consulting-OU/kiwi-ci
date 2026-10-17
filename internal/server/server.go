@@ -200,9 +200,19 @@ type Server struct {
 	// (tests seeding the map) triggers one rebuild.
 	artifactByKey     map[string]string
 	artifactIndexCard int
-	reports           map[string]model.TestReport
-	deliveries        map[string]string
-	completions       map[string]model.CompletionReceipt
+	// artifactsByJob / reportsByJob / snapshotsByJob index evidence by job
+	// id so attestation and contract checks do not scan the whole maps on
+	// every completion. Size cards force one rebuild when tests seed maps
+	// directly (same pattern as artifactByKey).
+	artifactsByJob     map[string][]string
+	artifactsByJobCard int
+	reportsByJob       map[string][]string
+	reportsByJobCard   int
+	snapshotsByJob     map[string][]string
+	snapshotsByJobCard int
+	reports            map[string]model.TestReport
+	deliveries         map[string]string
+	completions        map[string]model.CompletionReceipt
 	// idempotency holds the fs-mode run-idempotency receipts keyed by
 	// canonical repository scope + client key (runIdempotencyReceiptKey).
 	// Guarded by s.mu; persisted in the SAME snapshot write as the run it
@@ -6745,6 +6755,89 @@ func (s *Server) ensureJobsByRunLocked() {
 		s.jobsByRun[j.RunID][j.ID] = true
 	}
 	s.jobsByRunCard = len(s.jobs)
+}
+
+// artifactsForJobLocked returns the job's artifacts under a lease generation
+// using the job index (rebuilt if the map size drifted).
+func (s *Server) artifactsForJobLocked(jobID string, generation int64) []model.ArtifactRecord {
+	s.ensureArtifactsByJobLocked()
+	var out []model.ArtifactRecord
+	for _, id := range s.artifactsByJob[jobID] {
+		a, ok := s.artifacts[id]
+		if !ok || a.LeaseGeneration != generation {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+func (s *Server) ensureArtifactsByJobLocked() {
+	if s.artifactsByJob != nil && s.artifactsByJobCard == len(s.artifacts) {
+		return
+	}
+	s.artifactsByJob = make(map[string][]string, len(s.artifacts))
+	for id, a := range s.artifacts {
+		if a.JobID == "" {
+			continue
+		}
+		s.artifactsByJob[a.JobID] = append(s.artifactsByJob[a.JobID], id)
+	}
+	s.artifactsByJobCard = len(s.artifacts)
+}
+
+func (s *Server) reportsForJobLocked(jobID string, generation int64) []model.TestReport {
+	s.ensureReportsByJobLocked()
+	var out []model.TestReport
+	for _, id := range s.reportsByJob[jobID] {
+		r, ok := s.reports[id]
+		if !ok || r.JobID != jobID || r.LeaseGeneration != generation {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+func (s *Server) ensureReportsByJobLocked() {
+	if s.reportsByJob != nil && s.reportsByJobCard == len(s.reports) {
+		return
+	}
+	s.reportsByJob = make(map[string][]string, len(s.reports))
+	for id, r := range s.reports {
+		if r.JobID == "" {
+			continue
+		}
+		s.reportsByJob[r.JobID] = append(s.reportsByJob[r.JobID], id)
+	}
+	s.reportsByJobCard = len(s.reports)
+}
+
+func (s *Server) snapshotsForJobLocked(jobID string, generation int64) []model.SnapshotRecord {
+	s.ensureSnapshotsByJobLocked()
+	var out []model.SnapshotRecord
+	for _, id := range s.snapshotsByJob[jobID] {
+		rec, ok := s.snapshots[id]
+		if !ok || rec.JobID != jobID || rec.LeaseGeneration != generation {
+			continue
+		}
+		out = append(out, rec)
+	}
+	return out
+}
+
+func (s *Server) ensureSnapshotsByJobLocked() {
+	if s.snapshotsByJob != nil && s.snapshotsByJobCard == len(s.snapshots) {
+		return
+	}
+	s.snapshotsByJob = make(map[string][]string, len(s.snapshots))
+	for id, rec := range s.snapshots {
+		if rec.JobID == "" {
+			continue
+		}
+		s.snapshotsByJob[rec.JobID] = append(s.snapshotsByJob[rec.JobID], id)
+	}
+	s.snapshotsByJobCard = len(s.snapshots)
 }
 
 // jobsForRunLocked returns the live jobs of one run from the index.

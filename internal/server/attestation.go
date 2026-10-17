@@ -190,26 +190,12 @@ func (s *Server) gatherAttestationEvidenceLocal(jobID string, generation int64) 
 	}
 	run := s.runs[j.RunID]
 	ev := attestationEvidence{job: j, run: run}
-	for _, a := range s.artifacts {
-		if a.JobID == jobID && a.LeaseGeneration == generation {
-			ev.artifacts = append(ev.artifacts, a)
-		}
-	}
-	for _, r := range s.reports {
-		if r.JobID == jobID && r.LeaseGeneration == generation {
-			ev.reports = append(ev.reports, r)
-		}
-	}
-	for _, rec := range s.snapshots {
-		if rec.JobID == jobID && rec.LeaseGeneration == generation {
-			ev.snapshots = append(ev.snapshots, rec)
-		}
-	}
-	for _, jj := range s.jobs {
-		if jj.RunID == j.RunID {
-			ev.graphJobs = append(ev.graphJobs, jj)
-		}
-	}
+	// Index lookups: full-map scans per attested completion were
+	// O(artifacts+reports+snapshots+jobs) × completions.
+	ev.artifacts = s.artifactsForJobLocked(jobID, generation)
+	ev.reports = s.reportsForJobLocked(jobID, generation)
+	ev.snapshots = s.snapshotsForJobLocked(jobID, generation)
+	ev.graphJobs = s.jobsForRunLocked(j.RunID)
 	if j.AttemptRunnerID != "" {
 		if rec, ok := s.completions[completionReceiptKey(jobID, generation, j.AttemptRunnerID)]; ok && rec.ResultHashVersion >= storage.CompletionResultHashVersionV2 {
 			ev.completionResultDigest = rec.ResultHash
