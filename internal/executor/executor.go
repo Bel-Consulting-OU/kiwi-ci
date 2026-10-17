@@ -1367,6 +1367,29 @@ const maxGeneratedFragmentBytes = 256 << 10
 // pipeline's registry credential bindings. Secrets are resolved through the
 // job's secret provider and never logged. The returned directory is set as
 // DOCKER_CONFIG for every docker invocation of this job; cleanup removes it.
+// copyDirContents copies src's files into dst (creating dst). Used to clone
+// docker context metadata into a job-scoped DOCKER_CONFIG dir.
+func copyDirContents(src, dst string) error {
+	return filepath.WalkDir(src, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, rerr := filepath.Rel(src, path)
+		if rerr != nil {
+			return rerr
+		}
+		target := filepath.Join(dst, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		b, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return rerr
+		}
+		return os.WriteFile(target, b, 0o644)
+	})
+}
+
 func (e *Executor) provisionRegistryAuth(ctx context.Context, cj pipeline.CompiledJob) (string, func(), error) {
 	names := make([]string, 0, len(cj.Job.Registries)*2)
 	for _, r := range cj.Job.Registries {
@@ -1394,7 +1417,24 @@ func (e *Executor) provisionRegistryAuth(ctx context.Context, cj pipeline.Compil
 		return "", func() {}, fmt.Errorf("registry credentials: %w", err)
 	}
 	cleanup := func() { _ = os.RemoveAll(cfgDir) }
-	raw, err := json.Marshal(map[string]any{"auths": auths})
+	// Merge into the caller's existing docker config (currentContext,
+	// credsStore, …) and copy the context metadata it references. Writing a
+	// bare {"auths":…} replaces DOCKER_CONFIG and drops Docker Desktop's /
+	// colima's socket context: the docker CLI then dials
+	// /var/run/docker.sock (or a context whose meta is missing) and fails.
+	baseCfg := map[string]any{}
+	if home, herr := os.UserHomeDir(); herr == nil {
+		dockerHome := filepath.Join(home, ".docker")
+		if raw, rerr := os.ReadFile(filepath.Join(dockerHome, "config.json")); rerr == nil {
+			_ = json.Unmarshal(raw, &baseCfg)
+		}
+		if cerr := copyDirContents(filepath.Join(dockerHome, "contexts"), filepath.Join(cfgDir, "contexts")); cerr != nil {
+			// No context store is fine (plain daemon socket).
+			_ = cerr
+		}
+	}
+	baseCfg["auths"] = auths
+	raw, err := json.Marshal(baseCfg)
 	if err != nil {
 		cleanup()
 		return "", func() {}, fmt.Errorf("registry credentials: %w", err)

@@ -60,6 +60,11 @@ type Store struct {
 	// advisory).
 	Retention RetentionPolicy
 	pruneMu   sync.Mutex
+	// keyMu serializes local save/restore per cache key. Concurrent matrix
+	// shards sharing one key used to interleave archive and digest writes
+	// and fail restore with a digest mismatch.
+	keyMu    sync.Mutex
+	keyLocks map[string]*sync.Mutex
 	// Manager, when non-nil, is the runner-wide aggregate cache budget owner:
 	// saves and remote restores reserve capacity through it before writing
 	// bytes, and Prune delegates to its shared lock.
@@ -628,6 +633,21 @@ func (c *countWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// lockKey returns the per-key mutex for local save/restore serialization.
+func (s *Store) lockKey(key string) *sync.Mutex {
+	s.keyMu.Lock()
+	defer s.keyMu.Unlock()
+	if s.keyLocks == nil {
+		s.keyLocks = map[string]*sync.Mutex{}
+	}
+	m, ok := s.keyLocks[key]
+	if !ok {
+		m = &sync.Mutex{}
+		s.keyLocks[key] = m
+	}
+	return m
+}
+
 // archivePath returns the on-disk archive path for key.
 func (s *Store) archivePath(key string) string {
 	return filepath.Join(s.Root, key+".tar.gz")
@@ -703,6 +723,11 @@ func (s *Store) restoreLocalWithReporter(ctx context.Context, key, workspace str
 	if err != nil {
 		return false, err
 	}
+	// Serialize with SaveContext on this key so restore never observes a
+	// half-published archive/digest pair.
+	km := s.lockKey(key)
+	km.Lock()
+	defer km.Unlock()
 	dst := s.archivePath(key)
 	fi, err := os.Lstat(dst)
 	if os.IsNotExist(err) {
@@ -1251,6 +1276,11 @@ func (s *Store) SaveContext(ctx context.Context, key, workspace string, paths []
 	if !validKey(key) {
 		return fmt.Errorf("cache: invalid cache key")
 	}
+	// One writer per key: archive and its digest sidecar must publish as a
+	// pair or a concurrent same-key save can leave archive B + digest A.
+	km := s.lockKey(key)
+	km.Lock()
+	defer km.Unlock()
 	bound := s.maxStoredBytes()
 	if err := os.MkdirAll(s.Root, 0o755); err != nil {
 		return err
