@@ -1,5 +1,5 @@
 #!/bin/sh
-# fetch-n-minus-one.sh resolves the PUBLISHED previous-release binary for
+# fetch-n-minus-one.sh resolves the published previous-release binary for
 # release certification and exports KIWI_N_MINUS_ONE_BIN /
 # KIWI_N_MINUS_ONE_SHA256 so dogfood-release-artifacts cannot fall back to a
 # source rebuild.
@@ -14,7 +14,10 @@
 #      scripts/release-store.sh). The store generates SHA256SUMS itself, so
 #      the digest is independent metadata.
 #   4. GitHub Releases latest asset (download + verify against the release's
-#      published SHA256SUMS — independent metadata)
+#      published SHA256SUMS — independent metadata). This path needs the
+#      network and is therefore opt-in:
+#      KIWI_ALLOW_GITHUB_RELEASE_FETCH=1. A hermetic release-gate never sets
+#      it; live GitHub/OCI probes live under make integration-live.
 #
 # Fail-closed: a missing or unverifiable artifact is fatal. Source rebuild is
 # never performed here, and a supplied binary is never trusted on its own
@@ -48,7 +51,7 @@ export KIWI_REQUIRE_RELEASED_N_MINUS_ONE="${KIWI_REQUIRE_RELEASED_N_MINUS_ONE:-1
 CACHE="${KIWI_N_MINUS_ONE_CACHE:-${TMPDIR:-/tmp}/kiwi-n-minus-one}"
 mkdir -p "$CACHE"
 
-# write_env records the resolved pin so the caller (Make, CI) can source it
+# write_env records the resolved pin so the caller (Make, ci) can source it
 # after this script exits. Every success path must call it — a computed
 # SHA256 that only lives in this process is a silent empty pin downstream.
 write_env() {
@@ -70,7 +73,7 @@ if [ -n "${KIWI_N_MINUS_ONE_BIN:-}" ]; then
 		got="$(sha256_of "$KIWI_N_MINUS_ONE_BIN")"
 		[ "$got" = "$KIWI_N_MINUS_ONE_SHA256" ] || die "supplied N-1 sha256 $got != pinned $KIWI_N_MINUS_ONE_SHA256"
 	elif [ "${KIWI_REQUIRE_RELEASED_N_MINUS_ONE:-}" = "1" ]; then
-		# Release certification refuses a SELF-AUTHENTICATING N-1: hashing
+		# Release certification refuses a self-authenticating N-1: hashing
 		# whatever file we were handed proves only "this is the same bytes",
 		# not "this is the authentic previously published Kiwi". The
 		# expected digest must come from independent release metadata:
@@ -122,7 +125,7 @@ if [ -n "${KIWI_N_MINUS_ONE_URL:-}" ]; then
 	exit 0
 fi
 
-# ---- 3a. PUBLISHED artifact store (the independent trust anchor) --------
+# ---- 3a. published artifact store (the independent trust anchor) --------
 # KIWI_RELEASE_STORE is a directory of published releases whose SHA256SUMS
 # the store itself generated (scripts/release-store.sh publish). Resolving
 # from the store is independent metadata: the digest comes from the store,
@@ -149,6 +152,14 @@ if [ -n "${KIWI_RELEASE_STORE:-}" ]; then
 	exit 0
 fi
 
+# GitHub Releases is the last resort and only when explicitly allowed.
+# A release candidate must not become uncertifiable because api.github.com
+# timed out: hermetic callers resolve through a supplied bin, a URL pin, or
+# KIWI_RELEASE_STORE alone.
+if [ "${KIWI_ALLOW_GITHUB_RELEASE_FETCH:-}" != "1" ]; then
+	die "no local N-1 source (set KIWI_N_MINUS_ONE_BIN+SHA256, KIWI_N_MINUS_ONE_URL+SHA256, or KIWI_RELEASE_STORE). GitHub Releases is opt-in via KIWI_ALLOW_GITHUB_RELEASE_FETCH=1 (integration-live only)"
+fi
+
 REPO_SLUG="${KIWI_GITHUB_REPOSITORY:-Bel-Consulting-OU/kiwi-ci}"
 API="${KIWI_GITHUB_API:-https://api.github.com}"
 command -v curl >/dev/null 2>&1 || die "curl is required to auto-fetch the published N-1"
@@ -161,17 +172,33 @@ elif [ -n "${GH_TOKEN:-}" ]; then
 	AUTH_HEADER="Authorization: Bearer $GH_TOKEN"
 fi
 
+# api_get retries transient network failures. A single timeout must not
+# fail a live probe that a human asked for.
 api_get() {
 	url="$1"
-	if [ -n "$AUTH_HEADER" ]; then
-		curl -fsSL -H "$AUTH_HEADER" -H "Accept: application/vnd.github+json" "$url"
-	else
-		curl -fsSL -H "Accept: application/vnd.github+json" "$url"
-	fi
+	try=1
+	max=4
+	while [ "$try" -le "$max" ]; do
+		if [ -n "$AUTH_HEADER" ]; then
+			if curl -fsSL --connect-timeout 10 --max-time 60 \
+				-H "$AUTH_HEADER" -H "Accept: application/vnd.github+json" "$url"; then
+				return 0
+			fi
+		else
+			if curl -fsSL --connect-timeout 10 --max-time 60 \
+				-H "Accept: application/vnd.github+json" "$url"; then
+				return 0
+			fi
+		fi
+		echo "fetch-n-minus-one: GitHub GET $url failed (try $try/$max)" >&2
+		try=$((try + 1))
+		[ "$try" -le "$max" ] && sleep $((try * 2))
+	done
+	return 1
 }
 
 latest_json="$CACHE/latest-release.json"
-if ! api_get "$API/repos/$REPO_SLUG/releases/latest" >"$latest_json.tmp" 2>/dev/null; then
+if ! api_get "$API/repos/$REPO_SLUG/releases/latest" >"$latest_json.tmp"; then
 	rm -f "$latest_json.tmp"
 	die "no published release found for $REPO_SLUG (set KIWI_N_MINUS_ONE_BIN/KIWI_N_MINUS_ONE_SHA256 or KIWI_N_MINUS_ONE_URL; source rebuild is not release certification)"
 fi

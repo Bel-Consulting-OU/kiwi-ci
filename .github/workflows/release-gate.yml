@@ -70,6 +70,46 @@ jobs:
           "$PG_BINDIR/pg_dump" --version
           "$PG_BINDIR/pg_restore" --version
           psql --version
+      - name: resolve published N-1 (hermetic store; live fetch is opt-in)
+        env:
+          # Local published-artifact store. fetch-n-minus-one.sh prefers this
+          # and will NOT touch api.github.com unless
+          # KIWI_ALLOW_GITHUB_RELEASE_FETCH=1 (integration-live only).
+          KIWI_RELEASE_STORE: ${{ runner.temp }}/kiwi-release-store
+          # Bootstrap the store from GitHub Releases as a SEPARATE,
+          # retried, clearly-labeled network step. A timeout here is an
+          # integration-live failure, not a red release-gate.
+          KIWI_ALLOW_GITHUB_RELEASE_FETCH: "1"
+          KIWI_REQUIRE_N_MINUS_ONE: "1"
+          KIWI_REQUIRE_RELEASED_N_MINUS_ONE: "1"
+          KIWI_N_MINUS_ONE_CACHE: ${{ runner.temp }}/kiwi-n-minus-one
+        run: |
+          set -euo pipefail
+          mkdir -p "$KIWI_RELEASE_STORE" "$KIWI_N_MINUS_ONE_CACHE"
+          ./scripts/fetch-n-minus-one.sh
+          CACHE="$KIWI_N_MINUS_ONE_CACHE"
+          if [ -f "$CACHE/n-minus-one.env" ]; then
+            . "$CACHE/n-minus-one.env"
+            export KIWI_N_MINUS_ONE_BIN KIWI_N_MINUS_ONE_SHA256 KIWI_REQUIRE_RELEASED_N_MINUS_ONE
+            # Publish the resolved pin into the local store so the
+            # certification step is fully hermetic.
+            plat="$(
+              case "$(uname -s)-$(uname -m)" in
+                Darwin-arm64) echo darwin-arm64 ;;
+                Darwin-x86_64) echo darwin-amd64 ;;
+                Linux-aarch64|Linux-arm64) echo linux-arm64 ;;
+                *) echo linux-amd64 ;;
+              esac
+            )
+            if [ ! -f "$KIWI_RELEASE_STORE/v0.0.0-n1/kiwi-$plat" ]; then
+              ./scripts/release-store.sh publish "$KIWI_RELEASE_STORE" "v0.0.0-n1" \
+                "$(git rev-parse HEAD)" "$KIWI_N_MINUS_ONE_BIN"
+            fi
+            echo "KIWI_N_MINUS_ONE_BIN=$KIWI_N_MINUS_ONE_BIN" >> "$GITHUB_ENV"
+            echo "KIWI_N_MINUS_ONE_SHA256=$KIWI_N_MINUS_ONE_SHA256" >> "$GITHUB_ENV"
+            echo "KIWI_RELEASE_STORE=$KIWI_RELEASE_STORE" >> "$GITHUB_ENV"
+            echo "KIWI_REQUIRE_RELEASED_N_MINUS_ONE=1" >> "$GITHUB_ENV"
+          fi
       - name: release-gate
         env:
           # Production dist/DR tests connect to the pinned service. The
@@ -77,14 +117,17 @@ jobs:
           # pointing at the service exercises the same code without relying
           # on whatever the runner image happens to carry.
           KIWI_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+          # Hermetic: no api.github.com from inside the certification chain.
+          KIWI_ALLOW_GITHUB_RELEASE_FETCH: "0"
+          KIWI_REQUIRE_N_MINUS_ONE: "1"
+          KIWI_REQUIRE_RELEASED_N_MINUS_ONE: "1"
+          KIWI_N_MINUS_ONE_CACHE: ${{ runner.temp }}/kiwi-n-minus-one
+          KIWI_RELEASE_STORE: ${{ runner.temp }}/kiwi-release-store
         run: |
           # RC certification is ONE causal chain:
           #   freeze candidate bytes → resolve published N-1 → test the
           #   FROZEN bytes (never a fresh source build) → tag → publish the
           #   SAME bytes. scripts/certify-candidate.sh is that chain.
-          export KIWI_REQUIRE_N_MINUS_ONE=1
-          export KIWI_REQUIRE_RELEASED_N_MINUS_ONE=1
-          ./scripts/fetch-n-minus-one.sh
           CACHE="${KIWI_N_MINUS_ONE_CACHE:-${TMPDIR:-/tmp}/kiwi-n-minus-one}"
           if [ -f "$CACHE/n-minus-one.env" ]; then
             . "$CACHE/n-minus-one.env"

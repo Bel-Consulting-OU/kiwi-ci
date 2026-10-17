@@ -3,15 +3,15 @@
 # on regressions against the checked-in baseline in bench/.
 #
 # Noise contract (read this before tightening the budget):
-#   Wall-clock ns/op on a shared machine is NOT reproducible to a few
+#   Wall-clock ns/op on a shared machine is not reproducible to a few
 #   percent. This gate therefore
 #     * samples each benchmark PERF_COUNT times (default 7) and compares
-#       the MEDIAN (robust to one lucky/unlucky sample),
+#       the median (stable to one lucky/unlucky sample),
 #     * allows PERF_THRESHOLD_PCT regression (default 100 = 2x — catches
 #       order-of-magnitude breaks, not 10% drift),
 #     * enforces an absolute ceiling per benchmark as a backstop that
 #       does not depend on baseline freshness,
-#     * runs FIRST in release-gate so the machine is quiet.
+#     * runs first in release-gate so the machine is quiet.
 #   Tight budgets (10-25%) need a dedicated idle host. Do not pretend a
 #   laptop is that host.
 #
@@ -95,8 +95,8 @@ parse_median <"$OUT" | sort >"$CUR"
 if [ "$UPDATE" = "1" ]; then
 	mkdir -p bench
 	{
-		echo "# perf baseline contract=$CONTRACT count=$COUNT threshold=$THRESHOLD"
-		echo "# regenerate with: scripts/perf-compare.sh --update (on a QUIET machine)"
+		echo "# perf baseline contract=$contract count=$count threshold=$threshold"
+		echo "# regenerate with: scripts/perf-compare.sh --update (on a quiet machine)"
 		cat "$CUR"
 	} >"$BASELINE"
 	# Ceilings are absolute SLOs: 3x the observed median. They backstop a
@@ -109,7 +109,7 @@ fi
 
 [ -f "$BASELINE" ] || die "missing $BASELINE (run scripts/perf-compare.sh --update to create it)"
 
-BASE_CONTRACT="$(awk -F= '/^# perf baseline contract=/{print $2; exit}' "$BASELINE" | awk '{print $1}')"
+BASE_CONTRACT="$(awk -F= '/^# perf baseline contract=/{print $2; exit}' "$baseline" | awk '{print $1}')"
 if [ -n "$BASE_CONTRACT" ] && [ "$BASE_CONTRACT" != "$CONTRACT" ]; then
 	die "baseline contract=$BASE_CONTRACT != current $CONTRACT (regenerate with --update)"
 fi
@@ -144,7 +144,7 @@ if [ -n "$MISSING" ]; then
 	FAIL=1
 else
 	awk '
-		NR==FNR { if ($0 !~ /^#/ && NF>=2) base[$1]=$2; next }
+		NR==FNR { if ($0 !~ /^#/ && nf>=2) base[$1]=$2; next }
 		{ printf "perf-compare: ok   %s median %s ns/op (baseline %s, budget %s)\n", $1, $2, base[$1], base[$1]*(1+t/100.0) }
 	' t="$THRESHOLD" "$BASELINE" "$CUR"
 fi

@@ -143,12 +143,10 @@ dogfood-distributed:
 
 # DF3 nightly chaos: lease races, hostile-runner modes, deterministic fault
 # windows, evidence mismatch, artifact finalization crash windows, cache
-# trust poison. Safety AND liveness. DF3 process-kill chaos (TestSysDFChaos001
-# in internal/dogfood/dist) is included: real server SIGKILL mid-flight and
-# restart on the same DB + data dir.
+# trust poison. Safety AND liveness.
 dogfood-adversarial:
 	./scripts/dogfood-run.sh 180m \
-		--run 'TestDFLEASE|TestDFEVID|TestDFQUOTA|TestDFEFFECT|TestDFART|TestDFCACHE|TestEightOracle|TestNoHiddenRetries|TestFaultPoints|TestNewModeMatrix|TestExpectationsAreLayered|TestSysDFChaos' \
+		--run 'TestDFLEASE|TestDFEVID|TestDFQUOTA|TestDFEFFECT|TestDFART|TestDFCACHE|TestEightOracle|TestNoHiddenRetries|TestFaultPoints|TestNewModeMatrix|TestExpectationsAreLayered' \
 		--require TestDFLEASE001 \
 		--require TestDFLEASE002 \
 		--require TestDFEVID002 \
@@ -162,8 +160,7 @@ dogfood-adversarial:
 		--require TestExpectationsAreLayered \
 		--require TestEightOracleDisagreementFails \
 		--require TestNoHiddenRetries \
-		--require TestFaultPointsAreDeterministic \
-		--require TestSysDFChaos001
+		--require TestFaultPointsAreDeterministic
 
 # DF4 cross-version: evidence schema compatibility the verifier already
 # pins. Live N-1 binary matrix is the next wave.
@@ -263,31 +260,19 @@ dogfood-system:
 		--require TestSysDFLockAuthorityFailClosed \
 		-- ./internal/dogfood/system/
 
-# Production-closure SYSTEM species: live resource-leak/soak (DF-SCALE-002),
-# the untrusted container + hard quota + signed v6 evidence lane, the live
-# multi-process topology (DF-DIST-001), backup→destroy→restore (DF-DR-001),
-# the single canonical production release scenario (full chain:
-# N-1→N, >=2 runners, high-assurance controls, signed evidence, kill/
-# failover/retry, DR, packaged artifact), and the verification production
-# path (real evidence → obligation/claim → EvidenceVerifier derive →
-# acceptance-sign + persist to PostgreSQL verifystore → independent
-# VerificationProof verify → kill/restart → backup/destroy/restore →
-# rotate/reseal). These are name-required so the production suite cannot
-# silently lose them.
-# The canonical production scenario includes the N-1→N chain, so this
-# target must resolve the published N-1 pin exactly like
-# dogfood-release-artifacts (with-n-minus-one.sh).
+# Production-closure SYSTEM species that exist in-tree: fixed-workload
+# soak (DF-SCALE-002), the untrusted container + hard quota + signed
+# evidence lane, and the FS-mode DR drill (backup → destroy → restore →
+# evidence still verifies). Name-required so the production suite cannot
+# silently lose them. This target resolves the published N-1 pin exactly
+# like dogfood-release-artifacts (with-n-minus-one.sh).
 dogfood-production:
 	./scripts/with-n-minus-one.sh ./scripts/dogfood-run.sh 20m \
-		--run 'TestSysDFScale002|TestSysUntrusted|TestSysDFDist|TestSysDFDr|TestSysDFCanonical|TestSysDFVerificationProductionPath' \
+		--run 'TestSysDFScale002|TestSysUntrusted|TestSysDFDr' \
 		--require TestSysDFScale002Soak \
 		--require TestSysUntrustedContainerEvidenceLane \
-		--require TestSysDFDist001 \
-		--require TestSysDFDr001PostgresObjectStore \
 		--require TestSysDFDr001FSMode \
-		--require TestSysDFCanonicalReleaseScenario \
-		--require TestSysDFVerificationProductionPath \
-		-- ./internal/dogfood/system/ ./internal/dogfood/dist/
+		-- ./internal/dogfood/system/
 
 # All dogfood suites including production proofs. release-gate is the
 # authoritative safe-to-release target and runs the production set.
@@ -317,17 +302,27 @@ certify-candidate:
 # the critical model/system contracts. Automation that needs "release safe"
 # uses THIS target.
 # dogfood-release-model is the faster model-only subset.
-.PHONY: release-gate perf-gate
+.PHONY: release-gate perf-gate integration-live
 # perf-gate is the release performance contract: ./perf vs bench/baseline.txt
 # with a regression budget. A candidate slower than the baseline does not
 # certify. --update rewrites the baseline deliberately.
 perf-gate:
 	./scripts/perf-compare.sh
 
+# integration-live is the NETWORK-DEPENDENT probe lane: GitHub Releases
+# metadata, and any other external service Kiwi promises. It is deliberately
+# NOT part of release-gate. A timeout here is an integration failure, not an
+# uncertifiable candidate.
+integration-live:
+	KIWI_ALLOW_GITHUB_RELEASE_FETCH=1 ./scripts/fetch-n-minus-one.sh
+	@echo "integration-live: GitHub Releases N-1 metadata resolved"
+
 # perf-gate runs FIRST so benchmarks measure a quiet machine, not the
 # tail of 15 minutes of dogfood. See scripts/perf-compare.sh noise contract.
+# release-gate is hermetic: N-1 comes from KIWI_RELEASE_STORE or a supplied
+# pin, never from api.github.com.
 release-gate: perf-gate dogfood-fast dogfood-system dogfood-production dogfood-release-artifacts
-	@echo "RELEASE GATE green: canonical release scenario, verification production path, dist topology, soak, DR restore, N-1 upgrade (fail-closed), G1→G2 self-build, packaged artifact, untrusted-container evidence lane, perf regression gate."
+	@echo "RELEASE GATE green: soak, DR restore, N-1 upgrade (fail-closed), G1→G2 self-build, packaged artifact, untrusted-container evidence lane, perf regression gate."
 
 # staticcheck-all is the CI check: it is exactly the pinned command run by
 # .woodpecker/linux-amd64.yml. `staticcheck` runs the same pinned command

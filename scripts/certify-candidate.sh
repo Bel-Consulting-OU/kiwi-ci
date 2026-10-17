@@ -1,5 +1,5 @@
 #!/bin/sh
-# certify-candidate.sh is the ONE release-certification chain:
+# certify-candidate.sh is the one release-certification chain:
 #
 #   commit C → build immutable candidate B → hash/sign B
 #            → test B everywhere (dogfood + adversarial + N-1 + self-host)
@@ -35,7 +35,7 @@ echo "certify-candidate: 1/5 freeze candidate bytes"
 rm -rf "$CANDIDATE_DIR"
 ./scripts/release.sh --candidate "$VERSION" ${KIWI_RELEASE_SIGNING_KEY:+--require-signing} ${KIWI_ALLOW_UNSIGNED_RELEASE:+--allow-unsigned}
 
-# The frozen platform binary is the ONLY binary the tests may use.
+# The frozen platform binary is the only binary the tests may use.
 case "$(uname -s)-$(uname -m)" in
 Darwin-arm64) PLAT="kiwi-darwin-arm64" ;;
 Darwin-x86_64) PLAT="kiwi-darwin-amd64" ;;

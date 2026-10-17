@@ -1,15 +1,15 @@
 #!/bin/sh
-# release-store.sh is the PUBLISHED artifact store the N-1 upgrade chain
+# release-store.sh is the published artifact store the N-1 upgrade chain
 # consumes. A release is not "published" until its bytes live here, hashed
 # in a SHA256SUMS the store itself generated — that digest is the
-# INDEPENDENT metadata fetch-n-minus-one.sh verifies against. Computing the
+# independent metadata fetch-n-minus-one.sh verifies against. Computing the
 # hash of a file someone handed you proves nothing about its provenance.
 #
 # Layout:
 #   <store>/<version>/
 #     kiwi-<os>-<arch>[.exe]
 #     SHA256SUMS          (generated here; the trust anchor)
-#     RELEASE             (version= / commit= / published_at=)
+#     release             (version= / commit= / published_at=)
 #
 # Usage:
 #   scripts/release-store.sh publish <store> <version> <commit> <bin>...
@@ -107,7 +107,7 @@ resolve)
 	store="${1:-}"; plat="${2:-}"
 	[ -n "$store" ] && [ -n "$plat" ] || die "usage: release-store.sh resolve <store> <platform>"
 	# Newest version (lexicographic v-semver is not enough; use the
-	# published_at order in RELEASE, falling back to directory mtime).
+	# published_at order in release, falling back to directory mtime).
 	latest=""
 	latest_ts=0
 	for d in "$store"/v*; do

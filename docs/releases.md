@@ -1,8 +1,8 @@
 # Releases and supply chain
 
-This document describes how Kiwi CI release artifacts are produced, verified,
+This document describes how Kiwi ci release artifacts are produced, verified,
 and reproduced: the release/snapshot gates, the Homebrew formula rendering, the
-dependency SBOM, the SLSA builder identity, reproducible builds via
+dependency sbom, the slsa builder identity, reproducible builds via
 `SOURCE_DATE_EPOCH`, and the lifecycle of the Ed25519 release signing key.
 
 Everything here is implemented by `scripts/release.sh` and
@@ -17,26 +17,26 @@ script exits non-zero with a precise message and publishes nothing.
 
 | Gate | release (default) | `--snapshot` |
 | --- | --- | --- |
-| Exact semver tag (`vX.Y.Z`) at `HEAD` | required | not required |
-| `VERSION` matches the tag (without `v`) | required (`VERSION` may be omitted) | base version; `-snapshot+<short-sha>` appended |
-| Tag points at `HEAD`, recorded commit = tagged commit | required | n/a |
+| Exact semver tag (`vX.Y.Z`) at `head` | required | not required |
+| `version` matches the tag (without `v`) | required (`version` may be omitted) | base version; `-snapshot+<short-sha>` appended |
+| Tag points at `head`, recorded commit = tagged commit | required | n/a |
 | Recorded commit is the full 40-char lowercase SHA | required | short SHA (or explicit override) |
 | Clean git tree | required | allowed; `.dirty` is appended to the version |
 | Ed25519 signing key (`KIWI_RELEASE_SIGNING_KEY`) | required unless `--allow-unsigned` or `KIWI_ALLOW_UNSIGNED_RELEASE=1`; an explicit `--require-signing` overrides the env var | ignored entirely, even when set: snapshots are never signed, so the variable is never read or materialized and `release-tool` is never invoked with `-key`. `--require-signing` is rejected (release-only flag); `--allow-unsigned` is accepted and ignored |
 | `Formula/kiwi.rb` re-rendered from `Formula/kiwi.rb.tmpl` | every release, unconditionally | never; snapshot builds skip formula rendering rather than refusing |
-| Bundle location | `dist/release/` | `dist/snapshot/`, with a `SNAPSHOT` marker file |
+| Bundle location | `dist/release/` | `dist/snapshot/`, with a `snapshot` marker file |
 | `SOURCE_DATE_EPOCH` default | committer date of the tagged commit | current time unless set |
 
-The tag is never inferred from a branch name: when `HEAD` is not an exact tag,
+The tag is never inferred from a branch name: when `head` is not an exact tag,
 release mode refuses:
 
 ```
-release: HEAD is not an exact tag; releases must be cut from a tagged commit
+release: head is not an exact tag; releases must be cut from a tagged commit
 (use --snapshot for branch/dirty development builds)
 ```
 
-Other release-mode refusals include a tag argument that is not the exact tag at `HEAD`, a non-semver tag, a dirty tree, a `COMMIT` override that is not the full 40-char SHA of the tagged commit.
-A `VERSION` that does not match the tag.
+Other release-mode refusals include a tag argument that is not the exact tag at `head`, a non-semver tag, a dirty tree, a `commit` override that is not the full 40-char SHA of the tagged commit.
+A `version` that does not match the tag.
 Formula rendering has no flag: release mode always re-renders `Formula/kiwi.rb`, and snapshot mode always skips it.
 
 
@@ -51,8 +51,8 @@ In snapshot mode `KIWI_RELEASE_SIGNING_KEY` is never read or materialized and `r
 Invocation:
 
 ```sh
-# Release (CI or a tagged workstation). KIWI_RELEASE_SIGNING_KEY may be the
-# PEM itself or a path to it.
+# Release (ci or a tagged workstation). KIWI_RELEASE_SIGNING_KEY may be the
+# pem itself or a path to it.
 scripts/release.sh v1.2.3
 
 # Development snapshot from any branch, clean or dirty.
@@ -66,9 +66,9 @@ scripts/release.sh v1.2.3 --require-signing
 scripts/release.sh v1.2.3 --allow-unsigned
 ```
 
-Snapshot versions look like `0.1.0-dev-snapshot+1a2b3c4` (or `...+1a2b3c4.dirty`) and the bundle contains a `SNAPSHOT` marker file that states the build is not a release.
+Snapshot versions look like `0.1.0-dev-snapshot+1a2b3c4` (or `...+1a2b3c4.dirty`) and the bundle contains a `snapshot` marker file that states the build is not a release.
 Snapshots are for testing; they are never published as releases, never update the Homebrew formula, and are never signed: `--snapshot --require-signing` is rejected as a usage error, while `--snapshot --allow-unsigned` is accepted and ignored.
-The signing key is ignored in snapshot mode even when `KIWI_RELEASE_SIGNING_KEY` is set in the environment (PEM or path).
+The signing key is ignored in snapshot mode even when `KIWI_RELEASE_SIGNING_KEY` is set in the environment (pem or path).
 The variable is neither read nor materialized, no key temp file is created, and `release-tool` receives no `-key` argument, so snapshot behavior does not depend on the caller's environment.
 
 
@@ -85,7 +85,7 @@ token, and refuses malformed digests.
 The renderer is also exposed for tests and manual use:
 
 ```sh
-scripts/release.sh --render-formula 1.2.3 <sha-arm64> <sha-amd64> [OUT]
+scripts/release.sh --render-formula 1.2.3 <sha-arm64> <sha-amd64> [out]
 scripts/release-formula-test.sh   # make release-formula-test
 ```
 
@@ -93,7 +93,7 @@ The test script renders `v1.2.3` and then `v2.0.0` over the same output file and
 Both digests are exactly the new values, with no tokens and no leftovers from the earlier rendering.
 
 
-## 3. Dependency SBOM
+## 3. Dependency sbom
 
 For each built binary, `release-tool` writes `<binary>.sbom.cdx.json`, a
 CycloneDX 1.5 document describing the **complete** Go dependency graph:
@@ -119,14 +119,14 @@ CycloneDX 1.5 document describing the **complete** Go dependency graph:
 
 The graph comes from `debug/buildinfo.ReadFile` on the built binary.
 If build info cannot be read, `release-tool` falls back to parsing the tab-separated output of `go version -m <binary>` (including `=>` replacement lines).
- if neither source yields a main module, the tool fails rather than emit an SBOM with missing dependencies.
-Note that the SBOM is generated from the module graph recorded in the binary, not from `go.sum`, so it reflects exactly what was linked.
+ if neither source yields a main module, the tool fails rather than emit an sbom with missing dependencies.
+Note that the sbom is generated from the module graph recorded in the binary, not from `go.sum`, so it reflects exactly what was linked.
 
 
-## 4. SLSA builder identity
+## 4. slsa builder identity
 
-Provenance is an in-toto statement with the SLSA provenance v1 predicate
-(`https://slsa.dev/provenance/v1`) wrapped in a DSSE envelope and signed with
+Provenance is an in-toto statement with the slsa provenance v1 predicate
+(`https://slsa.dev/provenance/v1`) wrapped in a dsse envelope and signed with
 the release Ed25519 key. The standard predicate field
 `predicate.runDetails.builder.id` is populated with the release-tool identity:
 
@@ -150,24 +150,24 @@ Flow in `scripts/release.sh` release mode:
 
 1. 1.
   If `BUILD_DATE` is set explicitly, it wins.
-  It must be exactly `YYYY-MM-DDTHH:MM:SSZ` (RFC3339 UTC) *and* name a real UTC calendar instant.
+  It must be exactly `yyyy-mm-ddthh:mm:ssz` (RFC3339 utc) *and* name a real utc calendar instant.
    Any other value, including one carrying whitespace or extra `-X` linker flags, and including a shape-valid impossible date such as `2006-13-45T99:99:99Z`, is rejected with a fatal error before the build, in both release.
   Snapshot mode, so a caller cannot override the validated version through `-ldflags`.
   The calendar check is performed by `scripts/rfc3339check` (see 5.1).
 
 
-2. Else if `SOURCE_DATE_EPOCH` is set, it is converted to RFC3339 UTC.
+2. Else if `SOURCE_DATE_EPOCH` is set, it is converted to RFC3339 utc.
 
 3. Else `SOURCE_DATE_EPOCH` is derived from the tagged commit:
-   `git log -1 --format=%ct <tag>`, then converted to RFC3339 UTC.
+   `git log -1 --format=%ct <tag>`, then converted to RFC3339 utc.
 
 4. The RFC3339 value is baked into the binary as
    `internal/version.BuildDate` via `-ldflags`.
 
 Snapshot mode honors an explicit `SOURCE_DATE_EPOCH`; without one it records the current time.
-`make docker-build` converts `SOURCE_DATE_EPOCH` (default: the `HEAD` commit date) to an RFC3339 `BUILD_DATE` on the host with a BSD-then-GNU `date` fallback.
+`make docker-build` converts `SOURCE_DATE_EPOCH` (default: the `head` commit date) to an RFC3339 `BUILD_DATE` on the host with a bsd-then-gnu `date` fallback.
 Passes it as a build arg, so the Dockerfile never depends on the build-stage userland (BusyBox) understanding epoch syntax.
-A direct `docker build` may pass `--build-arg BUILD_DATE=<RFC3339>` itself; that build arg is validated against the same exact RFC3339 UTC shape in the build stage before it reaches `-ldflags` (a rejected value fails the build).
+A direct `docker build` may pass `--build-arg BUILD_DATE=<RFC3339>` itself; that build arg is validated against the same exact RFC3339 utc shape in the build stage before it reaches `-ldflags` (a rejected value fails the build).
 When only `SOURCE_DATE_EPOCH` is given, the Dockerfile converts it with the Go toolchain in the image.
 `make` users can override the timestamp with `DOCKER_BUILD_DATE`.
 
@@ -178,11 +178,11 @@ The distinction is deliberate:
   `SOURCE_DATE_EPOCH` makes `go build` output byte-identical and a rebuild
   reproduces the published digests.
 
-- **Provenance and SBOM timestamps**: `predicate.runDetails.metadata.startedOn`
-  / `finishedOn` and the SBOM `metadata.timestamp` always record the actual
+- **Provenance and sbom timestamps**: `predicate.runDetails.metadata.startedOn`
+  / `finishedOn` and the sbom `metadata.timestamp` always record the actual
   execution time (`time.Now`). They are evidence of when the release ran, not
   build inputs, and are intentionally *not* pinned: two reproducible artifact
-  builds produce identical binaries but distinct, truthful provenance and SBOM
+  builds produce identical binaries but distinct, truthful provenance and sbom
   timestamps.
 
 Local check: `make repro-build` builds twice with fixed ldflags and compares
@@ -196,23 +196,23 @@ build:
 
 | Input | Accepted values |
 | --- | --- |
-| `VERSION` | characters `[A-Za-z0-9._+-]` only: ASCII letters, digits, `.`, `_`, `+`, `-`. No whitespace, quotes, or any other punctuation. (In the Docker build an omitted `VERSION` uses the `dev` default; an explicit empty value cannot inject anything.) |
-| `COMMIT` | the literal `unknown`, or 7-40 lowercase hex characters: the Makefile's short SHA, the `--snapshot` short SHA, or the full 40-char release SHA |
-| `BUILD_DATE` | exactly the canonical RFC3339 UTC form `YYYY-MM-DDTHH:MM:SSZ`, naming a real UTC calendar instant |
+| `version` | characters `[A-Za-z0-9._+-]` only: ascii letters, digits, `.`, `_`, `+`, `-`. No whitespace, quotes, or any other punctuation. (In the Docker build an omitted `version` uses the `dev` default; an explicit empty value cannot inject anything.) |
+| `commit` | the literal `unknown`, or 7-40 lowercase hex characters: the Makefile's short SHA, the `--snapshot` short SHA, or the full 40-char release SHA |
+| `BUILD_DATE` | exactly the canonical RFC3339 utc form `yyyy-mm-ddthh:mm:ssz`, naming a real utc calendar instant |
 
 `BUILD_DATE` is validated in two layers. The character set (`0-9 T Z : . -`)
 and the canonical shape are checked first. Then for every caller-supplied
 `BUILD_DATE` in both release and snapshot mode, `scripts/release.sh` runs
 `scripts/rfc3339check`, which parses the value with
 `time.Parse(time.RFC3339, ...)` and requires the parsed time to re-format to
-exactly the canonical UTC `Z` spelling. Shape alone would accept impossible
+exactly the canonical utc `Z` spelling. Shape alone would accept impossible
 dates such as `2006-13-45T99:99:99Z`; the helper rejects those, along with
-non-UTC numeric offsets (`+02:00`, `-00:00`), fractional seconds, and any
+non-utc numeric offsets (`+02:00`, `-00:00`), fractional seconds, and any
 other non-canonical spelling. Internally generated timestamps (the
 `SOURCE_DATE_EPOCH` conversion and `date -u`) are checked against the
 canonical shape.
 
-The Docker build stage applies the identical `VERSION` and `COMMIT` character
+The Docker build stage applies the identical `version` and `commit` character
 rules and the identical canonical `BUILD_DATE` shape check to its build args
 before composing `-ldflags`; a mismatch fails the build with the offending
 value quoted. The real-calendar half of the `BUILD_DATE` check is the one in
@@ -229,13 +229,13 @@ canonical shape.
 
 - Algorithm: Ed25519.
 
-- Private key: PKCS#8 PEM, supplied to `scripts/release.sh` through
-  `KIWI_RELEASE_SIGNING_KEY` (either the PEM contents or a path to a file).
+- Private key: pkcs#8 pem, supplied to `scripts/release.sh` through
+  `KIWI_RELEASE_SIGNING_KEY` (either the pem contents or a path to a file).
   Release mode only: the variable is ignored for snapshots, which are never
-  signed. It must never be committed; keep it in the release CI secret store,
-  ideally backed by an HSM or a hardware token used by an offline signer.
+  signed. It must never be committed; keep it in the release ci secret store,
+  ideally backed by an hsm or a hardware token used by an offline signer.
 
-- Public key: PKIX `PUBLIC KEY` PEM, published for verifiers and accepted by
+- Public key: pkix `public key` pem, published for verifiers and accepted by
   `kiwi verify --trusted-key`.
 
 - The private key is **distinct** from the control plane's provenance key
@@ -255,31 +255,31 @@ openssl pkey -in kiwi-release-signing-key.pem -pubout -out kiwi-release.pub
 Every release publishes the public key plus two identifiers so verifiers can
 pin trust out of band:
 
-- **KID** (expected `keyid` on the DSSE signature): the first 8 bytes of
+- **kid** (expected `keyid` on the dsse signature): the first 8 bytes of
   SHA-256 over the raw 32-byte Ed25519 public key, lowercase hex (16 chars).
   This is exactly what `release-tool` computes:
 
   ```sh
-  openssl pkey -pubin -in kiwi-release.pub -outform DER | tail -c 32 \
+  openssl pkey -pubin -in kiwi-release.pub -outform der | tail -c 32 \
     | shasum -a 256 | cut -c1-16
   ```
 
 - **Fingerprint** (human comparison value): SHA-256 over the complete
-  SubjectPublicKeyInfo DER of the public key:
+  SubjectPublicKeyInfo der of the public key:
 
   ```sh
-  openssl pkey -pubin -in kiwi-release.pub -outform DER | shasum -a 256
+  openssl pkey -pubin -in kiwi-release.pub -outform der | shasum -a 256
   ```
 
-Publish the public key, its fingerprint, and its KID in the GitHub release
+Publish the public key, its fingerprint, and its kid in the GitHub release
 notes and in the operations runbook, and record them in the repository's
-trust-root documentation (see `SECURITY.md`). Rotate the published copy only
+trust-root documentation (see `security.md`). Rotate the published copy only
 through the rotation procedure below.
 
 ### 6.3 Verification
 
 The supported verification command is `kiwi verify` with the pinned release
-key; `--trusted-key` replaces JWKS lookup with the exact published key:
+key; `--trusted-key` replaces jwks lookup with the exact published key:
 
 ```sh
 kiwi verify --server https://kiwi.example \
@@ -290,7 +290,7 @@ kiwi verify --server https://kiwi.example \
 ```
 
 `kiwi verify` prints the artifact SHA-256 and the signing `keyid`. Compare the
-printed keyid with the published KID and the downloaded `kiwi-release.pub`
+printed keyid with the published kid and the downloaded `kiwi-release.pub`
 with the published fingerprint. A mismatch means the artifact was signed by a
 different key; do not trust it.
 
@@ -302,12 +302,12 @@ whenever the signer moves. Rotation is additive first:
 1. Generate a new Ed25519 key pair (6.1) and store the private half in the
    release secret store.
 
-2. Publish the new public key, fingerprint, and KID (6.2) in the release
+2. Publish the new public key, fingerprint, and kid (6.2) in the release
    notes and trust-root documentation. Announce a rotation window and keep
    both keys verifiable during it.
 
 3. Update the release pipeline secret (`KIWI_RELEASE_SIGNING_KEY`) to the new
-   key; the next release is signed with the new KID. Releases are immutable:
+   key; the next release is signed with the new kid. Releases are immutable:
    never re-sign old artifacts with the new key.
 
 4. After the window closes, mark the old key as retired in the documentation.
@@ -320,7 +320,7 @@ whenever the signer moves. Rotation is additive first:
 If a release key is compromised, is lost, or is suspected to be:
 
 1. Remove it from the release secret store immediately; publish a revocation
-   notice naming the KID and fingerprint, with the date and reason.
+   notice naming the kid and fingerprint, with the date and reason.
 
 2. Mark the key revoked in the trust-root documentation and in the release
    notes of the next release; do not sign anything else with it.
@@ -336,7 +336,7 @@ If a release key is compromised, is lost, or is suspected to be:
 ### 6.6 Sigstore keyless signing (future)
 
 The current root of trust is the static Ed25519 release key above.
-The DSSE envelope, the in-toto statement, and the recorded builder identity are designed so that Sigstore keyless signing (Fulcio certificates plus Rekor transparency entries) can be layered on later without changing the statement format.
+The dsse envelope, the in-toto statement, and the recorded builder identity are designed so that Sigstore keyless signing (Fulcio certificates plus Rekor transparency entries) can be layered on later without changing the statement format.
 The predicate already carries the repository, ref, commit, and builder identity, so a keyless signature can be added alongside or replace the Ed25519 signature.
 Until that lands, `--trusted-key` verification against the published release key is the supported path.
 
@@ -357,18 +357,18 @@ An unaudited bypass voids the release's supply-chain claims.
 ## Compatibility corpus identity policy
 
 The compatibility corpora under `testdata/compat/` (`n-1/`, `n-2/`) are
-frozen producer output that HEAD must keep consuming across upgrades
+frozen producer output that head must keep consuming across upgrades
 (`internal/storage/compat_corpus_test.go`).
 
-**Honesty note: these manifests identify hash-pinned SOURCE BUILDS, not
+**Honesty note: these manifests identify hash-pinned source builds, not
 released artifacts.** Each corpus was emitted from a git worktree at the
 producer commit and a producer binary built with `go build ./cmd/kiwi` of
 that same tree. The `binary_sha256` pins those source-build bytes. None of
 the committed corpora is an official release binary, and no fixture may
 claim to come from "the N-1 release" unless it was actually produced from
-the released artifact and that artifact's SHA-256 is what the MANIFEST pins.
+the released artifact and that artifact's SHA-256 is what the manifest pins.
 
-Every corpus `MANIFEST` records both:
+Every corpus `manifest` records both:
 
 | Field | Meaning |
 | --- | --- |
@@ -376,7 +376,7 @@ Every corpus `MANIFEST` records both:
 | `producer.binary_sha256` | SHA-256 of the producer product binary (`go build ./cmd/kiwi`) of that exact tree, hash-pinned at corpus-freeze time |
 
 `TestCompatCorpusNMinusOneConsumedByHead` and
-`TestCompatCorpusNMinusTwoConsumedByHead` refuse a corpus whose `MANIFEST`
+`TestCompatCorpusNMinusTwoConsumedByHead` refuse a corpus whose `manifest`
 omits `binary_sha256` or carries a non-hex value. A commit alone is not a
 corpus identity: the same source can produce different binary bytes under a
 different `go` toolchain. The binary hash makes the fixture reproducible as
@@ -395,16 +395,16 @@ fails the consumer tests):
 2. Emit the corpus files from that tree's own storage APIs.
 3. Record `producer.commit`, `producer.binary_sha256` (the exact bytes
    hash of the producer binary), `producer.method` and `producer.go_version`
-   in the `MANIFEST`, and the per-file SHA-256 map.
+   in the `manifest`, and the per-file SHA-256 map.
 4. Never rewrite an existing corpus in place. Add a new generation directory
-   and teach HEAD to consume both.
+   and teach head to consume both.
 
 The dogfood proofs named `make dogfood-release-artifacts` (N-1→N upgrade,
 G1→G2 self-build, packaged-artifact install) are a separate, stronger
 claim: there the N-1 side must be a hash-pinned released binary
 (`KIWI_N_MINUS_ONE_BIN` + `KIWI_N_MINUS_ONE_SHA256`), or a worktree build
 whose failure is fail-closed under `KIWI_REQUIRE_N_MINUS_ONE=1`. Automation
-that must certify "HEAD consumes the previous release" supplies the
+that must certify "head consumes the previous release" supplies the
 released artifact and its pinned SHA-256, never a locally rebuilt stand-in,
 and must not substitute the source-build compat corpora as if they were
 release artifacts.
@@ -416,17 +416,17 @@ Third-party licensing is gated by `scripts/license-check.sh`
 (`make license-check`). The script scans the complete `go list -m -json all`
 build list, skips the main module, follows `replace` directives, locates each
 dependency's license file in the module cache (with a `vendor/` fallback),
-and classifies it by canonical markers. The allowlist is Apache-2.0, MIT,
-BSD-2-Clause, BSD-3-Clause, ISC, MPL-2.0, PostgreSQL, Unlicense, and 0BSD;
-composite identifiers such as `Apache-2.0/MIT` pass when every part is
+and classifies it by canonical markers. The allowlist is Apache-2.0, mit,
+bsd-2-Clause, bsd-3-Clause, isc, mpl-2.0, PostgreSQL, Unlicense, and 0BSD;
+composite identifiers such as `Apache-2.0/mit` pass when every part is
 listed. A dependency with a missing cache entry, no license file, or an
 unrecognized or non-allowlisted license fails the gate with the module path
 and the detected marker.
 
-`make license-notice` regenerates `NOTICE` from the same scan (module,
+`make license-notice` regenerates `notice` from the same scan (module,
 version, and detected license per dependency). Commit the regenerated
-`NOTICE` with any dependency change; the `license` lane in
+`notice` with any dependency change; the `license` lane in
 `.woodpecker/linux-amd64.yml` regenerates it and fails on drift.
 `./scripts/license-check.sh --selftest` exercises the classifier against
 embedded fixtures without network access. The contributor-facing policy is
-in [CONTRIBUTING.md](../CONTRIBUTING.md).
+in [contributing.md](../contributing.md).

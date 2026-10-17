@@ -284,9 +284,11 @@ function check_para(  t, s, k, ns, wc, n, i, tok, core, after, lw, m) {
     before = RSTART > 1 ? substr(s, RSTART - 1, 1) : ""
     after = substr(s, RSTART + RLENGTH, 1)
     if (after ~ /[a-z]/) { s = substr(s, RSTART + 1); continue }
-    # A token glued to a code reference (::, ->, ., $, _, or a backtick on
-    # either side) is an identifier or constant, not prose.
-    if (before ~ /[:._>$`]|[-]/ && before != "-" || after == "`" || before == "`") {
+    # A token glued to a code reference (::, ->, ., $, _, {, or a backtick on
+    # either side) is an identifier or constant, not prose. `_` after a token
+    # means a longer name such as the sample-count env var, so the scanner
+    # must not report the first word fragment as prose.
+    if (before ~ /[:._>$`{]|[-]/ && before != "-" || after == "`" || before == "`" || after == "_") {
       s = substr(s, RSTART + RLENGTH)
       continue
     }

@@ -3,7 +3,7 @@
 Two evaluators exist and must agree: the legacy condition evaluator
 (`internal/pipeline/condition.go`) used by job/step `if` fields, and the
 expression engine (`internal/expr`) used for `${{ ... }}` interpolation
-and boolean evaluation. The control plane, the SQL scheduler, and the
+and boolean evaluation. The control plane, the sql scheduler, and the
 local executor all route job conditions through one entry point
 (`ConditionAllows`), so a condition can never diverge between server and
 local execution.
@@ -24,7 +24,7 @@ any failed/blocked dependency makes the outcome `failure`; otherwise a
 cancelled dependency makes it `cancelled`; success otherwise. For steps,
 the status is the job's current status.
 
-The `if` expression is ALWAYS evaluated — including when the dependency
+The `if` expression is always evaluated — including when the dependency
 outcome is `success`. `if: failure()` after green dependencies is
 `skipped`, `if: false` never runs, and `if: branch == 'x'` / `if: event ==
 'y'` see the job's real branch and event (the control plane derives the
@@ -48,7 +48,7 @@ explicit `if` runs only while the job status still admits `success()`.
 
 - comparisons: `left == right`, `left != right`
 
-- left-hand values: `status`, `event`, `branch`, `env.NAME`, or a
+- left-hand values: `status`, `event`, `branch`, `env.name`, or a
   quoted literal; right-hand values are literals
 
 Condition example:
@@ -88,7 +88,7 @@ Scalar contexts (usable bare):
 | `branch` | branch being built |
 | `ref` | full git ref (`refs/heads/main`) |
 | `sha` | commit SHA |
-| `repo` | repository URL |
+| `repo` | repository url |
 | `repo.full_name` | `owner/name` form |
 | `event.name` | same as `event` |
 | `git.branch` / `git.ref` / `git.sha` | mirrors of `branch`/`ref`/`sha` |
@@ -103,7 +103,7 @@ Map contexts (require a field; dotted keys resolve as `a.b`):
 | `steps.id.outputs.name` | earlier step outputs |
 | `runner.*` | runner metadata |
 | `job.*` | job metadata (e.g. `job.id`) |
-| `env.VAR` | environment variable |
+| `env.var` | environment variable |
 | `kiwi.*` | run metadata (e.g. `kiwi.run_id`) |
 | `extra.*` | extra values |
 

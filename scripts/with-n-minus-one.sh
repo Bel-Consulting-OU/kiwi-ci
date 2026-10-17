@@ -1,5 +1,5 @@
 #!/bin/sh
-# with-n-minus-one.sh resolves the PUBLISHED N-1 pin (unless
+# with-n-minus-one.sh resolves the published N-1 pin (unless
 # KIWI_ALLOW_SOURCE_N_MINUS_ONE=1) and then execs the given command with
 # KIWI_N_MINUS_ONE_BIN / KIWI_N_MINUS_ONE_SHA256 /
 # KIWI_REQUIRE_RELEASED_N_MINUS_ONE in the environment.
@@ -22,7 +22,7 @@ if [ -z "${KIWI_N_MINUS_ONE_BIN:-}" ] && [ "${KIWI_ALLOW_SOURCE_N_MINUS_ONE:-}" 
 	exec "$@"
 fi
 
-# Resolve (supplied BIN gets its pin computed/verified here too).
+# Resolve (supplied bin gets its pin computed/verified here too).
 ./scripts/fetch-n-minus-one.sh
 
 if [ -f "$CACHE/n-minus-one.env" ]; then

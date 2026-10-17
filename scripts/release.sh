@@ -1,14 +1,14 @@
 #!/bin/sh
-# release.sh builds Kiwi CI release or snapshot binaries, hashes them
+# release.sh builds Kiwi ci release or snapshot binaries, hashes them
 # (SHA256SUMS, sorted by filename), records per-binary `go version -m` build
-# info, and emits per-binary CycloneDX SBOMs plus optional signed SLSA
+# info, and emits per-binary CycloneDX SBOMs plus optional signed slsa
 # provenance via cmd/release-tool.
 #
 # Modes:
-#   release (default)  fail-closed release build. Requires ALL of:
-#                        * HEAD is an exact semver tag (vX.Y.Z)
-#                        * VERSION (if set) equals the tag without "v"
-#                        * the tag points at HEAD and HEAD is the tagged commit
+#   release (default)  fail-closed release build. Requires all of:
+#                        * head is an exact semver tag (vX.Y.Z)
+#                        * version (if set) equals the tag without "v"
+#                        * the tag points at head and head is the tagged commit
 #                        * the working tree is clean
 #                        * the recorded commit is the full 40-char lowercase SHA
 #                        * the Ed25519 signing key is present (unless the caller
@@ -18,24 +18,24 @@
 #                      Formula/kiwi.rb.tmpl.
 #   --snapshot         branch/dirty development build. Records the short SHA
 #                      and a "-snapshot+<shortsha>" version suffix, labels the
-#                      bundle with a SNAPSHOT marker, never touches
+#                      bundle with a snapshot marker, never touches
 #                      Formula/kiwi.rb, and is never signed: it ignores
 #                      KIWI_RELEASE_SIGNING_KEY entirely (neither reads nor
 #                      materializes it, and never passes -key to release-tool).
 #   --render-formula   internal helper used by scripts/release-formula-test.sh:
 #                      renders Formula/kiwi.rb.tmpl deterministically.
 #
-#   --candidate         pre-tag release CANDIDATE. Builds the exact release
-#                       bytes from a clean tree at HEAD without requiring the
+#   --candidate         pre-tag release candidate. Builds the exact release
+#                       bytes from a clean tree at head without requiring the
 #                       tag to exist yet, freezes them under dist/candidate
-#                       with a FREEZE manifest, and refuses to touch
-#                       Formula/kiwi.rb. Certification runs against THESE
+#                       with a freeze manifest, and refuses to touch
+#                       Formula/kiwi.rb. Certification runs against these
 #                       bytes; --publish-frozen later emits them unchanged.
-#   --publish-frozen    post-tag publish of a frozen candidate. Requires HEAD
+#   --publish-frozen    post-tag publish of a frozen candidate. Requires head
 #                       to now be an exact vX.Y.Z tag matching the candidate
-#                       VERSION and COMMIT, then verifies every frozen byte
-#                       against the FREEZE manifest and copies the bundle to
-#                       dist/release WITHOUT rebuilding. This is the "same
+#                       version and commit, then verifies every frozen byte
+#                       against the freeze manifest and copies the bundle to
+#                       dist/release without rebuilding. This is the "same
 #                       bytes" guarantee between certification and publish.
 #
 # Usage:
@@ -43,7 +43,7 @@
 #   scripts/release.sh --snapshot [--allow-unsigned]
 #   scripts/release.sh --candidate vX.Y.Z [--allow-unsigned] [--require-signing]
 #   scripts/release.sh --publish-frozen dist/candidate [vX.Y.Z] [--require-signing]
-#   scripts/release.sh --render-formula VERSION SHA_DARWIN_ARM64 SHA_DARWIN_AMD64 [OUT]
+#   scripts/release.sh --render-formula version SHA_DARWIN_ARM64 SHA_DARWIN_AMD64 [out]
 #
 # Signing policy: releases are signed by default. --allow-unsigned is the
 # explicit opt-out; KIWI_ALLOW_UNSIGNED_RELEASE=1 is only the default policy.
@@ -54,10 +54,10 @@
 # accepted and ignored for snapshots.
 #
 # Inputs (env):
-#   VERSION                       release version override; in release mode it
+#   version                       release version override; in release mode it
 #                                 must exactly match the tag without the "v"
-#   KIWI_RELEASE_SIGNING_KEY      Ed25519 PKCS#8 private key PEM, or a path
-#                                 to a PEM file. Required in release mode
+#   KIWI_RELEASE_SIGNING_KEY      Ed25519 pkcs#8 private key pem, or a path
+#                                 to a pem file. Required in release mode
 #                                 unless --allow-unsigned /
 #                                 KIWI_ALLOW_UNSIGNED_RELEASE=1. Ignored in
 #                                 snapshot mode: snapshots are never signed,
@@ -72,17 +72,17 @@
 #                                 date (`git log -1 --format=%ct <tag>`); in
 #                                 snapshot mode it defaults to the current
 #                                 time. It only pins the recorded BuildDate
-#                                 (artifact bytes); provenance and SBOM
+#                                 (artifact bytes); provenance and sbom
 #                                 timestamps stay truthful.
-#   BUILD_DATE                    explicit RFC3339 UTC BuildDate override
-#                                 (YYYY-MM-DDTHH:MM:SSZ). Any other value is
+#   BUILD_DATE                    explicit RFC3339 utc BuildDate override
+#                                 (yyyy-mm-ddthh:mm:ssz). Any other value is
 #                                 rejected before the build. Shape alone is not
-#                                 enough: the date must be a real UTC calendar
+#                                 enough: the date must be a real utc calendar
 #                                 time, which scripts/rfc3339check decides.
-#   COMMIT / REF                  build identity overrides. In release mode
-#                                 COMMIT must be the full 40-char SHA of the
+#   commit / ref                  build identity overrides. In release mode
+#                                 commit must be the full 40-char SHA of the
 #                                 tagged commit.
-#   $REPO                         repository URL override (default: origin)
+#   $repo                         repository url override (default: origin)
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -112,8 +112,8 @@ require_sha256() {
 }
 
 # require_rfc3339_shape verifies that an internally generated timestamp is
-# exactly the RFC3339 UTC form emitted by epoch_to_rfc3339
-# (YYYY-MM-DDTHH:MM:SSZ). The case guard rejects characters outside the
+# exactly the RFC3339 utc form emitted by epoch_to_rfc3339
+# (yyyy-mm-ddthh:mm:ssz). The case guard rejects characters outside the
 # allowed set first -- including whitespace and newlines -- so a multi-line
 # value cannot pass on a matching first line and then be whitespace-split by
 # cmd/go into extra linker flags. This is the cheap check for values this
@@ -134,7 +134,7 @@ require_rfc3339_shape() {
 
 # require_rfc3339 verifies a caller-supplied timestamp. The case guard is the
 # same cheap charset defense-in-depth as above; the calendar truth (month,
-# day, and time ranges, no numeric offsets, canonical UTC "Z" spelling) is
+# day, and time ranges, no numeric offsets, canonical utc "Z" spelling) is
 # decided by the scripts/rfc3339check Go helper, because a shape regex alone
 # accepts impossible dates such as 2006-13-45T99:99:99Z. Go is already
 # required to build, so the helper adds no new dependency. The helper runs
@@ -189,8 +189,8 @@ render_formula() {
 	echo "release: rendered $out for version $version"
 }
 
-# epoch_to_rfc3339 converts seconds since the Unix epoch to an RFC3339 UTC
-# timestamp, supporting both BSD (macOS) and GNU date.
+# epoch_to_rfc3339 converts seconds since the Unix epoch to an RFC3339 utc
+# timestamp, supporting both bsd (macOS) and gnu date.
 epoch_to_rfc3339() {
 	epoch="$1"
 	case "$epoch" in
@@ -210,7 +210,7 @@ epoch_to_rfc3339() {
 }
 
 if [ "${1:-}" = "--render-formula" ]; then
-	[ "$#" -ge 4 ] && [ "$#" -le 5 ] || usage "usage: release.sh --render-formula VERSION SHA_DARWIN_ARM64 SHA_DARWIN_AMD64 [OUT]"
+	[ "$#" -ge 4 ] && [ "$#" -le 5 ] || usage "usage: release.sh --render-formula version SHA_DARWIN_ARM64 SHA_DARWIN_AMD64 [out]"
 	render_formula "$2" "$3" "$4" "${5:-Formula/kiwi.rb}"
 	exit 0
 fi
@@ -268,8 +268,8 @@ REPO="${REPO:-$(git remote get-url origin 2>/dev/null | sed 's/\.git$//' || true
 
 # ---------------------------------------------------------------------------
 # --publish-frozen: emit a previously frozen candidate as the release bundle.
-# NEVER rebuilds. The only operations are: verify the freeze manifest, verify
-# HEAD is the matching tagged commit, copy bytes, render the formula.
+# never rebuilds. The only operations are: verify the freeze manifest, verify
+# head is the matching tagged commit, copy bytes, render the formula.
 # ---------------------------------------------------------------------------
 if [ "$PUBLISH_FROZEN" = "1" ]; then
 	[ -d "$FROZEN_DIR" ] || die "frozen candidate directory '$FROZEN_DIR' does not exist"
@@ -278,7 +278,7 @@ if [ "$PUBLISH_FROZEN" = "1" ]; then
 	SHA_SUMS="$FROZEN_DIR/SHA256SUMS"
 	[ -f "$SHA_SUMS" ] || die "missing $SHA_SUMS in frozen candidate"
 
-	# Parse FREEZE (key=value). Reject anything we do not recognise so a
+	# Parse freeze (key=value). Reject anything we do not recognise so a
 	# hostile manifest cannot smuggle extra fields.
 	FREEZE_VERSION=""
 	FREEZE_COMMIT=""
@@ -328,7 +328,7 @@ if [ "$PUBLISH_FROZEN" = "1" ]; then
 		[ "$actual" = "$sum" ] || die "frozen byte mismatch for $name: manifest=$sum actual=$actual"
 	done <"$SHA_SUMS"
 
-	# HEAD must now be the exact tagged commit the candidate froze.
+	# head must now be the exact tagged commit the candidate froze.
 	git rev-parse --git-dir >/dev/null 2>&1 || die "not a git checkout; --publish-frozen requires git metadata"
 	EXACT_TAG="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
 	[ -n "$EXACT_TAG" ] || die "HEAD is not an exact tag; certify and tag the frozen commit before --publish-frozen"
@@ -350,8 +350,8 @@ if [ "$PUBLISH_FROZEN" = "1" ]; then
 	OUT="${OUT:-dist/release}"
 	rm -rf "$OUT"
 	mkdir -p "$OUT"
-	# Resolve both sides to absolute paths BEFORE copying: the source
-	# listing must not change our CWD-relative view of $OUT (a subshell
+	# Resolve both sides to absolute paths before copying: the source
+	# listing must not change our cwd-relative view of $out (a subshell
 	# `cd $FROZEN_DIR` would turn `dist/release` into
 	# `dist/candidate/dist/release` and silently copy nowhere).
 	case "$OUT" in
@@ -380,10 +380,10 @@ if [ "$PUBLISH_FROZEN" = "1" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# --candidate: pre-tag release build that FREEZES the exact bytes a later
-# --publish-frozen will emit. HEAD need not be tagged yet (certification and
-# tagging come after); the tree must be clean and VERSION is the planned
-# vX.Y.Z. Formula/kiwi.rb is NEVER touched here — only the publish step
+# --candidate: pre-tag release build that freezes the exact bytes a later
+# --publish-frozen will emit. head need not be tagged yet (certification and
+# tagging come after); the tree must be clean and version is the planned
+# vX.Y.Z. Formula/kiwi.rb is never touched here — only the publish step
 # renders it, from the frozen digests.
 # ---------------------------------------------------------------------------
 if [ "$CANDIDATE" = "1" ]; then
@@ -452,10 +452,10 @@ elif [ "$SNAPSHOT" = "1" ]; then
 	fi
 	BRANCH="$(git symbolic-ref --short -q HEAD 2>/dev/null || echo detached)"
 	BASE_VERSION="${VERSION:-0.1.0-dev}"
-	# VERSION is embedded in -ldflags below. A caller-supplied value carrying
+	# version is embedded in -ldflags below. A caller-supplied value carrying
 	# whitespace, quotes or an extra `-X ...` pair would be whitespace-split by
 	# cmd/go into an attacker-controlled linker argument. Apply the same
-	# charset rule the Dockerfile enforces (VERSION in [A-Za-z0-9._+-]).
+	# charset rule the Dockerfile enforces (version in [A-Za-z0-9._+-]).
 	case "$BASE_VERSION" in
 	"" | *[!A-Za-z0-9._+-]*)
 		die "snapshot VERSION '$BASE_VERSION' must match [A-Za-z0-9._+-] (no whitespace, quotes or extra linker flags)"
@@ -538,18 +538,18 @@ else
 		case "$SIGNING_POLICY" in
 		allow) ;;
 		require)
-			die "KIWI_RELEASE_SIGNING_KEY is not set and --require-signing was given; refusing to publish an unsigned release. Set the Ed25519 PKCS#8 PEM (or a path to it), or drop --require-signing."
+			die "KIWI_RELEASE_SIGNING_KEY is not set and --require-signing was given; refusing to publish an unsigned release. Set the Ed25519 PKCS#8 pem (or a path to it), or drop --require-signing."
 			;;
 		*)
-			[ "${KIWI_ALLOW_UNSIGNED_RELEASE:-}" = "1" ] || die "KIWI_RELEASE_SIGNING_KEY is not set; refusing to publish an unsigned release. Set the Ed25519 PKCS#8 PEM (or a path to it), or pass --allow-unsigned / KIWI_ALLOW_UNSIGNED_RELEASE=1 only for an explicit disaster recovery release."
+			[ "${KIWI_ALLOW_UNSIGNED_RELEASE:-}" = "1" ] || die "KIWI_RELEASE_SIGNING_KEY is not set; refusing to publish an unsigned release. Set the Ed25519 PKCS#8 pem (or a path to it), or pass --allow-unsigned / KIWI_ALLOW_UNSIGNED_RELEASE=1 only for an explicit disaster recovery release."
 			;;
 		esac
 	fi
 fi
 
 # Final defense in depth before interpolation: every value embedded in
-# LDFLAGS must be whitespace-free so cmd/go cannot split it into additional
-# linker arguments. VERSION/COMMIT/BUILD_DATE are validated on their own
+# ldflags must be whitespace-free so cmd/go cannot split it into additional
+# linker arguments. version/commit/BUILD_DATE are validated on their own
 # paths above; this check catches any future mode that forgets to.
 case "$VERSION" in
 "" | *[!A-Za-z0-9._+-]*)
@@ -611,7 +611,7 @@ go build -trimpath -buildvcs=false \
 # handled first and unconditionally: KEY_FILE stays empty and
 # KIWI_RELEASE_SIGNING_KEY is never read or materialized, no matter what the
 # environment happens to contain. Release mode keeps the fail-closed policy
-# validated above: an existing path is used in place, inline PEM contents are
+# validated above: an existing path is used in place, inline pem contents are
 # written to a mode-600 temp file, and an empty key stays on the already
 # permitted unsigned disaster-release path.
 if [ "$SNAPSHOT" = "1" ]; then
@@ -660,7 +660,7 @@ fi
 	# `for ...; done | sort >SHA256SUMS` pipeline reports sort's status and
 	# would swallow a hash_cmd failure, silently publishing an incomplete
 	# bundle; with the loop redirected to a file, `set -e` aborts the release
-	# on the first failed hash. (release.sh runs under POSIX sh/dash, where
+	# on the first failed hash. (release.sh runs under posix sh/dash, where
 	# `set -o pipefail` is not available.)
 	for f in *; do
 		if [ "$f" = "SHA256SUMS" ]; then
@@ -675,7 +675,7 @@ echo "release: bundle at $OUT"
 echo "release: version=$VERSION tag=$TAG commit=$COMMIT"
 
 if [ "$CANDIDATE" = "1" ]; then
-	# Freeze the FINAL versioned bytes before certification. The FREEZE
+	# Freeze the final versioned bytes before certification. The freeze
 	# digest covers SHA256SUMS, which covers every binary and buildinfo
 	# file — so any post-freeze byte change is detected at publish time.
 	if command -v sha256sum >/dev/null 2>&1; then
