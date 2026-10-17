@@ -397,6 +397,14 @@ func (e *Executor) Run(ctx context.Context, g *pipeline.Graph) (map[string]model
 	for id := range g.Jobs {
 		pending[id] = true
 	}
+	// Reverse edges: a completion only invalidates its dependents. Rescanning
+	// the whole pending set per completion was O(J²) on matrix fan-out.
+	dependents := map[string][]string{}
+	for id, cj := range g.Jobs {
+		for _, dep := range cj.Needs {
+			dependents[dep] = append(dependents[dep], id)
+		}
+	}
 	type completion struct {
 		id     string
 		result model.JobResult
@@ -404,29 +412,40 @@ func (e *Executor) Run(ctx context.Context, g *pipeline.Graph) (map[string]model
 	sem := make(chan struct{}, e.Opt.MaxParallel)
 	done := make(chan completion, len(g.Jobs))
 	running := 0
-	// pendingOrder is the stable iteration order of the pending set. It is
-	// rebuilt ONLY when the set changes; re-sorting every tick was
-	// O(P log P) per scheduling pass.
-	var pendingOrder []string
-	rebuildOrder := func() {
-		pendingOrder = make([]string, 0, len(pending))
-		for id := range pending {
-			pendingOrder = append(pendingOrder, id)
-		}
-		sort.Strings(pendingOrder)
+	// Work queue of IDs whose dependency gate must be (re)evaluated. The
+	// initial seed is every job; after that only dependents of a finished or
+	// rejected job are re-checked.
+	queue := make([]string, 0, len(g.Jobs))
+	for id := range g.Jobs {
+		queue = append(queue, id)
 	}
-	rebuildOrder()
+	sort.Strings(queue)
+	queued := map[string]bool{}
+	for _, id := range queue {
+		queued[id] = true
+	}
+	pushDeps := func(of string) {
+		for _, id := range dependents[of] {
+			if pending[id] && !queued[id] {
+				queued[id] = true
+				queue = append(queue, id)
+			}
+		}
+	}
 	for len(pending) > 0 || running > 0 {
 		scheduled := false
-		// Rebuild only when the pending set shrank since the last pass.
-		if len(pendingOrder) != len(pending) {
-			rebuildOrder()
-		}
-		for _, id := range pendingOrder {
+		for len(queue) > 0 {
+			id := queue[0]
+			queue = queue[1:]
+			delete(queued, id)
+			if !pending[id] {
+				continue
+			}
 			cj := g.Jobs[id]
 			if e.Opt.OnlyJob != "" && cj.BaseID != e.Opt.OnlyJob && cj.ID != e.Opt.OnlyJob {
 				statuses[id] = model.StatusSkipped
 				delete(pending, id)
+				pushDeps(id)
 				continue
 			}
 			ready, depStatus := depsOutcome(cj.Needs, statuses)
@@ -448,11 +467,12 @@ func (e *Executor) Run(ctx context.Context, g *pipeline.Graph) (map[string]model
 					results[id] = model.JobResult{JobID: id, Status: model.StatusBlocked, Error: "dependency failed"}
 				}
 				delete(pending, id)
+				pushDeps(id)
 				continue
 			}
 			delete(pending, id)
-			running++
 			scheduled = true
+			running++
 			needsOutputs := collectNeedsOutputs(cj.Needs, g.Jobs, results)
 			sem <- struct{}{}
 			go func(cj pipeline.CompiledJob, depStatus model.Status, needsOutputs map[string]map[string]string) {
@@ -461,22 +481,13 @@ func (e *Executor) Run(ctx context.Context, g *pipeline.Graph) (map[string]model
 				done <- completion{id: cj.ID, result: res}
 			}(cj, depStatus, needsOutputs)
 		}
-		// Drop resolved ids from the order so the next pass does not
-		// revisit them; the len check above is the safety net.
-		if len(pendingOrder) != len(pending) {
-			kept := pendingOrder[:0]
-			for _, id := range pendingOrder {
-				if pending[id] {
-					kept = append(kept, id)
-				}
-			}
-			pendingOrder = kept
-		}
 		if running > 0 {
 			c := <-done
 			results[c.id] = c.result
 			statuses[c.id] = c.result.Status
 			running--
+			// Only this job's dependents can become ready (or blocked) now.
+			pushDeps(c.id)
 			continue
 		}
 		if !scheduled && len(pending) > 0 {
@@ -492,7 +503,6 @@ func (e *Executor) Run(ctx context.Context, g *pipeline.Graph) (map[string]model
 	}
 	return results, errors.Join(errs...)
 }
-
 func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.CompiledJob, dependencyStatus model.Status, needsOutputs map[string]map[string]string) model.JobResult {
 	if e.Opt.LogMaxBytes > 0 {
 		// The log quota is scoped per job: wrap the shared sink in a

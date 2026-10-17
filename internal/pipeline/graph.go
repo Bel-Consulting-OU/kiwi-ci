@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -531,6 +532,13 @@ func inputEnv(inputs map[string]string) map[string]string {
 // reference runtime contexts (needs/steps) legitimately stay literal and
 // are skipped because their evaluation error names a different context.
 func validateInputsResolved(jobID string, j Job, m, inputs map[string]string) error {
+	// Fast reject: after interpolation the common case is a hole-free job.
+	// Marshaling the whole Job (including multi-megabyte Run commands) just
+	// to discover there is nothing to check made matrix expansion O(variants
+	// × job bytes).
+	if !jobMayHaveHoles(j) {
+		return nil
+	}
 	b, err := json.Marshal(j)
 	if err != nil {
 		return err
@@ -570,6 +578,43 @@ func mergeStringMaps(a, b map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+// jobMayHaveHoles reports whether any string reachable from the job still
+// carries an interpolation marker. Used as a cheap pre-filter before the
+// JSON-marshal hole scan in validateInputsResolved.
+func jobMayHaveHoles(j Job) bool {
+	var walk func(v reflect.Value) bool
+	walk = func(v reflect.Value) bool {
+		switch v.Kind() {
+		case reflect.String:
+			return strings.Contains(v.String(), "${{")
+		case reflect.Struct:
+			for i := 0; i < v.NumField(); i++ {
+				if walk(v.Field(i)) {
+					return true
+				}
+			}
+		case reflect.Slice, reflect.Array:
+			for i := 0; i < v.Len(); i++ {
+				if walk(v.Index(i)) {
+					return true
+				}
+			}
+		case reflect.Map:
+			for _, k := range v.MapKeys() {
+				if walk(k) || walk(v.MapIndex(k)) {
+					return true
+				}
+			}
+		case reflect.Ptr, reflect.Interface:
+			if !v.IsNil() {
+				return walk(v.Elem())
+			}
+		}
+		return false
+	}
+	return walk(reflect.ValueOf(j))
 }
 
 // InterpolateOutputs resolves runtime output contexts after upstream jobs or

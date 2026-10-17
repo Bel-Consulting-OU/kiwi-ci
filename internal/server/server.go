@@ -168,10 +168,17 @@ type Server struct {
 	// (fail closed) unless the principal is admin.
 	VerificationScopes map[string]verifyapi.SubjectRef
 
-	mu      sync.Mutex
-	runs    map[string]model.Run
-	jobs    map[string]model.Job
-	runners map[string]model.Runner
+	mu   sync.Mutex
+	runs map[string]model.Run
+	jobs map[string]model.Job
+	// jobsByRun indexes live job IDs under their run so per-run aggregation
+	// (refreshRunLocked) and run-scoped scans do not walk every job in the
+	// process. Maintained by putJobLocked/deleteJobLocked; jobsByRunCard is
+	// the len(s.jobs) the index was last built against so tests that assign
+	// s.jobs directly trigger one rebuild.
+	jobsByRun     map[string]map[string]bool
+	jobsByRunCard int
+	runners       map[string]model.Runner
 	// schemaFloor caches the database's migration compatibility floor so the
 	// readiness probe and the lease/submit gates do not query per request.
 	schemaFloor      int
@@ -728,7 +735,7 @@ func newServer(token string) *Server {
 		UntrustedMemoryCeiling: 4 << 30,
 		UntrustedDiskCeiling:   10 << 30,
 		UntrustedPIDCeiling:    256,
-		runs:                   map[string]model.Run{}, jobs: map[string]model.Job{}, runners: map[string]model.Runner{}, artifacts: map[string]model.ArtifactRecord{}, reports: map[string]model.TestReport{}, deliveries: map[string]string{}, idempotency: map[string]storage.IdempotencyReceipt{}, completions: map[string]model.CompletionReceipt{}, completionReceiptAt: map[string]time.Time{}, generatedFragments: map[string]storage.GeneratedFragmentReceipt{}, leaseKey: key, oidc: newOIDCSigner(),
+		runs:                   map[string]model.Run{}, jobs: map[string]model.Job{}, jobsByRun: map[string]map[string]bool{}, runners: map[string]model.Runner{}, artifacts: map[string]model.ArtifactRecord{}, reports: map[string]model.TestReport{}, deliveries: map[string]string{}, idempotency: map[string]storage.IdempotencyReceipt{}, completions: map[string]model.CompletionReceipt{}, completionReceiptAt: map[string]time.Time{}, generatedFragments: map[string]storage.GeneratedFragmentReceipt{}, leaseKey: key, oidc: newOIDCSigner(),
 		outbox:            mustNewOutbox(nil),
 		AuthStore:         auth.NewTokenStore(),
 		deployments:       map[string]model.Deployment{},
@@ -1032,6 +1039,14 @@ func NewPersistentWithCluster(runnerToken, adminToken, dataDir string, cluster C
 		return nil, err
 	}
 	s.runs, s.jobs, s.runners, s.artifacts, s.reports = snap.Runs, snap.Jobs, snap.Runners, snap.Artifacts, snap.Reports
+	s.jobsByRun = make(map[string]map[string]bool, len(s.jobs))
+	for _, j := range s.jobs {
+		if s.jobsByRun[j.RunID] == nil {
+			s.jobsByRun[j.RunID] = map[string]bool{}
+		}
+		s.jobsByRun[j.RunID][j.ID] = true
+	}
+	s.jobsByRunCard = len(s.jobs)
 	// The CRL is monotonic: merge the snapshot's revocations (written with
 	// the runner disable) OVER the legacy runner-crl.json mirror loaded
 	// above. A revocation present in either source is permanent, so the
@@ -2350,7 +2365,7 @@ func (s *Server) enqueueID(ctx context.Context, in SubmitRun, preRunID string) (
 	}
 	s.runs[runID] = run
 	for id, j := range created {
-		s.jobs[id] = j
+		s.putJobLocked(j)
 		if contracts, ok := jobContracts[id]; ok {
 			s.contracts[id] = contracts
 		}
@@ -3278,7 +3293,7 @@ func (s *Server) revokeRunnerLeasesLocked(runnerID, reason string, now time.Time
 		j.LeaseRunnerID = ""
 		j.LeaseTokenHash = nil
 		j.LeaseExpiresAt = nil
-		s.jobs[id] = j
+		s.putJobLocked(j)
 		s.releaseRunnerLocked(runnerID, id, model.StatusFailure)
 		action := "job.runner_disabled_cancelled"
 		if requeue {
@@ -3610,17 +3625,45 @@ func (s *Server) listServingRunners(w http.ResponseWriter, r *http.Request) {
 	}
 	repoFilter := strings.TrimSpace(r.URL.Query().Get("repo"))
 	dto := make([]v1.RunnerServingDTO, 0)
+	// Batch the job/run reads: one lookup per ActiveJob (and a run cache)
+	// instead of a GetJob+GetRun round trip per runner×job pair.
+	type jobRef struct {
+		job model.Job
+		run model.Run
+		ok  bool
+	}
+	jobRefs := map[string]jobRef{}
+	runCache := map[string]model.Run{}
+	jobFor := func(jobID string) jobRef {
+		if cached, ok := jobRefs[jobID]; ok {
+			return cached
+		}
+		job, err := s.jobForLease(r.Context(), jobID)
+		if err != nil {
+			jobRefs[jobID] = jobRef{}
+			return jobRef{}
+		}
+		run, ok := runCache[job.RunID]
+		if !ok {
+			run, err = s.runForAuth(r.Context(), job.RunID)
+			if err != nil {
+				jobRefs[jobID] = jobRef{}
+				return jobRef{}
+			}
+			runCache[job.RunID] = run
+		}
+		ref := jobRef{job: job, run: run, ok: true}
+		jobRefs[jobID] = ref
+		return ref
+	}
 	for _, ri := range all {
 		var visibleJobs []string
 		for _, jobID := range ri.ActiveJobs {
-			job, err := s.jobForLease(r.Context(), jobID)
-			if err != nil {
+			ref := jobFor(jobID)
+			if !ref.ok {
 				continue
 			}
-			run, err := s.runForAuth(r.Context(), job.RunID)
-			if err != nil {
-				continue
-			}
+			run := ref.run
 			if repoFilter != "" {
 				canon := repoIDForRun(run)
 				if repoFilter != run.RepoFullName && repoFilter != canon && repoFilter != auth.CanonicalRepoID("", run.RepoFullName) {
@@ -3827,7 +3870,7 @@ func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
 		s.crl[ri.CertSerial] = ri.ID
 	}
 	now := time.Now().UTC()
-	for jobID, j := range s.jobs {
+	for _, j := range s.jobs {
 		if j.Status != model.StatusRunning || j.LeaseRunnerID != id {
 			continue
 		}
@@ -3837,7 +3880,7 @@ func (s *Server) runnerDisable(w http.ResponseWriter, r *http.Request) {
 		j.LeaseRunnerID = ""
 		j.LeaseTokenHash = nil
 		j.LeaseExpiresAt = nil
-		s.jobs[jobID] = j
+		s.putJobLocked(j)
 		s.appendJobEventLocked(j, model.StatusRunning, model.StatusCancelled, "admin", map[string]string{"job": j.Key, "reason": "runner disabled"})
 	}
 	ri.ActiveJobs = nil
@@ -4009,7 +4052,7 @@ func (s *Server) captureLeaseRollbackLocked(j model.Job, runnerID string) leaseR
 // transition then failed). The maps are restored in place (never swapped) so
 // no reader can hold a stale map reference.
 func (s *Server) rollbackLeaseLocked(rb leaseRollback) {
-	s.jobs[rb.jobID] = rb.job
+	s.putJobLocked(rb.job)
 	if rb.hadRun {
 		s.runs[rb.runID] = rb.run
 	} else {
@@ -4396,7 +4439,7 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	// s.mu critical section, so it can never revert concurrent work.
 	rb := s.captureLeaseRollbackLocked(s.jobs[j.ID], id)
 	j.QueueReason = ""
-	s.jobs[j.ID] = j
+	s.putJobLocked(j)
 	j.NeedsOutputs = scheduler.CollectNeedsOutputs(j, s.jobs)
 	exp := now.Add(s.leaseDuration())
 	t1, err := newID()
@@ -4425,7 +4468,7 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	if j.StartedAt == nil {
 		j.StartedAt = &now
 	}
-	s.jobs[j.ID] = j
+	s.putJobLocked(j)
 	ri.ActiveJobs = appendUnique(ri.ActiveJobs, j.ID)
 	ri.Busy = len(ri.ActiveJobs) >= ri.Capacity
 	if len(ri.ActiveJobs) > 0 {
@@ -4686,7 +4729,7 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	prevRunner, hadRunner := s.runners[in.RunnerID]
 	exp := now.Add(s.leaseDuration())
 	cur.LeaseExpiresAt = &exp
-	s.jobs[jobID] = cur
+	s.putJobLocked(cur)
 	if ri, ok := s.runners[in.RunnerID]; ok {
 		ri.LastSeen = now
 		s.runners[in.RunnerID] = ri
@@ -4702,7 +4745,7 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 		// deadline is retained and the refusal is the standard degraded
 		// body. The runner retries against the same still-valid lease.
 		if !fsutil.Renamed(perr) {
-			s.jobs[jobID] = prevJob
+			s.putJobLocked(prevJob)
 			if hadRunner {
 				s.runners[in.RunnerID] = prevRunner
 			} else {
@@ -5190,7 +5233,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	// only survive together with the state it dedupes.
 	rollback := s.captureCompletionRollbackLocked(jobID, in.LeaseGeneration, in.RunnerID)
 	s.recordCompletionReceiptLocked(jobID, in.LeaseGeneration, in.RunnerID, hash)
-	s.jobs[jobID] = j
+	s.putJobLocked(j)
 	if d, ok := s.deployments[jobID]; ok {
 		d.Status = j.Status
 		d.FinishedAt = j.FinishedAt
@@ -6058,7 +6101,7 @@ func (s *Server) approveJob(w http.ResponseWriter, r *http.Request) {
 	// move only AFTER the snapshot write: a failed persist must not claim an
 	// approval that was rolled back.
 	waitSeconds, waited := approvalWaitSeconds(&j)
-	s.jobs[jobID] = j
+	s.putJobLocked(j)
 	s.scheduleStateLocked()
 	s.refreshRunLocked(j.RunID)
 	if perr := s.persistCheckedErrLocked("job.approve"); perr != nil {
@@ -6509,7 +6552,7 @@ func (s *Server) cancelRunLocked(runID, reason, actor string) {
 		j.LeaseRunnerID = ""
 		j.LeaseTokenHash = nil
 		j.LeaseExpiresAt = nil
-		s.jobs[id] = j
+		s.putJobLocked(j)
 		s.appendJobEventLocked(j, prev, j.Status, actor, map[string]string{"job": j.Key, "reason": reason})
 		// A cancelled RUNNING job releases its runner slot in the same
 		// critical section: the runner becomes immediately schedulable
@@ -6538,77 +6581,188 @@ func (s *Server) scheduleStateLocked() {
 		// maps are not authoritative.
 		return
 	}
-	changed := true
-	for changed {
-		changed = false
-		for id, j := range s.jobs {
-			if j.Status != model.StatusQueued && j.Status != model.StatusWaitingApproval {
-				continue
-			}
-			ready, depStatus := dependencyOutcomeLocked(j, s.jobs)
-			if !ready {
-				continue
-			}
-			j.DependencyStatus = depStatus
-			// Condition is ALWAYS evaluated (full branch/event ctx). The
-			// old `depStatus != success &&` short-circuit let `if: failure()`
-			// and `if: branch == …` through on green deps, and the
-			// status-only evaluator resolved branch conditions against an
-			// empty branch before blocking.
-			if !scheduler.ConditionAllows(j.Condition, pipeline.JobConditionContext(depStatus, j.Ref, j.Event, nil)) {
-				now := time.Now().UTC()
-				prev := j.Status
-				// Deps green + condition rejects → skipped (if: failure(),
-				// branch mismatch). Deps failed + rejects → blocked.
-				if depStatus == model.StatusSuccess {
-					j.Status = model.StatusSkipped
-					j.Error = "condition not satisfied"
-				} else {
-					j.Status = model.StatusBlocked
-					j.Error = "dependency failed"
-				}
-				j.FinishedAt = &now
-				s.jobs[id] = j
-				s.appendJobEventLocked(j, prev, j.Status, "scheduler", nil)
-				changed = true
-				continue
-			}
-			s.jobs[id] = j
-			if len(j.EnvironmentBranches) > 0 && !environmentBranchAllowed(s.runs[j.RunID].Ref, j.EnvironmentBranches) {
-				now := time.Now().UTC()
-				prev := j.Status
-				j.Status = model.StatusBlocked
-				j.Error = "ref is not allowed to deploy to environment " + j.Environment
-				j.FinishedAt = &now
-				s.jobs[id] = j
-				s.appendJobEventLocked(j, prev, j.Status, "scheduler", nil)
-				changed = true
-				continue
-			}
-			if j.ApprovalRequired && j.ApprovedBy == "" {
-				if j.Status != model.StatusWaitingApproval {
-					prev := j.Status
-					j.Status = model.StatusWaitingApproval
-					if j.WaitingSince == nil {
-						w := time.Now().UTC()
-						j.WaitingSince = &w
-					}
-					s.jobs[id] = j
-					s.appendJobEventLocked(j, prev, j.Status, "scheduler", nil)
-					changed = true
-				}
-			} else if j.Status == model.StatusWaitingApproval {
-				prev := j.Status
-				j.Status = model.StatusQueued
-				s.jobs[id] = j
-				s.appendJobEventLocked(j, prev, j.Status, "scheduler", nil)
-				changed = true
-			}
+	// Reverse edges: who waits on me. A terminal transition only invalidates
+	// my dependents, so the cascade is O(J+E) instead of a full fixpoint
+	// rescan (O(J²) on long dependency chains).
+	dependents := map[string][]string{}
+	for id, j := range s.jobs {
+		for _, dep := range j.Needs {
+			dependents[dep] = append(dependents[dep], id)
 		}
 	}
+	// seed is every currently non-terminal dependency-waiting job; the
+	// caller may have just finished a dependency outside this pass.
+	seed := make([]string, 0, len(s.jobs))
+	for id, j := range s.jobs {
+		if j.Status == model.StatusQueued || j.Status == model.StatusWaitingApproval {
+			seed = append(seed, id)
+		}
+	}
+	inQueue := map[string]bool{}
+	var queue []string
+	for _, id := range seed {
+		if !inQueue[id] {
+			inQueue[id] = true
+			queue = append(queue, id)
+		}
+	}
+	push := func(ids []string) {
+		for _, id := range ids {
+			if inQueue[id] {
+				continue
+			}
+			j, ok := s.jobs[id]
+			if !ok || (j.Status != model.StatusQueued && j.Status != model.StatusWaitingApproval) {
+				continue
+			}
+			inQueue[id] = true
+			queue = append(queue, id)
+		}
+	}
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		delete(inQueue, id)
+		j, ok := s.jobs[id]
+		if !ok || (j.Status != model.StatusQueued && j.Status != model.StatusWaitingApproval) {
+			continue
+		}
+		ready, depStatus := dependencyOutcomeLocked(j, s.jobs)
+		if !ready {
+			continue
+		}
+		j.DependencyStatus = depStatus
+		// Condition is ALWAYS evaluated (full branch/event ctx). The
+		// old `depStatus != success &&` short-circuit let `if: failure()`
+		// and `if: branch == …` through on green deps, and the
+		// status-only evaluator resolved branch conditions against an
+		// empty branch before blocking.
+		if !scheduler.ConditionAllows(j.Condition, pipeline.JobConditionContext(depStatus, j.Ref, j.Event, nil)) {
+			now := time.Now().UTC()
+			prev := j.Status
+			// Deps green + condition rejects → skipped (if: failure(),
+			// branch mismatch). Deps failed + rejects → blocked.
+			if depStatus == model.StatusSuccess {
+				j.Status = model.StatusSkipped
+				j.Error = "condition not satisfied"
+			} else {
+				j.Status = model.StatusBlocked
+				j.Error = "dependency failed"
+			}
+			j.FinishedAt = &now
+			s.putJobLocked(j)
+			s.appendJobEventLocked(j, prev, j.Status, "scheduler", nil)
+			// A terminal outcome unblocks (or blocks) only my dependents.
+			push(dependents[id])
+			continue
+		}
+		s.putJobLocked(j)
+		if len(j.EnvironmentBranches) > 0 && !environmentBranchAllowed(s.runs[j.RunID].Ref, j.EnvironmentBranches) {
+			now := time.Now().UTC()
+			prev := j.Status
+			j.Status = model.StatusBlocked
+			j.Error = "ref is not allowed to deploy to environment " + j.Environment
+			j.FinishedAt = &now
+			s.putJobLocked(j)
+			s.appendJobEventLocked(j, prev, j.Status, "scheduler", nil)
+			push(dependents[id])
+			continue
+		}
+		if j.ApprovalRequired && j.ApprovedBy == "" {
+			if j.Status != model.StatusWaitingApproval {
+				prev := j.Status
+				j.Status = model.StatusWaitingApproval
+				if j.WaitingSince == nil {
+					w := time.Now().UTC()
+					j.WaitingSince = &w
+				}
+				s.putJobLocked(j)
+				s.appendJobEventLocked(j, prev, j.Status, "scheduler", nil)
+			}
+		} else if j.Status == model.StatusWaitingApproval {
+			prev := j.Status
+			j.Status = model.StatusQueued
+			s.putJobLocked(j)
+			s.appendJobEventLocked(j, prev, j.Status, "scheduler", nil)
+		}
+	}
+	// Recompute every run's aggregate status. refreshRunLocked is O(jobs in
+	// that run) via jobsByRun, so a full sweep is O(J) — not O(runs × J).
 	for runID := range s.runs {
 		s.refreshRunLocked(runID)
 	}
+}
+
+// putJobLocked stores a job and keeps jobsByRun in sync. Every in-memory
+// write of s.jobs MUST go through this helper (or deleteJobLocked) or
+// per-run scans silently miss the row.
+func (s *Server) putJobLocked(j model.Job) {
+	if prev, ok := s.jobs[j.ID]; ok && prev.RunID != j.RunID {
+		s.unindexJobLocked(prev)
+	}
+	if s.jobsByRun == nil {
+		s.jobsByRun = map[string]map[string]bool{}
+	}
+	if s.jobsByRun[j.RunID] == nil {
+		s.jobsByRun[j.RunID] = map[string]bool{}
+	}
+	s.jobs[j.ID] = j
+	s.jobsByRun[j.RunID][j.ID] = true
+	s.jobsByRunCard = len(s.jobs)
+}
+
+// deleteJobLocked removes a job and its jobsByRun entry.
+func (s *Server) deleteJobLocked(id string) {
+	prev, ok := s.jobs[id]
+	if !ok {
+		return
+	}
+	delete(s.jobs, id)
+	s.unindexJobLocked(prev)
+	s.jobsByRunCard = len(s.jobs)
+}
+
+func (s *Server) unindexJobLocked(prev model.Job) {
+	set := s.jobsByRun[prev.RunID]
+	if set == nil {
+		return
+	}
+	delete(set, prev.ID)
+	if len(set) == 0 {
+		delete(s.jobsByRun, prev.RunID)
+	}
+}
+
+// ensureJobsByRunLocked rebuilds the run→job index when it is missing or
+// out of sync with s.jobs (tests that assign the map directly).
+func (s *Server) ensureJobsByRunLocked() {
+	if s.jobsByRun != nil && s.jobsByRunCard == len(s.jobs) {
+		return
+	}
+	s.jobsByRun = make(map[string]map[string]bool, len(s.jobs))
+	for _, j := range s.jobs {
+		if s.jobsByRun[j.RunID] == nil {
+			s.jobsByRun[j.RunID] = map[string]bool{}
+		}
+		s.jobsByRun[j.RunID][j.ID] = true
+	}
+	s.jobsByRunCard = len(s.jobs)
+}
+
+// jobsForRunLocked returns the live jobs of one run from the index.
+func (s *Server) jobsForRunLocked(runID string) []model.Job {
+	s.ensureJobsByRunLocked()
+	ids := s.jobsByRun[runID]
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make([]model.Job, 0, len(ids))
+	for id := range ids {
+		if j, ok := s.jobs[id]; ok {
+			out = append(out, j)
+		}
+	}
+	return out
 }
 
 // dependencyOutcomeLocked wraps the scheduler's unified DependencyOutcome
@@ -6647,10 +6801,9 @@ func (s *Server) refreshRunLocked(runID string) {
 	var anyRunning, anyFailure, anyCancelled, anyWaiting bool
 	var firstStart *time.Time
 	var lastFinish *time.Time
-	for _, j := range s.jobs {
-		if j.RunID != runID {
-			continue
-		}
+	// jobsForRunLocked uses the run→job index; scanning every job in the
+	// process per run refresh was O(all jobs) on every job event.
+	for _, j := range s.jobsForRunLocked(runID) {
 		total++
 		if j.StartedAt != nil && (firstStart == nil || j.StartedAt.Before(*firstStart)) {
 			t := *j.StartedAt
@@ -6724,7 +6877,7 @@ func (s *Server) recoverLeasesLocked(now time.Time, startup bool) (expirations, 
 		return 0, 0, 0
 	}
 	_ = startup // Signature kept for call-site stability; startup no longer forces expiry: unexpired leases survive restart.
-	for id, j := range s.jobs {
+	for _, j := range s.jobs {
 		// Queue-timeout expiry, mirroring the scheduler's RecoverExpired: a
 		// queued (or approval-waiting) job past its queue deadline is
 		// cancelled terminally and never leased, independent of attempts.
@@ -6741,7 +6894,7 @@ func (s *Server) recoverLeasesLocked(now time.Time, startup bool) (expirations, 
 			j.LeaseRunnerID = ""
 			j.LeaseTokenHash = nil
 			j.LeaseExpiresAt = nil
-			s.jobs[id] = j
+			s.putJobLocked(j)
 			s.auditLocked("job.queue_timeout", "scheduler", j.RunID, j.ID, "job cancelled after queue deadline", map[string]string{"job": j.Key})
 			s.appendJobEventLocked(j, prev, j.Status, "scheduler", map[string]string{"job": j.Key, "reason": "queue_timeout"})
 			timedOut++
@@ -6775,7 +6928,7 @@ func (s *Server) recoverLeasesLocked(now time.Time, startup bool) (expirations, 
 			s.auditLocked("job.lost_runner", "scheduler", j.RunID, j.ID, j.Error, map[string]string{"job": j.Key})
 			s.appendJobEventLocked(j, model.StatusRunning, j.Status, "scheduler", map[string]string{"job": j.Key, "runner": runnerID})
 		}
-		s.jobs[id] = j
+		s.putJobLocked(j)
 		s.releaseRunnerLocked(runnerID, j.ID, model.StatusFailure)
 	}
 	s.scheduleStateLocked()

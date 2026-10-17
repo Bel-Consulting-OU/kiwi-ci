@@ -253,9 +253,9 @@ func (s *Server) effectUsageAccount(ctx context.Context, j model.Job) error {
 		live.Cost = cost
 		live.EnergyWh = energy
 	}
-	s.jobs[j.ID] = live
+	s.putJobLocked(live)
 	if err := s.persistCheckedErrLocked("job.usage_account"); err != nil {
-		s.jobs[j.ID] = prev
+		s.putJobLocked(prev)
 		return err
 	}
 	if computed {

@@ -692,7 +692,7 @@ func (s *Server) processGeneratedFragment(ctx context.Context, parent model.Job,
 	}
 	rb := s.captureStateRollbackLocked()
 	for id, j := range created {
-		s.jobs[id] = j
+		s.putJobLocked(j)
 		if contracts, ok := jobContracts[id]; ok {
 			s.contracts[id] = contracts
 		}

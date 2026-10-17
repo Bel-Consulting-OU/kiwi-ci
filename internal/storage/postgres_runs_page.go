@@ -132,6 +132,13 @@ func PageRuns(runs []model.Run, afterCreatedAt time.Time, afterID string, limit 
 			eligible = append(eligible, run)
 		}
 	}
+	// Top-(limit+1) selection: a full sort of a large snapshot is O(n log n)
+	// when the page only needs the newest few. The heap keeps the newest
+	// limit+1; the tail of that set is the exact HasMore probe.
+	const heapThreshold = 64
+	if len(eligible) > limit+1 && len(eligible) > heapThreshold {
+		eligible = newestRuns(eligible, limit+1)
+	}
 	SortRunsNewestFirst(eligible)
 	page := RunPage{Runs: eligible}
 	if len(eligible) > limit {
@@ -144,6 +151,67 @@ func PageRuns(runs []model.Run, afterCreatedAt time.Time, afterID string, limit 
 		page.NextID = last.ID
 	}
 	return page
+}
+
+// newestRuns returns the k newest runs (unspecified order among them).
+// A min-heap of size k walks the slice once: O(n log k) instead of O(n log n).
+func newestRuns(runs []model.Run, k int) []model.Run {
+	if k <= 0 {
+		return nil
+	}
+	h := runMinHeap(make([]model.Run, 0, k))
+	for _, r := range runs {
+		if len(h) < k {
+			h = append(h, r)
+			if len(h) == k {
+				h.init()
+			}
+			continue
+		}
+		if runNewerThan(r, h[0]) {
+			h[0] = r
+			h.down(0)
+		}
+	}
+	return h
+}
+
+func runNewerThan(a, b model.Run) bool {
+	if !a.CreatedAt.Equal(b.CreatedAt) {
+		return a.CreatedAt.After(b.CreatedAt)
+	}
+	return a.ID > b.ID
+}
+
+// runMinHeap is a min-heap under runNewerThan's order (the "min" is the
+// oldest of the selected set).
+type runMinHeap []model.Run
+
+func (h runMinHeap) init() {
+	for i := len(h)/2 - 1; i >= 0; i-- {
+		h.down(i)
+	}
+}
+
+func (h runMinHeap) down(i int) {
+	for {
+		l := 2*i + 1
+		if l >= len(h) {
+			return
+		}
+		oldest := l
+		if r := l + 1; r < len(h) && runNewerThan(h[l], h[r]) {
+			// h[l] is newer than h[r], so h[r] is the older child.
+			oldest = r
+		}
+		// Swap only when the parent is newer than its oldest child, so the
+		// root always holds the oldest of the selected set.
+		if !runNewerThan(h[i], h[oldest]) {
+			return
+		}
+		h[i], h[oldest] = h[oldest], h[i]
+		i = oldest
+	}
 }
 
 // ListRunsPage implements RunPageStore for the durable store. One

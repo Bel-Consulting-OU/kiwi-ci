@@ -290,7 +290,7 @@ func (s *Server) pruneRunsLocked(now time.Time) []string {
 	prunedJobs := map[string]bool{}
 	for id, j := range s.jobs {
 		if prunable[j.RunID] {
-			delete(s.jobs, id)
+			s.deleteJobLocked(id)
 			prunedJobs[id] = true
 		}
 	}

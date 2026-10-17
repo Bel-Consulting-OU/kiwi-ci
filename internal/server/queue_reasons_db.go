@@ -353,7 +353,7 @@ func (s *Server) applyQueueReasonsMemoryLocked(ri model.Runner) {
 // map for it. The caller holds s.mu.
 func (s *Server) applyQueueReasonsMemoryLockedWithSums(ri model.Runner, reserved map[string]model.ResourceCapacity) {
 	fleet := s.fleetQueueRunnerViewsLocked(ri, reserved)
-	for id, j := range s.jobs {
+	for _, j := range s.jobs {
 		reason := queue.None
 		switch j.Status {
 		case model.StatusWaitingApproval:
@@ -363,7 +363,7 @@ func (s *Server) applyQueueReasonsMemoryLockedWithSums(ri model.Runner, reserved
 		}
 		if j.QueueReason != string(reason) {
 			j.QueueReason = string(reason)
-			s.jobs[id] = j
+			s.putJobLocked(j)
 		}
 	}
 }

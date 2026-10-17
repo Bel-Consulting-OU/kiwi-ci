@@ -202,13 +202,13 @@ func (s *Server) markQueueReasonsAll(ctx context.Context, reason string) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for id, j := range s.jobs {
+	for _, j := range s.jobs {
 		if j.Status != model.StatusQueued {
 			continue
 		}
 		if j.QueueReason != reason {
 			j.QueueReason = reason
-			s.jobs[id] = j
+			s.putJobLocked(j)
 		}
 	}
 }

@@ -151,6 +151,9 @@ type Outbox struct {
 	// queuedIDs is the set of item IDs currently in items, so HasIntent and
 	// duplicate-enqueue checks are O(1) instead of a full queue scan.
 	queuedIDs map[string]bool
+	// byLogicalKey groups queued item versions by LogicalKey so supersede
+	// lookups are O(versions of that key) instead of a full queue scan.
+	byLogicalKey map[string]map[string]int64
 	// claimer uniquely identifies this process in the durable outbox claim
 	// lease. Lazily initialized.
 	claimer string
@@ -615,9 +618,11 @@ func (o *Outbox) enqueueVersionedLocked(ctx context.Context, item forge.OutboxIt
 // copy in place instead of retiring it). The caller holds o.mu.
 func (o *Outbox) supersededIDsLocked(newID, logicalKey string, version int64) []string {
 	var ids []string
-	for _, it := range o.items {
-		if it.LogicalKey == logicalKey && it.StateVersion <= version && it.ID != newID {
-			ids = append(ids, it.ID)
+	// Only the versions of THIS logical key can be superseded; a full queue
+	// scan made every versioned enqueue O(N).
+	for id, ver := range o.byLogicalKey[logicalKey] {
+		if id != newID && ver <= version {
+			ids = append(ids, id)
 		}
 	}
 	return ids
@@ -1503,6 +1508,13 @@ func (o *Outbox) noteQueuedLocked(it forge.OutboxItem) {
 	if it.StateVersion > o.pendingMax[it.LogicalKey] {
 		o.pendingMax[it.LogicalKey] = it.StateVersion
 	}
+	if o.byLogicalKey == nil {
+		o.byLogicalKey = map[string]map[string]int64{}
+	}
+	if o.byLogicalKey[it.LogicalKey] == nil {
+		o.byLogicalKey[it.LogicalKey] = map[string]int64{}
+	}
+	o.byLogicalKey[it.LogicalKey][it.ID] = it.StateVersion
 }
 
 // unindexLocked drops one item from the ID set and refreshes its logical
@@ -1512,7 +1524,18 @@ func (o *Outbox) unindexLocked(it forge.OutboxItem) {
 	if it.ID != "" && o.queuedIDs != nil {
 		delete(o.queuedIDs, it.ID)
 	}
-	if it.LogicalKey == "" || it.StateVersion <= 0 || o.pendingMax == nil {
+	if it.LogicalKey == "" || it.StateVersion <= 0 {
+		return
+	}
+	if o.byLogicalKey != nil {
+		if set := o.byLogicalKey[it.LogicalKey]; set != nil {
+			delete(set, it.ID)
+			if len(set) == 0 {
+				delete(o.byLogicalKey, it.LogicalKey)
+			}
+		}
+	}
+	if o.pendingMax == nil {
 		return
 	}
 	if o.pendingMax[it.LogicalKey] != it.StateVersion {
@@ -1531,18 +1554,26 @@ func (o *Outbox) unindexLocked(it forge.OutboxItem) {
 	o.pendingMax[it.LogicalKey] = max
 }
 
-// recomputeIndexLocked rebuilds queuedIDs and pendingMax from items after a
-// bulk rewrite (supersede, prune, load). Caller holds o.mu.
+// recomputeIndexLocked rebuilds queuedIDs, byLogicalKey and pendingMax from
+// items after a bulk rewrite (supersede, prune, load). Caller holds o.mu.
 func (o *Outbox) recomputeIndexLocked() {
 	o.queuedIDs = make(map[string]bool, len(o.items))
 	o.pendingMax = make(map[string]int64)
+	o.byLogicalKey = make(map[string]map[string]int64)
 	for _, it := range o.items {
 		if it.ID != "" {
 			o.queuedIDs[it.ID] = true
 		}
-		if it.LogicalKey != "" && it.StateVersion > o.pendingMax[it.LogicalKey] {
+		if it.LogicalKey == "" || it.StateVersion <= 0 {
+			continue
+		}
+		if it.StateVersion > o.pendingMax[it.LogicalKey] {
 			o.pendingMax[it.LogicalKey] = it.StateVersion
 		}
+		if o.byLogicalKey[it.LogicalKey] == nil {
+			o.byLogicalKey[it.LogicalKey] = map[string]int64{}
+		}
+		o.byLogicalKey[it.LogicalKey][it.ID] = it.StateVersion
 	}
 }
 
