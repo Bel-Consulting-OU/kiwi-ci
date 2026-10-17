@@ -84,7 +84,12 @@ func VerifyArtifact(args []string) error {
 		return fmt.Errorf("usage: kiwi verify [--server URL] ARTIFACT_ID")
 	}
 	id := fs.Arg(0)
-	base := strings.TrimRight(*serverURL, "/")
+	// Same endpoint contract as attestation mode: flag > login context > env.
+	ep, epErr := ResolveEndpoint(*serverURL, *token)
+	if epErr != nil {
+		return epErr
+	}
+	base := strings.TrimRight(ep.Server, "/")
 	// The token is a bearer credential: redirects must never be followed.
 	client := server.NoRedirectClient(&http.Client{Timeout: 10 * time.Minute})
 
@@ -92,8 +97,8 @@ func VerifyArtifact(args []string) error {
 	if err != nil {
 		return err
 	}
-	if *token != "" {
-		req.Header.Set("Authorization", "Bearer "+*token)
+	if ep.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+ep.Token)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -115,7 +120,7 @@ func VerifyArtifact(args []string) error {
 		return fmt.Errorf("artifact digest mismatch: got %s want %s", artifactSHA, advertised)
 	}
 
-	envBytes, err := fetchBytes(client, base+"/api/v1/artifacts/"+id+"/provenance", *token)
+	envBytes, err := fetchBytes(client, base+"/api/v1/artifacts/"+id+"/provenance", ep.Token)
 	if err != nil {
 		return err
 	}

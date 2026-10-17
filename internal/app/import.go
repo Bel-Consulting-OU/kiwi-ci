@@ -96,8 +96,14 @@ func Import(args []string) error {
 }
 
 // detectImportSource finds the conventional configuration file for a tool in
-// the current directory.
+// the current directory. Aliases accepted by Import map to the same lookup.
 func detectImportSource(tool string) string {
+	switch tool {
+	case "github", "actions":
+		tool = "github-actions"
+	case "circle":
+		tool = "circleci"
+	}
 	candidates := map[string][]string{
 		"github-actions": {".github/workflows/ci.yml", ".github/workflows/ci.yaml"},
 		"gitlab":         {".gitlab-ci.yml", ".gitlab-ci.yaml"},

@@ -354,6 +354,10 @@ Usage:
   kiwi cancel RUN | kiwi rerun RUN | kiwi approve JOB | kiwi artifacts RUN
   kiwi schedules list|trigger
   kiwi policy check [-f .kiwi/pipeline.yaml] [--trusted]
+  kiwi login URL --token TOKEN | kiwi logout | kiwi context
+  kiwi lock    [-f .kiwi/pipeline.yaml]
+  kiwi secret  explain NAME [--repo R] [--env E] [--job ID] [--json]
+  kiwi setup
   kiwi version
 
 Design goals:

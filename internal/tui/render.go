@@ -48,7 +48,12 @@ func renderFrame(lines []string, cursor int, collapsed map[string]bool, matches 
 	visible := make([]string, 0, len(lines))
 	// lineToVisible maps every source line to the visible line representing
 	// it: its own position when the group is open, the collapsed marker
-	// when not.
+	// when not. Group sizes are counted in one pass: countGroup-per-marker
+	// was O(groups × lines) per frame (up to 10k ring lines × many steps).
+	groupCount := map[string]int{}
+	for _, l := range lines {
+		groupCount[stepName(l)]++
+	}
 	lineToVisible := make([]int, len(lines))
 	group := ""
 	open := true
@@ -60,7 +65,7 @@ func renderFrame(lines []string, cursor int, collapsed map[string]bool, matches 
 			open = !collapsed[group]
 			if !open {
 				marker = len(visible)
-				visible = append(visible, fmt.Sprintf("▶ %s (%d lines)", group, countGroup(lines, group)))
+				visible = append(visible, fmt.Sprintf("▶ %s (%d lines)", group, groupCount[group]))
 			}
 		}
 		if open {

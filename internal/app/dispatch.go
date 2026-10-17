@@ -110,7 +110,7 @@ func Dispatch(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	ep, epErr := ResolveEndpoint(*serverURL, "")
+	ep, epErr := ResolveEndpoint(*serverURL, *token)
 	if epErr != nil {
 		return epErr
 	}
@@ -131,8 +131,8 @@ func Dispatch(ctx context.Context, args []string) error {
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Idempotency-Key", opKey)
-		if *token != "" {
-			req.Header.Set("Authorization", "Bearer "+*token)
+		if ep.Token != "" {
+			req.Header.Set("Authorization", "Bearer "+ep.Token)
 		}
 		resp, err := client.Do(req)
 		if err != nil {

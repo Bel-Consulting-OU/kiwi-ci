@@ -1704,7 +1704,7 @@ func RunnerAdmin(ctx context.Context, sub string, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	ep, epErr := ResolveEndpoint(*url, "")
+	ep, epErr := ResolveEndpoint(*url, *token)
 	if epErr != nil {
 		return epErr
 	}
@@ -1719,8 +1719,8 @@ func RunnerAdmin(ctx context.Context, sub string, args []string) error {
 		if err != nil {
 			return err
 		}
-		if *token != "" {
-			req.Header.Set("Authorization", "Bearer "+*token)
+		if ep.Token != "" {
+			req.Header.Set("Authorization", "Bearer "+ep.Token)
 		}
 		if method == http.MethodPost {
 			req.Header.Set("Content-Type", "application/json")

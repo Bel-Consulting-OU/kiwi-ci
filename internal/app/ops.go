@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -245,16 +246,50 @@ func opsRuns(ctx context.Context, args []string) error {
 		return fmt.Errorf("kiwi runs takes no arguments")
 	}
 	var out []model.Run
-	if err := newOpsClient(serverURL, token).do(ctx, http.MethodGet, "/api/v1/runs", nil, &out); err != nil {
-		return err
+	c := newOpsClient(serverURL, token)
+	cursor := ""
+	// Follow X-Kiwi-Next-Cursor so the listing is not silently capped at
+	// one page (the server pages; a single decode hid the rest of the runs).
+	for page := 0; page < 64; page++ {
+		var batch []model.Run
+		path := "/api/v1/runs"
+		if cursor != "" {
+			path = "/api/v1/runs?cursor=" + url.QueryEscape(cursor)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+path, nil)
+		if err != nil {
+			return err
+		}
+		if c.token != "" {
+			req.Header.Set("Authorization", "Bearer "+c.token)
+		}
+		resp, err := c.client.Do(req)
+		if err != nil {
+			return err
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return fmt.Errorf("GET %s: %s: %s", path, resp.Status, strings.TrimSpace(string(body)))
+		}
+		if err := json.Unmarshal(body, &batch); err != nil {
+			return err
+		}
+		out = append(out, batch...)
+		cursor = resp.Header.Get("X-Kiwi-Next-Cursor")
+		if cursor == "" || len(batch) == 0 {
+			break
+		}
 	}
 	if len(out) == 0 {
 		fmt.Println("no runs")
 		return nil
 	}
-	fmt.Printf("%-10s %-16s %-12s %-28s %-8s %s\n", "ID", "STATUS", "EVENT", "REPO", "TRUSTED", "AGE")
+	// Full IDs: a truncated 10-char prefix cannot be passed back to
+	// cancel/jobs/schedules trigger (32-hex ids collide on display).
+	fmt.Printf("%-32s %-16s %-12s %-28s %-8s %s\n", "ID", "STATUS", "EVENT", "REPO", "TRUSTED", "AGE")
 	for _, r := range out {
-		fmt.Printf("%-10s %-16s %-12s %-28s %-8t %s\n", truncate(r.ID, 10), r.Status, r.Event, truncate(r.Repo, 28), r.Trusted, time.Since(r.CreatedAt).Round(time.Second))
+		fmt.Printf("%-32s %-16s %-12s %-28s %-8t %s\n", r.ID, r.Status, r.Event, truncate(r.Repo, 28), r.Trusted, time.Since(r.CreatedAt).Round(time.Second))
 	}
 	return nil
 }
@@ -275,9 +310,9 @@ func opsJobs(ctx context.Context, args []string) error {
 		fmt.Println("no jobs")
 		return nil
 	}
-	fmt.Printf("%-10s %-20s %-16s %-10s %s\n", "ID", "KEY", "STATUS", "ATTEMPTS", "RUNNER")
+	fmt.Printf("%-32s %-20s %-16s %-10s %s\n", "ID", "KEY", "STATUS", "ATTEMPTS", "RUNNER")
 	for _, j := range out {
-		fmt.Printf("%-10s %-20s %-16s %-10d %s\n", truncate(j.ID, 10), truncate(j.Key, 20), j.Status, j.Attempts, truncate(j.LeaseRunnerID, 10))
+		fmt.Printf("%-32s %-20s %-16s %-10d %s\n", j.ID, truncate(j.Key, 20), j.Status, j.Attempts, j.LeaseRunnerID)
 	}
 	return nil
 }
@@ -459,13 +494,13 @@ func opsSchedules(ctx context.Context, args []string) error {
 			fmt.Println("no schedules")
 			return nil
 		}
-		fmt.Printf("%-10s %-28s %-24s %-8s %s\n", "ID", "REPOSITORY", "SPEC", "ENABLED", "LAST RUN")
+		fmt.Printf("%-32s %-28s %-24s %-8s %s\n", "ID", "REPOSITORY", "SPEC", "ENABLED", "LAST RUN")
 		for _, sc := range out {
 			last := "-"
 			if sc.LastRun != nil {
 				last = sc.LastRun.Format(time.RFC3339)
 			}
-			fmt.Printf("%-10s %-28s %-24s %-8t %s\n", truncate(sc.ID, 10), truncate(sc.Repository, 28), truncate(sc.Spec, 24), sc.Enabled, last)
+			fmt.Printf("%-32s %-28s %-24s %-8t %s\n", sc.ID, truncate(sc.Repository, 28), truncate(sc.Spec, 24), sc.Enabled, last)
 		}
 		return nil
 	case "trigger":
@@ -488,8 +523,11 @@ func opsSchedules(ctx context.Context, args []string) error {
 }
 
 // opsPolicy implements `kiwi policy check`: it parses the pipeline file and
-// evaluates admission against the trusted or untrusted default capability
-// set, mirroring the server's enqueue-time policy pass.
+// previews admission against the trusted or untrusted DEFAULT capability
+// set. It is a local capability preview for operators, not the server's
+// full enqueue admission (org policy file, principal grants, and
+// structural admitCompiledSpec checks run server-side only). A green result
+// here does not guarantee the server will admit the same pipeline.
 func opsPolicy(ctx context.Context, args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("kiwi policy requires a subcommand: check")

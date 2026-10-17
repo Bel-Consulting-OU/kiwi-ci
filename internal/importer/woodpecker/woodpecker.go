@@ -218,12 +218,23 @@ func (i *Importer) Import(src string) (*importer.Result, error) {
 		deps := importer.Key(s.node, "depends_on")
 		if deps != nil {
 			names, optional := dependsOnEntries(res, deps, s.name)
+			// Membership set: appendUnique's linear scan made a step with d
+			// depends_on O(d²) on the Needs slice.
+			needSet := make(map[string]bool, len(j.Needs)+len(names))
+			for _, id := range j.Needs {
+				needSet[id] = true
+			}
 			for _, dep := range names {
-				if id, ok := ids[dep]; ok {
-					j.Needs = appendUnique(j.Needs, id)
-				} else {
+				id, ok := ids[dep]
+				if !ok {
 					res.AddUnsupported("step %q: depends_on %q names no step in this workflow (cross-workflow dependencies are not converted)", s.name, dep)
+					continue
 				}
+				if needSet[id] {
+					continue
+				}
+				needSet[id] = true
+				j.Needs = append(j.Needs, id)
 			}
 			if optional && len(names) > 0 {
 				// Optional depends_on: the dependent must still run when the
@@ -1145,8 +1156,18 @@ func appendUnique(list []string, v string) []string {
 }
 
 func appendUniqueAll(list []string, vs ...string) []string {
+	// O(n+m) with a set: a long secrets/labels list must not re-scan the
+	// destination for every value.
+	seen := make(map[string]bool, len(list)+len(vs))
+	for _, e := range list {
+		seen[e] = true
+	}
 	for _, v := range vs {
-		list = appendUnique(list, v)
+		if seen[v] {
+			continue
+		}
+		seen[v] = true
+		list = append(list, v)
 	}
 	return list
 }

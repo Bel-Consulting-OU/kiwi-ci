@@ -326,27 +326,21 @@ func topoOrder(jobs map[string]pipeline.Job, idIndex map[string]int) []string {
 		id := ready[0]
 		ready = ready[1:]
 		out = append(out, id)
-		inserted := false
+		added := false
 		for _, dep := range reverse[id] {
 			indeg[dep]--
 			if indeg[dep] != 0 {
 				continue
 			}
-			// Keep ready ordered by idIndex without a full re-sort.
-			pos := len(ready)
-			for i, existing := range ready {
-				if idIndex[dep] < idIndex[existing] ||
-					(idIndex[dep] == idIndex[existing] && dep < existing) {
-					pos = i
-					break
-				}
-			}
-			ready = append(ready, "")
-			copy(ready[pos+1:], ready[pos:])
-			ready[pos] = dep
-			inserted = true
+			// Append in bulk and sort once per pop that added nodes. A
+			// per-insert sorted splice was O(|ready|) memmove each time →
+			// O(V²) on a wide DAG (one parent, V−1 children).
+			ready = append(ready, dep)
+			added = true
 		}
-		_ = inserted
+		if added {
+			sortReady()
+		}
 	}
 	// Cycles cannot occur (pipeline.Parse rejects them) but never drop jobs.
 	if len(out) < len(jobs) {

@@ -93,13 +93,9 @@ func (e Endpoint) RequireToken() (string, error) {
 	return e.Token, nil
 }
 
-// mustResolveServer is the TUI's endpoint lookup: it panics only on a
-// malformed URL (a configuration error the operator must fix) and never
-// silently falls back to a host the operator did not choose.
-func mustResolveServer(flagServer string) string {
-	e, err := ResolveEndpoint(flagServer, "")
-	if err != nil {
-		panic(err)
-	}
-	return e.Server
+// mustResolveServer is the TUI's endpoint lookup. It returns an error on a
+// malformed or refused endpoint (plaintext non-loopback with a token) so the
+// caller can report it instead of panicking mid-session.
+func resolveServerForTUI(flagServer, flagToken string) (Endpoint, error) {
+	return ResolveEndpoint(flagServer, flagToken)
 }

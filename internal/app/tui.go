@@ -33,9 +33,13 @@ func tuiWithIO(ctx context.Context, args []string, out io.Writer, in io.Reader) 
 	if len(rest) != 1 {
 		return fmt.Errorf("kiwi tui requires a run ID")
 	}
+	ep, epErr := resolveServerForTUI(*serverURL, *token)
+	if epErr != nil {
+		return epErr
+	}
 	return tui.Run(ctx, tui.Config{
-		Server: mustResolveServer(*serverURL),
-		Token:  *token,
+		Server: ep.Server,
+		Token:  ep.Token,
 		RunID:  rest[0],
 		JobKey: *job,
 		Follow: *follow,
