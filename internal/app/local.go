@@ -136,9 +136,12 @@ func RunLocal(ctx context.Context, args []string) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return fmt.Errorf("run cancelled: %w", ctxErr)
 	}
+	// A job-level cancellation (its own timeout, cancel_job_on_failure) is a
+	// job outcome, not a run-wide abort. Exit non-zero (a cancelled job is
+	// not success) but do not claim the RUN was cancelled.
 	for id, r := range res {
 		if r.Status == model.StatusCancelled {
-			return fmt.Errorf("run cancelled: job %s was cancelled", id)
+			return fmt.Errorf("job %s cancelled (timeout or cancel_job_on_failure)", id)
 		}
 	}
 	return runErr

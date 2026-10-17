@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"syscall"
 )
 
@@ -65,6 +66,15 @@ func provisionWorkspaceTree(workspace string, uid, gid int) (func() error, error
 		return nil, fmt.Errorf("make workspace root traverse-only: %w", err)
 	}
 	if err := chownWorkspaceTree(root, uid, gid); err != nil {
+		// macOS cannot chown a user-owned tree to 65534 (EPERM). Docker
+		// Desktop bind-mounts do not need that ownership change to work, so
+		// degrade instead of failing the job: restore the mode and leave the
+		// tree under the runner. Linux still fail-closes on a real chown
+		// error (the workload uid would lose access).
+		if runtime.GOOS == "darwin" && errors.Is(err, os.ErrPermission) {
+			_ = os.Chmod(root, originalMode)
+			return func() error { return nil }, nil
+		}
 		// Best effort: put the tree back under the runner so a failed
 		// provision never leaves the checkout inaccessible to its owner.
 		_ = chownWorkspaceTree(root, runnerUID, runnerGID)
