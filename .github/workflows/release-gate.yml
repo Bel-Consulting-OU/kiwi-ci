@@ -100,7 +100,7 @@ jobs:
                 Linux-aarch64|Linux-arm64) echo linux-arm64 ;;
                 *) echo linux-amd64 ;;
               esac
-            )
+            )"
             if [ ! -f "$KIWI_RELEASE_STORE/v0.0.0-n1/kiwi-$plat" ]; then
               ./scripts/release-store.sh publish "$KIWI_RELEASE_STORE" "v0.0.0-n1" \
                 "$(git rev-parse HEAD)" "$KIWI_N_MINUS_ONE_BIN"

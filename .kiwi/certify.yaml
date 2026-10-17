@@ -32,7 +32,19 @@ jobs:
     timeout: 15m
     steps:
       - name: gofmt
-        run: test -z "$(gofmt -l .)"
+        # Use the gofmt that belongs to the same go as `go` on PATH. A bare
+        # `gofmt` can resolve to a different installation (for example
+        # /usr/local/go/bin/gofmt behind a homebrew go) and report files the
+        # CI gofmt job never sees.
+        run: |
+          set -eu
+          GOFMT="$(dirname "$(command -v go)")/gofmt"
+          test -x "$GOFMT"
+          files="$("$GOFMT" -l .)"
+          if [ -n "$files" ]; then
+            printf 'gofmt wants changes:\n%s\n' "$files"
+            exit 1
+          fi
       - name: go-vet
         run: go vet ./...
       - name: go-build
