@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 )
 
 // This file defines the typed repository identity used by every authorization,
@@ -559,6 +560,26 @@ func parseRepoGrant(s string, allowLegacyCanonical bool) (RepoGrant, error) {
 // never consults dots. Persisted canonical IDs written by CanonicalRepoID are
 // therefore parsed into the same typed identity they were derived from, with a
 // dotless host parsed exactly like a dotted one.
+//
+// Results (including failures) are memoized: authorization resolves the same
+// grant keys on every decision, and resolveRepoGrantEntries parses every key
+// of a principal per call. Without the cache a wide-repo principal paid
+// O(grants) string parse per candidate.
 func ParseStoredRepoID(s string) (RepoGrant, error) {
-	return parseRepoGrant(s, true)
+	if v, ok := parsedStoredRepoID.Load(s); ok {
+		c := v.(parsedStoredRepoIDEntry)
+		return c.grant, c.err
+	}
+	g, err := parseRepoGrant(s, true)
+	parsedStoredRepoID.Store(s, parsedStoredRepoIDEntry{grant: g, err: err})
+	return g, err
 }
+
+type parsedStoredRepoIDEntry struct {
+	grant RepoGrant
+	err   error
+}
+
+// parsedStoredRepoID memoizes ParseStoredRepoID. Keys are repository id
+// strings (bounded by admission / ACL config); values are immutable structs.
+var parsedStoredRepoID sync.Map

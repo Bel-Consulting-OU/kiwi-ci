@@ -169,12 +169,7 @@ func (s *Server) eachJobByRun(ctx context.Context, runID string, fn func(model.J
 		return
 	}
 	s.mu.Lock()
-	js := make([]model.Job, 0)
-	for _, j := range s.jobs {
-		if j.RunID == runID {
-			js = append(js, j)
-		}
-	}
+	js := s.jobsForRunLocked(runID)
 	s.mu.Unlock()
 	for _, j := range js {
 		fn(j)

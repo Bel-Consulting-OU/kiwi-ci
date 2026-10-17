@@ -2942,10 +2942,8 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]v1.JobDTO, 0)
-	for _, j := range s.jobs {
-		if j.RunID == runID {
-			out = append(out, v1.JobDTOFrom(j))
-		}
+	for _, j := range s.jobsForRunLocked(runID) {
+		out = append(out, v1.JobDTOFrom(j))
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Priority != out[j].Priority {

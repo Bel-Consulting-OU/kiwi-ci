@@ -65,8 +65,8 @@ func (s *Server) publishForgeStatus(ctx context.Context, run model.Run) error {
 		}
 	} else {
 		s.mu.Lock()
-		for _, j := range s.jobs {
-			if j.RunID != run.ID || !j.Status.Terminal() {
+		for _, j := range s.jobsForRunLocked(run.ID) {
+			if !j.Status.Terminal() {
 				continue
 			}
 			jstatus, jconclusion := checkStateForRun(j.Status)
@@ -78,13 +78,23 @@ func (s *Server) publishForgeStatus(ctx context.Context, run model.Run) error {
 		}
 		s.mu.Unlock()
 	}
-	// Deterministic order: pipeline first, then jobs by name.
-	sort.Slice(items[1:], func(i, j int) bool {
-		var a, b forge.CheckPayload
-		_ = json.Unmarshal(items[i+1].Payload, &a)
-		_ = json.Unmarshal(items[j+1].Payload, &b)
-		return a.Name < b.Name
-	})
+	// Deterministic order: pipeline first, then jobs by name. Decode each
+	// name ONCE: unmarshaling inside the sort comparator was O(n²) JSON
+	// decodes on every run transition.
+	type namedIntent struct {
+		name string
+		item forge.OutboxItem
+	}
+	named := make([]namedIntent, 0, len(items)-1)
+	for _, it := range items[1:] {
+		var p forge.CheckPayload
+		_ = json.Unmarshal(it.Payload, &p)
+		named = append(named, namedIntent{name: p.Name, item: it})
+	}
+	sort.Slice(named, func(i, j int) bool { return named[i].name < named[j].name })
+	for i := range named {
+		items[i+1] = named[i].item
+	}
 	// Durable-first: every intended row must be recorded before the effect
 	// reports success, otherwise the completion effect would be ACKed with
 	// forge statuses missing. Every item carries a concrete kind: the

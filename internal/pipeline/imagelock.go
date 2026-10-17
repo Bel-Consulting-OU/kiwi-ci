@@ -148,12 +148,6 @@ func (s *Spec) ApplyImageLock(lock map[string]string) {
 		if pinned, ok := lock[ref]; ok && pinned != "" {
 			return pinned
 		}
-		// Already-digest refs that appear verbatim in the lock also resolve.
-		for k, v := range lock {
-			if k == ref {
-				return v
-			}
-		}
 		return ref
 	}
 	for id, j := range s.Jobs {
