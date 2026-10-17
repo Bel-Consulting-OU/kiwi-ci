@@ -144,7 +144,11 @@ func (*NativeBackend) Run(ctx context.Context, c Command, emit func(string)) err
 	if shell == "" {
 		shell = "bash"
 	}
-	args := []string{"-lc", c.Script}
+	// Non-login shell: cmd.Env already carries the executor-resolved PATH
+	// (host inherit or cleanExecutionEnv). A login shell (-lc) sources
+	// /etc/profile and can prepend a different, older Go — breaking
+	// "Kiwi certifies Kiwi" when the host has more than one toolchain.
+	args := []string{"-c", c.Script}
 	if shell == "powershell" || shell == "pwsh" {
 		args = []string{"-NoProfile", "-Command", c.Script}
 	}

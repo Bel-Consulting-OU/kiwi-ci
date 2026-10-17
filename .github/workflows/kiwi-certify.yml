@@ -1,0 +1,49 @@
+name: kiwi-certification
+
+# Kiwi certifies Kiwi. The meaningful pipeline graph runs through the product
+# (./kiwi run -f .kiwi/certify.yaml) and this workflow is only the bootstrap
+# plus the GitHub check that reports the result. A red certification means
+# Kiwi did not certify Kiwi — not that a YAML re-encode of the gates failed.
+#
+# The commit status context is ci/kiwi-certification. The job name
+# "certification" is the check run GitHub shows on the commit.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  statuses: write
+
+# Action refs are pinned to full commit SHAs (same pins as ci.yml).
+jobs:
+  certification:
+    name: certification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      - name: build kiwi
+        run: go build -o dist/kiwi ./cmd/kiwi
+      - name: kiwi certifies kiwi
+        run: ./dist/kiwi run -f .kiwi/certify.yaml -json
+      - name: publish certification status
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OUTCOME: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          state=success
+          if [ "$OUTCOME" != "success" ]; then
+            state=failure
+          fi
+          gh api "repos/${{ github.repository }}/statuses/${{ github.sha }}" \
+            -f state="$state" \
+            -f context="ci/kiwi-certification" \
+            -f description="Kiwi certifies Kiwi (.kiwi/certify.yaml)" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

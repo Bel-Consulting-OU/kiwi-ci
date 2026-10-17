@@ -1,0 +1,58 @@
+# Kiwi certifies Kiwi: this is the certification entry point GitHub Actions
+# invokes through the product (`./kiwi run -f .kiwi/certify.yaml`), not a
+# re-encoded copy of the gates in YAML that the product never sees.
+#
+# Unlike .kiwi/pipeline.yaml (the full self-host matrix, rootless containers,
+# digest-pinned images, PostgreSQL service), this graph runs natively so a
+# standard GitHub-hosted runner can execute it without a rootless daemon.
+# It is still Kiwi's own engine: the jobs, needs, logs and evidence records
+# all come from a real kiwi run.
+#
+# Gates (run texts mirror the Makefile / CI surface checks exactly):
+#   quality      gofmt, go vet, go build, surface-check, filemap, docs-lint
+#   proofs       dogfood-fast (model proofs) — DF0 closes the loop on itself
+version: 1
+name: kiwi-certify-kiwi
+
+defaults:
+  shell: bash
+
+# No GOTOOLCHAIN=local: the host (or setup-go) must be able to resolve the
+# go.mod toolchain. Forcing local breaks hosts whose base Go is older than
+# the go directive (for example go1.27.0 with `go 1.27.2`). Containers in
+# .kiwi/pipeline.yaml pin the image instead.
+
+concurrency:
+  group: "certify:${{ repo.full_name }}:${{ git.branch }}"
+  cancel_in_progress: true
+
+jobs:
+  quality:
+    runtime: native
+    timeout: 15m
+    steps:
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      - name: go-vet
+        run: go vet ./...
+      - name: go-build
+        run: go build ./...
+      - name: surface-check
+        run: make surface-check
+      - name: filemap
+        run: go run ./cmd/filemap --check
+      - name: docs-lint
+        run: ./scripts/docs-lint.sh --source --baseline scripts/docs-lint-baseline.txt
+      - name: docs-links
+        run: ./scripts/docs-links-check.sh
+
+  proofs:
+    needs: [quality]
+    runtime: native
+    timeout: 20m
+    steps:
+      - name: dogfood-fast
+        run: make dogfood-fast
+      - name: certify-schema
+        # The certification pipeline itself must parse with the product.
+        run: go run ./cmd/kiwi validate -f .kiwi/certify.yaml
