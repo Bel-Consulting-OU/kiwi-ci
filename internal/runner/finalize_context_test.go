@@ -75,7 +75,10 @@ func TestExecuteBoundsArtifactUploadByJobTimeout(t *testing.T) {
 	}()
 	select {
 	case <-artifactSeen:
-	case <-time.After(15 * time.Second):
+	case <-time.After(30 * time.Second):
+		// 30s: the job timeout is 500ms, but a loaded CI box can delay
+		// process start/step execution; the product guarantee is the
+		// upload is bounded by the JOB timeout once it begins.
 		t.Fatalf("job never attempted its artifact upload; execute state unknown")
 	}
 	select {

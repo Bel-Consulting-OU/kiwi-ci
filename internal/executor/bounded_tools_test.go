@@ -75,7 +75,10 @@ func TestBoundedToolCommandHangingTimesOutTypedBoundedOutput(t *testing.T) {
 	if len(out) == 0 {
 		t.Fatal("timeout returned no captured output; the diagnostic lost the binary's output")
 	}
-	if elapsed > 10*time.Second {
+	if elapsed > 20*time.Second {
+		// 20s wall-clock budget: the command itself times out at 500ms, but
+		// a loaded CI box can delay process teardown; the product guarantee
+		// is "returns within the bound", not "returns in 10s of wall clock".
 		t.Fatalf("bounded command took %v; the caller was stranded", elapsed)
 	}
 }

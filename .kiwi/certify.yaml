@@ -1,26 +1,26 @@
-# Kiwi certifies Kiwi: this is the certification entry point GitHub Actions
-# invokes through the product (`./kiwi run -f .kiwi/certify.yaml`), not a
-# re-encoded copy of the gates in YAML that the product never sees.
+# Kiwi certifies Kiwi: THE certification / CI entry point.
 #
-# Unlike .kiwi/pipeline.yaml (the full self-host matrix, rootless containers,
-# digest-pinned images, PostgreSQL service), this graph runs natively so a
-# standard GitHub-hosted runner can execute it without a rootless daemon.
-# It is still Kiwi's own engine: the jobs, needs, logs and evidence records
-# all come from a real kiwi run.
+# GitHub Actions only bootstraps `kiwi` and runs this file. Every gate that
+# used to live in Actions or Woodpecker YAML is a job here:
 #
-# Gates (run texts mirror the Makefile / CI surface checks exactly):
-#   quality      gofmt, go vet, go build, surface-check, filemap, docs-lint
-#   proofs       dogfood-fast (model proofs) — DF0 closes the loop on itself
+#   quality           gofmt, vet, build, surface-check, filemap, docs
+#   unit              go test ./... + race on the sensitive packages
+#   suite-contracts   dogfood registry / Makefile require contracts
+#   fuzz              bounded fuzz smoke
+#   perf-gate         release performance contract vs bench/baseline.txt
+#   dogfood-local     model proofs (DF0–DF* local harness)
+#   dogfood-system    real server + runner system proofs
+#   dogfood-adversarial  lease/evidence/quota/effect fault suite
+#   formal            TLC model check (kiwi_lease)
+#   proofs            dogfood-fast + certify-schema + Woodpecker timing proof
+#
+# Native runtime so a standard GitHub-hosted runner can execute this without
+# a rootless Docker daemon. Still Kiwi's engine: jobs, needs, logs, evidence.
 version: 1
 name: kiwi-certify-kiwi
 
 defaults:
   shell: bash
-
-# No GOTOOLCHAIN=local: the host (or setup-go) must be able to resolve the
-# go.mod toolchain. Forcing local breaks hosts whose base Go is older than
-# the go directive (for example go1.27.0 with `go 1.27.2`). Containers in
-# .kiwi/pipeline.yaml pin the image instead.
 
 concurrency:
   group: "certify:${{ repo.full_name }}:${{ git.branch }}"
@@ -29,13 +29,14 @@ concurrency:
 jobs:
   quality:
     runtime: native
+    env:
+      GOCACHE: /tmp/kiwi-gocache-quality
+      GOMODCACHE: /tmp/kiwi-gomod
     timeout: 15m
     steps:
       - name: gofmt
-        # Use the gofmt that belongs to the same go as `go` on PATH. A bare
-        # `gofmt` can resolve to a different installation (for example
-        # /usr/local/go/bin/gofmt behind a homebrew go) and report files the
-        # CI gofmt job never sees.
+        # Pin gofmt to the same toolchain as `go` on PATH (a bare gofmt can
+        # be a different install and disagree with setup-go).
         run: |
           set -eu
           GOFMT="$(dirname "$(command -v go)")/gofmt"
@@ -61,6 +62,9 @@ jobs:
   unit:
     needs: [quality]
     runtime: native
+    env:
+      GOCACHE: /tmp/kiwi-gocache-unit
+      GOMODCACHE: /tmp/kiwi-gomod
     timeout: 30m
     steps:
       - name: test-unit
@@ -68,19 +72,108 @@ jobs:
       - name: test-race
         run: go test -race -count=1 -timeout=15m ./internal/server/ ./internal/storage/ ./internal/runner/ ./internal/scheduler/
 
-  proofs:
-    needs: [quality]
+  suite-contracts:
+    needs: [unit]
     runtime: native
+    env:
+      GOCACHE: /tmp/kiwi-gocache-suite-contracts
+      GOMODCACHE: /tmp/kiwi-gomod
+    timeout: 5m
+    steps:
+      - name: registry-and-makefile-contracts
+        run: go test ./internal/dogfood/scenarios/ -count=1 -run 'TestEveryRegistry|TestMakefileRequires'
+
+  fuzz:
+    needs: [unit]
+    runtime: native
+    env:
+      GOCACHE: /tmp/kiwi-gocache-fuzz
+      GOMODCACHE: /tmp/kiwi-gomod
+    timeout: 10m
+    steps:
+      - name: fuzz-smoke
+        run: ./scripts/fuzz-smoke.sh 5s
+
+  perf-gate:
+    # LAST, after every other gate: perf-compare measures a quiet machine
+    # (see scripts/perf-compare.sh noise contract). Running it in parallel
+    # with dogfood/fuzz makes the 2× regression budget flake for load, not
+    # for product regressions.
+    needs: [dogfood-local, dogfood-system, dogfood-adversarial, formal, fuzz, suite-contracts, proofs]
+    runtime: native
+    env:
+      GOCACHE: /tmp/kiwi-gocache-perf-gate
+      GOMODCACHE: /tmp/kiwi-gomod
+    timeout: 20m
+    steps:
+      - name: perf-compare
+        run: ./scripts/perf-compare.sh
+
+  dogfood-local:
+    needs: [unit]
+    runtime: native
+    env:
+      GOCACHE: /tmp/kiwi-gocache-dogfood-local
+      GOMODCACHE: /tmp/kiwi-gomod
+    timeout: 15m
+    steps:
+      - name: dogfood-local
+        run: make dogfood-local
+
+  dogfood-system:
+    needs: [unit]
+    runtime: native
+    env:
+      GOCACHE: /tmp/kiwi-gocache-dogfood-system
+      GOMODCACHE: /tmp/kiwi-gomod
+    timeout: 20m
+    steps:
+      - name: dogfood-system
+        run: make dogfood-system
+
+  dogfood-adversarial:
+    needs: [unit]
+    runtime: native
+    env:
+      GOCACHE: /tmp/kiwi-gocache-dogfood-adversarial
+      GOMODCACHE: /tmp/kiwi-gomod
+    timeout: 30m
+    steps:
+      - name: dogfood-adversarial
+        run: make dogfood-adversarial
+
+  formal:
+    needs: [unit]
+    runtime: native
+    env:
+      GOCACHE: /tmp/kiwi-gocache-formal
+      GOMODCACHE: /tmp/kiwi-gomod
+    timeout: 15m
+    sandbox:
+      network: internet
+    steps:
+      - name: fetch-tla2tools
+        run: ./scripts/fetch-tla2tools.sh ~/.cache/kiwi/tla2tools.jar
+      - name: tlc-kiwi-lease
+        run: |
+          set -euo pipefail
+          java -Xmx4g -jar ~/.cache/kiwi/tla2tools.jar -workers auto \
+            -config formal/kiwi_lease.cfg formal/kiwi_lease.tla | tee tlc.log
+          grep -q "Model checking completed. No error has been found" tlc.log
+
+  proofs:
+    # After dogfood: timing proof needs a quieter machine (see perf-gate).
+    needs: [dogfood-local, dogfood-system, dogfood-adversarial, formal, fuzz, suite-contracts]
+    runtime: native
+    env:
+      GOCACHE: /tmp/kiwi-gocache-proofs
+      GOMODCACHE: /tmp/kiwi-gomod
     timeout: 20m
     steps:
       - name: dogfood-fast
         run: make dogfood-fast
       - name: certify-schema
-        # The certification pipeline itself must parse with the product.
         run: go run ./cmd/kiwi validate -f .kiwi/certify.yaml
       - name: woodpecker-proof
-        # Executable claim: Kiwi control plane is not slower than a
-        # Woodpecker-class reference (see perf/woodpecker_compare_test.go).
-        # Timing gates need a quiet machine — they are gated on KIWI_PROOF=1
-        # and live only in this proofs job, not on every unit run.
+        # Timing gates need a quiet machine — KIWI_PROOF=1, proofs job only.
         run: KIWI_PROOF=1 go test ./perf/ -count=1 -timeout=60s -run 'TestKiwi' -v
