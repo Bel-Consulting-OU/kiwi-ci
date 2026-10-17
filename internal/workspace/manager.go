@@ -111,6 +111,10 @@ func (m *Manager) Prepare(ctx context.Context, jobID string) (string, func(), er
 
 // snapshot materializes the source tree at target and reports which
 // strategy produced it.
+// snapshotCopyTree is copyTree unless a fallback test substitutes a
+// failing copy to exercise the reflink/cancel paths.
+var snapshotCopyTree = copyTree
+
 func (m *Manager) snapshot(ctx context.Context, target string) (string, error) {
 	if gitRepo(ctx, m.Source) {
 		clean, err := gitStatusClean(ctx, m.Source)
@@ -124,14 +128,22 @@ func (m *Manager) snapshot(ctx context.Context, target string) (string, error) {
 			_ = os.RemoveAll(target)
 		}
 	}
+	// Prefer copyTree (skips build-output dirs). APFS reflink clones the
+	// ENTIRE tree including multi-GB target/ before any strip — on a dirty
+	// Rust checkout that materializes tens of gigabytes and looks hung.
+	// snapshotCopyTree is a test seam so fallback tests can force the
+	// reflink path without disabling copyTree in production.
+	if err := snapshotCopyTree(m.Source, target); err == nil {
+		return "copy", nil
+	}
+	_ = os.RemoveAll(target)
 	if runtime.GOOS == "darwin" {
 		if _, err := exec.LookPath("cp"); err == nil {
 			cmd := exec.CommandContext(ctx, "cp", "-c", "-R", m.Source, target)
 			if err := cmd.Run(); err == nil {
-				// Reflinked clone: strip metadata directories the copy
-				// strategies deliberately exclude.
 				_ = os.RemoveAll(filepath.Join(target, ".git"))
 				_ = os.RemoveAll(filepath.Join(target, ".kiwi", "cache"))
+				stripBuildOutputDirs(target)
 				return "reflink", nil
 			} else if ctx.Err() != nil {
 				_ = os.RemoveAll(target)
@@ -140,10 +152,7 @@ func (m *Manager) snapshot(ctx context.Context, target string) (string, error) {
 			_ = os.RemoveAll(target)
 		}
 	}
-	if err := copyTree(m.Source, target); err != nil {
-		return "", err
-	}
-	return "copy", nil
+	return "", fmt.Errorf("workspace snapshot failed for %s", m.Source)
 }
 
 // gitRepo reports whether dir is inside a git working tree.
@@ -183,12 +192,31 @@ func removeWorktree(source, target string) {
 	_ = prune.Run()
 }
 
+// copyTreeSkipDirs are build-output directory names never copied into a job
+// workspace. A dirty checkout of a Rust repo can carry a multi-gigabyte
+// target/ tree; copying it made workspace materialization look hung and
+// filled the disk. Jobs rebuild from source.
+var copyTreeSkipDirs = map[string]bool{
+	"target":        true, // cargo/rustc
+	"node_modules":  true,
+	"__pycache__":   true,
+	".venv":         true,
+	"venv":          true,
+	".tox":          true,
+	".mypy_cache":   true,
+	".pytest_cache": true,
+	".ruff_cache":   true,
+	".cache":        true,
+}
+
 // copyTree recursively copies src into dst (created if missing), skipping
-// the .git directory, the in-repo .kiwi/cache directory and the DESTINATION
-// subtree itself. The destination exclusion matters when the workspace root
-// lives under the source (a TMPDIR inside the repository): without it the
-// walk descends into the half-copied workspace and copies it into itself
-// until the path length explodes.
+// build-output directory names, the in-repo .kiwi/cache directory and the
+// DESTINATION subtree itself. .git IS copied: audit tools that shell out to
+// `git ls-files` (and any pipeline step that inspects the commit) must see a
+// real repository inside the job workspace. The destination exclusion
+// matters when the workspace root lives under the source (a TMPDIR inside
+// the repository): without it the walk descends into the half-copied
+// workspace and copies it into itself until the path length explodes.
 func copyTree(src, dst string) error {
 	dstAbs, err := filepath.Abs(dst)
 	if err != nil {
@@ -213,11 +241,8 @@ func copyTree(src, dst string) error {
 		if rel == "." {
 			return nil
 		}
-		if rel == ".git" || strings.HasPrefix(rel, ".git"+string(filepath.Separator)) {
-			if info.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
+		if info.IsDir() && copyTreeSkipDirs[info.Name()] {
+			return filepath.SkipDir
 		}
 		cacheRel := filepath.Join(".kiwi", "cache")
 		if rel == cacheRel || strings.HasPrefix(rel, cacheRel+string(filepath.Separator)) {
@@ -242,6 +267,21 @@ func copyTree(src, dst string) error {
 		default:
 			return copyFile(path, target, info.Mode().Perm())
 		}
+	})
+}
+
+// stripBuildOutputDirs removes build-output directory names from a
+// materialized workspace (reflink clones copy them before this runs).
+func stripBuildOutputDirs(root string) {
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil || !info.IsDir() {
+			return nil
+		}
+		if copyTreeSkipDirs[info.Name()] {
+			_ = os.RemoveAll(path)
+			return filepath.SkipDir
+		}
+		return nil
 	})
 }
 

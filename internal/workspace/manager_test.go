@@ -126,12 +126,11 @@ func TestPrepareSkipsGitAndKiwiCache(t *testing.T) {
 	}
 	defer cleanup()
 
-	for _, absent := range []string{".git", ".kiwi/cache"} {
-		if _, err := os.Stat(filepath.Join(dir, absent)); !os.IsNotExist(err) {
-			t.Fatalf("workspace copied excluded path %q", absent)
-		}
+	if _, err := os.Stat(filepath.Join(dir, ".kiwi", "cache")); !os.IsNotExist(err) {
+		t.Fatal("workspace copied excluded path .kiwi/cache")
 	}
-	for _, present := range []string{"app.txt", ".kiwi/pipeline.yaml"} {
+	// .git is copied so `git ls-files` inside the job workspace works.
+	for _, present := range []string{"app.txt", ".kiwi/pipeline.yaml", ".git"} {
 		if _, err := os.Stat(filepath.Join(dir, present)); err != nil {
 			t.Fatalf("workspace missing %q: %v", present, err)
 		}

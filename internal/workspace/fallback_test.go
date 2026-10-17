@@ -1,6 +1,7 @@
 package workspace
 
 import (
+	"errors"
 	"context"
 	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"os"
@@ -71,17 +72,16 @@ func TestSnapshotCopyFallback(t *testing.T) {
 	if err != nil || link != "app.txt" {
 		t.Fatalf("symlink not preserved: %q %v", link, err)
 	}
-	for _, absent := range []string{".git", filepath.Join(".kiwi", "cache")} {
-		if _, err := os.Stat(filepath.Join(dir, absent)); !os.IsNotExist(err) {
-			t.Fatalf("copy fallback must skip %q", absent)
-		}
+	if _, err := os.Stat(filepath.Join(dir, ".kiwi", "cache")); !os.IsNotExist(err) {
+		t.Fatal("copy fallback must skip .kiwi/cache")
 	}
 	if _, err := os.Stat(filepath.Join(dir, ".kiwi", "pipeline.yaml")); err != nil {
 		t.Fatalf(".kiwi/pipeline.yaml must be copied: %v", err)
 	}
-	// The copied workspace is a plain directory, not a worktree.
-	if _, err := os.Stat(filepath.Join(dir, ".git")); !os.IsNotExist(err) {
-		t.Fatal("copy fallback must not carry .git")
+	// .git is copied: audit tools that run `git ls-files` inside the job
+	// workspace need a real repository.
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err != nil {
+		t.Fatalf("copy fallback must carry .git: %v", err)
 	}
 }
 
@@ -120,6 +120,8 @@ func TestSnapshotWorktreeAddFailure(t *testing.T) {
 	}
 }
 
+var errForceCopyTree = errors.New("copyTree forced failure")
+
 func TestSnapshotCancelDuringReflink(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("reflink path is darwin-only")
@@ -128,6 +130,11 @@ func TestSnapshotCancelDuringReflink(t *testing.T) {
 	shimCP(t, "block", marker)
 	src := t.TempDir()
 	writeFile(t, filepath.Join(src, "app.txt"), "app")
+	// Force the reflink fallback: production prefers copyTree (skips
+	// build-output dirs); this test cancels during `cp`.
+	origCopy := snapshotCopyTree
+	snapshotCopyTree = func(string, string) error { return errForceCopyTree }
+	t.Cleanup(func() { snapshotCopyTree = origCopy })
 
 	m, err := NewManager(src)
 	if err != nil {
@@ -372,8 +379,8 @@ func TestCopyTreeSkipsGitAndCacheFiles(t *testing.T) {
 	if err := copyTree(src, dst); err != nil {
 		t.Fatalf("copyTree: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dst, ".git")); !os.IsNotExist(err) {
-		t.Fatal(".git file must be skipped")
+	if _, err := os.Stat(filepath.Join(dst, ".git")); err != nil {
+		t.Fatalf(".git file must be copied (git ls-files in job): %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dst, ".kiwi", "cache")); !os.IsNotExist(err) {
 		t.Fatal(".kiwi/cache file must be skipped")

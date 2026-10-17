@@ -557,6 +557,9 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	}
 	workspace := e.Opt.Workspace
 	if e.Opt.WorkspaceFor != nil {
+		// Materializing a large dirty tree can take seconds; the CLI used to
+		// look hung with no lines. Say so before the copy/worktree starts.
+		e.log(cj.ID, "workspace", "preparing job workspace")
 		dir, cleanup, werr := e.Opt.WorkspaceFor(cj.ID)
 		if werr != nil {
 			res.Status = model.StatusFailure
