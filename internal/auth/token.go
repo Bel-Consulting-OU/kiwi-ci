@@ -46,6 +46,10 @@ type TokenStore struct {
 	mu        sync.RWMutex
 	tokens    map[string]Principal
 	bySubject map[string]Principal
+	// subjectDigests lists the token digests that share a subject, so
+	// PrincipalBySubject and RemoveToken touch only that subject instead of
+	// scanning every token. Maintained with bySubject.
+	subjectDigests map[string][]string
 
 	// saveMu serializes Save. Concurrent Save calls on one store are legal:
 	// each call snapshots, marshals and durably writes its own bytes with no
@@ -58,8 +62,9 @@ type TokenStore struct {
 
 func NewTokenStore() *TokenStore {
 	return &TokenStore{
-		tokens:    map[string]Principal{},
-		bySubject: map[string]Principal{},
+		tokens:         map[string]Principal{},
+		bySubject:      map[string]Principal{},
+		subjectDigests: map[string][]string{},
 	}
 }
 
@@ -146,14 +151,16 @@ func roleSet(roles []Role) map[Role]struct{} {
 // non-empty subject in tokens. Digests are visited in sorted order so a
 // persisted conflict always reports the same subject. The first differing
 // principal for a shared subject is an error wrapping ErrSubjectConflict;
-// nothing is merged or dropped.
-func buildSubjectIndex(tokens map[string]Principal) (map[string]Principal, error) {
+// nothing is merged or dropped. subjectDigests is filled alongside the
+// principal map so later updates never rescan the whole store.
+func buildSubjectIndex(tokens map[string]Principal) (map[string]Principal, map[string][]string, error) {
 	digests := make([]string, 0, len(tokens))
 	for digest := range tokens {
 		digests = append(digests, digest)
 	}
 	sort.Strings(digests)
 	index := make(map[string]Principal, len(tokens))
+	byDigest := make(map[string][]string, len(tokens))
 	for _, digest := range digests {
 		p := tokens[digest]
 		if p.Subject == "" {
@@ -161,13 +168,57 @@ func buildSubjectIndex(tokens map[string]Principal) (map[string]Principal, error
 		}
 		if existing, ok := index[p.Subject]; ok {
 			if !effectivePrincipalEqual(existing, p) {
-				return nil, fmt.Errorf("subject %q has conflicting principals: %w", p.Subject, ErrSubjectConflict)
+				return nil, nil, fmt.Errorf("subject %q has conflicting principals: %w", p.Subject, ErrSubjectConflict)
 			}
+			byDigest[p.Subject] = append(byDigest[p.Subject], digest)
 			continue
 		}
 		index[p.Subject] = p
+		byDigest[p.Subject] = []string{digest}
 	}
-	return index, nil
+	return index, byDigest, nil
+}
+
+// indexSubjectLocked refreshes bySubject/subjectDigests for one subject from
+// the live token map. Caller holds mu for writing.
+func (t *TokenStore) indexSubjectLocked(subject string) error {
+	if subject == "" {
+		return nil
+	}
+	if t.subjectDigests == nil {
+		t.subjectDigests = map[string][]string{}
+	}
+	if t.bySubject == nil {
+		t.bySubject = map[string]Principal{}
+	}
+	var digests []string
+	var principal Principal
+	seen := false
+	for digest, p := range t.tokens {
+		if p.Subject != subject {
+			continue
+		}
+		digests = append(digests, digest)
+		if !seen {
+			principal = p
+			seen = true
+			continue
+		}
+		if !effectivePrincipalEqual(principal, p) {
+			delete(t.bySubject, subject)
+			delete(t.subjectDigests, subject)
+			return fmt.Errorf("subject %q has conflicting principals: %w", subject, ErrSubjectConflict)
+		}
+	}
+	sort.Strings(digests)
+	if !seen {
+		delete(t.bySubject, subject)
+		delete(t.subjectDigests, subject)
+		return nil
+	}
+	t.bySubject[subject] = principal
+	t.subjectDigests[subject] = digests
+	return nil
 }
 
 // AddToken registers raw with principal, keyed by the token digest. It fails
@@ -209,17 +260,31 @@ func (t *TokenStore) AddToken(raw string, p Principal) error {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	next := make(map[string]Principal, len(t.tokens)+1)
-	for digest, existing := range t.tokens {
-		next[digest] = existing
+	digest := TokenDigest(raw)
+	prev, existed := t.tokens[digest]
+	if t.tokens == nil {
+		t.tokens = map[string]Principal{}
 	}
-	next[TokenDigest(raw)] = p
-	index, err := buildSubjectIndex(next)
-	if err != nil {
+	t.tokens[digest] = p
+	if err := t.indexSubjectLocked(p.Subject); err != nil {
+		// Roll back the failed registration; the store stays unchanged.
+		if existed {
+			t.tokens[digest] = prev
+			_ = t.indexSubjectLocked(prev.Subject)
+		} else {
+			delete(t.tokens, digest)
+			_ = t.indexSubjectLocked(p.Subject)
+		}
 		return fmt.Errorf("auth: add token: %w", err)
 	}
-	t.tokens = next
-	t.bySubject = index
+	if existed && prev.Subject != "" && prev.Subject != p.Subject {
+		if err := t.indexSubjectLocked(prev.Subject); err != nil {
+			// Unreachable through the public API (the old subject was already
+			// consistent). Fail closed rather than leave a stale index.
+			t.bySubject = nil
+			t.subjectDigests = nil
+		}
+	}
 	return nil
 }
 
@@ -261,7 +326,10 @@ func normalizePrincipalRepoGrants(p Principal) (Principal, error) {
 
 // RemoveToken revokes the token identified by raw and reports whether it was
 // present. Removing a token rebuilds the subject index: a subject that loses
-// its last token no longer resolves.
+// its last token no longer resolves. The rebuild is the fail-closed guard for
+// a conflict injected straight into the token map (unreachable through
+// AddToken) — it turns a successful removal into an ambiguous store that
+// resolves nothing rather than picking a winner.
 func (t *TokenStore) RemoveToken(raw string) bool {
 	if t == nil || raw == "" {
 		return false
@@ -272,21 +340,17 @@ func (t *TokenStore) RemoveToken(raw string) bool {
 	if _, ok := t.tokens[digest]; !ok {
 		return false
 	}
-	next := make(map[string]Principal, len(t.tokens)-1)
-	for d, p := range t.tokens {
-		if d != digest {
-			next[d] = p
-		}
-	}
-	t.tokens = next
-	index, err := buildSubjectIndex(next)
+	delete(t.tokens, digest)
+	index, subjectDigests, err := buildSubjectIndex(t.tokens)
 	if err != nil {
 		// Unreachable through the public API (conflicts are rejected when
 		// added). Fail closed instead of resolving an ambiguous subject.
 		t.bySubject = nil
+		t.subjectDigests = nil
 		return true
 	}
 	t.bySubject = index
+	t.subjectDigests = subjectDigests
 	return true
 }
 
@@ -322,8 +386,9 @@ func (t *TokenStore) PrincipalBySubject(subject string) (Principal, bool) {
 		return Principal{}, false
 	}
 	matches := 0
-	for _, q := range t.tokens {
-		if q.Subject != subject {
+	for _, digest := range t.subjectDigests[subject] {
+		q, ok := t.tokens[digest]
+		if !ok || q.Subject != subject {
 			continue
 		}
 		matches++
@@ -386,7 +451,7 @@ func (t *TokenStore) Load(path string) error {
 			return fmt.Errorf("auth: load token file %s: token %s: %w", path, digest, err)
 		}
 	}
-	index, err := buildSubjectIndex(m)
+	index, subjectDigests, err := buildSubjectIndex(m)
 	if err != nil {
 		return fmt.Errorf("auth: load token file %s: %w", path, err)
 	}
@@ -394,6 +459,7 @@ func (t *TokenStore) Load(path string) error {
 	defer t.mu.Unlock()
 	t.tokens = m
 	t.bySubject = index
+	t.subjectDigests = subjectDigests
 	return nil
 }
 

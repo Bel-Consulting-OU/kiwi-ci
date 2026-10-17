@@ -6,6 +6,10 @@ import (
 	"strings"
 )
 
+// matrixIDRe matches DF-… scenario ids in the dogfood matrix document.
+// Compiled once: CheckMatrixImplementedIDs runs from the matrix gates.
+var matrixIDRe = regexp.MustCompile(`DF-[A-Z0-9]+-\d+`)
+
 // ScenarioID is a stable dogfood scenario identifier.
 type ScenarioID string
 
@@ -416,9 +420,9 @@ func CheckMatrixImplementedIDs(doc string) []string {
 	if end := strings.Index(rest, "\n## "); end >= 0 {
 		rest = rest[:end]
 	}
-	idRe := regexp.MustCompile(`DF-[A-Z0-9]+-\d+`)
+	// Compiled once: this helper runs from matrix gates on every check.
 	docIDs := map[string]bool{}
-	for _, m := range idRe.FindAllString(rest, -1) {
+	for _, m := range matrixIDRe.FindAllString(rest, -1) {
 		docIDs[m] = true
 	}
 	if len(docIDs) == 0 {

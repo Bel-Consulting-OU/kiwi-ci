@@ -232,11 +232,18 @@ func (h *History) Flaky(repo string) []string {
 	out := []string{}
 	seen := map[string]bool{}
 	for key, st := range h.stats {
-		if !repoMatches(key, repo) {
+		parts, ok := decodeHistoryKey(key)
+		if parts.repo != repo {
 			continue
 		}
 		if st.FlakeProb > 0 {
-			name := displayName(key)
+			name := key
+			if ok {
+				name = parts.name
+				if parts.class != "" {
+					name = parts.class + "." + parts.name
+				}
+			}
 			if seen[name] {
 				continue
 			}
@@ -256,10 +263,18 @@ func (h *History) Manifest(repo, suite string) []string {
 	defer h.mu.Unlock()
 	out := []string{}
 	for key := range h.stats {
-		if !repoMatches(key, repo) || !suiteMatches(key, suite) {
+		parts, ok := decodeHistoryKey(key)
+		if parts.repo != repo || parts.suite != suite {
 			continue
 		}
-		out = append(out, displayName(key))
+		name := key
+		if ok {
+			name = parts.name
+			if parts.class != "" {
+				name = parts.class + "." + parts.name
+			}
+		}
+		out = append(out, name)
 	}
 	sort.Strings(out)
 	return out
@@ -300,7 +315,10 @@ func (h *History) Shard(repo, suite string, shards int) [][]string {
 	}
 	entries := []entry{}
 	for key, st := range h.stats {
-		if !repoMatches(key, repo) || !suiteMatches(key, suite) {
+		// Decode the history key once per stat. repoMatches/suiteMatches/
+		// displayName each ran base64+JSON on the same key.
+		parts, ok := decodeHistoryKey(key)
+		if !(parts.repo == repo && parts.suite == suite) {
 			continue
 		}
 		dur := st.EWMA
@@ -312,7 +330,13 @@ func (h *History) Shard(repo, suite string, shards int) [][]string {
 		if st.Runs == 0 || math.IsNaN(dur) || math.IsInf(dur, 0) || dur < 0 {
 			dur = defaultShardDuration
 		}
-		entries = append(entries, entry{name: displayName(key), ewma: dur})
+		name := parts.name
+		if !ok {
+			name = key
+		} else if parts.class != "" {
+			name = parts.class + "." + parts.name
+		}
+		entries = append(entries, entry{name: name, ewma: dur})
 	}
 	sort.Slice(entries, func(i, j int) bool {
 		if entries[i].ewma != entries[j].ewma {

@@ -255,6 +255,12 @@ func hashFilesFunc(c Context, args []Expr) (string, error) {
 			}
 			seen[f] = true
 			files = append(files, f)
+			// Abort as soon as the cap is exceeded so one huge pattern
+			// cannot materialize an unbounded file list before the limit
+			// is applied (filepath.Glob itself is uncapped).
+			if len(files) > hashFilesMaxFiles {
+				return "", fmt.Errorf("hashFiles: more than %d files matched, limit is %d", hashFilesMaxFiles, hashFilesMaxFiles)
+			}
 		}
 	}
 	if len(files) > hashFilesMaxFiles {

@@ -41,6 +41,11 @@ type Registry struct {
 	// outcomes holds every recorded claim (and the outcome side of verified
 	// records) keyed by verification id.
 	outcomes map[string]VerificationOutcome
+	// Secondary indexes over outcomes so obligation/group queries do not
+	// scan the whole registry. Values are verification ids (stable order is
+	// imposed at query time).
+	byObligation map[string][]string
+	byGroup      map[string][]string
 	// verified holds ONLY sealed DerivedVerifiedOutcome records. Membership
 	// here is what makes a result authoritative.
 	verified     map[string]DerivedVerifiedOutcome
@@ -63,9 +68,27 @@ func NewRegistry(clock func() time.Time) *Registry {
 		clock:        clock,
 		obligations:  make(map[string]VerificationObligation),
 		outcomes:     make(map[string]VerificationOutcome),
+		byObligation: make(map[string][]string),
+		byGroup:      make(map[string][]string),
 		verified:     make(map[string]DerivedVerifiedOutcome),
 		groups:       make(map[string]SpeculativeGroup),
 		capabilities: make(map[string]VerifierCapability),
+	}
+}
+
+// noteOutcomeLocked records the secondary indexes for one stored outcome.
+// Caller holds mu for writing.
+func (r *Registry) noteOutcomeLocked(v VerificationOutcome) {
+	if r.byObligation == nil {
+		r.byObligation = map[string][]string{}
+	}
+	if r.byGroup == nil {
+		r.byGroup = map[string][]string{}
+	}
+	r.byObligation[v.ObligationID] = append(r.byObligation[v.ObligationID], v.VerificationID)
+	if v.Resources.Speculative && v.Resources.VerificationGroupID != "" {
+		gid := v.Resources.VerificationGroupID
+		r.byGroup[gid] = append(r.byGroup[gid], v.VerificationID)
 	}
 }
 
@@ -145,6 +168,7 @@ func (r *Registry) RecordOutcome(v VerificationOutcome) error {
 	// only (no attested wall time).
 	v.Resources.Measured = DeriveMeasuredFacts(v, nil)
 	r.outcomes[v.VerificationID] = cloneOutcome(v)
+	r.noteOutcomeLocked(v)
 	return nil
 }
 
@@ -232,6 +256,7 @@ func (r *Registry) RecordVerifiedOutcome(v DerivedVerifiedOutcome) error {
 		}
 	} else {
 		r.outcomes[out.VerificationID] = claim
+		r.noteOutcomeLocked(claim)
 	}
 	// The stored seal carries the record-time Measured facts. There are no
 	// exported fields left to patch, so rebuild the sealed value through
@@ -409,9 +434,10 @@ func (r *Registry) Outcome(id string) (VerificationOutcome, error) {
 func (r *Registry) OutcomesForObligation(obligationID string) []VerificationOutcome {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	var out []VerificationOutcome
-	for _, v := range r.outcomes {
-		if v.ObligationID == obligationID {
+	ids := r.byObligation[obligationID]
+	out := make([]VerificationOutcome, 0, len(ids))
+	for _, id := range ids {
+		if v, ok := r.outcomes[id]; ok {
 			out = append(out, cloneOutcome(v))
 		}
 	}
@@ -488,7 +514,11 @@ func (r *Registry) CompareGroup(groupID string) (GroupComparison, error) {
 		return GroupComparison{}, fmt.Errorf("%w: group %q", ErrNotFound, groupID)
 	}
 	byCandidate := make(map[string]groupAttempt)
-	for _, v := range r.outcomes {
+	for _, id := range r.byGroup[groupID] {
+		v, ok := r.outcomes[id]
+		if !ok {
+			continue
+		}
 		rf := v.Resources
 		if !rf.Speculative || rf.VerificationGroupID != groupID {
 			continue

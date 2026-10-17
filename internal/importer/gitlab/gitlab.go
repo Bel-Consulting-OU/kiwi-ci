@@ -110,9 +110,10 @@ func (i *Importer) Import(src string) (*importer.Result, error) {
 		}
 	}
 	sort.Strings(jobNames)
+	docMap := importer.Mapping(doc)
 	stageOf := map[string]string{}
 	for _, name := range jobNames {
-		stageOf[name] = importer.StrScalar(importer.Key(importer.Mapping(doc)[name], "stage"))
+		stageOf[name] = importer.StrScalar(importer.Key(docMap[name], "stage"))
 	}
 	if len(stageOrder) == 0 {
 		// Derive stage order from first-seen job order.
@@ -148,7 +149,7 @@ func (i *Importer) Import(src string) (*importer.Result, error) {
 	}
 
 	for _, name := range jobNames {
-		jobNode := importer.Mapping(doc)[name]
+		jobNode := docMap[name]
 		j := convertJob(res, jobNode, name, defaultImage, ids)
 		// Implicit needs: all jobs in earlier stages.
 		explicitNeeds := importer.Key(jobNode, "needs")

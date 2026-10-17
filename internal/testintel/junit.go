@@ -837,6 +837,7 @@ func AggregateMasked(workspace string, patterns []string, mask func(string) stri
 		}
 	}
 	out := model.TestReport{}
+	var paths []string
 	for _, rel := range files {
 		f, _, err := openReport(root, rel)
 		if err != nil {
@@ -847,11 +848,7 @@ func AggregateMasked(workspace string, patterns []string, mask func(string) stri
 		if err != nil {
 			return model.TestReport{}, err
 		}
-		if out.Path == "" {
-			out.Path = rel
-		} else {
-			out.Path += ", " + rel
-		}
+		paths = append(paths, rel)
 		out.Tests += rep.Tests
 		out.Failures += rep.Failures
 		out.Errors += rep.Errors
@@ -870,6 +867,7 @@ func AggregateMasked(workspace string, patterns []string, mask func(string) stri
 			out.Cases = append(out.Cases, r)
 		}
 	}
+	out.Path = strings.Join(paths, ", ")
 	// Job-level budget sanitization, the same sanitize-not-reject policy as
 	// finalizeSuite/finalizeReport: each file's totals were clamped already,
 	// but a job sums many files, so the declared counters are clamped into

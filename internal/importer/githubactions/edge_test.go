@@ -351,7 +351,9 @@ func TestConvertJobMissingDefinition(t *testing.T) {
 	}
 	jobs := importer.Key(importer.Document(&root), "jobs")
 	res := &importer.Result{}
-	j := convertJob(res, jobs, "absent", map[string]string{})
+	// convertJob takes the job node directly (the caller looks the name up
+	// in the precomputed jobs map). A missing definition is a nil node.
+	j := convertJob(res, importer.Mapping(jobs)["absent"], "absent", map[string]string{})
 	if j.Needs != nil || len(j.Steps) != 0 {
 		t.Fatalf("convertJob(absent) = %+v", j)
 	}

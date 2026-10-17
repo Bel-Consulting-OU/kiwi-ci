@@ -91,7 +91,7 @@ func (i *Importer) Import(src string) (*importer.Result, error) {
 		ids[name] = importer.SanitizeID(name, taken)
 	}
 	for _, name := range keys {
-		job := convertJob(res, importer.Key(doc, "jobs"), name, ids)
+		job := convertJob(res, jobs[name], name, ids)
 		spec.Jobs[ids[name]] = job
 		supported++
 	}
@@ -187,8 +187,7 @@ func triggerFrom(cfg *yaml.Node) pipeline.Trigger {
 
 // convertJob converts one job node. ids is the precomputed name→sanitized-id
 // map so needs references resolve consistently regardless of order.
-func convertJob(res *importer.Result, jobsNode *yaml.Node, name string, ids map[string]string) pipeline.Job {
-	jobNode := importer.Key(jobsNode, name)
+func convertJob(res *importer.Result, jobNode *yaml.Node, name string, ids map[string]string) pipeline.Job {
 	j := pipeline.Job{Name: name}
 	if jobNode == nil {
 		res.AddWarning("job %q has no definition", name)

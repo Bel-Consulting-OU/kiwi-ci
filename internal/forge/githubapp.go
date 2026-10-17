@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,19 +55,23 @@ func (a *App) pruneCacheLocked(now time.Time) {
 			delete(a.cache, k)
 		}
 	}
-	for len(a.cache) > maxCachedInstallationTokens {
-		var victim string
-		var victimExp time.Time
-		first := true
-		for k, c := range a.cache {
-			if first || c.expiresAt.Before(victimExp) {
-				victim, victimExp, first = k, c.expiresAt, false
-			}
-		}
-		if first {
-			break
-		}
-		delete(a.cache, victim)
+	// One ranking pass then delete the oldest victims: scanning for a min
+	// on every eviction was O(cap²) when a burst pushed the cache over.
+	if len(a.cache) <= maxCachedInstallationTokens {
+		return
+	}
+	type entry struct {
+		key string
+		exp time.Time
+	}
+	all := make([]entry, 0, len(a.cache))
+	for k, c := range a.cache {
+		all = append(all, entry{key: k, exp: c.expiresAt})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].exp.Before(all[j].exp) })
+	over := len(a.cache) - maxCachedInstallationTokens
+	for i := 0; i < over && i < len(all); i++ {
+		delete(a.cache, all[i].key)
 	}
 }
 

@@ -59,8 +59,9 @@ func (i *Importer) Import(src string) (*importer.Result, error) {
 	for _, name := range jobNames {
 		ids[name] = importer.SanitizeID(name, taken)
 	}
+	jobMap := importer.Mapping(jobsNode)
 	for _, name := range jobNames {
-		j := convertJob(res, importer.Mapping(jobsNode)[name], name)
+		j := convertJob(res, jobMap[name], name)
 		spec.Jobs[ids[name]] = j
 		supported++
 	}

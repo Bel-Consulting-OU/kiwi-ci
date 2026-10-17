@@ -308,8 +308,10 @@ func topoOrder(jobs map[string]pipeline.Job, idIndex map[string]int) []string {
 			ready = append(ready, id)
 		}
 	}
-	out := make([]string, 0, len(jobs))
-	for len(ready) > 0 {
+	// Insert-sorted ready list: each pop is O(1) from the front and each
+	// new node is inserted in idIndex order. Re-sorting the whole ready set
+	// on every pop was O(V² log V) on wide graphs.
+	sortReady := func() {
 		sort.SliceStable(ready, func(a, b int) bool {
 			ia, ib := idIndex[ready[a]], idIndex[ready[b]]
 			if ia != ib {
@@ -317,27 +319,43 @@ func topoOrder(jobs map[string]pipeline.Job, idIndex map[string]int) []string {
 			}
 			return ready[a] < ready[b]
 		})
+	}
+	sortReady()
+	out := make([]string, 0, len(jobs))
+	for len(ready) > 0 {
 		id := ready[0]
 		ready = ready[1:]
 		out = append(out, id)
+		inserted := false
 		for _, dep := range reverse[id] {
 			indeg[dep]--
-			if indeg[dep] == 0 {
-				ready = append(ready, dep)
+			if indeg[dep] != 0 {
+				continue
 			}
-		}
-	}
-	// Cycles cannot occur (pipeline.Parse rejects them) but never drop jobs.
-	if len(out) < len(jobs) {
-		for _, id := range ids {
-			found := false
-			for _, o := range out {
-				if o == id {
-					found = true
+			// Keep ready ordered by idIndex without a full re-sort.
+			pos := len(ready)
+			for i, existing := range ready {
+				if idIndex[dep] < idIndex[existing] ||
+					(idIndex[dep] == idIndex[existing] && dep < existing) {
+					pos = i
 					break
 				}
 			}
-			if !found {
+			ready = append(ready, "")
+			copy(ready[pos+1:], ready[pos:])
+			ready[pos] = dep
+			inserted = true
+		}
+		_ = inserted
+	}
+	// Cycles cannot occur (pipeline.Parse rejects them) but never drop jobs.
+	if len(out) < len(jobs) {
+		present := make(map[string]bool, len(out))
+		for _, o := range out {
+			present[o] = true
+		}
+		for _, id := range ids {
+			if !present[id] {
 				out = append(out, id)
 			}
 		}
