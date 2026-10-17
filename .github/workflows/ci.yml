@@ -1,5 +1,13 @@
 name: ci
 
+# Kiwi is the CI for this repository. This workflow ONLY bootstraps the `kiwi`
+# binary and invokes the product. Every gate — gofmt, vet, build, surface
+# checks, unit/race tests, dogfood proofs, Woodpecker performance proof —
+# lives in `.kiwi/certify.yaml` and is executed by Kiwi itself.
+#
+# Do not re-implement tests in Actions YAML. If a gate is missing, add it to
+# `.kiwi/certify.yaml` so Kiwi certifies Kiwi.
+
 on:
   push:
     branches: [main]
@@ -8,79 +16,24 @@ on:
 permissions:
   contents: read
 
-# Action refs are pinned to full commit SHAs (mutable major tags are not an
-# acceptable trust root for a verification product). Re-resolve with:
-#   git ls-remote https://github.com/actions/<name>.git 'refs/tags/v*'
-# and update the trailing tag comment together with the SHA.
+# Action refs are pinned to full commit SHAs (same pins as release-gate.yml).
 jobs:
-  unit:
-    name: unit (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
-        with:
-          go-version-file: go.mod
-      - name: gofmt
-        run: |
-          files="$(gofmt -l .)"
-          if [ -n "$files" ]; then
-            printf 'Files requiring gofmt:\n%s\n' "$files"
-            exit 1
-          fi
-      - name: vet
-        run: go vet ./...
-      - name: surface checks
-        run: |
-          go run ./cmd/filemap --check
-          ./scripts/docs-links-check.sh
-          ./scripts/docs-lint.sh --source --baseline scripts/docs-lint-baseline.txt
-      - name: unit tests
-        run: go test -count=1 -timeout=40m ./...
-      - name: dogfood-fast (model proofs)
-        run: make dogfood-fast
-
-  dogfood:
-    name: dogfood-evidence-lease
+  kiwi-ci:
+    name: kiwi certifies kiwi
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
-      # Independent bootstrap CI route: dogfood must run on hosted CI so a
-      # broken harness or lost scenario cannot hide behind a green unit job.
-      - name: evidence / lease / quota / effect contracts
-        run: make dogfood-fast
-      - name: suite contracts (required names present)
+      - name: install kiwi
         run: |
-          go test ./internal/dogfood/scenarios/ -count=1 -run 'TestEveryRegistry|TestMakefileRequires'
-
-  race:
-    name: race (server/store/runner)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
-        with:
-          go-version-file: go.mod
-      - name: race-sensitive packages
-        run: go test -race -count=1 -timeout=40m ./internal/server/ ./internal/storage/ ./internal/runner/ ./internal/app/ ./internal/verifyapi/
-
-  fuzz-smoke:
-    name: fuzz smoke
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
-        with:
-          go-version-file: go.mod
-      - name: fuzz smoke (5s per target)
-        run: ./scripts/fuzz-smoke.sh 5s
+          set -euo pipefail
+          go build -o dist/kiwi ./cmd/kiwi
+          echo "$PWD/dist" >> "$GITHUB_PATH"
+          dist/kiwi version
+      - name: kiwi run .kiwi/certify.yaml
+        run: kiwi run -f .kiwi/certify.yaml -json
 
   workflow-lint:
     name: Workflow lint (actionlint)

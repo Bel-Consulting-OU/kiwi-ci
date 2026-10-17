@@ -2,6 +2,7 @@ package perf
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -257,6 +258,12 @@ func BenchmarkKiwiScheduleWide(b *testing.B) {
 //     class yaml.Unmarshal does not. It may be slower; it must stay within
 //     2× so validation is not an order-of-magnitude tax.
 func TestKiwiControlPlaneNotSlowerThanWoodpeckerClass(t *testing.T) {
+	// Timing gates need a quiet machine. They run in the dedicated proofs
+	// job (KIWI_PROOF=1), not on every `go test ./...` under parallel load
+	// where 2× budgets flake for reasons unrelated to the product.
+	if os.Getenv("KIWI_PROOF") == "" {
+		t.Skip("set KIWI_PROOF=1 to run the Woodpecker-class timing proof (see .kiwi/certify.yaml proofs)")
+	}
 	// --- 1. schedule ---
 	wpG, err := woodpeckerClassParse(wpDAG)
 	if err != nil {
@@ -392,6 +399,9 @@ func timeNanos(fn func(b *testing.B)) int64 {
 // Woodpecker-class agent would do for the same filter. Kiwi must not lose
 // on a realistic expression.
 func TestKiwiConditionEvalNotSlowerThanWoodpeckerClass(t *testing.T) {
+	if os.Getenv("KIWI_PROOF") == "" {
+		t.Skip("set KIWI_PROOF=1 to run the Woodpecker-class timing proof (see .kiwi/certify.yaml proofs)")
+	}
 	expr := "branch == 'main' && event == 'push'"
 	ctx := pipeline.EvalContext{Branch: "main", Event: "push", Status: "success"}
 	wp := timeNanos(func(b *testing.B) {

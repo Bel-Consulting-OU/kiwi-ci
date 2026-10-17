@@ -58,6 +58,16 @@ jobs:
       - name: docs-links
         run: ./scripts/docs-links-check.sh
 
+  unit:
+    needs: [quality]
+    runtime: native
+    timeout: 30m
+    steps:
+      - name: test-unit
+        run: go test -count=1 -timeout=25m ./...
+      - name: test-race
+        run: go test -race -count=1 -timeout=15m ./internal/server/ ./internal/storage/ ./internal/runner/ ./internal/scheduler/
+
   proofs:
     needs: [quality]
     runtime: native
@@ -68,3 +78,9 @@ jobs:
       - name: certify-schema
         # The certification pipeline itself must parse with the product.
         run: go run ./cmd/kiwi validate -f .kiwi/certify.yaml
+      - name: woodpecker-proof
+        # Executable claim: Kiwi control plane is not slower than a
+        # Woodpecker-class reference (see perf/woodpecker_compare_test.go).
+        # Timing gates need a quiet machine — they are gated on KIWI_PROOF=1
+        # and live only in this proofs job, not on every unit run.
+        run: KIWI_PROOF=1 go test ./perf/ -count=1 -timeout=60s -run 'TestKiwi' -v

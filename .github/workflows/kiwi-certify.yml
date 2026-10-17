@@ -27,10 +27,14 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
-      - name: build kiwi
-        run: go build -o dist/kiwi ./cmd/kiwi
+      - name: install kiwi
+        run: |
+          set -euo pipefail
+          go build -o dist/kiwi ./cmd/kiwi
+          echo "$PWD/dist" >> "$GITHUB_PATH"
+          dist/kiwi version
       - name: kiwi certifies kiwi
-        run: ./dist/kiwi run -f .kiwi/certify.yaml -json
+        run: kiwi run -f .kiwi/certify.yaml -json
       - name: publish certification status
         if: always()
         env:
