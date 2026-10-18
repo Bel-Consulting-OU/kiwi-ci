@@ -198,6 +198,15 @@ admit the new status (`failure()`, `always()`, ...) still run. After
 cancellation, only steps that explicitly admit the cancelled state run,
 under a 60-second cleanup budget.
 
+### Job environment
+
+Every job receives `KIWI_GIT_SHA`, `KIWI_GIT_REF`, `KIWI_GIT_BRANCH`,
+`KIWI_REPO`, `KIWI_REPO_FULL` and `KIWI_WORKSPACE`, plus the legacy names
+imported scripts already use: `CI=true`, `CI_COMMIT_SHA`,
+`CI_COMMIT_REF`, `CI_COMMIT_BRANCH`, `CI_REPO`, `CI_REPO_NAME` and
+`CI_WORKSPACE` (the job workspace root — the container `$PWD` when the
+step runs at the workspace root).
+
 Shell resolution order: step `shell` > job `shell` > `defaults.shell` >
 per-runtime default (`sh` for containers, `bash` for Tart, `pwsh` on
 native Windows, `bash` otherwise). Allowed names: `bash`, `sh`, `zsh`,

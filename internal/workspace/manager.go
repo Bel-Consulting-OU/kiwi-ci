@@ -199,6 +199,7 @@ func removeWorktree(source, target string) {
 // filled the disk. Jobs rebuild from source.
 var copyTreeSkipDirs = map[string]bool{
 	"target":        true, // cargo/rustc
+	"dist":          true, // release output (tracked assets are kept)
 	"node_modules":  true,
 	"__pycache__":   true,
 	".venv":         true,
@@ -208,6 +209,36 @@ var copyTreeSkipDirs = map[string]bool{
 	".pytest_cache": true,
 	".ruff_cache":   true,
 	".cache":        true,
+}
+
+
+// isGitTracked reports whether exactly this path is in the git index.
+func isGitTracked(src, rel string) bool {
+	cmd := exec.Command("git", "-C", src, "ls-files", "--error-unmatch", "--", rel)
+	return cmd.Run() == nil
+}
+
+
+// isSkipRoot reports whether rel is exactly one of the kept skip roots
+// (those must stay so the walk can reach tracked children).
+func isSkipRoot(roots []string, rel string) bool {
+	for _, root := range roots {
+		if rel == root {
+			return true
+		}
+	}
+	return false
+}
+
+// inPreservedSkip reports whether rel is inside one of the kept skip-name
+// directories (whose tracked files must survive the snapshot).
+func inPreservedSkip(roots []string, rel string) bool {
+	for _, root := range roots {
+		if rel == root || strings.HasPrefix(rel, root+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 // hasTrackedFiles reports whether any path under rel is tracked by git in
@@ -235,6 +266,7 @@ func copyTree(src, dst string) error {
 	if err != nil {
 		return err
 	}
+	var preserveTrackedUnder []string
 	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -256,12 +288,25 @@ func copyTree(src, dst string) error {
 		}
 		if info.IsDir() && copyTreeSkipDirs[info.Name()] {
 			// A skip-name directory that carries TRACKED paths is source
-			// (tools/redteam/target is the canonical collision). Keep it.
-			// Untracked build output is still omitted.
+			// (tools/redteam/target, dist/ release assets). Keep only the
+			// tracked subtree; untracked build output inside it is omitted.
 			if hasTrackedFiles(src, rel) {
-				// fall through and copy
+				preserveTrackedUnder = append(preserveTrackedUnder, rel)
 			} else {
 				return filepath.SkipDir
+			}
+		}
+		// Inside a kept skip-name directory, copy only git-tracked paths.
+		// The root itself always stays so the walk reaches its children.
+		// Directories stay if they hold tracked descendants (a bare dir is
+		// not in the index; its files are).
+		if inPreservedSkip(preserveTrackedUnder, rel) && !isSkipRoot(preserveTrackedUnder, rel) {
+			if info.IsDir() {
+				if !hasTrackedFiles(src, rel) {
+					return filepath.SkipDir
+				}
+			} else if !isGitTracked(src, rel) {
+				return nil
 			}
 		}
 		cacheRel := filepath.Join(".kiwi", "cache")
@@ -278,7 +323,7 @@ func copyTree(src, dst string) error {
 			if err != nil {
 				return err
 			}
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			if err := mkdirParents(filepath.Dir(target), info.Mode().Perm()); err != nil {
 				return err
 			}
 			return os.Symlink(link, target)
@@ -312,13 +357,44 @@ func stripBuildOutputDirs(root, source string) {
 	})
 }
 
+// mkdirParents creates missing parent directories using the source entry's
+// permission bits instead of forcing 0755. Forcing a mode is a silent
+// normalization: tracked files that are 0644/0664/0755 stay as they are in
+// the checkout, and the deletion guard no longer sees phantom mode diffs.
+func mkdirParents(dir string, mode os.FileMode) error {
+	if dir == "" || dir == "." {
+		return nil
+	}
+	perm := mode.Perm()
+	if perm == 0 {
+		perm = 0o755
+	}
+	// Build the path from the root so every missing component gets the same
+	// source-derived mode; existing directories are left untouched.
+	parts := strings.Split(dir, string(filepath.Separator))
+	cur := ""
+	if filepath.IsAbs(dir) {
+		cur = string(filepath.Separator)
+	}
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		cur = filepath.Join(cur, part)
+		if err := os.MkdirAll(cur, perm); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func copyFile(src, dst string, mode os.FileMode) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+	if err := mkdirParents(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)

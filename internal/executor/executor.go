@@ -686,6 +686,16 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	jobEnv["KIWI_REPO"] = e.Opt.RepoURL
 	jobEnv["KIWI_REPO_FULL"] = e.Opt.RepoFullName
 	jobEnv["KIWI_WORKSPACE"] = workspace
+	// Legacy CI_* names so imported Woodpecker/Drone/GitLab scripts run
+	// unmodified. CI_WORKSPACE is the job workspace (the container's $PWD
+	// when the step runs at the workspace root).
+	jobEnv["CI"] = "true"
+	jobEnv["CI_COMMIT_BRANCH"] = e.Opt.Branch
+	jobEnv["CI_COMMIT_REF"] = e.Opt.GitRef
+	jobEnv["CI_COMMIT_SHA"] = e.Opt.GitSHA
+	jobEnv["CI_WORKSPACE"] = workspace
+	jobEnv["CI_REPO"] = e.Opt.RepoFullName
+	jobEnv["CI_REPO_NAME"] = e.Opt.RepoFullName
 	// Cache-definition ceiling (defense in depth): an untrusted job can
 	// reach the executor through paths that skipped enqueue admission
 	// (generated fragments), and every entry is an independent archive/key,
