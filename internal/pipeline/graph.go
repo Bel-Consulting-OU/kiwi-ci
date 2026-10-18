@@ -410,6 +410,8 @@ func InterpolateWithInputs(s string, m map[string]string, inputs map[string]stri
 		return unescapeHoleOpeners(s)
 	}
 	c := expr.Context{Matrix: m, Inputs: inputs}
+	// Compile-time interpolation is matrix/inputs only. git.* is resolved at
+	// execution time (InterpolateGit) so the SHA/ref are the real ones.
 	allowed := map[string]bool{"matrix": true}
 	if inputs != nil {
 		allowed["inputs"] = true
@@ -639,6 +641,22 @@ func jobMayHaveHoles(j Job) bool {
 // needs/steps output maps ("job.outputs.name" keys); holes that do not
 // resolve (missing outputs, other contexts such as env) stay literal, which
 // matches the previous ReplaceAll-based behavior.
+// InterpolateGit resolves ${{ git.* }} / ${{ branch }} / ${{ sha }} / ${{ ref }}
+// holes in a runtime string. Used for step run texts so imported scripts can
+// use the same names as GitHub Actions without re-deriving the SHA.
+func InterpolateGit(v string, c expr.Context) string {
+	if !strings.Contains(v, "${{") {
+		return v
+	}
+	v = escapeHoleOpeners(v)
+	holes, err := expr.Holes(v)
+	if err != nil || len(holes) == 0 {
+		return unescapeHoleOpeners(v)
+	}
+	allowed := map[string]bool{"git": true, "branch": true, "ref": true, "sha": true, "repo": true, "event": true}
+	return unescapeHoleOpeners(interpolateLenient(v, holes, c, allowed))
+}
+
 func InterpolateOutputs(v string, needs, steps map[string]map[string]string) string {
 	if !strings.Contains(v, "${{") {
 		return v

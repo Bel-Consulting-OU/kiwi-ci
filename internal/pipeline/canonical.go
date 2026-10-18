@@ -161,6 +161,7 @@ type canonicalJob struct {
 type canonicalService struct {
 	Name        string            `json:"name"`
 	Image       string            `json:"image"`
+	Command     []string          `json:"command,omitempty"`
 	Env         orderedMap        `json:"env,omitempty"`
 	Healthcheck string            `json:"healthcheck,omitempty"`
 	Interval    canonicalDuration `json:"interval,omitempty"`
@@ -225,7 +226,8 @@ func canonicalJobOf(j Job) canonicalJob {
 	for i := range j.Services {
 		c.Services[i] = canonicalService{
 			Name: j.Services[i].Name, Image: j.Services[i].Image,
-			Env: pairs(j.Services[i].Env), Healthcheck: j.Services[i].Healthcheck,
+			Command: j.Services[i].Command,
+			Env:     pairs(j.Services[i].Env), Healthcheck: j.Services[i].Healthcheck,
 			Interval: durOf(j.Services[i].Interval), Timeout: durOf(j.Services[i].Timeout),
 			Retries: j.Services[i].Retries, RetriesSet: j.Services[i].RetriesSet,
 		}

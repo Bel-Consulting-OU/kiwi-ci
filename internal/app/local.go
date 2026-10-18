@@ -103,13 +103,16 @@ func RunLocal(ctx context.Context, args []string) error {
 	masker := &secrets.Masker{}
 	logs := &logging.Console{Writer: os.Stdout, Masker: masker}
 	provider := secrets.Chain{secrets.EnvProvider{Prefix: "KIWI_SECRET_"}, secrets.MacKeychainProvider{Service: "kiwi-ci"}}
-	opts := executor.Options{Workspace: wd, WorkspaceFor: func(jobID string) (string, func(), error) { return wm.Prepare(ctx, jobID) }, RunID: runID, MaxParallel: *parallel, OnlyJob: *job, ChangedFiles: detectChangedFilesOpts(wd, *base, *head, *mergeBase, *changedFile), SecretProvider: provider, Logs: logs,
+	repoURL, repoFullName := detectGitRepo(wd)
+	opts := executor.Options{Workspace: wd, WorkspaceFor: func(jobID string) (string, func(), error) { return wm.Prepare(ctx, jobID) }, RunID: runID, MaxParallel: *parallel, OnlyJob: *job, ChangedFiles: detectChangedFilesOpts(wd, *base, *head, *mergeBase, *changedFile), SecretProvider: provider, Logs: logs, RepoURL: repoURL, RepoFullName: repoFullName,
 		// Local parity: job conditions evaluate against the same branch and
 		// event context `kiwi explain --why` uses (the git-detected branch,
 		// push event), so a branch/event condition cannot silently diverge
 		// between explain, local runs and the control plane.
 		Branch: detectCurrentBranch(wd),
 		Event:  "push",
+		GitSHA: detectGitSHA(wd),
+		GitRef: detectGitRef(wd),
 		// Declared dependency downloads are restored from this run's local
 		// artifact store (the distributed runner restores them through the
 		// control plane).

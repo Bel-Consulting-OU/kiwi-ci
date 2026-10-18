@@ -45,6 +45,9 @@ func (i *Importer) Import(src string) (*importer.Result, error) {
 	if err := yaml.Unmarshal([]byte(src), &root); err != nil {
 		return nil, fmt.Errorf("parse .woodpecker.yml: %w", err)
 	}
+	// Expand anchors/aliases/merge keys before walking: repeated matrix
+	// steps that share an anchor otherwise import as empty.
+	importer.ExpandYAML(&root)
 	if root.Kind == yaml.DocumentNode && len(root.Content) > 1 {
 		res.AddUnsupported("multi-workflow documents (multiple YAML documents in one file) are not converted; import one workflow per file")
 	}
@@ -175,8 +178,12 @@ func (i *Importer) Import(src string) (*importer.Result, error) {
 		globalWorkspace, haveWorkspace = workspaceFromNode(res, ws)
 	}
 
-	for idx, s := range steps {
-		j := convertStepBlock(res, s.node, s.name)
+	// Woodpecker steps share one workspace; Kiwi jobs are isolated. A serial
+	// workflow (no depends_on) that passes files between steps therefore has
+	// to be ONE Kiwi job with several steps — the exact mapping the reference
+	// deployments use. DAG workflows keep one job per step; those need
+	// artifacts (or a manual merge) when steps pass files.
+	applyJobChrome := func(j pipeline.Job) pipeline.Job {
 		if haveClone {
 			j.Clone = globalClone
 		}
@@ -207,60 +214,104 @@ func (i *Importer) Import(src string) (*importer.Result, error) {
 		if len(sharedVolumes) > 0 {
 			j.Volumes = append(j.Volumes, sharedVolumes...)
 		}
-		spec.Jobs[ids[s.name]] = j
-		supported++
-		_ = idx
+		return j
+	}
+
+	if !dagMode && len(steps) > 1 {
+		// Merge the serial chain into one job so file passing survives the
+		// isolated workspace. The job is named after the first step; later
+		// steps contribute their commands as additional step blocks.
+		merged := convertStepBlock(res, steps[0].node, steps[0].name)
+		// Per-step when filters become step-level if: the merged job runs
+		// once, and each step still honors its own branch/event gate.
+		liftWhenToSteps(&merged)
+		for _, s := range steps[1:] {
+			part := convertStepBlock(res, s.node, s.name)
+			liftWhenToSteps(&part)
+			// Prefer the first image that carries one; a mixed-image serial
+			// chain is reported (Kiwi job runtime is one image).
+			if merged.Image == "" && part.Image != "" {
+				merged.Image = part.Image
+				merged.Runtime = part.Runtime
+			} else if part.Image != "" && part.Image != merged.Image {
+				res.AddUnsupported("step %q image %q differs from merged job image %q; split the workflow or pin one image", s.name, part.Image, merged.Image)
+			}
+			merged.Steps = append(merged.Steps, part.Steps...)
+			for k, v := range part.Env {
+				if merged.Env == nil {
+					merged.Env = map[string]string{}
+				}
+				if _, exists := merged.Env[k]; !exists {
+					merged.Env[k] = v
+				}
+			}
+			if len(part.Needs) > 0 {
+				res.AddUnsupported("step %q depends_on inside a serial merge is not converted", s.name)
+			}
+		}
+		merged = applyJobChrome(merged)
+		id := ids[steps[0].name]
+		spec.Jobs[id] = merged
+		supported += len(steps)
+		res.AddMapped("serial steps (no depends_on) → one job with N steps (shared Woodpecker workspace preserved)")
+	} else {
+		for idx, s := range steps {
+			j := convertStepBlock(res, s.node, s.name)
+			j = applyJobChrome(j)
+			spec.Jobs[ids[s.name]] = j
+			supported++
+			_ = idx
+		}
 	}
 
 	// Second pass resolves depends_on (or the serial chain) once all ids exist.
-	for idx, s := range steps {
-		j := spec.Jobs[ids[s.name]]
-		deps := importer.Key(s.node, "depends_on")
-		if deps != nil {
-			names, optional := dependsOnEntries(res, deps, s.name)
-			// Membership set: appendUnique's linear scan made a step with d
-			// depends_on O(d²) on the Needs slice.
-			needSet := make(map[string]bool, len(j.Needs)+len(names))
-			for _, id := range j.Needs {
-				needSet[id] = true
-			}
-			for _, dep := range names {
-				id, ok := ids[dep]
-				if !ok {
-					res.AddUnsupported("step %q: depends_on %q names no step in this workflow (cross-workflow dependencies are not converted)", s.name, dep)
-					continue
+	// A merged serial workflow has a single job and no cross-job edges.
+	if !(!dagMode && len(steps) > 1) {
+		for idx, s := range steps {
+			j := spec.Jobs[ids[s.name]]
+			deps := importer.Key(s.node, "depends_on")
+			if deps != nil {
+				names, optional := dependsOnEntries(res, deps, s.name)
+				// Membership set: appendUnique's linear scan made a step with d
+				// depends_on O(d²) on the Needs slice.
+				needSet := make(map[string]bool, len(j.Needs)+len(names))
+				for _, id := range j.Needs {
+					needSet[id] = true
 				}
-				if needSet[id] {
-					continue
+				for _, dep := range names {
+					id, ok := ids[dep]
+					if !ok {
+						res.AddUnsupported("step %q: depends_on %q names no step in this workflow (cross-workflow dependencies are not converted)", s.name, dep)
+						continue
+					}
+					if needSet[id] {
+						continue
+					}
+					needSet[id] = true
+					j.Needs = append(j.Needs, id)
 				}
-				needSet[id] = true
-				j.Needs = append(j.Needs, id)
-			}
-			if optional && len(names) > 0 {
-				// Optional depends_on: the dependent must still run when the
-				// dependency is skipped/failed. Kiwi expresses that as the
-				// need (graph order) plus always() — which bypasses the
-				// implicit success() dependency gate. An EXISTING when
-				// condition is AND-ed, not OR-ed: `(orig) || always()` is
-				// unconditionally true and erases branch/event filters.
-				if j.If == "" {
-					j.If = "always()"
-					res.AddMapped("step %q optional depends_on → needs + if: always()", s.name)
-				} else {
-					j.If = "always() && (" + j.If + ")"
-					res.AddMapped("step %q optional depends_on → needs + if: always() && (orig)", s.name)
+				if optional && len(names) > 0 {
+					// Optional depends_on: the dependent must still run when the
+					// dependency is skipped/failed. Kiwi expresses that as the
+					// need (graph order) plus always() — which bypasses the
+					// implicit success() dependency gate. An EXISTING when
+					// condition is AND-ed, not OR-ed: `(orig) || always()` is
+					// unconditionally true and erases branch/event filters.
+					if j.If == "" {
+						j.If = "always()"
+						res.AddMapped("step %q optional depends_on → needs + if: always()", s.name)
+					} else {
+						j.If = "always() && (" + j.If + ")"
+						res.AddMapped("step %q optional depends_on → needs + if: always() && (orig)", s.name)
+					}
 				}
+			} else if !dagMode && idx > 0 {
+				// Serial mode: preserve Woodpecker's definition-order chain.
+				prev := ids[steps[idx-1].name]
+				j.Needs = appendUnique(j.Needs, prev)
 			}
-		} else if !dagMode && idx > 0 {
-			// Serial mode: preserve Woodpecker's definition-order chain.
-			prev := ids[steps[idx-1].name]
-			j.Needs = appendUnique(j.Needs, prev)
+			spec.Jobs[ids[s.name]] = j
 		}
-		spec.Jobs[ids[s.name]] = j
-	}
-	if !dagMode && len(steps) > 1 {
-		res.AddMapped("sequential steps (no depends_on) → chained needs edges in definition order")
-		supported++
 	}
 	if hasSecretRefs(steps) {
 		res.AddMapped("secret references → step.secrets (values provisioned in the Kiwi secret store, like Woodpecker project settings); registry credentials map to job.registries")
@@ -413,9 +464,11 @@ func convertServices(res *importer.Result, n *yaml.Node) ([]pipeline.Service, bo
 		if priv, found := importer.BoolScalar(importer.Key(s.node, "privileged")); found && priv {
 			res.AddMapped("service %q privileged → trusted-only sandbox capability (untrusted jobs refused)", s.name)
 		}
-		if importer.Key(s.node, "commands") != nil {
-			res.AddUnsupported("service %q: commands (e.g. custom dockerd entrypoints) are not converted", s.name)
-			ok = false
+		if cmds := importer.Key(s.node, "commands"); cmds != nil {
+			// Custom service entrypoints (dockerd, redis with flags, ...)
+			// become the service command Kiwi passes after the image.
+			svc.Command = importer.SeqScalars(cmds)
+			res.AddMapped("service %q commands → services[].command", s.name)
 		}
 		out = append(out, svc)
 	}
@@ -546,6 +599,43 @@ func convertWorkspace(res *importer.Result, n *yaml.Node, _ *pipeline.Spec) int 
 	return 1
 }
 
+// liftWhenToSteps moves a job-level If (from a Woodpecker step `when`) onto
+// every step of the job so a serial merge keeps per-step gates.
+func liftWhenToSteps(j *pipeline.Job) {
+	if j.If == "" {
+		return
+	}
+	for i := range j.Steps {
+		if j.Steps[i].If == "" {
+			j.Steps[i].If = j.If
+		} else {
+			j.Steps[i].If = "(" + j.If + ") && (" + j.Steps[i].If + ")"
+		}
+	}
+	j.If = ""
+}
+
+// normalizeWoodpeckerDollars rewrites Woodpecker's $$ literal-dollar escape to
+// a single $ so the generated pipeline does not hand the shell a PID token.
+// A run of N dollars becomes N/2 dollars (Woodpecker semantics).
+func normalizeWoodpeckerDollars(s string) string {
+	if !strings.Contains(s, "$$") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if s[i] == '$' && i+1 < len(s) && s[i+1] == '$' {
+			b.WriteByte('$')
+			i += 2
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
 // convertStepBlock converts one Woodpecker step (job) block.
 func convertStepBlock(res *importer.Result, node *yaml.Node, name string) pipeline.Job {
 	j := pipeline.Job{Name: name}
@@ -566,7 +656,11 @@ func convertStepBlock(res *importer.Result, node *yaml.Node, name string) pipeli
 		j.Env = convertEnvironment(res, env, name)
 	}
 	if cmds := importer.Key(node, "commands"); cmds != nil {
-		j.Steps = append(j.Steps, pipeline.Step{Name: "commands", Run: strings.Join(importer.SeqScalars(cmds), "\n")})
+		// Woodpecker's $$ is a literal-dollar escape. Kiwi hands the script to
+		// the shell unchanged, where $$ is the shell PID — so the importer
+		// normalizes $$ to a single $ (and $$$ to $$, and so on) at import time.
+		run := normalizeWoodpeckerDollars(strings.Join(importer.SeqScalars(cmds), "\n"))
+		j.Steps = append(j.Steps, pipeline.Step{Name: "commands", Run: run})
 		res.AddMapped("step %q commands → steps[].run", name)
 	}
 	if dir := importer.StrScalar(importer.Key(node, "directory")); dir != "" {

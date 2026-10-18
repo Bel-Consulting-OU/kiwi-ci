@@ -1,6 +1,7 @@
 package woodpecker
 
 import (
+	"sort"
 	"strings"
 	"testing"
 
@@ -193,10 +194,19 @@ func TestImportWhenBranchScalarGlobAndInjection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generated pipeline does not parse: %v\n%s", err, res.PipelineYAML)
 	}
-	if got := spec.Jobs["scalar"].If; got != "branch == 'main'" {
+	// Serial steps merge into one job (shared workspace); each step keeps
+	// its own when gate as step-level if.
+	merged, ok := spec.Jobs["scalar"]
+	if !ok {
+		t.Fatalf("merged job missing: %v", keysOf(spec.Jobs))
+	}
+	if len(merged.Steps) != 2 {
+		t.Fatalf("merged steps = %d, want 2", len(merged.Steps))
+	}
+	if got := merged.Steps[0].If; got != "branch == 'main'" {
 		t.Fatalf("scalar branch if = %q", got)
 	}
-	glob := spec.Jobs["glob"].If
+	glob := merged.Steps[1].If
 	if glob != "branchMatch('release/*')" {
 		t.Fatalf("glob branch if = %q", glob)
 	}
@@ -336,4 +346,13 @@ func TestOptionalDependsOnPreservesExistingWhen(t *testing.T) {
 	if !okIf {
 		t.Fatalf("if=%q must be true on main even when the optional dep failed", test.If)
 	}
+}
+
+func keysOf(m map[string]pipeline.Job) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

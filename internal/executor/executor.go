@@ -18,6 +18,7 @@ import (
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/artifact"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/cache"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/expr"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/logging"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
@@ -81,6 +82,12 @@ type Options struct {
 	OnlyStep         string
 	Event            string
 	Branch           string
+	// Git identity for jobs: SHA/ref/repo. Exposed as KIWI_GIT_*
+	// env and ${{ git.* }} so imported scripts need not re-derive them.
+	GitSHA           string
+	GitRef           string
+	RepoURL          string
+	RepoFullName     string
 	ChangedFiles     []string
 	SecretProvider   secrets.Provider
 	Logs             logging.Sink
@@ -671,6 +678,14 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	jobEnv["KIWI"] = "true"
 	jobEnv["KIWI_RUN_ID"] = e.Opt.RunID
 	jobEnv["KIWI_JOB_ID"] = cj.ID
+	// Git metadata for jobs (migration gap: imported scripts expect
+	// GITHUB_SHA/GITHUB_REF-style values). Also mirrored as ${{ git.* }}.
+	jobEnv["KIWI_GIT_BRANCH"] = e.Opt.Branch
+	jobEnv["KIWI_GIT_REF"] = e.Opt.GitRef
+	jobEnv["KIWI_GIT_SHA"] = e.Opt.GitSHA
+	jobEnv["KIWI_REPO"] = e.Opt.RepoURL
+	jobEnv["KIWI_REPO_FULL"] = e.Opt.RepoFullName
+	jobEnv["KIWI_WORKSPACE"] = workspace
 	// Cache-definition ceiling (defense in depth): an untrusted job can
 	// reach the executor through paths that skipped enqueue admission
 	// (generated fragments), and every entry is an independent archive/key,
@@ -998,6 +1013,16 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	for i, st := range effectiveSteps(cj) {
 		st.Name = pipeline.InterpolateOutputs(st.Name, needsOutputs, stepOutputs)
 		st.Run = pipeline.InterpolateOutputs(st.Run, needsOutputs, stepOutputs)
+		gitCtx := expr.Context{
+			Event:    e.Opt.Event,
+			Branch:   e.Opt.Branch,
+			Ref:      e.Opt.GitRef,
+			SHA:      e.Opt.GitSHA,
+			Repo:     e.Opt.RepoURL,
+			RepoFull: e.Opt.RepoFullName,
+			Workspace: workspace,
+		}
+		st.Run = pipeline.InterpolateGit(st.Run, gitCtx)
 		st.If = pipeline.InterpolateOutputs(st.If, needsOutputs, stepOutputs)
 		st.WorkingDirectory = pipeline.InterpolateOutputs(st.WorkingDirectory, needsOutputs, stepOutputs)
 		st.Env = pipeline.InterpolateOutputMap(st.Env, needsOutputs, stepOutputs)

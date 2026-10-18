@@ -119,24 +119,21 @@ func TestImportSequenceNonScalarTriggerEntry(t *testing.T) {
 	}
 }
 
-// TestImportAliasTriggerNodeHitsDefaultShape covers an aliased `on` value: the
-// node kind is neither scalar, sequence nor mapping, so the import must report
-// the unsupported shape and fall back to the sentinel instead of crashing or
-// widening the trigger.
-func TestImportAliasTriggerNodeHitsDefaultShape(t *testing.T) {
+// TestImportAliasTriggerNodeExpands covers an aliased `on` value: YAML
+// anchors/aliases are expanded before the walk, so `on: *events` maps the
+// same as `on: [push]` instead of importing empty.
+func TestImportAliasTriggerNodeExpands(t *testing.T) {
 	src := "shared: &events [push]\non: *events\n" + edgeJobs
 	res, err := New().Import(src)
 	if err != nil {
 		t.Fatalf("import: %v", err)
 	}
-	if !hasUnsupported(res, "must be an event name, a list of event names, or an event mapping") {
-		t.Fatalf("shape diagnosis missing: %v", res.Unsupported)
-	}
-	if !hasUnsupported(res, "no workflow trigger could be mapped") {
-		t.Fatalf("sentinel diagnosis missing: %v", res.Unsupported)
-	}
-	if _, err := pipeline.Parse([]byte(res.PipelineYAML)); err != nil {
+	spec, err := pipeline.Parse([]byte(res.PipelineYAML))
+	if err != nil {
 		t.Fatalf("generated pipeline does not parse: %v\n%s", err, res.PipelineYAML)
+	}
+	if _, ok := spec.On["push"]; !ok || len(spec.On) != 1 {
+		t.Fatalf("on = %+v, want only push via alias expansion", spec.On)
 	}
 }
 

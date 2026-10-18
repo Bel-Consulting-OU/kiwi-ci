@@ -337,3 +337,140 @@ func EnvMap(n *yaml.Node) map[string]string {
 	}
 	return out
 }
+
+// ExpandYAML resolves YAML anchors, aliases, and merge keys so importer
+// walkers that inspect yaml.Node see concrete values. Woodpecker (and every
+// other source system) legally uses anchors; walking AliasNode without
+// resolution imported repeated matrix steps as empty.
+func ExpandYAML(root *yaml.Node) {
+	if root == nil {
+		return
+	}
+	// First pass: rewrite every alias in place as a deep copy of its target.
+	// Identity map prevents cycles (illegal in YAML but cheap to guard).
+	seen := map[*yaml.Node]bool{}
+	expandAliases(root, seen)
+	// Second pass: apply merge keys (<<) bottom-up so nested merges land.
+	applyMerges(root)
+}
+
+func expandAliases(n *yaml.Node, seen map[*yaml.Node]bool) {
+	if n == nil || seen[n] {
+		return
+	}
+	seen[n] = true
+	if n.Kind == yaml.AliasNode && n.Alias != nil {
+		target := n.Alias
+		expandAliases(target, seen)
+		// Splice the target's concrete shape into this node so parent
+		// walkers (Key/Mapping/SeqScalars/StrScalar) observe the value.
+		n.Kind = target.Kind
+		n.Style = target.Style
+		n.Tag = target.Tag
+		n.Value = target.Value
+		n.Anchor = ""
+		n.Alias = nil
+		n.Content = cloneNodes(target.Content)
+		// Children are fresh copies; expand them under a new identity set
+		// so shared anchors still expand at every use site.
+		for _, c := range n.Content {
+			expandAliases(c, map[*yaml.Node]bool{})
+		}
+		return
+	}
+	for _, c := range n.Content {
+		expandAliases(c, seen)
+	}
+}
+
+func cloneNodes(in []*yaml.Node) []*yaml.Node {
+	if in == nil {
+		return nil
+	}
+	out := make([]*yaml.Node, len(in))
+	for i, c := range in {
+		if c == nil {
+			continue
+		}
+		cp := *c
+		cp.Alias = nil
+		cp.Anchor = ""
+		cp.Content = cloneNodes(c.Content)
+		out[i] = &cp
+	}
+	return out
+}
+
+// applyMerges expands mapping merge keys (<<: *anchor / <<: [*a, *b]) into
+// concrete key/value pairs. Explicit keys win over merged ones, matching
+// YAML 1.1 merge-key semantics.
+func applyMerges(n *yaml.Node) {
+	if n == nil {
+		return
+	}
+	for _, c := range n.Content {
+		applyMerges(c)
+	}
+	if n.Kind != yaml.MappingNode {
+		return
+	}
+	type kv struct{ k, v *yaml.Node }
+	var explicit []kv
+	var merged []kv
+	mergedKeys := map[string]bool{}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		k, v := n.Content[i], n.Content[i+1]
+		if k != nil && k.Value == "<<" {
+			for _, src := range mergeSources(v) {
+				if src == nil || src.Kind != yaml.MappingNode {
+					continue
+				}
+				for j := 0; j+1 < len(src.Content); j += 2 {
+					mk, mv := src.Content[j], src.Content[j+1]
+					if mk == nil || mergedKeys[mk.Value] {
+						continue
+					}
+					mergedKeys[mk.Value] = true
+					ck := cloneNodes([]*yaml.Node{mk})
+					cv := cloneNodes([]*yaml.Node{mv})
+					merged = append(merged, kv{ck[0], cv[0]})
+				}
+			}
+			continue
+		}
+		explicit = append(explicit, kv{k, v})
+	}
+	// Merged pairs first (in source order), then explicit pairs. A later
+	// explicit key replaces an earlier merged one of the same name.
+	out := make([]*yaml.Node, 0, 2*(len(merged)+len(explicit)))
+	index := map[string]int{}
+	for _, p := range merged {
+		if p.k == nil {
+			continue
+		}
+		index[p.k.Value] = len(out)
+		out = append(out, p.k, p.v)
+	}
+	for _, p := range explicit {
+		if p.k == nil {
+			continue
+		}
+		if at, ok := index[p.k.Value]; ok && at+1 < len(out) {
+			out[at+1] = p.v
+			continue
+		}
+		index[p.k.Value] = len(out)
+		out = append(out, p.k, p.v)
+	}
+	n.Content = out
+}
+
+func mergeSources(v *yaml.Node) []*yaml.Node {
+	if v == nil {
+		return nil
+	}
+	if v.Kind == yaml.SequenceNode {
+		return v.Content
+	}
+	return []*yaml.Node{v}
+}

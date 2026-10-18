@@ -124,6 +124,60 @@ func detectCurrentBranch(workspace string) string {
 	return b
 }
 
+// detectGitSHA returns the current commit SHA (empty when the workspace is
+// not a git repo or HEAD is unborn).
+func detectGitSHA(workspace string) string {
+	out, err := exec.Command("git", "-C", workspace, "rev-parse", "HEAD").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// detectGitRepo derives the clone URL and owner/name full name from the
+// workspace's git remote (origin, then any remote). Local runs previously
+// left KIWI_REPO / KIWI_REPO_FULL empty; scripts that expect the GitHub
+// shape then had to re-derive it from the host environment.
+func detectGitRepo(workspace string) (repoURL, fullName string) {
+	for _, remote := range []string{"origin", "upstream"} {
+		out, err := exec.Command("git", "-C", workspace, "remote", "get-url", remote).Output()
+		if err != nil {
+			continue
+		}
+		url := strings.TrimSpace(string(out))
+		if url == "" {
+			continue
+		}
+		return repoCoords(url)
+	}
+	// Any remaining remote is better than nothing.
+	out, err := exec.Command("git", "-C", workspace, "remote", "-v").Output()
+	if err != nil {
+		return "", ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] != "" {
+			return repoCoords(fields[1])
+		}
+	}
+	return "", ""
+}
+
+// detectGitRef returns the full symbolic ref for HEAD (refs/heads/... or
+// refs/tags/...), or the SHA when detached.
+func detectGitRef(workspace string) string {
+	if out, err := exec.Command("git", "-C", workspace, "symbolic-ref", "-q", "HEAD").Output(); err == nil {
+		if r := strings.TrimSpace(string(out)); r != "" {
+			return r
+		}
+	}
+	if sha := detectGitSHA(workspace); sha != "" {
+		return sha
+	}
+	return ""
+}
+
 // lockfileDigest computes the SHA-256 cache-key digest of a job's lock
 // files with exactly cache.Store.Key semantics: the empty base, a NUL
 // separator, then each glob-matched file's workspace-relative path followed

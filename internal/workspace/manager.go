@@ -19,6 +19,7 @@
 package workspace
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -143,7 +144,7 @@ func (m *Manager) snapshot(ctx context.Context, target string) (string, error) {
 			if err := cmd.Run(); err == nil {
 				_ = os.RemoveAll(filepath.Join(target, ".git"))
 				_ = os.RemoveAll(filepath.Join(target, ".kiwi", "cache"))
-				stripBuildOutputDirs(target)
+				stripBuildOutputDirs(target, m.Source)
 				return "reflink", nil
 			} else if ctx.Err() != nil {
 				_ = os.RemoveAll(target)
@@ -209,6 +210,18 @@ var copyTreeSkipDirs = map[string]bool{
 	".cache":        true,
 }
 
+// hasTrackedFiles reports whether any path under rel is tracked by git in
+// src. Used so a source directory named target/ (or node_modules/, ...) is
+// not mistaken for build output and stripped from the job workspace.
+func hasTrackedFiles(src, rel string) bool {
+	cmd := exec.Command("git", "-C", src, "ls-files", "--", rel)
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return len(bytes.TrimSpace(out)) > 0
+}
+
 // copyTree recursively copies src into dst (created if missing), skipping
 // build-output directory names, the in-repo .kiwi/cache directory and the
 // DESTINATION subtree itself. .git IS copied: audit tools that shell out to
@@ -242,7 +255,14 @@ func copyTree(src, dst string) error {
 			return nil
 		}
 		if info.IsDir() && copyTreeSkipDirs[info.Name()] {
-			return filepath.SkipDir
+			// A skip-name directory that carries TRACKED paths is source
+			// (tools/redteam/target is the canonical collision). Keep it.
+			// Untracked build output is still omitted.
+			if hasTrackedFiles(src, rel) {
+				// fall through and copy
+			} else {
+				return filepath.SkipDir
+			}
 		}
 		cacheRel := filepath.Join(".kiwi", "cache")
 		if rel == cacheRel || strings.HasPrefix(rel, cacheRel+string(filepath.Separator)) {
@@ -272,12 +292,19 @@ func copyTree(src, dst string) error {
 
 // stripBuildOutputDirs removes build-output directory names from a
 // materialized workspace (reflink clones copy them before this runs).
-func stripBuildOutputDirs(root string) {
+// source is the original checkout: a skip-name directory that carries
+// tracked paths there is kept (tools/redteam/target is source, not cargo
+// output).
+func stripBuildOutputDirs(root, source string) {
 	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil || !info.IsDir() {
 			return nil
 		}
 		if copyTreeSkipDirs[info.Name()] {
+			rel, rerr := filepath.Rel(root, path)
+			if rerr == nil && hasTrackedFiles(source, rel) {
+				return nil
+			}
 			_ = os.RemoveAll(path)
 			return filepath.SkipDir
 		}

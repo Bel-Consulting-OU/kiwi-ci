@@ -203,6 +203,10 @@ per-runtime default (`sh` for containers, `bash` for Tart, `pwsh` on
 native Windows, `bash` otherwise). Allowed names: `bash`, `sh`, `zsh`,
 `pwsh`, `powershell`, `fish`, `dash`, `ksh`, `python`.
 
+Alpine (and other bash-less) images must use `shell: sh` — or rely on
+the container default, which is already `sh`. A pipeline-level
+`defaults.shell: bash` will break those images.
+
 ### Retry classes
 
 `retry.on` accepts: `failure` (command failures), `infra`
@@ -224,7 +228,14 @@ services:
     interval: 5s
     timeout: 10s
     retries: 5
+  - name: cache
+    image: redis:7@sha256:...
+    command: ["redis-server", "--save", ""]
 ```
+
+`command` (optional) overrides the image entrypoint — the same
+capability Woodpecker's service `commands` maps to. Without it the
+image's default entrypoint runs.
 
 When `sandbox.network` is `none` or `services-only`, the network is
 created with `--internal`, so the job can reach its services but not the

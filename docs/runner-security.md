@@ -41,6 +41,30 @@ regardless of any local flag default.
 - Working directories are resolved through symlinks and rejected if
   they escape the workspace.
 
+### Container jobs and the Docker socket
+
+A `runtime: container` job never sees the host Docker socket. The local
+workflow guard refuses Docker-socket mounts and `--privileged`, so
+docker-in-docker workloads (image builds, compose, registry pushes that
+need a daemon) must run on `runtime: native` with a Docker CLI on the
+runner, or use a remote builder. This is intentional: a container job is
+untrusted workload and must not reach the host daemon.
+
+### macOS container workspaces
+
+Docker Desktop only shares selected host paths. Kiwi's default temp
+workspace (`$TMPDIR`, typically `/var/folders/...`) is **not** shared, so
+the bind mount appears empty inside the container. Point the workspace
+temp dir at a shared path for container jobs:
+
+```sh
+mkdir -p "$HOME/kiwi-tmp"
+TMPDIR="$HOME/kiwi-tmp" kiwi run -f .kiwi/pipeline.yaml
+```
+
+Combine with `--no-inherit-env` so that host `TMPDIR` does not leak into
+the job environment (the workspace path is injected as `KIWI_WORKSPACE`).
+
 ### Container workspace ownership (hardened jobs)
 
 A hardened container job (`sandbox.rootless` or

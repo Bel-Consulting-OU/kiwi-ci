@@ -508,8 +508,10 @@ type Job struct {
 }
 
 type Service struct {
-	Name        string            `yaml:"name" json:"name"`
-	Image       string            `yaml:"image" json:"image"`
+	Name  string `yaml:"name" json:"name"`
+	Image string `yaml:"image" json:"image"`
+	// Command overrides the image entrypoint (Woodpecker service commands).
+	Command     []string          `yaml:"command,omitempty" json:"command,omitempty"`
 	Env         map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
 	Healthcheck string            `yaml:"healthcheck,omitempty" json:"healthcheck,omitempty"`
 	Interval    Duration          `yaml:"interval,omitempty" json:"interval,omitempty"`

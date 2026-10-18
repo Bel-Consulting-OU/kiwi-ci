@@ -552,6 +552,13 @@ const schemaSource = `{
         "image": {
           "type": "string"
         },
+        "command": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
         "env": {
           "$ref": "#/$defs/stringMap"
         },

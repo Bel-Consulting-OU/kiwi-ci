@@ -39,6 +39,7 @@ func (i *Importer) Import(src string) (*importer.Result, error) {
 	if err := yaml.Unmarshal([]byte(src), &root); err != nil {
 		return nil, fmt.Errorf("parse workflow: %w", err)
 	}
+	importer.ExpandYAML(&root)
 	doc := importer.Document(&root)
 	if doc == nil || doc.Kind != yaml.MappingNode {
 		return nil, fmt.Errorf("workflow must be a YAML mapping")

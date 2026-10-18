@@ -480,6 +480,12 @@ func startContainerServicesOwned(ctx context.Context, runID, jobID string, owner
 		// Starting a service pulls its image and is legitimately slow: it
 		// runs under the 10m setup ceiling (min with the job context).
 		args = append(args, "--", svc.Image)
+		// Explicit command overrides the image entrypoint (Woodpecker
+		// service commands). Flag-shaped tokens cannot be injected: the
+		// first argv after the image is the entrypoint, never a docker flag.
+		if len(svc.Command) > 0 {
+			args = append(args, svc.Command...)
+		}
 		// The prospective container name joins the owned set BEFORE the
 		// create command: an ambiguous `docker run` failure may have created
 		// the container, so cleanupAll must be able to remove it.
