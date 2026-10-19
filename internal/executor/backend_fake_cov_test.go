@@ -36,6 +36,11 @@ case "$sub" in
   info)
     if [ -n "$FAKE_DOCKER_INFO" ]; then printf '%s\n' "$FAKE_DOCKER_INFO"; else echo "[name=seccomp,profile=builtin name=rootless]"; fi
     exit "${FAKE_DOCKER_INFO_EXIT:-0}";;
+  inspect)
+    # serviceAlive polls container state right after docker run -d.
+    if [ "${FAKE_DOCKER_INSPECT_DEAD:-0}" = "1" ]; then echo "exited 137"; exit 0; fi
+    echo "running 0"
+    exit 0;;
   run)
     if [ -n "$FAKE_DOCKER_RUN_FAIL" ]; then echo "run failed"; exit 1; fi
     name=""

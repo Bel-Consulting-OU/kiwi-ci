@@ -303,7 +303,7 @@ func TestRunJobServicesWithoutJobCgroupReportsAggregate(t *testing.T) {
 	if !sink.has("job resource cgroup unavailable (no delegated cgroup here)") {
 		t.Fatalf("fallback reason not logged: %v", sink.lines)
 	}
-	if !sink.has("aggregate service request (cpu=2 memory=2147483648 pids=256)") {
+	if !sink.has("aggregate service request (cpu=2 memory=2147483648 pids=512)") {
 		t.Fatalf("aggregate service request not logged: %v", sink.lines)
 	}
 	if strings.Contains(readFakeLog(t, "FAKE_DOCKER_LOG"), "--cgroup-parent") {

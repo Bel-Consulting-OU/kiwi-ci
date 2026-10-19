@@ -215,24 +215,24 @@ func TestServiceBudgetAllocationFairSplit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first allocation: %v", err)
 	}
-	if a1.CPU != 2 || a1.Memory != 1610612736 || a1.PIDs != 256 {
+	if a1.CPU != 2 || a1.Memory != 1610612736 || a1.PIDs != 350 {
 		t.Fatalf("first allocation = %+v", a1)
 	}
-	if b.CPU != 2.5 || b.Memory != 1610612736 || b.PIDs != 444 || b.remaining != 1 {
+	if b.CPU != 2.5 || b.Memory != 1610612736 || b.PIDs != 350 || b.remaining != 1 {
 		t.Fatalf("remaining after first = %+v", b)
 	}
 	a2, err := b.allocate()
 	if err != nil {
 		t.Fatalf("second allocation: %v", err)
 	}
-	if a2.CPU != 2 || a2.Memory != 1610612736 || a2.PIDs != 256 {
+	if a2.CPU != 2 || a2.Memory != 1610612736 || a2.PIDs != 350 {
 		t.Fatalf("second allocation = %+v", a2)
 	}
-	if b.CPU != 0.5 || b.Memory != 0 || b.PIDs != 188 || b.remaining != 0 {
+	if b.CPU != 0.5 || b.Memory != 0 || b.PIDs != 0 || b.remaining != 0 {
 		t.Fatalf("remaining after second = %+v", b)
 	}
 	// A single service on an undeclared-resource job keeps the historical
-	// per-service defaults exactly (2 CPU / 2 GiB / 256 PIDs).
+	// per-service defaults exactly (2 CPU / 2 GiB / 1024 PIDs).
 	single := serviceBudgetFor(pipeline.Resources{}, 1)
 	a, err := single.allocate()
 	if err != nil {
@@ -325,7 +325,7 @@ func TestServiceEnvelopeRequestAggregate(t *testing.T) {
 		t.Fatal("oversubscribed plan reported an aggregate")
 	}
 	// A single-service aggregate on an undeclared job equals one per-service
-	// default (2 CPU / 2 GiB / 256 PIDs).
+	// default (2 CPU / 2 GiB / 1024 PIDs).
 	req, err = ServiceEnvelopeRequest(pipeline.Resources{}, services[:1])
 	if err != nil {
 		t.Fatalf("single aggregate: %v", err)
@@ -400,7 +400,7 @@ func TestStartContainerServicesFairSplitsEnvelope(t *testing.T) {
 	if len(runs) != 2 {
 		t.Fatalf("docker run count = %d, want 2:\n%v", len(runs), runs)
 	}
-	for i, want := range []string{"--cpus=2", "--memory=1610612736", "--pids-limit=256"} {
+	for i, want := range []string{"--cpus=2", "--memory=1610612736", "--pids-limit=350"} {
 		if !strings.Contains(runs[0], want) {
 			t.Fatalf("first service run missing %q: %s", want, runs[0])
 		}

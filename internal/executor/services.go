@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"math"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -150,7 +151,10 @@ func serviceDisplayName(physical string, svc pipeline.Service) string {
 const (
 	serviceDefaultCPUs   = 2.0
 	serviceDefaultMemory = int64(2) << 30
-	serviceDefaultPIDs   = 256
+	// ClickHouse/RabbitMQ spawn many threads; 170 PIDs (512/3) killed
+	// ClickHouse with SIGSYS (exit 133). 1024 covers a fair split of 4–8
+	// DB services without letting one service exhaust the host.
+	serviceDefaultPIDs   = 1024
 )
 
 // Aggregate service-envelope fallbacks, used only when the job declares no
@@ -160,7 +164,7 @@ const (
 const (
 	serviceAggregateDefaultCPUs   = 2.0
 	serviceAggregateDefaultMemory = int64(2) << 30
-	serviceAggregateDefaultPIDs   = 2 * serviceDefaultPIDs
+	serviceAggregateDefaultPIDs   = 4 * serviceDefaultPIDs
 )
 
 // serviceResourceBudget is the aggregate resource envelope all service
@@ -333,8 +337,16 @@ func serviceResourceArgs(a serviceAllocation) []string {
 	return []string{
 		"--pids-limit=" + strconv.Itoa(a.PIDs),
 		"--memory=" + strconv.FormatInt(a.Memory, 10),
-		"--cpus=" + strconv.FormatFloat(a.CPU, 'f', -1, 64),
+		// Docker's --cpus rejects high-precision floats ("value is too
+		// precise"). Round to 3 decimals — the fair-split of 2.0/3 is
+		// 0.667, not 0.6666666666666666.
+		"--cpus=" + strconv.FormatFloat(roundCPUs(a.CPU), 'f', 3, 64),
 	}
+}
+
+// roundCPUs rounds a CPU share to 3 decimals (docker --cpus precision).
+func roundCPUs(v float64) float64 {
+	return math.Round(v*1000) / 1000
 }
 
 // serviceEnvelopeSummary renders the fair-split aggregate service request for
@@ -454,6 +466,77 @@ func waitServiceReady(ctx context.Context, probe, alias, network string, emit fu
 	}
 }
 
+
+
+// defaultReadyProbe returns a sensible readiness probe for well-known
+// service images so a job never races the service's own init (postgres
+// takes seconds to accept connections; without this the alias resolves
+// but the port is closed, or the container is still starting and the
+// name does not resolve at all).
+func defaultReadyProbe(image string) string {
+	img := strings.ToLower(image)
+	switch {
+	case strings.Contains(img, "postgres"):
+		return "tcp:5432"
+	case strings.Contains(img, "redis"):
+		return "tcp:6379"
+	case strings.Contains(img, "clickhouse"):
+		return "http:8123/ping"
+	case strings.Contains(img, "mysql") || strings.Contains(img, "mariadb"):
+		return "tcp:3306"
+	case strings.Contains(img, "mongo"):
+		return "tcp:27017"
+	case strings.Contains(img, "memcached"):
+		return "tcp:11211"
+	case strings.Contains(img, "rabbitmq"):
+		return "tcp:5672"
+	}
+	return ""
+}
+
+// serviceAlive reports whether the service container is still running a
+// moment after docker run -d. An entrypoint that exits (postgres under a
+// read-only rootfs, a bad command) leaves a vanished network alias and a
+// silent job failure; this turns that into a loud one.
+func serviceAlive(ctx context.Context, docker, name string) (bool, string) {
+	// One short poll: the entrypoint crash is typically instant. Only a
+	// DEFINITIVE non-running status (or a vanished container) is death —
+	// empty/garbage inspect output is inconclusive and docker run -d
+	// already succeeded.
+	for i := 0; i < 3; i++ {
+		out, err := phaseCommand(ctx, 3*time.Second, docker, "inspect", "--format", "{{.State.Status}} {{.State.ExitCode}}", name)
+		text := strings.TrimSpace(string(out))
+		if err != nil {
+			// --rm removes the container the moment it exits: "No such
+			// object" IS the death signal. Any other inspect failure is
+			// inconclusive (keep going).
+			if strings.Contains(text, "No such object") || strings.Contains(text, "no such object") {
+				return false, "container vanished after start (entrypoint exited)"
+			}
+			if i == 2 {
+				return true, "inspect inconclusive"
+			}
+		} else {
+			if strings.HasPrefix(text, "running") {
+				return true, text
+			}
+			if text != "" {
+				// A real status that is not running.
+				return false, text
+			}
+			if i == 2 {
+				return true, "inspect empty"
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return false, "cancelled"
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	return true, "assumed running"
+}
+
 func startContainerServices(ctx context.Context, runID, jobID string, services []pipeline.Service, jobResources pipeline.Resources, isolated, requireImmutable bool, cgroupParent string, emit func(string)) (string, func() error, error) {
 	return startContainerServicesOwned(ctx, runID, jobID, runtimeOwner{}, services, jobResources, isolated, requireImmutable, cgroupParent, emit, nil)
 }
@@ -530,15 +613,24 @@ func startContainerServicesOwned(ctx context.Context, runID, jobID string, owner
 		name := serviceContainerName(runID, jobID, i)
 		display := serviceDisplayName(name, svc)
 		alloc := plan[i]
-		// Every service runs maximally hardened. The user is hard-coded to
-		// 65534:65534 (nobody) rather than omitted: images known to require
-		// root are not a reason to weaken isolation for the rest. Services
-		// and the job container share one network only; the workspace
-		// ownership mapping never applies here.
+		// Services keep the hardened profile EXCEPT a writable rootfs: DB
+		// images (postgres, clickhouse) must initialize /var/lib/* and
+		// otherwise exit instantly, which silently un-registers the network
+		// alias (K13: "bad address 'postgres'"). cap-drop and
+		// no-new-privileges stay; the image's own user is used so initdb
+		// can create its cluster. Services and the job container share one
+		// network only; the workspace ownership mapping never applies here.
+		// cap-drop=ALL plus the minimum DB-init capabilities (CHOWN,
+		// SETUID/SETGID, FOWNER, DAC_OVERRIDE): postgres's entrypoint must
+		// chown its data dir and setuid to the postgres user or it exits
+		// instantly (K13). The image's own user is used; read-only rootfs
+		// is dropped so /var/lib/* can initialize. no-new-privileges stays.
 		args := []string{"run", "-d", "--rm", "--network=" + network, "--name", name,
-			"--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
+			"--cap-drop=ALL",
+			"--cap-add=CHOWN", "--cap-add=SETUID", "--cap-add=SETGID",
+			"--cap-add=FOWNER", "--cap-add=DAC_OVERRIDE",
+			"--security-opt=no-new-privileges",
 			"--tmpfs", "/tmp:rw,nosuid,nodev",
-			"--user=" + serviceWorkloadUser,
 		}
 		if cgroupParent != "" {
 			args = append(args, "--cgroup-parent="+cgroupParent)
@@ -572,13 +664,32 @@ func startContainerServicesOwned(ctx context.Context, runID, jobID string, owner
 			}
 			return "", func() error { return nil }, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("start service %q: %w: %s", display, err, strings.TrimSpace(string(out)))}
 		}
+		// Liveness: docker run -d returns 0 even when the entrypoint exits
+		// immediately. A dead service is a LOUD failure (K13) — its alias
+		// is gone and every DB gate would fail on "host not found".
+		if alive, detail := serviceAlive(ctx, docker, name); !alive {
+			if cerr := cleanupAll(); cerr != nil {
+				reportDebt(CleanupService, name, cerr)
+			}
+			return "", func() error { return nil }, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("service %q exited immediately after start (%s): image cannot run under the service profile", display, detail)}
+		}
 		emit("service " + display + " started (" + svc.Image + ")")
 	}
 	// Native readiness probes (tcp/http/pg_isready) run before the job
 	// starts so pipelines never hand-roll wait loops.
 	for _, svc := range services {
-		if probe := strings.TrimSpace(svc.Ready); probe != "" {
-			if err := waitServiceReady(ctx, probe, serviceAlias(svc), network, emit, svc.Name); err != nil {
+		alias := serviceAlias(svc)
+		// A nameless service has no alias to probe against; the liveness
+		// check above already covered "did the entrypoint stay up".
+		if alias == "" {
+			continue
+		}
+		probe := strings.TrimSpace(svc.Ready)
+		if probe == "" && strings.TrimSpace(svc.Healthcheck) == "" {
+			probe = defaultReadyProbe(svc.Image)
+		}
+		if probe != "" {
+			if err := waitServiceReady(ctx, probe, alias, network, emit, svc.Name); err != nil {
 				if cerr := cleanupAll(); err != nil {
 					reportDebt(CleanupService, svc.Name, cerr)
 				}

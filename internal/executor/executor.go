@@ -883,6 +883,14 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	// the service containers started here and by the main container started
 	// below.
 	cgroupParent := ""
+	if len(cj.Job.Services) > 0 && !RuntimeRunsServices(cj.Job.Runtime) {
+		// Fail closed: a declared-but-unprovisioned service is a silent
+		// absence today (no containers, no warning, names unresolvable).
+		// Every DB-backed gate then fails on a missing daemon.
+		res.Status = model.StatusFailure
+		res.Error = fmt.Sprintf("job %q declares %d service(s) but runtime %q cannot provision them (services require runtime: container)", cj.ID, len(cj.Job.Services), cj.Job.Runtime)
+		return finish(res)
+	}
 	if RuntimeRunsServices(cj.Job.Runtime) && len(cj.Job.Services) > 0 {
 		// One job-scoped parent cgroup holds the main container AND every
 		// service container, with the declared envelope applied to the
