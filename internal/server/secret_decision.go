@@ -75,7 +75,7 @@ func (s *Server) explainSecret(ctx context.Context, j model.Job, name string) Se
 	case !d.Declared:
 		d.Allowed = false
 		d.Stage = "declaration"
-		d.Reason = "secret is not in the job's declared allowlist (run secrets ∪ step secrets)"
+		d.Reason = "secret is not in the job's declared allowlist (run secrets ∪ step secrets); add " + d.Name + " to the job's secrets: list (or .kiwi/policy.toml secret_allowlist for repository-wide grants)"
 		return d
 	}
 	if s.SecretBroker == nil {

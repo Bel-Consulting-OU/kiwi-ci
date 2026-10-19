@@ -156,6 +156,7 @@ type canonicalJob struct {
 	Component       string              `json:"component,omitempty"`
 	With            orderedMap          `json:"with,omitempty"`
 	QueueTimeout    canonicalDuration   `json:"queue_timeout,omitempty"`
+	Tools []string `json:"tools,omitempty"`
 }
 
 type canonicalService struct {
@@ -163,6 +164,7 @@ type canonicalService struct {
 	Image       string            `json:"image"`
 	Command     []string          `json:"command,omitempty"`
 	Env         orderedMap        `json:"env,omitempty"`
+	Ready       string            `json:"ready,omitempty"`
 	Healthcheck string            `json:"healthcheck,omitempty"`
 	Interval    canonicalDuration `json:"interval,omitempty"`
 	Timeout     canonicalDuration `json:"timeout,omitempty"`
@@ -220,14 +222,15 @@ func canonicalJobOf(j Job) canonicalJob {
 		Outputs: pairs(j.Outputs), Sandbox: j.Sandbox, Placement: j.Placement,
 		Resources: j.Resources, Tests: j.Tests, Generate: j.Generate,
 		Snapshot: j.Snapshot, Component: j.Component, With: pairs(j.With),
-		QueueTimeout: durOf(j.QueueTimeout),
+		QueueTimeout: durOf(j.QueueTimeout), Tools: j.Tools,
 	}
 	c.Services = make([]canonicalService, len(j.Services))
 	for i := range j.Services {
 		c.Services[i] = canonicalService{
 			Name: j.Services[i].Name, Image: j.Services[i].Image,
 			Command: j.Services[i].Command,
-			Env:     pairs(j.Services[i].Env), Healthcheck: j.Services[i].Healthcheck,
+			Env:     pairs(j.Services[i].Env), Ready: j.Services[i].Ready,
+			Healthcheck: j.Services[i].Healthcheck,
 			Interval: durOf(j.Services[i].Interval), Timeout: durOf(j.Services[i].Timeout),
 			Retries: j.Services[i].Retries, RetriesSet: j.Services[i].RetriesSet,
 		}

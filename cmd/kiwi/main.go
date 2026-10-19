@@ -75,7 +75,17 @@ func dispatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	case "replay":
 		return app.Replay(ctx, args[1:])
 	case "verify":
+		// `kiwi verify --since ...` walks the blessing ledger; anything else
+		// is the artifact/attestation verifier.
+		for _, a := range args[1:] {
+			if a == "--since" || strings.HasPrefix(a, "--since=") ||
+				a == "--ledger" || strings.HasPrefix(a, "--ledger=") {
+				return app.VerifySince(args[1:])
+			}
+		}
 		return app.VerifyArtifact(args[1:])
+	case "promote":
+		return app.Promote(ctx, args[1:])
 	case "init":
 		return app.Init(args[1:])
 	case "login", "logout", "context":
@@ -86,7 +96,7 @@ func dispatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return app.SecretCommand(args[1:])
 	case "setup":
 		return app.Setup(args[1:])
-	case "runs", "jobs", "logs", "cancel", "approve", "rerun", "artifacts", "schedules", "policy":
+	case "runs", "jobs", "logs", "cancel", "approve", "rerun", "artifacts", "schedules", "policy", "flake":
 		return app.Ops(ctx, args[0], args[1:])
 	case "tui":
 		return app.TUI(ctx, args[1:])
@@ -349,7 +359,10 @@ Usage:
                 (or) --attestation JOB [--generation N] | --attestation-file PATH
   kiwi runs [--server URL] [--token ADMIN_TOKEN]
   kiwi jobs RUN [--server URL] [--token ADMIN_TOKEN]
-  kiwi logs RUN [--job KEY] [--follow] [--interactive] [--server URL] [--token ADMIN_TOKEN]
+  kiwi logs RUN [--job KEY] [--step NAME] [--follow] [--interactive] [--server URL] [--token ADMIN_TOKEN]
+  kiwi flake REPO [--server URL] [--token ADMIN_TOKEN]
+  kiwi promote RUN --env ENV [--sha SHA] [--server URL]
+  kiwi verify --since [RFC3339] [--ledger DIR]
   kiwi tui RUN [--job KEY] [--follow] [--search TEXT] [--server URL] [--token ADMIN_TOKEN]
   kiwi cancel RUN | kiwi rerun RUN | kiwi approve JOB | kiwi artifacts RUN
   kiwi schedules list|trigger

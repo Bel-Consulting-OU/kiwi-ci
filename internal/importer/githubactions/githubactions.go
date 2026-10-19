@@ -64,8 +64,17 @@ func (i *Importer) Import(src string) (*importer.Result, error) {
 		}
 		supported++
 	}
-	if importer.Key(doc, "concurrency") != nil {
-		res.AddUnsupported("workflow-level concurrency group is not supported; declare per-run concurrency via the server or repository policy")
+	if c := importer.Key(doc, "concurrency"); c != nil {
+		if g := importer.StrScalar(importer.Key(c, "group")); g != "" {
+			spec.Concurrency.Group = g
+			if cancel, ok := importer.BoolScalar(importer.Key(c, "cancel-in-progress")); ok {
+				spec.Concurrency.CancelInProgress = cancel
+			}
+			res.AddMapped("workflow concurrency → concurrency.group (+ cancel_in_progress)")
+			supported++
+		} else {
+			res.AddUnsupported("workflow-level concurrency without a group string is not converted")
+		}
 	}
 	if perm := importer.Key(doc, "permissions"); perm != nil {
 		res.AddUnsupported("workflow-level permissions (%s) are not supported; Kiwi grants id_token via job permissions", strings.Join(importer.SeqScalars(perm), ", "))

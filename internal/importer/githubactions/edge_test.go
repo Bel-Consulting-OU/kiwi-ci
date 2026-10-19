@@ -418,3 +418,22 @@ jobs:
 		t.Fatalf("dropped dimension leaked into the YAML:\n%s", res.PipelineYAML)
 	}
 }
+
+// TestImportConcurrencyGroup maps workflow concurrency to Kiwi's group.
+func TestImportConcurrencyGroup(t *testing.T) {
+	src := "on: push\nconcurrency:\n  group: deploy-${{ github.ref }}\n  cancel-in-progress: true\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
+	res, err := New().Import(src)
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	spec, err := pipeline.Parse([]byte(res.PipelineYAML))
+	if err != nil {
+		t.Fatalf("parse: %v\n%s", err, res.PipelineYAML)
+	}
+	if spec.Concurrency.Group == "" {
+		t.Fatalf("concurrency group empty: %+v", spec.Concurrency)
+	}
+	if !spec.Concurrency.CancelInProgress {
+		t.Fatalf("cancel_in_progress not mapped: %+v", spec.Concurrency)
+	}
+}

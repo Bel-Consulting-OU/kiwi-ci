@@ -562,6 +562,9 @@ const schemaSource = `{
         "env": {
           "$ref": "#/$defs/stringMap"
         },
+        "ready": {
+          "type": "string"
+        },
         "healthcheck": {
           "type": "string"
         },
@@ -809,6 +812,12 @@ const schemaSource = `{
         },
         "queue_timeout": {
           "$ref": "#/$defs/duration"
+        },
+        "tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "retry": {
           "$ref": "#/$defs/retry"

@@ -21,6 +21,12 @@ import (
 // continuing to drain the pipe (see executil.CaptureBounded).
 const maxHealthcheckOutputBytes = 64 << 10
 
+// serviceReadyTimeout / serviceReadyPoll bound native ready probes.
+// Timeout is a var so tests can shrink it; poll stays a const.
+var serviceReadyTimeout = 2 * time.Minute
+
+const serviceReadyPoll = 500 * time.Millisecond
+
 // serviceNetworkArgs builds the `docker network create` arguments for the
 // job's services network. A plain user-defined bridge HAS a route to the
 // outside world by default; the --internal flag removes that route, which is
@@ -378,6 +384,76 @@ func validateServiceImages(services []pipeline.Service, runID, jobID string, req
 // the documented fair split of the job's envelope (allocating the remaining
 // budget across the remaining services); a job whose service declarations
 // genuinely cannot fit its own resource envelope fails closed.
+
+// waitServiceReady polls one native readiness probe until it passes or the
+// job context ends. Probe forms: tcp:PORT, http:PORT[/path], pg_isready:PORT.
+// The probe target is the service's network alias on the job bridge — so the
+// check MUST run inside that network (a one-shot container), never from the
+// host, which cannot resolve the alias.
+func waitServiceReady(ctx context.Context, probe, alias, network string, emit func(string), name string) error {
+	kind, rest, ok := strings.Cut(probe, ":")
+	if !ok || alias == "" || strings.TrimSpace(rest) == "" {
+		return fmt.Errorf("probe %q needs the form tcp:PORT, http:PORT[/path], or pg_isready:PORT", probe)
+	}
+	deadline := time.Now().Add(serviceReadyTimeout)
+	attempt := 0
+	for {
+		attempt++
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout after %s waiting for %s", serviceReadyTimeout, probe)
+		}
+		var err error
+		switch kind {
+		case "tcp", "pg_isready":
+			// Reachability of the alias from INSIDE the job network is the
+			// contract; a host dial cannot see the bridge alias.
+			port := rest
+			script := "nc -z " + alias + " " + port
+			out, e := phaseCommand(ctx, 5*time.Second, "docker",
+				"run", "--rm", "--network="+network, "--cap-drop=ALL", "--security-opt=no-new-privileges",
+				"alpine:3.20", "sh", "-c", script)
+			if e != nil {
+				err = fmt.Errorf("%s", strings.TrimSpace(string(out)))
+				if err.Error() == "" {
+					err = e
+				}
+			}
+		case "http":
+			path := "/"
+			port := rest
+			if i := strings.Index(rest, "/"); i >= 0 {
+				port, path = rest[:i], rest[i:]
+			}
+			script := "wget -q -O /dev/null http://" + alias + ":" + port + path
+			out, e := phaseCommand(ctx, 5*time.Second, "docker",
+				"run", "--rm", "--network="+network, "--cap-drop=ALL", "--security-opt=no-new-privileges",
+				"alpine:3.20", "sh", "-c", script)
+			if e != nil {
+				err = fmt.Errorf("%s", strings.TrimSpace(string(out)))
+				if err.Error() == "" {
+					err = e
+				}
+			}
+		default:
+			return fmt.Errorf("unknown ready probe kind %q (tcp/http/pg_isready)", kind)
+		}
+		if err == nil {
+			return nil
+		}
+		if attempt == 1 || attempt%5 == 0 {
+			emit("service " + name + " not ready yet: " + err.Error())
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(serviceReadyPoll):
+		}
+	}
+}
+
 func startContainerServices(ctx context.Context, runID, jobID string, services []pipeline.Service, jobResources pipeline.Resources, isolated, requireImmutable bool, cgroupParent string, emit func(string)) (string, func() error, error) {
 	return startContainerServicesOwned(ctx, runID, jobID, runtimeOwner{}, services, jobResources, isolated, requireImmutable, cgroupParent, emit, nil)
 }
@@ -497,6 +573,19 @@ func startContainerServicesOwned(ctx context.Context, runID, jobID string, owner
 			return "", func() error { return nil }, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("start service %q: %w: %s", display, err, strings.TrimSpace(string(out)))}
 		}
 		emit("service " + display + " started (" + svc.Image + ")")
+	}
+	// Native readiness probes (tcp/http/pg_isready) run before the job
+	// starts so pipelines never hand-roll wait loops.
+	for _, svc := range services {
+		if probe := strings.TrimSpace(svc.Ready); probe != "" {
+			if err := waitServiceReady(ctx, probe, serviceAlias(svc), network, emit, svc.Name); err != nil {
+				if cerr := cleanupAll(); err != nil {
+					reportDebt(CleanupService, svc.Name, cerr)
+				}
+				return "", func() error { return nil }, &RunError{Kind: ErrorInfra, Err: fmt.Errorf("service %q ready probe %q: %w", svc.Name, probe, err)}
+			}
+			emit("service " + svc.Name + " ready (" + probe + ")")
+		}
 	}
 	for i, svc := range services {
 		if strings.TrimSpace(svc.Healthcheck) == "" {

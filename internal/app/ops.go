@@ -42,6 +42,8 @@ func Ops(ctx context.Context, sub string, args []string) error {
 		return opsArtifacts(ctx, args)
 	case "schedules":
 		return opsSchedules(ctx, args)
+	case "flake":
+		return opsFlake(ctx, args)
 	case "policy":
 		return opsPolicy(ctx, args)
 	default:
@@ -238,13 +240,24 @@ func flagTakesValue(fs *flag.FlagSet, name string) bool {
 }
 
 func opsRuns(ctx context.Context, args []string) error {
-	serverURL, token, rest, err := opsFlags("runs", args)
+	// --test filters the listing to runs whose test reports contain a
+	// failing/known test name (evidence query, not a log grep).
+	fs := flag.NewFlagSet("runs", flag.ContinueOnError)
+	srv := fs.String("server", "", "Kiwi server URL (defaults to the active context / KIWI_SERVER)")
+	tok := fs.String("token", os.Getenv("KIWI_ADMIN_TOKEN"), "admin bearer token")
+	testName := fs.String("test", "", "only runs whose test records include this test name")
+	rest, err := parseFlagsAndPositionals(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(rest) != 0 {
 		return fmt.Errorf("kiwi runs takes no arguments")
 	}
+	ep, epErr := ResolveEndpoint(*srv, *tok)
+	if epErr != nil {
+		return epErr
+	}
+	serverURL, token := ep.Server, ep.Token
 	var out []model.Run
 	c := newOpsClient(serverURL, token)
 	cursor := ""
@@ -292,6 +305,9 @@ func opsRuns(ctx context.Context, args []string) error {
 			return fmt.Errorf("kiwi runs: server pagination did not terminate after %d pages (%d runs so far); refusing to claim a complete listing", maxRunPages, len(out))
 		}
 	}
+	if *testName != "" {
+		out = filterRunsByTest(ctx, c, out, *testName)
+	}
 	if len(out) == 0 {
 		fmt.Println("no runs")
 		return nil
@@ -303,6 +319,31 @@ func opsRuns(ctx context.Context, args []string) error {
 		fmt.Printf("%-32s %-16s %-12s %-28s %-8t %s\n", r.ID, r.Status, r.Event, truncate(r.Repo, 28), r.Trusted, time.Since(r.CreatedAt).Round(time.Second))
 	}
 	return nil
+}
+
+// filterRunsByTest keeps runs whose JUnit-derived test records include
+// testName (case-sensitive class-qualified name). Evidence, not log text.
+func filterRunsByTest(ctx context.Context, c *opsClient, runs []model.Run, testName string) []model.Run {
+	var out []model.Run
+	for _, r := range runs {
+		var reports []model.TestReport
+		if err := c.do(ctx, http.MethodGet, "/api/v1/runs/"+r.ID+"/tests", nil, &reports); err != nil {
+			continue
+		}
+		for _, rep := range reports {
+			for _, tc := range rep.Cases {
+				name := tc.Name
+				if tc.Class != "" {
+					name = tc.Class + "." + tc.Name
+				}
+				if name == testName || tc.Name == testName {
+					out = append(out, r)
+					break
+				}
+			}
+		}
+	}
+	return out
 }
 
 func opsJobs(ctx context.Context, args []string) error {
@@ -333,6 +374,7 @@ func opsLogs(ctx context.Context, args []string) error {
 	srv := fs.String("server", "", "Kiwi server URL (defaults to the active context / KIWI_SERVER)")
 	tok := fs.String("token", os.Getenv("KIWI_ADMIN_TOKEN"), "admin bearer token")
 	job := fs.String("job", "", "only print entries for this job key")
+	step := fs.String("step", "", "only print entries for this step name (e.g. security)")
 	follow := fs.Bool("follow", false, "follow the SSE log stream after the backlog")
 	interactive := fs.Bool("interactive", false, "open the interactive TUI log viewer (same as kiwi tui)")
 	rest, err := parseFlagsAndPositionals(fs, args)
@@ -366,6 +408,9 @@ func opsLogs(ctx context.Context, args []string) error {
 		if *job != "" && e.JobKey != *job {
 			continue
 		}
+		if *step != "" && e.Step != *step {
+			continue
+		}
 		fmt.Printf("[%s/%s] %s\n", e.JobKey, e.Step, e.Line)
 		if e.Seq > lastSeq {
 			lastSeq = e.Seq
@@ -374,12 +419,17 @@ func opsLogs(ctx context.Context, args []string) error {
 	if !*follow {
 		return nil
 	}
-	return followLogs(ctx, c, runID, lastSeq, *job)
+	return followLogsFiltered(ctx, c, runID, lastSeq, *job, *step)
 }
 
 // followLogs consumes the SSE endpoint, printing entries as they arrive
 // until the stream ends (idle timeout) or ctx is cancelled.
 func followLogs(ctx context.Context, c *opsClient, runID string, after int64, job string) error {
+	return followLogsFiltered(ctx, c, runID, after, job, "")
+}
+
+// followLogsFiltered is followLogs with optional job and step-name filters.
+func followLogsFiltered(ctx context.Context, c *opsClient, runID string, after int64, job, step string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/api/v1/runs/%s/logs/stream?after=%d", c.base, runID, after), nil)
 	if err != nil {
 		return err
@@ -409,9 +459,53 @@ func followLogs(ctx context.Context, c *opsClient, runID string, after int64, jo
 		if job != "" && e.JobKey != job {
 			continue
 		}
+		if step != "" && e.Step != step {
+			continue
+		}
 		fmt.Printf("[%s/%s] %s\n", e.JobKey, e.Step, e.Line)
 	}
 	return sc.Err()
+}
+
+
+// opsFlake prints flaky tests for a repository from the test-intelligence
+// store (tests that flip across runs). This is the CLI half of the JUnit
+// evidence contract: status descriptions and release gates must read this
+// store, never grep logs (audit SM14 F14).
+func opsFlake(ctx context.Context, args []string) error {
+	serverURL, token, rest, err := opsFlags("flake", args)
+	if err != nil {
+		return err
+	}
+	if len(rest) != 1 {
+		return fmt.Errorf("kiwi flake requires a repository (owner/name or canonical host/owner/name)")
+	}
+	repo := rest[0]
+	var out struct {
+		Repo        string   `json:"repo"`
+		Reports     int      `json:"reports"`
+		TotalTests  int      `json:"total_tests"`
+		Failures    int      `json:"failures"`
+		FlakyTests  []string `json:"flaky_tests"`
+	}
+	c := newOpsClient(serverURL, token)
+	path := "/api/v1/test-intelligence?repo=" + url.QueryEscape(repo)
+	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+		return err
+	}
+	fmt.Printf("repo        %s\n", out.Repo)
+	fmt.Printf("reports     %d\n", out.Reports)
+	fmt.Printf("tests       %d\n", out.TotalTests)
+	fmt.Printf("failures    %d\n", out.Failures)
+	if len(out.FlakyTests) == 0 {
+		fmt.Println("flaky       (none)")
+		return nil
+	}
+	fmt.Printf("flaky       %d\n", len(out.FlakyTests))
+	for _, name := range out.FlakyTests {
+		fmt.Printf("  %s\n", name)
+	}
+	return nil
 }
 
 func opsMutateRun(ctx context.Context, sub string, args []string) error {

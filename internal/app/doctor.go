@@ -166,6 +166,14 @@ func localDoctor() {
 		for _, name := range []string{"tart", "xcodebuild", "security"} {
 			toolCheck(name)
 		}
+		// Resource caps on macOS are advisory: the kernel has no per-job
+		// cgroup, so cpu/memory/pids limits are enforced by the executor's
+		// own bookkeeping and Tart VM sizing — not by the host. Linux
+		// runners with cgroup v2 get real kernel caps. Say it plainly so
+		// an operator is not surprised by a noisy-neighbor job.
+		fmt.Println("resource caps advisory on macOS (no cgroup v2): cpu/memory/pids")
+		fmt.Println("  are tracked by the executor and Tart VM size, not the kernel.")
+		fmt.Println("  Use a Linux runner when a hard ceiling is required.")
 	}
 	// Git version.
 	if p, err := exec.LookPath("git"); err == nil {

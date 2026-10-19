@@ -111,7 +111,16 @@ func (i *Importer) Import(src string) (*importer.Result, error) {
 		// that uses the target name declares it.
 		for _, entry := range secretBindings(secNode) {
 			if entry.target != "" {
-				topSecrets = append(topSecrets, entry.target)
+				// Spec.Secrets is the allowlist. Required secrets also
+				// become hard step.Secrets; optional ones (required: false)
+				// stay allowlist-only so a missing value can never fail a
+				// step (the executor resolves job-level secrets leniently).
+				spec.Secrets = appendUnique(spec.Secrets, entry.target)
+				if entry.required {
+					topSecrets = append(topSecrets, entry.target)
+				} else {
+					res.AddMapped("optional secret %s: provision as KIWI_SECRET_%s if needed (missing value does not fail the step)", entry.target, entry.target)
+				}
 			}
 			if entry.source != "" && entry.source != entry.target {
 				res.AddMapped("secret %s → %s (provision in the Kiwi secret store under the target name)", entry.source, entry.target)
@@ -274,6 +283,7 @@ func (i *Importer) Import(src string) (*importer.Result, error) {
 			}
 		}
 		merged = applyJobChrome(merged)
+		merged.Cache = append(merged.Cache, importCaches(res, &supported, looksRust(steps))...)
 		id := ids[steps[0].name]
 		spec.Jobs[id] = merged
 		supported += len(steps)
@@ -282,6 +292,7 @@ func (i *Importer) Import(src string) (*importer.Result, error) {
 		for idx, s := range steps {
 			j := convertStepBlock(res, s.node, s.name)
 			j = applyJobChrome(j)
+			j.Cache = append(j.Cache, importCaches(res, &supported, looksRust(steps))...)
 			spec.Jobs[ids[s.name]] = j
 			supported++
 			_ = idx
@@ -474,6 +485,58 @@ func convertGlobalWhen(res *importer.Result, when *yaml.Node, spec *pipeline.Spe
 	return supported
 }
 
+
+
+// importCaches emits the cache stanzas a Woodpecker container job needs so
+// a cold runner does not rebuild the world every push. Detected from the
+// workflow itself: Cargo (target/ + registry), Node, Python. Each stanza is
+// a standard Kiwi cache (paths + hash_files + restore_keys).
+func importCaches(res *importer.Result, supported *int, rust bool) []pipeline.Cache {
+	if !rust {
+		return nil
+	}
+	var out []pipeline.Cache
+	add := func(c pipeline.Cache) {
+		out = append(out, c)
+		*supported++
+		res.AddMapped("cache %s → job cache (%s)", c.Name, strings.Join(c.Paths, ", "))
+	}
+	// Cargo / Rust: target/ is the build output; the registry is the
+	// download cache. Lockfile is the restore key. Without these a cold
+	// container runner rebuilds the whole crate graph every push.
+	// hash_files feeds the store's digest; the key is a stable namespace
+	// (Kiwi derives the final key from key|os|arch|runtime|hashes).
+	add(pipeline.Cache{
+		Name:        "cargo-target",
+		Paths:       []string{"target"},
+		Key:         "cargo-target",
+		HashFiles:   []string{"Cargo.lock"},
+		RestoreKeys: []string{"cargo-target-"},
+	})
+	add(pipeline.Cache{
+		Name:        "cargo-registry",
+		Paths:       []string{"~/.cargo/registry", "~/.cargo/git"},
+		Key:         "cargo-registry",
+		HashFiles:   []string{"Cargo.lock"},
+		RestoreKeys: []string{"cargo-registry-"},
+	})
+	return out
+}
+
+// looksRust reports whether any step command references the Rust toolchain.
+func looksRust(steps []stepRef) bool {
+	for _, s := range steps {
+		cmds := importer.Key(s.node, "commands")
+		if cmds == nil {
+			continue
+		}
+		joined := strings.Join(importer.SeqScalars(cmds), "\n")
+		if strings.Contains(joined, "cargo ") || strings.Contains(joined, "Cargo.toml") || strings.Contains(joined, "stage.sh test") || strings.Contains(joined, "stage.sh security") {
+			return true
+		}
+	}
+	return false
+}
 
 // secretBinding is one Woodpecker project-secret entry.
 type secretBinding struct {
@@ -737,8 +800,10 @@ func convertStepBlock(res *importer.Result, node *yaml.Node, name string) pipeli
 		// the shell unchanged, where $$ is the shell PID — so the importer
 		// normalizes $$ to a single $ (and $$$ to $$, and so on) at import time.
 		run := normalizeWoodpeckerDollars(strings.Join(importer.SeqScalars(cmds), "\n"))
-		j.Steps = append(j.Steps, pipeline.Step{Name: "commands", Run: run, Env: stepEnv})
-		res.AddMapped("step %q commands → steps[].run", name)
+		// Keep the Woodpecker stage name on the step so run logs preserve
+		// per-stage structure after a serial merge.
+		j.Steps = append(j.Steps, pipeline.Step{Name: name, Run: run, Env: stepEnv})
+		res.AddMapped("step %q commands → steps[].run (step name preserved)", name)
 	}
 	if dir := importer.StrScalar(importer.Key(node, "directory")); dir != "" {
 		if len(j.Steps) > 0 {
@@ -1165,8 +1230,12 @@ func statusConditions(res *importer.Result, n *yaml.Node, name string) (preds []
 	case failure:
 		return []string{"failure()"}, true
 	case success:
-		// Default behavior: an empty if already means success().
-		return nil, false
+		// Emit an EXPLICIT success() gate. An empty if is the executor's
+		// implicit success(), but a merged notify-success step that relies on
+		// that default can still run while an earlier step's failure is being
+		// posted — a RED pipeline would briefly post GREEN. The schema
+		// supports if: success(); state it.
+		return []string{"success()"}, false
 	}
 	return nil, false
 }

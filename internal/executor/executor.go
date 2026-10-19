@@ -669,7 +669,10 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	}
 	jobEnv := mergeEnvMap(baseEnv, s.Env, cj.Job.Env)
 	secretCache := map[string]string{}
-	jobSecrets, secErr := e.resolveSecrets(ctx, s.Secrets, secretCache)
+	// Job-level secrets (Spec.Secrets) are the allowlist: resolve leniently
+	// so an optional project secret (Woodpecker required: false) that is not
+	// provisioned cannot fail the job. Step-level secrets stay fail-closed.
+	jobSecrets, secErr := e.resolveSecretsOptional(ctx, s.Secrets, secretCache)
 	if secErr != nil {
 		res.Status = model.StatusFailure
 		res.Error = secErr.Error()
@@ -1032,6 +1035,16 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		e.sessions.delete(cj.ID)
 	}()
 	stepOutputs := map[string]map[string]string{}
+	// Toolchain fingerprint gate: run before step 1, fail closed on a
+	// missing or wrong-version tool. Observed versions are recorded so the
+	// execution attestation can carry them.
+	if len(cj.Job.Tools) > 0 {
+		if err := e.checkToolFingerprint(cj.ID, cj.Job.Tools); err != nil {
+			res.Status = model.StatusFailure
+			res.Error = err.Error()
+			return finish(res)
+		}
+	}
 	// currentStatus drives step condition evaluation. A hard step failure
 	// does NOT abort the job: later steps whose conditions explicitly allow
 	// the new status (always(), failure(), cancelled(), ...) still run.
@@ -1411,6 +1424,47 @@ func (e *Executor) captureSnapshot(jobID, workspace string) {
 		return
 	}
 	e.log(jobID, "snapshot", "saved "+dest)
+}
+
+
+// checkToolFingerprint asserts each tools: entry ("docker=29.5") before any
+// step runs. The tool must exist and its --version output must contain the
+// declared version prefix. Observed versions are logged for the attestation.
+func (e *Executor) checkToolFingerprint(jobID string, tools []string) error {
+	for _, entry := range tools {
+		name, want, ok := strings.Cut(entry, "=")
+		name = strings.TrimSpace(name)
+		if !ok || name == "" {
+			return fmt.Errorf("tools entry %q must be name=version-prefix", entry)
+		}
+		path, err := exec.LookPath(name)
+		if err != nil {
+			return fmt.Errorf("tools: %s is required (declared %q) but not on PATH", name, entry)
+		}
+		if want == "" {
+			e.log(jobID, "tools", name+" found at "+path)
+			continue
+		}
+		out, err := exec.Command(path, "--version").Output()
+		if err != nil {
+			// Some tools use -v or -V; try those before failing.
+			out, err = exec.Command(path, "-v").Output()
+		}
+		versionText := strings.TrimSpace(string(out))
+		if !strings.Contains(versionText, strings.TrimSpace(want)) {
+			return fmt.Errorf("tools: %s version %q does not match required %q", name, truncateVersion(versionText), want)
+		}
+		e.log(jobID, "tools", name+" "+versionText)
+	}
+	return nil
+}
+
+// truncateVersion keeps fingerprint log lines bounded.
+func truncateVersion(s string) string {
+	if len(s) > 120 {
+		return s[:120] + "..."
+	}
+	return s
 }
 
 // defaultCondition supplies the implicit step condition: a step without an
@@ -1942,6 +1996,53 @@ func (e *Executor) resolveSecrets(ctx context.Context, names []string, cache map
 			var er error
 			v, er = e.Opt.SecretProvider.Get(ctx, name)
 			if er != nil {
+				return nil, er
+			}
+			if e.Masker != nil {
+				if err := e.Masker.AddStrict(v); err != nil {
+					return nil, &RunError{Kind: ErrorConfig, Err: fmt.Errorf("secret %q cannot be masked; refusing to run: %w", name, err)}
+				}
+			}
+			cache[name] = v
+		}
+		out[secretEnvName(name)] = v
+	}
+	return out, nil
+}
+
+
+
+// isSecretNotFound reports whether err means "this secret is not
+// provisioned" (skip for optional job-level secrets) as opposed to a
+// provider failure (fail closed).
+func isSecretNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "not found") || strings.Contains(s, "not set") ||
+		strings.Contains(s, "unset") || strings.Contains(s, "not configured")
+}
+
+// resolveSecretsOptional is resolveSecrets for the job-level allowlist: a
+// missing secret is skipped (logged via the empty map) instead of failing.
+func (e *Executor) resolveSecretsOptional(ctx context.Context, names []string, cache map[string]string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, name := range names {
+		v, ok := cache[name]
+		if !ok {
+			if e.Opt.SecretProvider == nil {
+				continue
+			}
+			var er error
+			v, er = e.Opt.SecretProvider.Get(ctx, name)
+			if er != nil {
+				// Missing/absent is optional and skipped. A provider
+				// FAILURE (outage, auth) is still fail-closed — an
+				// unreachable secret store must never look like "not set".
+				if isSecretNotFound(er) {
+					continue
+				}
 				return nil, er
 			}
 			if e.Masker != nil {

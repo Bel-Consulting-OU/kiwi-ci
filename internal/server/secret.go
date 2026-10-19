@@ -704,7 +704,7 @@ func (s *Server) issueSecret(w http.ResponseWriter, r *http.Request) {
 		// Opaque to the client: the decision detail goes to the server log
 		// and the audit trail, not the wire.
 		s.logError("secret delivery refused", "job", j.ID, "name", in.Name, "stage", d.Stage, "reason", d.Reason)
-		http.Error(w, "secret not available for this job", status)
+		http.Error(w, "secret not available for this job: add the name to the job's secrets: list or .kiwi/policy.toml secret_allowlist", status)
 		return
 	}
 	s.deliverSecret(w, r, j, in, pubRaw)

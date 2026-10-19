@@ -505,14 +505,23 @@ type Job struct {
 	Component       string            `yaml:"component,omitempty" json:"component,omitempty"`
 	With            map[string]string `yaml:"with,omitempty" json:"with,omitempty"`
 	QueueTimeout    Duration          `yaml:"queue_timeout,omitempty" json:"queue_timeout,omitempty"`
+	// Tools is a toolchain fingerprint checked before step 1 and recorded
+	// in the execution attestation: ["docker=29.5", "psql=17", "cargo=1.80"].
+	// Each entry is name=version-prefix. The job fails closed if a tool is
+	// missing or its version does not match.
+	Tools []string `yaml:"tools,omitempty" json:"tools,omitempty"`
 }
 
 type Service struct {
 	Name  string `yaml:"name" json:"name"`
 	Image string `yaml:"image" json:"image"`
 	// Command overrides the image entrypoint (Woodpecker service commands).
-	Command     []string          `yaml:"command,omitempty" json:"command,omitempty"`
-	Env         map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
+	Command []string          `yaml:"command,omitempty" json:"command,omitempty"`
+	Env     map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
+	// Ready is a native readiness probe: "tcp:5432", "http:8123/ping",
+	// or "pg_isready:5432". The executor waits for it before the job
+	// starts, replacing hand-rolled wait loops in pipelines.
+	Ready       string            `yaml:"ready,omitempty" json:"ready,omitempty"`
 	Healthcheck string            `yaml:"healthcheck,omitempty" json:"healthcheck,omitempty"`
 	Interval    Duration          `yaml:"interval,omitempty" json:"interval,omitempty"`
 	Timeout     Duration          `yaml:"timeout,omitempty" json:"timeout,omitempty"`
