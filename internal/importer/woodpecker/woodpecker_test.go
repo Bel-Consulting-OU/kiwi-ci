@@ -81,8 +81,8 @@ func TestImportParsesAndMapsSemantics(t *testing.T) {
 	if len(test.Needs) != 1 || test.Needs[0] != "lint" {
 		t.Fatalf("test needs = %v", test.Needs)
 	}
-	if test.Env["RACE"] != "true" {
-		t.Fatalf("test env = %v", test.Env)
+	if len(test.Steps) == 0 || test.Steps[0].Env["RACE"] != "true" {
+		t.Fatalf("test step env = %+v (Woodpecker environment is per-step)", test.Steps)
 	}
 	if len(test.Steps) != 1 || len(test.Steps[0].Secrets) != 1 || test.Steps[0].Secrets[0] != "codecov_token" {
 		t.Fatalf("test step secrets = %+v", test.Steps)

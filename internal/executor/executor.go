@@ -88,6 +88,9 @@ type Options struct {
 	GitRef           string
 	RepoURL          string
 	RepoFullName     string
+	// RunURL is the control-plane run link (CI_PIPELINE_URL /
+	// STATUS_TARGET_URL for forge commit-status scripts). Empty locally.
+	RunURL string
 	ChangedFiles     []string
 	SecretProvider   secrets.Provider
 	Logs             logging.Sink
@@ -686,9 +689,10 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	jobEnv["KIWI_REPO"] = e.Opt.RepoURL
 	jobEnv["KIWI_REPO_FULL"] = e.Opt.RepoFullName
 	jobEnv["KIWI_WORKSPACE"] = workspace
-	// Legacy CI_* names so imported Woodpecker/Drone/GitLab scripts run
-	// unmodified. CI_WORKSPACE is the job workspace (the container's $PWD
-	// when the step runs at the workspace root).
+	// Legacy CI_* / GITHUB_* names so imported Woodpecker/Drone/GitLab and
+	// GitHub-Actions-style scripts run unmodified. CI_WORKSPACE is the job
+	// workspace (the container's $PWD when the step runs at the workspace
+	// root). CI_SHA / CI_REF are the aliases ApexMail's stage.sh expects.
 	jobEnv["CI"] = "true"
 	jobEnv["CI_COMMIT_BRANCH"] = e.Opt.Branch
 	jobEnv["CI_COMMIT_REF"] = e.Opt.GitRef
@@ -696,6 +700,20 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	jobEnv["CI_WORKSPACE"] = workspace
 	jobEnv["CI_REPO"] = e.Opt.RepoFullName
 	jobEnv["CI_REPO_NAME"] = e.Opt.RepoFullName
+	jobEnv["CI_SHA"] = e.Opt.GitSHA
+	jobEnv["CI_REF"] = e.Opt.GitRef
+	jobEnv["CI_BUILD_LINK"] = e.Opt.RunURL
+	jobEnv["CI_PIPELINE_URL"] = e.Opt.RunURL
+	jobEnv["CI_PIPELINE_LINK"] = e.Opt.RunURL
+	jobEnv["GITHUB_SHA"] = e.Opt.GitSHA
+	jobEnv["GITHUB_REF"] = e.Opt.GitRef
+	jobEnv["GITHUB_REPOSITORY"] = e.Opt.RepoFullName
+	// Owner/name split for scripts that post commit statuses.
+	if owner, name, ok := strings.Cut(e.Opt.RepoFullName, "/"); ok {
+		jobEnv["CI_REPO_OWNER"] = owner
+		jobEnv["GITHUB_REPOSITORY_OWNER"] = owner
+		_ = name
+	}
 	// Cache-definition ceiling (defense in depth): an untrusted job can
 	// reach the executor through paths that skipped enqueue admission
 	// (generated fragments), and every entry is an independent archive/key,

@@ -60,7 +60,7 @@ func TestImportEdgeFixture(t *testing.T) {
 	}
 
 	build := spec.Jobs["build"]
-	if build.Image != "golang:1.23" || build.Env["CGO"] != "0" {
+	if build.Image != "golang:1.23" || len(build.Steps) == 0 || build.Steps[0].Env["CGO"] != "0" {
 		t.Fatalf("build = %+v", build)
 	}
 	// when.branch list is an OR, when.event list is an OR, and the two

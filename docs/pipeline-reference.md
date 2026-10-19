@@ -226,7 +226,13 @@ cancellation.
 ### Services
 
 `services` runs sidecar containers for `runtime: container` jobs on a
-dedicated network:
+dedicated network. The **host** docker daemon starts the sidecars; the
+job container joins the same bridge and reaches each service by name
+(`postgres:5432`, `redis:6379`, ...). The job itself never receives
+`/var/run/docker.sock` — so a security gate that forbids docker inside
+the executor (audit SM14 F5) is already satisfied. DB-gated suites that
+need a live Postgres/Redis/ClickHouse use this shape; they do not need
+docker-in-docker.
 
 ```yaml
 services:

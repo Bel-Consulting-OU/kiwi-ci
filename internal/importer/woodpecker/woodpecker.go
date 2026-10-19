@@ -104,6 +104,33 @@ func (i *Importer) Import(src string) (*importer.Result, error) {
 	// difference is reported.
 	var sharedServices []pipeline.Service
 	var sharedVolumes []pipeline.Volume
+	var topSecrets []string
+	if secNode := importer.Key(doc, "secrets"); secNode != nil {
+		// Project secret bindings (source → target). Values are provisioned
+		// in the Kiwi secret store; the binding is recorded so every step
+		// that uses the target name declares it.
+		for _, entry := range secretBindings(secNode) {
+			if entry.target != "" {
+				topSecrets = append(topSecrets, entry.target)
+			}
+			if entry.source != "" && entry.source != entry.target {
+				res.AddMapped("secret %s → %s (provision in the Kiwi secret store under the target name)", entry.source, entry.target)
+			} else if entry.target != "" {
+				res.AddMapped("secret %s → step secret declaration", entry.target)
+			}
+			if entry.required {
+				res.AddTODO("secret %q: Woodpecker required secrets are provisioned at project settings; ensure the Kiwi secret store has %q", entry.target, entry.target)
+			}
+		}
+		supported++
+	}
+	if varsNode := importer.Key(doc, "variables"); varsNode != nil {
+		// Woodpecker `variables` is a YAML-anchor carrier in practice (the
+		// ApexMail pipeline pins the CI image here). Anchors are expanded
+		// before the walk, so there is nothing left to convert.
+		res.AddMapped("variables → YAML anchors expanded at import")
+		supported++
+	}
 	if svcNode := importer.Key(doc, "services"); svcNode != nil {
 		svc, ok := convertServices(res, svcNode)
 		sharedServices = svc
@@ -214,6 +241,11 @@ func (i *Importer) Import(src string) (*importer.Result, error) {
 		if len(sharedVolumes) > 0 {
 			j.Volumes = append(j.Volumes, sharedVolumes...)
 		}
+		if len(topSecrets) > 0 {
+			for i := range j.Steps {
+				j.Steps[i].Secrets = appendUniqueAll(j.Steps[i].Secrets, topSecrets...)
+			}
+		}
 		return j
 	}
 
@@ -237,14 +269,6 @@ func (i *Importer) Import(src string) (*importer.Result, error) {
 				res.AddUnsupported("step %q image %q differs from merged job image %q; split the workflow or pin one image", s.name, part.Image, merged.Image)
 			}
 			merged.Steps = append(merged.Steps, part.Steps...)
-			for k, v := range part.Env {
-				if merged.Env == nil {
-					merged.Env = map[string]string{}
-				}
-				if _, exists := merged.Env[k]; !exists {
-					merged.Env[k] = v
-				}
-			}
 			if len(part.Needs) > 0 {
 				res.AddUnsupported("step %q depends_on inside a serial merge is not converted", s.name)
 			}
@@ -323,6 +347,7 @@ func (i *Importer) Import(src string) (*importer.Result, error) {
 		"branches": true, "when": true, "matrix": true, "clone": true,
 		"skip_clone": true, "labels": true, "workspace": true, "services": true,
 		"volumes": true, "pipeline": true, "steps": true,
+		"secrets": true, "variables": true,
 	}
 	for _, k := range mapKeys(doc) {
 		if !handledTop[k] {
@@ -415,6 +440,11 @@ func convertGlobalWhen(res *importer.Result, when *yaml.Node, spec *pipeline.Spe
 					}
 					spec.On[e] = spec.On[e]
 					supported++
+				case "manual":
+					// Kiwi has no scheduled/manual event token in on.*; the
+					// equivalent is an explicit `kiwi run` / `kiwi dispatch`.
+					res.AddMapped("workflow when.event manual → run via `kiwi run` / `kiwi dispatch` (no on.* key)")
+					supported++
 				default:
 					res.AddUnsupported("workflow when.event %q has no Kiwi trigger event; the workflow-level filter is not converted", e)
 				}
@@ -442,6 +472,52 @@ func convertGlobalWhen(res *importer.Result, when *yaml.Node, spec *pipeline.Spe
 		res.AddMapped("workflow when → on triggers")
 	}
 	return supported
+}
+
+
+// secretBinding is one Woodpecker project-secret entry.
+type secretBinding struct {
+	source   string
+	target   string
+	required bool
+}
+
+// secretBindings reads a top-level `secrets` block: a sequence of
+// {source, target, required} mappings (or bare names).
+func secretBindings(n *yaml.Node) []secretBinding {
+	if n == nil {
+		return nil
+	}
+	var out []secretBinding
+	appendOne := func(item *yaml.Node) {
+		if item == nil {
+			return
+		}
+		switch item.Kind {
+		case yaml.ScalarNode:
+			if s := strings.TrimSpace(item.Value); s != "" {
+				out = append(out, secretBinding{source: s, target: s})
+			}
+		case yaml.MappingNode:
+			src := importer.StrScalar(importer.Key(item, "source"))
+			tgt := importer.StrScalar(importer.Key(item, "target"))
+			if tgt == "" {
+				tgt = src
+			}
+			req, _ := importer.BoolScalar(importer.Key(item, "required"))
+			if src != "" || tgt != "" {
+				out = append(out, secretBinding{source: src, target: tgt, required: req})
+			}
+		}
+	}
+	if n.Kind == yaml.SequenceNode {
+		for _, item := range n.Content {
+			appendOne(item)
+		}
+		return out
+	}
+	appendOne(n)
+	return out
 }
 
 // convertServices converts a Woodpecker services block into Kiwi job
@@ -652,15 +728,16 @@ func convertStepBlock(res *importer.Result, node *yaml.Node, name string) pipeli
 	if importer.Key(node, "pull") != nil {
 		res.AddMapped("step %q pull policy: Kiwi's container runtime resolves images the same way (digest pins are enforced for untrusted jobs)", name)
 	}
+	stepEnv := map[string]string{}
 	if env := importer.Key(node, "environment"); env != nil {
-		j.Env = convertEnvironment(res, env, name)
+		stepEnv = convertEnvironment(res, env, name)
 	}
 	if cmds := importer.Key(node, "commands"); cmds != nil {
 		// Woodpecker's $$ is a literal-dollar escape. Kiwi hands the script to
 		// the shell unchanged, where $$ is the shell PID — so the importer
 		// normalizes $$ to a single $ (and $$$ to $$, and so on) at import time.
 		run := normalizeWoodpeckerDollars(strings.Join(importer.SeqScalars(cmds), "\n"))
-		j.Steps = append(j.Steps, pipeline.Step{Name: "commands", Run: run})
+		j.Steps = append(j.Steps, pipeline.Step{Name: "commands", Run: run, Env: stepEnv})
 		res.AddMapped("step %q commands → steps[].run", name)
 	}
 	if dir := importer.StrScalar(importer.Key(node, "directory")); dir != "" {
