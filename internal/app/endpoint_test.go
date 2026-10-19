@@ -9,6 +9,10 @@ import (
 // The precedence contract: explicit flag > active context > env > local
 // default. A saved login context must actually be the default authority.
 func TestResolveEndpointPrecedence(t *testing.T) {
+	// Isolate from any saved operator context (flag > context > env): a
+	// real ~/.config/kiwi/contexts.json would win over env and break the
+	// precedence assertions.
+	t.Setenv("KIWI_CONFIG_DIR", t.TempDir())
 	t.Setenv("KIWI_SERVER", "")
 	t.Setenv("KIWI_ADMIN_TOKEN", "")
 	t.Setenv("KIWI_ALLOW_INSECURE_HTTP", "")

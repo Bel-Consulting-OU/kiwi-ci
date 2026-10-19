@@ -123,10 +123,8 @@ func TestRunnerProcessBoundaryLedgerIsolation(t *testing.T) {
 	bin := buildKiwi(t, root)
 	workDir := filepath.Join(root, "shared-work")
 	os.MkdirAll(workDir, 0o700)
-	// Workspaces are created under TMPDIR; both runners share it, exactly
-	// like two runners sharing /tmp on a host.
-	sharedTmp := filepath.Join(root, "shared-tmp")
-	os.MkdirAll(sharedTmp, 0o700)
+	// Workspaces are created under WorkDir (Docker-shareable); both
+	// runners share it, exactly like two runners sharing a work root.
 	port := freeTCPPort(t)
 	base := fmt.Sprintf("http://127.0.0.1:%d", port)
 
@@ -202,8 +200,7 @@ func TestRunnerProcessBoundaryLedgerIsolation(t *testing.T) {
 			"--identity-dir", filepath.Join(root, "identity-"+name))
 		cmd.Env = append(os.Environ(),
 			"KIWI_ALLOW_UNQUOTAED_UNTRUSTED_DISK=1",
-			"KIWI_ALLOW_INSECURE_CLONE=1",
-			"TMPDIR="+sharedTmp)
+			"KIWI_ALLOW_INSECURE_CLONE=1")
 		cmd.Stdout = os.Stderr
 		cmd.Stderr = os.Stderr
 		if err := cmd.Start(); err != nil {
@@ -223,7 +220,7 @@ func TestRunnerProcessBoundaryLedgerIsolation(t *testing.T) {
 	// A's live workspace and its ledger entry appear while the hold step runs.
 	var liveWS string
 	waitFor(t, "runner A live workspace", 60*time.Second, func() bool {
-		matches, _ := filepath.Glob(filepath.Join(sharedTmp, "kiwi-run-*"))
+		matches, _ := filepath.Glob(filepath.Join(workDir, "kiwi-run-*"))
 		for _, m := range matches {
 			if st, err := os.Stat(filepath.Join(m, "hold.txt")); err == nil && st.Mode().IsRegular() {
 				liveWS = m
@@ -271,7 +268,7 @@ func TestRunnerProcessBoundaryLedgerIsolation(t *testing.T) {
 	}
 	var crashedWS string
 	waitFor(t, "second live workspace", 60*time.Second, func() bool {
-		matches, _ := filepath.Glob(filepath.Join(sharedTmp, "kiwi-run-*"))
+		matches, _ := filepath.Glob(filepath.Join(workDir, "kiwi-run-*"))
 		for _, m := range matches {
 			if m == liveWS {
 				continue
@@ -311,7 +308,7 @@ func TestRunnerProcessBoundaryLedgerIsolation(t *testing.T) {
 	}
 	if _, err := os.Stat(crashedWS); !os.IsNotExist(err) {
 		entries, _ := filepath.Glob(filepath.Join(workDir, ".kiwi-runtime", "*", "ledger", "*.json"))
-		workspaces, _ := filepath.Glob(filepath.Join(sharedTmp, "kiwi-run-*"))
+		workspaces, _ := filepath.Glob(filepath.Join(workDir, "kiwi-run-*"))
 		t.Fatalf("runner A replacement did not reclaim %s\nledger entries: %v\nworkspaces: %v\na2 output:\n%s", crashedWS, entries, workspaces, a2Out.String())
 	}
 	if _, err := os.Stat(liveWS); err != nil {

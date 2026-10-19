@@ -1889,15 +1889,18 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAction(w, r, auth.ActionRun, in.RepoID, false) {
 		return
 	}
-	// Direct API submissions are trusted only when the deployment opted in
-	// (kiwi.toml [runner] trusted = true, the local/embedded runner).
-	// Otherwise only the forge webhook path (and internal reruns of
-	// previously trusted runs) set Trusted. The `trusted` field is not
-	// accepted from client JSON (json:"-").
-	if !s.LocalTrusted {
-		in.Trusted = false
-	} else {
-		in.Trusted = true
+	// Direct API submissions are trusted when: (a) the deployment opted in
+	// (kiwi.toml [runner] trusted = true), or (b) an admin explicitly
+	// requested it via X-Kiwi-Trusted (dispatch --trusted). The `trusted`
+	// field is never accepted from client JSON (json:"-").
+	in.Trusted = s.LocalTrusted
+	if !in.Trusted && r.Header.Get("X-Kiwi-Trusted") == "1" {
+		// The header is honored only for an AUTHENTICATED principal that
+		// holds ActionTrustedRun. requireAction allows the no-principal
+		// legacy path through, so the principal check is explicit here.
+		if p, ok := auth.PrincipalFrom(r); ok {
+			in.Trusted = auth.Authorize(p, auth.ActionTrustedRun, in.RepoID, true)
+		}
 	}
 	// Image lock is compilation authority for API submits too. The client
 	// supplies the pipeline text; when the submission names a repository and

@@ -1253,7 +1253,11 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		}
 	}()
 
-	tmp, err := os.MkdirTemp("", "kiwi-run-*")
+	// Workspace root must be Docker-shareable: TMPDIR (/var/folders on
+	// macOS) is invisible to Docker Desktop, so a checkout into it yields
+	// an empty /workspace in the container (K12). Prefer WorkDir, then a
+	// directory under the user's home.
+	tmp, err := r.newJobWorkspaceRoot()
 	if err != nil {
 		r.complete(parent, t, model.StatusFailure, err, nil, nil)
 		return
@@ -1420,11 +1424,20 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		setupCtx, setupCancel = context.WithTimeout(ctx, r.setupPhaseTimeout())
 	}
 	defer setupCancel()
+	// Checkout runs before the log sink exists; use a direct console line
+	// so the clone is visible (a silent success used to look like "zero
+	// git/clone attempts" to the operator).
+	logf := func(step, line string) {
+		fmt.Printf("[%s/%s] %s\n", t.Job.Key, step, line)
+	}
 	checkoutStart := time.Now()
+	logf("checkout", "cloning "+t.Job.RepoURL+" @ "+t.Job.SHA)
 	if err = r.checkoutTask(setupCtx, t.Job, tmp); err != nil {
+		logf("checkout", "failed: "+err.Error())
 		r.complete(parent, t, statusForErr(setupCtx, err), err, nil, nil)
 		return
 	}
+	logf("checkout", "done in "+time.Since(checkoutStart).String())
 	r.Metrics.Observe("kiwi_runner_checkout_duration_seconds", time.Since(checkoutStart).Seconds())
 	spec, err := pipeline.Parse([]byte(t.Job.Pipeline))
 	if err != nil {
@@ -1940,6 +1953,28 @@ func networkPolicyName(p pipeline.NetworkPolicy) string {
 // checkoutTask provisions the job workspace: the default git checkout or
 // the configured replacement. The job's declared clone/workspace policy is
 // resolved from the persisted pipeline and honored by the default checkout.
+
+// newJobWorkspaceRoot picks a Docker-shareable location for the job
+// workspace. os.MkdirTemp("") uses TMPDIR, which Docker Desktop does not
+// share on macOS — the bind mount is empty and every dispatched job sees
+// files=0. Prefer Cfg.WorkDir, else ~/.kiwi/workspaces.
+func (r *Runner) newJobWorkspaceRoot() (string, error) {
+	if r.Cfg.WorkDir != "" {
+		if err := os.MkdirAll(r.Cfg.WorkDir, 0o755); err == nil {
+			return os.MkdirTemp(r.Cfg.WorkDir, "kiwi-run-")
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if _, serr := os.Stat(home); serr == nil {
+			base := filepath.Join(home, ".kiwi", "workspaces")
+			if err := os.MkdirAll(base, 0o755); err == nil {
+				return os.MkdirTemp(base, "run-")
+			}
+		}
+	}
+	return os.MkdirTemp("", "kiwi-run-")
+}
+
 func (r *Runner) checkoutTask(ctx context.Context, j model.Job, dir string) error {
 	if r.Cfg.CheckoutFn != nil {
 		return r.Cfg.CheckoutFn(ctx, j, dir)

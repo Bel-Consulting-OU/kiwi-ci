@@ -61,6 +61,7 @@ func Dispatch(ctx context.Context, args []string) error {
 	forgeKind := fs.String("forge", "", "forge to fetch from: github, gitlab or forgejo (auto-detected from --repo when omitted)")
 	var inputs kvFlags
 	fs.Var(&inputs, "input", "pipeline input k=v (repeatable)")
+	trusted := fs.Bool("trusted", false, "submit as a trusted run (enables secrets, host mounts; requires admin)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -131,6 +132,11 @@ func Dispatch(ctx context.Context, args []string) error {
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Idempotency-Key", opKey)
+		if *trusted {
+			// Trusted is json:"-" on SubmitRun (never from client JSON); the
+			// header is the explicit operator request the server may honor.
+			req.Header.Set("X-Kiwi-Trusted", "1")
+		}
 		if ep.Token != "" {
 			req.Header.Set("Authorization", "Bearer "+ep.Token)
 		}

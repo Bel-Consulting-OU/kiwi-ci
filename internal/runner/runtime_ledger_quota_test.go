@@ -59,7 +59,8 @@ func runAmbiguousQuotaTask(t *testing.T, r *Runner, fsrv *fakeRunnerServer, tmpD
 	}
 	r.execute(context.Background(), task)
 	c, ok := fsrv.lastComplete()
-	workspaces, _ := filepath.Glob(filepath.Join(tmpDir, "kiwi-run-*"))
+	// Workspaces live under WorkDir (Docker-shareable), not TMPDIR.
+	workspaces, _ := filepath.Glob(filepath.Join(r.Cfg.WorkDir, "kiwi-run-*"))
 	ws := ""
 	if len(workspaces) > 0 {
 		ws = workspaces[0]

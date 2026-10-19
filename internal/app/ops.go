@@ -649,6 +649,7 @@ func opsPolicy(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("policy check", flag.ContinueOnError)
 	file := fs.String("f", ".kiwi/pipeline.yaml", "pipeline file")
 	trusted := fs.Bool("trusted", false, "evaluate with trusted default capabilities instead of untrusted")
+	policyFile := fs.String("config", "", "policy file to intersect (default .kiwi/policy.toml when present)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -659,6 +660,25 @@ func opsPolicy(ctx context.Context, args []string) error {
 	caps := policy.DefaultUntrustedCapabilities()
 	if *trusted {
 		caps = policy.DefaultTrustedCapabilities()
+	}
+	// Honor the policy file so a trusted preview matches the server:
+	// secret_allowlist and other restrictions narrow the capability set.
+	polPath := *policyFile
+	if polPath == "" {
+		for _, cand := range []string{".kiwi/policy.toml", ".kiwi/policy.yaml"} {
+			if _, serr := os.Stat(cand); serr == nil {
+				polPath = cand
+				break
+			}
+		}
+	}
+	if polPath != "" {
+		if pol, perr := policy.Load(polPath); perr == nil {
+			caps = policy.Intersect(caps, pol.CapabilitiesFor(""))
+			fmt.Printf("  policy file:    %s\n", polPath)
+		} else {
+			return fmt.Errorf("policy: %w", perr)
+		}
 	}
 	effective := caps.Effective(*trusted)
 	trust := "untrusted"
