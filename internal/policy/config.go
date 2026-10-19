@@ -1,6 +1,7 @@
 package policy
 
 import (
+	toml "github.com/pelletier/go-toml/v2"
 	"fmt"
 	"os"
 	"reflect"
@@ -149,7 +150,20 @@ func Load(path string) (*Config, error) {
 	if len(data) > 1<<20 {
 		return nil, fmt.Errorf("policy: file exceeds 1 MiB")
 	}
+	// policy.toml is TOML; also accept YAML for hand-edited files. Detect
+	// by trying YAML first only when the file does not look like TOML
+	// (bare `key =` or `[section]` lines).
 	var root yaml.Node
+	if looksLikeTOML(data) {
+		cfg, err := loadTOML(data)
+		if err != nil {
+			return nil, fmt.Errorf("policy: %w", err)
+		}
+		if err := cfg.Validate(); err != nil {
+			return nil, err
+		}
+		return cfg, nil
+	}
 	if err := yaml.Unmarshal(data, &root); err != nil {
 		return nil, fmt.Errorf("policy: %w", err)
 	}
@@ -176,6 +190,100 @@ func Load(path string) (*Config, error) {
 // top-level mapping of doc. Presence is what distinguishes "opa_file was
 // explicitly set to the empty string" (a configuration error: the gate would
 // be disabled) from "opa_file was not configured" (no OPA).
+
+// looksLikeTOML reports whether data is TOML rather than YAML: a `[section]`
+// header or a bare `key =` assignment at the start of a line.
+func looksLikeTOML(data []byte) bool {
+	for _, line := range strings.Split(string(data), "\n") {
+		s := strings.TrimSpace(line)
+		if s == "" || strings.HasPrefix(s, "#") {
+			continue
+		}
+		if strings.HasPrefix(s, "[") || strings.Contains(s, " = ") || strings.HasSuffix(s, " =") {
+			return true
+		}
+		return false
+	}
+	return false
+}
+
+// loadTOML decodes a policy.toml into Config. Secret_allowlist and the
+// repositories map follow the same shapes as the YAML form.
+func loadTOML(data []byte) (*Config, error) {
+	var raw map[string]any
+	if err := toml.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+	cfg := &Config{}
+	if v, ok := raw["secret_allowlist"]; ok {
+		cfg.SecretAllowlist = anyToStrings(v)
+	}
+	if v, ok := raw["oidc_audiences"]; ok {
+		cfg.OIDCAudiences = anyToStrings(v)
+	}
+	if v, ok := raw["allowed_clone_hosts"]; ok {
+		cfg.AllowedCloneHosts = anyToStrings(v)
+	}
+	if v, ok := raw["allowed_runner_pools"]; ok {
+		cfg.AllowedRunnerPools = anyToStrings(v)
+	}
+	if v, ok := raw["allowed_regions"]; ok {
+		cfg.AllowedRegions = anyToStrings(v)
+	}
+	if v, ok := raw["require_digest_pins"]; ok {
+		cfg.RequireDigestPins, _ = v.(bool)
+	}
+	if v, ok := raw["require_rootless"]; ok {
+		cfg.RequireRootless, _ = v.(bool)
+	}
+	if v, ok := raw["network"].(string); ok {
+		cfg.Network = v
+	}
+	if v, ok := raw["opa_file"].(string); ok {
+		cfg.OPAFile = v
+	}
+	if v, ok := raw["opa_rules"].(string); ok {
+		cfg.OPARules = v
+	}
+	if v, ok := raw["repositories"].(map[string]any); ok {
+		cfg.Repositories = map[string]RepoPolicy{}
+		for name, rv := range v {
+			rm, _ := rv.(map[string]any)
+			rp := RepoPolicy{}
+			if x, ok := rm["secret_allowlist"]; ok {
+				rp.SecretAllowlist = anyToStrings(x)
+			}
+			if x, ok := rm["oidc_audiences"]; ok {
+				rp.OIDCAudiences = anyToStrings(x)
+			}
+			if x, ok := rm["allowed_clone_hosts"]; ok {
+				rp.AllowedCloneHosts = anyToStrings(x)
+			}
+			if x, ok := rm["allowed_regions"]; ok {
+				rp.AllowedRegions = anyToStrings(x)
+			}
+			cfg.Repositories[name] = rp
+		}
+	}
+	return cfg, nil
+}
+
+func anyToStrings(v any) []string {
+	switch x := v.(type) {
+	case []any:
+		out := make([]string, 0, len(x))
+		for _, e := range x {
+			if s, ok := e.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	case []string:
+		return x
+	}
+	return nil
+}
+
 func topLevelKeysSet(doc *yaml.Node, keys ...string) (present []bool) {
 	present = make([]bool, len(keys))
 	if doc == nil || doc.Kind != yaml.MappingNode {

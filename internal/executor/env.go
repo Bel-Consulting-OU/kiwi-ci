@@ -20,6 +20,24 @@ func cleanExecutionEnv() map[string]string {
 	}
 }
 
+// containerSafeEnv drops host-only variables that must never enter a
+// container step: they carry host paths and make the toolchain diverge per
+// invoking user. PATH is dropped entirely so the IMAGE's PATH stands
+// (a digest-pinned image is the toolchain contract).
+func containerSafeEnv(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		switch k {
+		case "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TEMP", "TMP",
+			"PWD", "OLDPWD", "SHLVL", "TERM", "LC_CTYPE", "LC_COLLATE",
+			"LC_MESSAGES", "LC_MONETARY", "LC_NUMERIC", "LC_TIME":
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
 // osEnvironMap captures the host environment as a map. It is used only for the
 // explicit InheritEnv opt-in (local trusted jobs) and PassEnv allowlisting.
 func osEnvironMap() map[string]string {

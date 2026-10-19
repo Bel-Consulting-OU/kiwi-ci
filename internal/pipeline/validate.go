@@ -602,7 +602,11 @@ func validateJob(s *Spec, id string, j Job) error {
 		}
 	}
 	for i := range j.Cache {
-		if err := checkRelPath(fmt.Sprintf("job %q cache %d", id, i), j.Cache[i].Paths...); err != nil {
+		// Cache paths MAY be absolute (CARGO_HOME=/usr/local/cargo/registry,
+		// GOMODCACHE, npm cache outside the workspace). They are still
+		// confined: no ".." components, and the store writes through its
+		// own sandbox. hash_files stay workspace-relative.
+		if err := checkCachePaths(fmt.Sprintf("job %q cache %d", id, i), j.Cache[i].Paths...); err != nil {
 			return err
 		}
 		if err := checkRelPath(fmt.Sprintf("job %q cache %d hash_files", id, i), j.Cache[i].HashFiles...); err != nil {
@@ -993,6 +997,23 @@ func portableAbsPath(p string) bool {
 		}
 	}
 	return false
+}
+
+
+// checkCachePaths allows absolute cache paths (tool caches live outside the
+// workspace) but still rejects empty entries and ".." traversal.
+func checkCachePaths(where string, paths ...string) error {
+	for _, p := range paths {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		for _, part := range strings.FieldsFunc(p, func(r rune) bool { return r == '/' || r == '\\' }) {
+			if part == ".." {
+				return fmt.Errorf("%s: path %q contains a .. component", where, p)
+			}
+		}
+	}
+	return nil
 }
 
 // checkRelPath rejects absolute paths (on every platform) and any ".."

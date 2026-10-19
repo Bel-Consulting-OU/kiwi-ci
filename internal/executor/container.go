@@ -356,6 +356,13 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 	}
 	b.volumeNames = nil
 	for _, v := range b.Volumes {
+		// /workspace is the reserved bind-mount point for the job checkout.
+		// A user volume there collides with it; fail with the reason instead
+		// of surfacing "Duplicate mount point: /workspace" from the daemon.
+		if strings.TrimSuffix(v.Path, "/") == "/workspace" {
+			_ = b.cleanupWorkspaceQuota()
+			return &RunError{Kind: ErrorPolicy, Err: fmt.Errorf("volume %q path /workspace is reserved for the job checkout; mount under /workspace/extra or another path", v.Name)}
+		}
 		if v.HostPath != "" {
 			spec := v.HostPath + ":" + v.Path
 			if v.ReadOnly {

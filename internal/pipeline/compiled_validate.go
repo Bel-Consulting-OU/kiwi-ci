@@ -215,7 +215,7 @@ func ValidateCompiledJob(cj CompiledJob) error {
 		}
 	}
 	for i := range j.Cache {
-		if err := checkRelPath(fmt.Sprintf("%s cache %d", where, i), j.Cache[i].Paths...); err != nil {
+		if err := checkCachePaths(fmt.Sprintf("%s cache %d", where, i), j.Cache[i].Paths...); err != nil {
 			return err
 		}
 		if err := checkRelPath(fmt.Sprintf("%s cache %d hash_files", where, i), j.Cache[i].HashFiles...); err != nil {

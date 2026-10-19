@@ -362,9 +362,15 @@ func opsJobs(ctx context.Context, args []string) error {
 		fmt.Println("no jobs")
 		return nil
 	}
-	fmt.Printf("%-32s %-20s %-16s %-10s %s\n", "ID", "KEY", "STATUS", "ATTEMPTS", "RUNNER")
+	fmt.Printf("%-32s %-20s %-16s %-10s %-20s %s\n", "ID", "KEY", "STATUS", "ATTEMPTS", "RUNNER", "ERROR")
 	for _, j := range out {
-		fmt.Printf("%-32s %-20s %-16s %-10d %s\n", j.ID, truncate(j.Key, 20), j.Status, j.Attempts, j.LeaseRunnerID)
+		// Scheduling failures (lease, policy, capability) live only in
+		// Error. Surface them here so a bare "failure" is never silent.
+		errCol := j.Error
+		if errCol == "" && j.Status != model.StatusSuccess && j.Status != model.StatusQueued && j.Status != model.StatusRunning {
+			errCol = "(no error recorded)"
+		}
+		fmt.Printf("%-32s %-20s %-16s %-10d %-20s %s\n", j.ID, truncate(j.Key, 20), j.Status, j.Attempts, truncate(j.LeaseRunnerID, 20), errCol)
 	}
 	return nil
 }

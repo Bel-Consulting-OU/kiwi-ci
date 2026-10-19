@@ -657,15 +657,26 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			return finish(res)
 		}
 	}
+	// Container and Tart jobs are hermetic by contract: the host environment
+	// must NEVER ride in (HOME/USER/PATH/TMPDIR/arbitrary markers like
+	// KIWI_MARKER). InheritEnv/PassEnv apply to native jobs only (developer
+	// shell parity). Distributed runners never set InheritEnv.
+	isSandbox := cj.Job.Runtime == "container" || cj.Job.Runtime == "tart"
 	baseEnv := cleanExecutionEnv()
-	if e.Opt.InheritEnv {
-		// Local trusted opt-in only; distributed runners must never set it.
+	if e.Opt.InheritEnv && !isSandbox {
 		baseEnv = osEnvironMap()
 	}
-	for _, name := range e.Opt.PassEnv {
-		if v, ok := os.LookupEnv(name); ok {
-			baseEnv[name] = v
+	if !isSandbox {
+		for _, name := range e.Opt.PassEnv {
+			if v, ok := os.LookupEnv(name); ok {
+				baseEnv[name] = v
+			}
 		}
+	}
+	// PATH is dropped from container/tart base env so the image's own PATH
+	// (cargo, go, ...) stands; the digest-pinned image IS the toolchain.
+	if isSandbox {
+		baseEnv = containerSafeEnv(baseEnv)
 	}
 	jobEnv := mergeEnvMap(baseEnv, s.Env, cj.Job.Env)
 	secretCache := map[string]string{}
@@ -691,7 +702,20 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	jobEnv["KIWI_GIT_SHA"] = e.Opt.GitSHA
 	jobEnv["KIWI_REPO"] = e.Opt.RepoURL
 	jobEnv["KIWI_REPO_FULL"] = e.Opt.RepoFullName
-	jobEnv["KIWI_WORKSPACE"] = workspace
+	// Inside a container the workspace is always /workspace (the bind
+	// mount). Exposing the host path makes scripts resolve a path that
+	// cannot exist there (composer/TMPDIR, stage.sh lib.sh lookups).
+	workspaceEnv := workspace
+	if cj.Job.Runtime == "container" {
+		workspaceEnv = "/workspace"
+		if workRoot != workspace {
+			rel, rerr := filepath.Rel(workspace, workRoot)
+			if rerr == nil && rel != "." && rel != "" {
+				workspaceEnv = "/workspace/" + filepath.ToSlash(rel)
+			}
+		}
+	}
+	jobEnv["KIWI_WORKSPACE"] = workspaceEnv
 	// Legacy CI_* / GITHUB_* names so imported Woodpecker/Drone/GitLab and
 	// GitHub-Actions-style scripts run unmodified. CI_WORKSPACE is the job
 	// workspace (the container's $PWD when the step runs at the workspace
@@ -700,7 +724,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	jobEnv["CI_COMMIT_BRANCH"] = e.Opt.Branch
 	jobEnv["CI_COMMIT_REF"] = e.Opt.GitRef
 	jobEnv["CI_COMMIT_SHA"] = e.Opt.GitSHA
-	jobEnv["CI_WORKSPACE"] = workspace
+	jobEnv["CI_WORKSPACE"] = workspaceEnv
 	jobEnv["CI_REPO"] = e.Opt.RepoFullName
 	jobEnv["CI_REPO_NAME"] = e.Opt.RepoFullName
 	jobEnv["CI_SHA"] = e.Opt.GitSHA
@@ -997,7 +1021,9 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			// close failure means removal could not be proven, so the runner
 			// must retain the ledger/workspace and stop leasing.
 			if cerr := lifecycle.CloseJob(); cerr != nil {
-				e.log(cj.ID, "runtime", "cleanup warning: "+cerr.Error())
+				// A daemon outage makes cleanup fail too: one warning is
+				// enough; repeat noise hides the real error.
+				e.log(cj.ID, "runtime", "cleanup warning: "+cerr.Error()+" (further cleanup warnings suppressed)")
 				e.reportCleanupDebt(CleanupMainRuntime, cj.ID, cerr)
 			}
 			res.Status = model.StatusFailure

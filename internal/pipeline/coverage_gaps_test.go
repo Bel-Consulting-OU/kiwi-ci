@@ -545,7 +545,7 @@ func TestValidateBranchesFromYAML(t *testing.T) {
 		{"canary step", doc("    deployment:\n      canary:\n        - name: x\n    steps:\n      - run: r\n"), "empty run command"},
 		{"verify step", doc("    deployment:\n      verify:\n        - name: x\n    steps:\n      - run: r\n"), "empty run command"},
 		{"rollback step", doc("    deployment:\n      rollback:\n        - name: x\n    steps:\n      - run: r\n"), "empty run command"},
-		{"cache absolute path", doc("    cache:\n      - paths: [/abs]\n    steps:\n      - run: r\n"), "absolute path"},
+		{"cache dotdot path", doc("    cache:\n      - paths: [../abs]\n    steps:\n      - run: r\n"), ".. component"},
 		{"cache hash traversal", doc("    cache:\n      - paths: [a]\n        hash_files: [../x]\n    steps:\n      - run: r\n"), ".. component"},
 		{"cache key interp", doc("    cache:\n      - paths: [a]\n        key: \"${{ nope.x }}\"\n    steps:\n      - run: r\n"), "unknown interpolation context"},
 		{"cache name interp", doc("    cache:\n      - paths: [a]\n        name: \"${{ nope.x }}\"\n    steps:\n      - run: r\n"), "unknown interpolation context"},

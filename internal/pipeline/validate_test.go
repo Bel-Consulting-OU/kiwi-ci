@@ -227,17 +227,17 @@ jobs:
 			".. component",
 		},
 		{
-			"absolute cache path",
+			"cache dotdot path",
 			`version: 1
 jobs:
   x:
     cache:
       - key: k
-        paths: ["/abs"]
+        paths: ["../escape"]
     steps:
       - run: echo hi
 `,
-			"absolute path",
+			".. component",
 		},
 		{
 			"zero timeout",

@@ -60,11 +60,29 @@ func NewManager(source string) (*Manager, error) {
 	if !st.IsDir() {
 		return nil, fmt.Errorf("workspace source %q is not a directory", abs)
 	}
-	root, err := os.MkdirTemp("", "kiwi-workspaces-")
+	root, err := newWorkspaceRoot()
 	if err != nil {
 		return nil, fmt.Errorf("workspace root: %w", err)
 	}
 	return &Manager{Source: abs, Root: root}, nil
+}
+
+// newWorkspaceRoot picks a Docker-shareable location for job workspaces.
+// The system temp dir (TMPDIR, often /var/folders/...) is NOT shared by
+// Docker Desktop on macOS, so a container job's bind mount is empty. Prefer
+// a directory under the user's home, which is shared by default.
+func newWorkspaceRoot() (string, error) {
+	// Only use HOME when it already exists: creating a tree under a
+	// missing HOME would invent a home directory the user never had.
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if _, serr := os.Stat(home); serr == nil {
+			base := filepath.Join(home, ".kiwi", "workspaces")
+			if err := os.MkdirAll(base, 0o755); err == nil {
+				return os.MkdirTemp(base, "run-")
+			}
+		}
+	}
+	return os.MkdirTemp("", "kiwi-workspaces-")
 }
 
 // Close removes the run-scoped Root and every workspace created under it.

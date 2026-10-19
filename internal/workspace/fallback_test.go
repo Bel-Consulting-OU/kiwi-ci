@@ -300,6 +300,10 @@ func TestNewManagerSourceErrors(t *testing.T) {
 
 func TestNewManagerRootError(t *testing.T) {
 	src := t.TempDir()
+	// newWorkspaceRoot prefers $HOME/.kiwi/workspaces and falls back to
+	// TMPDIR. Point both at missing parents so every root fails.
+	t.Setenv("HOME", filepath.Join(t.TempDir(), "missing-home"))
+	t.Setenv("USERPROFILE", filepath.Join(t.TempDir(), "missing-home"))
 	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "missing-root"))
 	if _, err := NewManager(src); err == nil || !strings.Contains(err.Error(), "workspace root") {
 		t.Fatalf("NewManager = %v, want workspace root error", err)
