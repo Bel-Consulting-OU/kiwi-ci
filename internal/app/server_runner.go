@@ -1226,8 +1226,21 @@ func Server(ctx context.Context, args []string) error {
 		}
 		teardownFns = append(teardownFns, func() { srv.ShutdownTracing(context.Background()) })
 	}
-	if cfg.Policy.File != "" {
-		pol, perr := policy.Load(cfg.Policy.File)
+	// Policy file resolution: explicit [policy].file wins; otherwise the
+	// documented default .kiwi/policy.toml (and .kiwi/policy.yaml) is loaded
+	// when present. The admission error names this file, so it MUST be
+	// honored without extra config — otherwise the remedy is a lie.
+	policyPath := cfg.Policy.File
+	if policyPath == "" {
+		for _, cand := range []string{".kiwi/policy.toml", ".kiwi/policy.yaml"} {
+			if _, serr := os.Stat(cand); serr == nil {
+				policyPath = cand
+				break
+			}
+		}
+	}
+	if policyPath != "" {
+		pol, perr := policy.Load(policyPath)
 		if perr != nil {
 			return fmt.Errorf("policy: %w", perr)
 		}

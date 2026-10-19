@@ -136,6 +136,12 @@ func RunLocal(ctx context.Context, args []string) error {
 		fmt.Println(string(b))
 	} else {
 		printSummary(res)
+	// A closed stdout pipe (kiwi run | head) used to swallow step output
+	// silently. Surface the writer failure so a "silent success" is
+	// explainable.
+	if werr := logs.WriteErr(); werr != nil {
+		fmt.Fprintf(os.Stderr, "kiwi: console output incomplete: %v\n", werr)
+	}
 	}
 	// A cancelled run is never a success: an interrupt (SIGINT/SIGTERM) or a
 	// parent-scoped cancellation must exit non-zero, or a `kiwi run && ...`

@@ -1013,6 +1013,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		}
 	}
 	var closeJob func() error
+	cleanupWarned := false
 	if lifecycle, ok := backend.(JobLifecycle); ok {
 		if err := lifecycle.StartJob(ctx, workspace, func(line string) { e.log(cj.ID, "runtime", line) }); err != nil {
 			// A failed start may still have created (and retained) external
@@ -1025,6 +1026,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 				// enough; repeat noise hides the real error.
 				e.log(cj.ID, "runtime", "cleanup warning: "+cerr.Error()+" (further cleanup warnings suppressed)")
 				e.reportCleanupDebt(CleanupMainRuntime, cj.ID, cerr)
+				cleanupWarned = true
 			}
 			res.Status = model.StatusFailure
 			res.Error = err.Error()
@@ -1054,8 +1056,11 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	defer func() {
 		if closeJob != nil {
 			if err := closeJob(); err != nil {
-				e.log(cj.ID, "runtime", "cleanup warning: "+err.Error())
+				if !cleanupWarned {
+					e.log(cj.ID, "runtime", "cleanup warning: "+err.Error()+" (further cleanup warnings suppressed)")
+				}
 				e.reportCleanupDebt(CleanupMainRuntime, cj.ID, err)
+				cleanupWarned = true
 			}
 		}
 		e.sessions.delete(cj.ID)
