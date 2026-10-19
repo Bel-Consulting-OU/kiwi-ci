@@ -106,7 +106,7 @@ case "$sub" in
       exec cat "$p"
     fi
     if [ "${FAKE_DOCKER_EXEC_FAIL:-0}" = "1" ]; then echo "step failed" >&2; exit 3; fi
-    if [ "$cmd" = "sh" ] && [ "$1" = "-lc" ]; then
+    if [ "$cmd" = "sh" ] && { [ "$1" = "-lc" ] || [ "$1" = "-c" ]; }; then
       shift
       script="$1"
       tmp=$(mktemp)

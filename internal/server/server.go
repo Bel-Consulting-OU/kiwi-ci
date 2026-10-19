@@ -313,6 +313,12 @@ type Server struct {
 	// that reference components.
 	ComponentRegistry components.Registry
 
+	// LocalTrusted marks this deployment's submissions as trusted (the
+	// kiwi.toml [runner] trusted = true escape for the embedded runner).
+	LocalTrusted bool
+	// AllowRootfulUntrusted lifts the rootless-docker requirement for
+	// untrusted jobs on hosts without rootless docker (macOS/colima).
+	AllowRootfulUntrusted bool
 	// AdmissionCapabilities, when non-nil, overrides the trust-default
 	// capabilities used for pipeline admission. The loaded organization
 	// policy file (Policy) is intersected — and its explicit grants
@@ -1883,10 +1889,16 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAction(w, r, auth.ActionRun, in.RepoID, false) {
 		return
 	}
-	// Direct API submissions are never trusted; only the forge webhook path
-	// (and internal reruns of previously trusted runs) set Trusted. The
-	// `trusted` field is not accepted from client JSON (json:"-").
-	in.Trusted = false
+	// Direct API submissions are trusted only when the deployment opted in
+	// (kiwi.toml [runner] trusted = true, the local/embedded runner).
+	// Otherwise only the forge webhook path (and internal reruns of
+	// previously trusted runs) set Trusted. The `trusted` field is not
+	// accepted from client JSON (json:"-").
+	if !s.LocalTrusted {
+		in.Trusted = false
+	} else {
+		in.Trusted = true
+	}
 	// Image lock is compilation authority for API submits too. The client
 	// supplies the pipeline text; when the submission names a repository and
 	// revision AND a recognized forge, pin the immutable SHA and fetch the

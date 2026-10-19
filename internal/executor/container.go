@@ -144,6 +144,9 @@ type ContainerBackend struct {
 	// Rootless demands a rootless Docker daemon (verified via
 	// `docker info --format {{.SecurityOptions}}`).
 	Rootless bool
+	// AllowRootfulUntrusted lifts the rootless daemon gate (kiwi.toml
+	// [runner] allow_rootful_untrusted).
+	AllowRootfulUntrusted bool
 	// ReadOnlyRootFS mounts the job container root filesystem read-only.
 	ReadOnlyRootFS bool
 	// NonRoot demands the workload not run as container UID 0 on a rootful
@@ -327,7 +330,7 @@ func (b *ContainerBackend) StartJob(ctx context.Context, workspace string, emit 
 		_ = b.cleanupWorkspaceQuota()
 		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("docker not found: %w", err)}
 	}
-	if b.Rootless {
+	if b.Rootless && !b.AllowRootfulUntrusted {
 		if err := b.verifyRootlessDaemon(ctx, docker); err != nil {
 			_ = b.cleanupWorkspaceQuota()
 			return err
@@ -1027,9 +1030,14 @@ func (b *ContainerBackend) Run(ctx context.Context, c Command, emit func(string)
 
 func shellCommand(shell, script string) []string {
 	if shell == "pwsh" || shell == "powershell" {
+		// -NoProfile: same contract as -c — never let a profile rewrite the
+		// image's ENV (PATH in particular).
 		return []string{shell, "-NoProfile", "-Command", script}
 	}
-	return []string{shell, "-lc", script}
+	// -c, not -lc: a login shell sources /etc/profile and replaces the
+	// image's ENV PATH with the bare default, which neuters every
+	// digest-pinned image that adds tools via PATH (rust, node, go).
+	return []string{shell, "-c", script}
 }
 
 func streamCommand(ctx context.Context, cmd *exec.Cmd, emit func(string)) error {

@@ -197,6 +197,16 @@ type PolicyConfig struct {
 	File string `toml:"file"`
 }
 
+// RunnerConfig is the local/embedded runner identity. Trusted marks jobs
+// run by this runner as trusted (enables secrets, host mounts, native).
+// AllowRootfulUntrusted lifts the rootless-docker requirement for untrusted
+// jobs on hosts where rootless is unavailable (macOS/colima) — the
+// workspace quota step-boundary bound still applies.
+type RunnerConfig struct {
+	Trusted                bool `toml:"trusted"`
+	AllowRootfulUntrusted  bool `toml:"allow_rootful_untrusted"`
+}
+
 type ObservabilityConfig struct {
 	// OTelEndpoint is accepted for forward compatibility; OpenTelemetry
 	// endpoint receives OTLP/HTTP traces from the control plane.
@@ -407,6 +417,7 @@ type Config struct {
 	Forgejo       ForgejoConfig       `toml:"forgejo"`
 	Bitbucket     BitbucketConfig     `toml:"bitbucket"`
 	Policy        PolicyConfig        `toml:"policy"`
+	Runner        RunnerConfig        `toml:"runner"`
 	Observability ObservabilityConfig `toml:"observability"`
 	RateLimit     RateLimitConfig     `toml:"rate_limit"`
 	Auth          AuthConfig          `toml:"auth"`

@@ -533,7 +533,9 @@ func TestShellCommandAndNativeAdvisory(t *testing.T) {
 	if got := shellCommand("pwsh", "x"); got[1] != "-NoProfile" {
 		t.Fatalf("pwsh args = %v", got)
 	}
-	if got := shellCommand("bash", "x"); got[1] != "-lc" {
+	// -c, not -lc: a login shell sources /etc/profile and resets the
+	// image's ENV PATH (K2 — rust/node/go images lose their tools).
+	if got := shellCommand("bash", "x"); got[1] != "-c" {
 		t.Fatalf("bash args = %v", got)
 	}
 	lines := nativeResourceAdvisory(pipeline.Resources{CPU: 1, Memory: 1 << 20, Disk: 1 << 20, PIDs: 4})

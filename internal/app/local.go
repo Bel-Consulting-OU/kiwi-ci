@@ -1,6 +1,7 @@
 package app
 
 import (
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/config"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -129,6 +130,13 @@ func RunLocal(ctx context.Context, args []string) error {
 	// skipped (no matching runner) instead of running everywhere.
 	opts.RunnerLabels = []string{"native", "local"}
 	opts.RunnerRegions = []string{"local"}
+	// [runner] allow_rootful_untrusted lifts the sandbox.rootless gate on
+	// hosts without rootless docker (macOS/colima). Read from kiwi.toml.
+	if _, serr := os.Stat("kiwi.toml"); serr == nil {
+		if cfg, cerr := config.Load("kiwi.toml"); cerr == nil {
+			opts.AllowRootfulUntrusted = cfg.Runner.AllowRootfulUntrusted
+		}
+	}
 	ex := executor.Executor{Opt: opts, Masker: masker}
 	res, runErr := ex.Run(ctx, g)
 	if *jsonOut {

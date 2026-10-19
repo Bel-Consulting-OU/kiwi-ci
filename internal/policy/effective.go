@@ -60,7 +60,7 @@ func ValidatePipeline(s *pipeline.Spec, caps Capabilities) error {
 	if len(s.Secrets) > 0 && caps.Secrets != nil {
 		for _, name := range s.Secrets {
 			if !caps.Secrets[name] {
-				return &Violation{Kind: ViolationKindSecrets, Detail: fmt.Sprintf("pipeline requests secret %q; add %q to .kiwi/policy.toml secret_allowlist (org or repo)", name, name)}
+				return &Violation{Kind: ViolationKindSecrets, Detail: fmt.Sprintf("pipeline requests secret %q; secrets require a TRUSTED job (dispatch --trusted or kiwi.toml [runner] trusted = true). For trusted jobs, list %q in .kiwi/policy.toml secret_allowlist to scope it", name, name)}
 			}
 		}
 	}
@@ -156,7 +156,7 @@ func validateJob(id string, job pipeline.Job, caps Capabilities) error {
 		for _, step := range job.Steps {
 			for _, name := range step.Secrets {
 				if !caps.Secrets[name] {
-					return &Violation{Kind: ViolationKindSecrets, Detail: fmt.Sprintf("job %q step %q requests secret %q; add %q to .kiwi/policy.toml secret_allowlist (org or repo)", id, step.Name, name, name)}
+					return &Violation{Kind: ViolationKindSecrets, Detail: fmt.Sprintf("job %q step %q requests secret %q; secrets require a TRUSTED job (dispatch --trusted or kiwi.toml [runner] trusted = true). For trusted jobs, list %q in .kiwi/policy.toml secret_allowlist to scope it", id, step.Name, name, name)}
 				}
 			}
 		}

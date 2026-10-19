@@ -1246,6 +1246,11 @@ func Server(ctx context.Context, args []string) error {
 		}
 		srv.Policy = pol
 	}
+	// [runner] escapes for the local/embedded runner: trusted marks the
+	// deployment's own submissions trusted; allow_rootful_untrusted lifts
+	// the rootless-docker requirement where rootless is unavailable.
+	srv.LocalTrusted = cfg.Runner.Trusted
+	srv.AllowRootfulUntrusted = cfg.Runner.AllowRootfulUntrusted
 	if m := cfg.RateLimitMiddleware(); m != nil {
 		srv.RateLimiter = m
 	}

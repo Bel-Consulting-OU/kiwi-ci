@@ -91,6 +91,10 @@ type Options struct {
 	// RunURL is the control-plane run link (CI_PIPELINE_URL /
 	// STATUS_TARGET_URL for forge commit-status scripts). Empty locally.
 	RunURL string
+	// AllowRootfulUntrusted lifts the sandbox.rootless daemon gate for
+	// hosts without rootless docker (macOS/colima). The workspace
+	// step-boundary bound still applies.
+	AllowRootfulUntrusted bool
 	ChangedFiles     []string
 	SecretProvider   secrets.Provider
 	Logs             logging.Sink
@@ -852,7 +856,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	// verify it before any service container or job container is started on
 	// that daemon, so services never run on a rootful daemon for a job that
 	// demanded rootless isolation.
-	if cj.Job.Runtime == "container" && cj.Job.Sandbox.Rootless {
+	if cj.Job.Runtime == "container" && cj.Job.Sandbox.Rootless && !e.Opt.AllowRootfulUntrusted {
 		docker, derr := exec.LookPath("docker")
 		if derr != nil {
 			res.Status = model.StatusFailure
@@ -966,6 +970,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	case *ContainerBackend:
 		b.RequireImmutableImages = e.Opt.RequireImmutableImages
 		b.Rootless = cj.Job.Sandbox.Rootless
+		b.AllowRootfulUntrusted = e.Opt.AllowRootfulUntrusted
 		b.ReadOnlyRootFS = cj.Job.Sandbox.ReadOnlyRootFS
 		b.NonRoot = cj.Job.Sandbox.NonRoot
 		b.Privileged = cj.Job.Sandbox.Privileged
@@ -2037,6 +2042,11 @@ func (e *Executor) resolveSecrets(ctx context.Context, names []string, cache map
 			cache[name] = v
 		}
 		out[secretEnvName(name)] = v
+		// Also deliver under the declared name itself: Woodpecker and
+		// imported scripts expect GITHUB_TOKEN, not KIWI_SECRET_GITHUB_TOKEN.
+		if name != secretEnvName(name) {
+			out[name] = v
+		}
 	}
 	return out, nil
 }
@@ -2084,6 +2094,11 @@ func (e *Executor) resolveSecretsOptional(ctx context.Context, names []string, c
 			cache[name] = v
 		}
 		out[secretEnvName(name)] = v
+		// Also deliver under the declared name itself: Woodpecker and
+		// imported scripts expect GITHUB_TOKEN, not KIWI_SECRET_GITHUB_TOKEN.
+		if name != secretEnvName(name) {
+			out[name] = v
+		}
 	}
 	return out, nil
 }
