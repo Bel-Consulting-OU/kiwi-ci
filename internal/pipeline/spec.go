@@ -263,6 +263,14 @@ type Defaults struct {
 	Retry   Retry    `yaml:"retry,omitempty" json:"retry,omitempty"`
 }
 
+// JobWhen is the job-level filter block: path/branch/event constraints.
+type JobWhen struct {
+	Path       []string `yaml:"path,omitempty" json:"path,omitempty"`
+	PathIgnore []string `yaml:"path_ignore,omitempty" json:"path_ignore,omitempty"`
+	Branch     []string `yaml:"branch,omitempty" json:"branch,omitempty"`
+	Event      []string `yaml:"event,omitempty" json:"event,omitempty"`
+}
+
 type Concurrency struct {
 	Group            string `yaml:"group,omitempty" json:"group,omitempty"`
 	CancelInProgress bool   `yaml:"cancel_in_progress,omitempty" json:"cancel_in_progress,omitempty"`
@@ -475,6 +483,12 @@ type Job struct {
 	Retry        Retry             `yaml:"retry,omitempty" json:"retry,omitempty"`
 	Env          map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
 	Matrix       map[string][]any  `yaml:"matrix,omitempty" json:"matrix,omitempty"`
+	// When is a job-level filter block (Woodpecker-style): path / branch /
+	// event constraints that fold into Paths / PathsIgnore / If at parse.
+	When         *JobWhen          `yaml:"when,omitempty" json:"when,omitempty"`
+	// Concurrency is a job-level group (single-flight deploys): at most one
+	// run of the group is active; later ones cancel or queue.
+	Concurrency  *Concurrency      `yaml:"concurrency,omitempty" json:"concurrency,omitempty"`
 	Paths        []string          `yaml:"paths,omitempty" json:"paths,omitempty"`
 	PathsIgnore  []string          `yaml:"paths_ignore,omitempty" json:"paths_ignore,omitempty"`
 	Services     []Service         `yaml:"services,omitempty" json:"services,omitempty"`
@@ -613,6 +627,9 @@ type Step struct {
 	// `detach: true`). The process is torn down with the job workspace. No
 	// step outputs are collected from a background step.
 	Background bool `yaml:"background,omitempty" json:"background,omitempty"`
+	// Matrix is a step-level matrix (Woodpecker). At parse it is hoisted
+	// onto the owning job so the expansion stays job-scoped.
+	Matrix map[string][]any `yaml:"matrix,omitempty" json:"matrix,omitempty"`
 }
 
 // Retry-policy caps. They are finite policy choices enforced at admission
@@ -636,6 +653,15 @@ type Retry struct {
 
 // UnmarshalYAML records the presence of "max" alongside the decoded value.
 func (r *Retry) UnmarshalYAML(value *yaml.Node) error {
+	// Scalar shorthand: `retry: 3` means max=3.
+	if value.Kind == yaml.ScalarNode {
+		var n int
+		if err := value.Decode(&n); err == nil && n >= 0 {
+			r.Max = n
+			r.MaxSet = true
+			return nil
+		}
+	}
 	type plain Retry
 	var p plain
 	if err := value.Decode(&p); err != nil {

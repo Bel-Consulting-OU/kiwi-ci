@@ -512,6 +512,9 @@ const schemaSource = `{
         },
         "background": {
           "type": "boolean"
+        },
+        "matrix": {
+          "$ref": "#/$defs/matrix"
         }
       },
       "additionalProperties": false
@@ -833,6 +836,25 @@ const schemaSource = `{
         },
         "paths_ignore": {
           "$ref": "#/$defs/stringArray"
+        },
+        "when": {
+          "type": "object",
+          "properties": {
+            "path": {"$ref": "#/$defs/stringArray"},
+            "path_ignore": {"$ref": "#/$defs/stringArray"},
+            "branch": {"$ref": "#/$defs/stringArray"},
+            "event": {"$ref": "#/$defs/stringArray"}
+          },
+          "additionalProperties": false
+        },
+        "concurrency": {
+          "type": "object",
+          "properties": {
+            "group": {"type": "string"},
+            "cancel_in_progress": {"type": "boolean"},
+            "limit": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": false
         },
         "services": {
           "type": "array",

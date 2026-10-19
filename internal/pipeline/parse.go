@@ -63,6 +63,73 @@ func canonicalizeSpec(s *Spec) {
 	if len(s.Secrets) > 1 {
 		sort.Strings(s.Secrets)
 	}
+	for id, j := range s.Jobs {
+		// Job.When folds into Paths / PathsIgnore / If so one glob list is
+		// evaluated against the changeset (monorepo filter parity).
+		if w := j.When; w != nil {
+			if len(w.Path) > 0 {
+				j.Paths = appendUniqueStrs(j.Paths, w.Path...)
+			}
+			if len(w.PathIgnore) > 0 {
+				j.PathsIgnore = appendUniqueStrs(j.PathsIgnore, w.PathIgnore...)
+			}
+			if len(w.Branch) > 0 {
+				preds := make([]string, 0, len(w.Branch))
+				for _, b := range w.Branch {
+					preds = append(preds, "branch == '"+strings.ReplaceAll(b, "'", "")+"'")
+				}
+				j.If = andIf(j.If, strings.Join(preds, " || "))
+			}
+			if len(w.Event) > 0 {
+				preds := make([]string, 0, len(w.Event))
+				for _, e := range w.Event {
+					preds = append(preds, "event == '"+strings.ReplaceAll(e, "'", "")+"'")
+				}
+				j.If = andIf(j.If, strings.Join(preds, " || "))
+			}
+			j.When = nil
+		}
+		// Step.Matrix is hoisted onto the job (expansion stays job-scoped).
+		for _, st := range j.Steps {
+			if len(st.Matrix) == 0 {
+				continue
+			}
+			if j.Matrix == nil {
+				j.Matrix = map[string][]any{}
+			}
+			for k, vals := range st.Matrix {
+				if _, exists := j.Matrix[k]; !exists {
+					j.Matrix[k] = vals
+				}
+			}
+			st.Matrix = nil
+		}
+		s.Jobs[id] = j
+	}
+}
+
+func appendUniqueStrs(dst []string, add ...string) []string {
+	seen := map[string]bool{}
+	for _, s := range dst {
+		seen[s] = true
+	}
+	for _, s := range add {
+		if !seen[s] {
+			seen[s] = true
+			dst = append(dst, s)
+		}
+	}
+	return dst
+}
+
+func andIf(base, add string) string {
+	if base == "" {
+		return add
+	}
+	if add == "" {
+		return base
+	}
+	return "(" + base + ") && (" + add + ")"
 }
 
 // ParseRetention converts an artifact retention string into a duration.

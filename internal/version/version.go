@@ -37,6 +37,9 @@ func String() string {
 	s := Version
 	if Commit != "" {
 		s += " (" + Commit + ")"
+	} else if BuildDate != "" {
+		// No commit stamp: still distinguish builds by date.
+		s += " (built " + BuildDate + ")"
 	}
 	return s
 }
