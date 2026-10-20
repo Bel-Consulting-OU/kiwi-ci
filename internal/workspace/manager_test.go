@@ -141,6 +141,10 @@ func TestPrepareGitWorktree(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
+	// K15: the clean-tree worktree snapshot is OPT-IN. The default is a
+	// deterministic working-tree copy, which also carries ignored files
+	// (.env) that a worktree of HEAD drops.
+	t.Setenv(workspaceStrategyEnv, "worktree")
 	src := t.TempDir()
 	runGit := func(args ...string) {
 		t.Helper()

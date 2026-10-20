@@ -1,8 +1,8 @@
 package workspace
 
 import (
-	"errors"
 	"context"
+	"errors"
 	testutil "github.com/Bel-Consulting-OU/kiwi-ci/internal/testutil"
 	"os"
 	"os/exec"
@@ -95,6 +95,7 @@ func TestSnapshotWorktreeAddFailure(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
+	t.Setenv(workspaceStrategyEnv, "worktree")
 	src := t.TempDir()
 	runGit(t, src, "init", "-b", "main")
 	runGit(t, src, "config", "user.email", "test@example.com")
@@ -165,6 +166,8 @@ func TestSnapshotCancelDuringReflink(t *testing.T) {
 // add` is running: the worktree strategy must report the context error.
 func TestSnapshotCancelDuringWorktree(t *testing.T) {
 	testutil.UnixShell(t)
+	// Worktree snapshot is opt-in (K15): default is deterministic copyTree.
+	t.Setenv(workspaceStrategyEnv, "worktree")
 	realGit, err := exec.LookPath("git")
 	if err != nil {
 		t.Skip("git not available")

@@ -5,15 +5,20 @@
 //
 // Snapshot strategy, in preference order:
 //
-//  1. git worktree: when Source is a git repository with a clean working
-//     tree, `git worktree add --detach <target> HEAD` checks out the
-//     committed state. This is the fastest strategy for large trees.
-//  2. APFS reflink copy (darwin only): `cp -c -R` clones files cheaply via
-//     clonefile; if the source and the run root live on different volumes
-//     the copy falls back automatically.
-//  3. Plain recursive copy: walks the source tree, skipping the `.git`
-//     directory and the in-repo `.kiwi/cache` directory.
+//  1. Plain recursive copy (copyTree): walks the source tree and copies
+//     everything the developer can see — tracked, untracked and ignored
+//     files alike (except build-output directory names and the in-repo
+//     `.kiwi/cache`). This is the ONLY strategy used by default: a local
+//     `kiwi run` must see the working directory as it is on disk, including
+//     `.env` and untracked files. A git-worktree of HEAD silently drops
+//     ignored/untracked content and flipped between that and a full copy
+//     whenever `git status` raced, which staged wildly different workspaces
+//     for identical probes (K15).
+//  2. APFS reflink copy (darwin only): `cp -c -R` fallback when copyTree
+//     cannot run.
 //
+// Set KIWI_WORKSPACE_STRATEGY=worktree to opt into the clean-tree
+// `git worktree add --detach <target> HEAD` snapshot (committed state only).
 // Cleanup removes worktrees via `git worktree remove --force` plus
 // `git worktree prune` and deletes copied workspaces with os.RemoveAll.
 package workspace
@@ -102,6 +107,11 @@ func (m *Manager) Close() error {
 // a cleanup function that removes it, and any error. The cleanup function
 // is idempotent. Callers should invoke it exactly once, after the job's
 // steps, artifacts, and caches have been collected.
+//
+// Staging is deterministic (K15): every Prepare of the same source produces
+// the same file set (the working tree via copyTree), and a snapshot that
+// lost top-level directories fails closed instead of handing the job a
+// silently truncated workspace.
 func (m *Manager) Prepare(ctx context.Context, jobID string) (string, func(), error) {
 	if err := ctx.Err(); err != nil {
 		return "", nil, err
@@ -120,6 +130,10 @@ func (m *Manager) Prepare(ctx context.Context, jobID string) (string, func(), er
 		_ = os.RemoveAll(target)
 		return "", nil, fmt.Errorf("prepare workspace for %q: %w", jobID, err)
 	}
+	if err := verifyStagedTree(m.Source, target, strategy); err != nil {
+		_ = os.RemoveAll(target)
+		return "", nil, fmt.Errorf("prepare workspace for %q: %w", jobID, err)
+	}
 	switch strategy {
 	case "worktree":
 		return target, func() { removeWorktree(m.Source, target) }, nil
@@ -128,14 +142,91 @@ func (m *Manager) Prepare(ctx context.Context, jobID string) (string, func(), er
 	}
 }
 
+// verifyStagedTree fails closed when a snapshot lost top-level directories
+// or produced an implausibly small tree. A racy walk or a silent skip must
+// never hand a job a 23-file stub while the source is a full repository.
+func verifyStagedTree(src, target, strategy string) error {
+	srcEntries, err := os.ReadDir(src)
+	if err != nil {
+		return fmt.Errorf("verify staged tree: read source: %w", err)
+	}
+	dstEntries, err := os.ReadDir(target)
+	if err != nil {
+		return fmt.Errorf("verify staged tree: read target: %w", err)
+	}
+	have := map[string]bool{}
+	dstFiles := 0
+	for _, e := range dstEntries {
+		have[e.Name()] = true
+	}
+	_ = filepath.Walk(target, func(_ string, info os.FileInfo, err error) error {
+		if err == nil && info != nil && !info.IsDir() {
+			dstFiles++
+		}
+		return nil
+	})
+	var missing []string
+	srcTopDirs := 0
+	for _, e := range srcEntries {
+		name := e.Name()
+		if name == ".git" && strategy == "reflink" {
+			// reflink strips .git on purpose
+			continue
+		}
+		if !e.IsDir() {
+			continue
+		}
+		if copyTreeSkipDirs[name] && !hasTrackedFiles(src, name) {
+			continue
+		}
+		if name == ".kiwi" {
+			// only .kiwi/cache is excluded; the dir itself should remain
+			// if the source has anything besides cache. Keep the check
+			// simple: require the dir when the source has other entries.
+			if !have[name] {
+				// count non-cache children
+				kids, _ := os.ReadDir(filepath.Join(src, name))
+				for _, k := range kids {
+					if k.Name() != "cache" {
+						missing = append(missing, name)
+						break
+					}
+				}
+			}
+			continue
+		}
+		srcTopDirs++
+		if !have[name] {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("staged workspace is truncated: missing top-level dir(s) %v (strategy=%s, staged %d files; source has %d top-level dirs)", missing, strategy, dstFiles, srcTopDirs)
+	}
+	if srcTopDirs > 0 && dstFiles == 0 {
+		return fmt.Errorf("staged workspace is empty but the source has %d top-level dirs (strategy=%s)", srcTopDirs, strategy)
+	}
+	return nil
+}
+
 // snapshot materializes the source tree at target and reports which
 // strategy produced it.
 // snapshotCopyTree is copyTree unless a fallback test substitutes a
 // failing copy to exercise the reflink/cancel paths.
 var snapshotCopyTree = copyTree
 
+// workspaceStrategyEnv selects the snapshot strategy. Empty (default) is
+// always copyTree — the deterministic working-tree copy. "worktree" opts
+// into the clean-tree `git worktree add` snapshot (committed files only).
+const workspaceStrategyEnv = "KIWI_WORKSPACE_STRATEGY"
+
 func (m *Manager) snapshot(ctx context.Context, target string) (string, error) {
-	if gitRepo(ctx, m.Source) {
+	// K15: staging must be deterministic. The historical clean-tree
+	// worktree path dropped ignored files (.env) and untracked files, so
+	// two identical probes flipped between a full working copy and a
+	// committed-only tree (and, under git races, worse). copyTree is the
+	// default for every local run. The worktree path is opt-in only.
+	if os.Getenv(workspaceStrategyEnv) == "worktree" && gitRepo(ctx, m.Source) {
 		clean, err := gitStatusClean(ctx, m.Source)
 		if err == nil && clean {
 			cmd := exec.CommandContext(ctx, "git", "-C", m.Source, "worktree", "add", "--detach", target, "HEAD")
@@ -229,13 +320,14 @@ var copyTreeSkipDirs = map[string]bool{
 	".cache":        true,
 }
 
-
 // isGitTracked reports whether exactly this path is in the git index.
+// A git failure (lock contention, corrupt index) is NOT "untracked":
+// treating it as such silently dropped source directories during the
+// copy (K15-class truncation). Fail closed — the path is kept.
 func isGitTracked(src, rel string) bool {
 	cmd := exec.Command("git", "-C", src, "ls-files", "--error-unmatch", "--", rel)
 	return cmd.Run() == nil
 }
-
 
 // isSkipRoot reports whether rel is exactly one of the kept skip roots
 // (those must stay so the walk can reach tracked children).
@@ -262,11 +354,13 @@ func inPreservedSkip(roots []string, rel string) bool {
 // hasTrackedFiles reports whether any path under rel is tracked by git in
 // src. Used so a source directory named target/ (or node_modules/, ...) is
 // not mistaken for build output and stripped from the job workspace.
+// On git failure the answer is "keep the directory" (true): a lock or
+// index race must never turn into a silent SkipDir (K15).
 func hasTrackedFiles(src, rel string) bool {
 	cmd := exec.Command("git", "-C", src, "ls-files", "--", rel)
 	out, err := cmd.Output()
 	if err != nil {
-		return false
+		return true
 	}
 	return len(bytes.TrimSpace(out)) > 0
 }

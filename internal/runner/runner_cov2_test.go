@@ -178,6 +178,10 @@ func TestCheckoutViaFakeGit(t *testing.T) {
 echo "$@" >> "${FAKE_GIT_LOG:-/dev/null}"
 if [ "$1" = "clone" ]; then
   if [ -n "$FAKE_GIT_FAIL_CLONE" ]; then echo "clone refused" >&2; exit 1; fi
+  dest=
+  for a in "$@"; do dest="$a"; done
+  # Materialize one file so the post-checkout emptiness probe (K12) passes.
+  if [ -n "$dest" ]; then echo ok > "$dest/README.md"; fi
   exit 0
 fi
 if [ "$3" = "checkout" ] && [ -n "$FAKE_GIT_FAIL_CHECKOUT" ]; then echo "checkout refused" >&2; exit 1; fi

@@ -2150,7 +2150,12 @@ func changedFiles(ctx context.Context, dir string) []string {
 
 func (r *Runner) checkout(ctx context.Context, j model.Job, root string, clone pipeline.Clone, ws pipeline.Workspace) error {
 	if clone.Skip {
+		// K12: a skipped clone is an EXPLICIT empty workspace. Say so —
+		// a silent no-op used to look like "the runner never checks out".
 		return nil
+	}
+	if strings.TrimSpace(j.RepoURL) == "" {
+		return fmt.Errorf("checkout refused: job %s has no repository URL (dispatch must set --repo / CheckoutRepoURL)", j.ID)
 	}
 	dir, err := checkoutDir(root, ws)
 	if err != nil {
@@ -2212,7 +2217,33 @@ func (r *Runner) checkout(ctx context.Context, j model.Job, root string, clone p
 			return fmt.Errorf("git lfs pull: %v: %s%s", err, out, truncationMarker(truncated))
 		}
 	}
+	// K12 fail-closed: a successful clone/checkout that left the tree empty
+	// must not run the job against /workspace with files=0. Sparse paths that
+	// match nothing, a wrong ref that produced no files, or a mount/permission
+	// glitch all look like "no checkout" to the operator otherwise.
+	if empty, err := dirIsEmpty(dir); err != nil {
+		return fmt.Errorf("checkout produced no readable workspace at %s: %w", dir, err)
+	} else if empty {
+		return fmt.Errorf("checkout produced an empty workspace at %s (repo=%q ref=%q sha=%q sparse=%v): refusing to run the job with files=0", dir, j.RepoURL, j.Ref, j.SHA, clone.SparsePaths)
+	}
 	return nil
+}
+
+// dirIsEmpty reports whether a directory has no entries (other than . and ..).
+func dirIsEmpty(dir string) (bool, error) {
+	f, err := os.Open(dir)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	names, err := f.Readdirnames(1)
+	if err == io.EOF {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return len(names) == 0, nil
 }
 
 // gitEnvForRepo builds the environment for git clone/checkout commands from
