@@ -2,18 +2,24 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
 // Doctor is the diagnostic engine (`kiwi doctor [--server URL] [--job ID]`).
@@ -24,11 +30,18 @@ func Doctor(args []string) error {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	server := fs.String("server", "", "also diagnose a Kiwi control plane URL")
 	job := fs.String("job", "", "explain why a job can/cannot run: name the missing runner capability")
+	pipelineFile := fs.String("pipeline", "", "verify toolchains: declared in this pipeline (default .kiwi/pipeline.yaml when present)")
+	installToolchains := fs.Bool("install-toolchains", false, "attempt checksum-pinned toolchain installs into ~/.kiwi/tools (requires network)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	fmt.Printf("OS: %s/%s  Go: %s\n", runtime.GOOS, runtime.GOARCH, runtime.Version())
 	localDoctor()
+	// Toolchain declaration check: hermetic native jobs fail closed when a
+	// pinned tool is missing. Doctor surfaces that before the pipeline does.
+	if err := doctorPipelineToolchains(*pipelineFile, *installToolchains); err != nil {
+		return err
+	}
 	// One endpoint resolution for the server and job probes.
 	base := *server
 	if base == "" {
@@ -274,4 +287,155 @@ func serverDoctor(base string) {
 		_ = resp.Body.Close()
 		fmt.Printf("%-14s %s\n", probe.label, status)
 	}
+}
+
+// doctorPipelineToolchains verifies every top-level toolchains: entry is
+// present (and version-matched) on this host. A missing pin is FAIL: native
+// jobs would fail closed at step 1. --install-toolchains attempts the
+// checksum-pinned bootstrap into ~/.kiwi/tools when an install: block exists.
+func doctorPipelineToolchains(file string, install bool) error {
+	if file == "" {
+		if _, err := os.Stat(".kiwi/pipeline.yaml"); err == nil {
+			file = ".kiwi/pipeline.yaml"
+		} else {
+			return nil
+		}
+	}
+	s, err := pipeline.Load(file)
+	if err != nil {
+		fmt.Printf("toolchains    FAIL (load %s: %v)\n", file, err)
+		return fmt.Errorf("doctor pipeline: %w", err)
+	}
+	if len(s.Toolchains) == 0 {
+		return nil
+	}
+	fmt.Println("== toolchains ==")
+	failed := false
+	// Stable order: sorted names.
+	names := make([]string, 0, len(s.Toolchains))
+	for n := range s.Toolchains {
+		names = append(names, n)
+	}
+	// sort without importing sort again if already present — sort.Strings
+	// is in this file's imports via other uses? It is not. Use a simple sort.
+	for i := 0; i < len(names); i++ {
+		for j := i + 1; j < len(names); j++ {
+			if names[j] < names[i] {
+				names[i], names[j] = names[j], names[i]
+			}
+		}
+	}
+	for _, name := range names {
+		tc := s.Toolchains[name]
+		bin := tc.Path
+		if bin == "" && len(tc.Command) > 0 {
+			bin = tc.Command[0]
+		}
+		if bin == "" {
+			bin = name
+		}
+		if install && tc.Install != nil {
+			if err := installToolchain(name, tc); err != nil {
+				fmt.Printf("%-14s FAIL (install: %v)\n", name, err)
+				failed = true
+				continue
+			}
+		}
+		path, err := exec.LookPath(bin)
+		if err != nil {
+			fmt.Printf("%-14s FAIL (not on PATH; declare install: or put %s on PATH)\n", name, bin)
+			failed = true
+			continue
+		}
+		args := tc.Command
+		if len(args) == 0 {
+			args = []string{path, "--version"}
+		} else {
+			args = append([]string{}, args...)
+			args[0] = path
+		}
+		out, verr := exec.Command(args[0], args[1:]...).Output()
+		if verr != nil {
+			out, _ = exec.Command(path, "-v").Output()
+		}
+		ver := strings.TrimSpace(string(out))
+		if tc.Version != "" && !strings.Contains(ver, tc.Version) {
+			fmt.Printf("%-14s FAIL (have %q, want prefix %q)\n", name, ver, tc.Version)
+			failed = true
+			continue
+		}
+		fmt.Printf("%-14s ok  %s (%s)\n", name, ver, path)
+	}
+	if failed {
+		return fmt.Errorf("doctor: one or more declared toolchains are missing or mismatched")
+	}
+	return nil
+}
+
+// installToolchain is a minimal checksum-pinned bootstrap: download the
+// install.url into ~/.kiwi/tools/<name>/<version>/ and verify sha256.
+// Extraction of tar.gz/zip is intentionally not implemented yet — raw
+// single-binary pins only — so the surface stays tiny and native.
+func installToolchain(name string, tc pipeline.Toolchain) error {
+	inst := tc.Install
+	if inst == nil {
+		return nil
+	}
+	ver := tc.Version
+	if ver == "" {
+		ver = "any"
+	}
+	dir := filepath.Join(homeOrDot(), ".kiwi", "tools", name, ver)
+	dest := filepath.Join(dir, inst.Bin)
+	if st, err := os.Stat(dest); err == nil && st.Mode()&0o111 != 0 {
+		return nil // already bootstrapped
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	if inst.Format != "" && inst.Format != "raw" {
+		return fmt.Errorf("format %q not supported yet (raw only)", inst.Format)
+	}
+	// Network download is intentionally explicit; doctor without
+	// --install-toolchains never fetches.
+	req, err := http.NewRequest(http.MethodGet, inst.URL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %d fetching %s", resp.StatusCode, inst.URL)
+	}
+	tmp := dest + ".partial"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	if err != nil {
+		return err
+	}
+	h := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(f, h), resp.Body); err != nil {
+		f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	got := hex.EncodeToString(h.Sum(nil))
+	if !strings.EqualFold(got, strings.TrimSpace(inst.SHA256)) {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("sha256 mismatch for %s: got %s want %s", name, got, inst.SHA256)
+	}
+	return os.Rename(tmp, dest)
+}
+
+func homeOrDot() string {
+	if h, err := os.UserHomeDir(); err == nil && h != "" {
+		return h
+	}
+	return "."
 }

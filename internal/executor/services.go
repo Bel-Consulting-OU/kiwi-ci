@@ -1,12 +1,12 @@
 package executor
 
 import (
-	"math"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -154,7 +154,7 @@ const (
 	// ClickHouse/RabbitMQ spawn many threads; 170 PIDs (512/3) killed
 	// ClickHouse with SIGSYS (exit 133). 1024 covers a fair split of 4–8
 	// DB services without letting one service exhaust the host.
-	serviceDefaultPIDs   = 1024
+	serviceDefaultPIDs = 1024
 )
 
 // Aggregate service-envelope fallbacks, used only when the job declares no
@@ -303,6 +303,24 @@ func serviceAllocationPlan(jobResources pipeline.Resources, services []pipeline.
 // capacity the aggregate alone exceeds.
 func RuntimeRunsServices(runtime string) bool {
 	return runtime == "container"
+}
+
+// RuntimeMayRunNativeServices reports whether a job on this runtime may
+// declare native (host-process) services. Native services never create a
+// docker network and never reserve the container service envelope.
+func RuntimeMayRunNativeServices(runtime string, services []pipeline.Service) bool {
+	if runtime != "" && runtime != "native" {
+		return false
+	}
+	if len(services) == 0 {
+		return true
+	}
+	for _, s := range services {
+		if !s.Native {
+			return false
+		}
+	}
+	return true
 }
 
 // ServiceEnvelopeRequest returns the aggregate service resources the
@@ -465,8 +483,6 @@ func waitServiceReady(ctx context.Context, probe, alias, network string, emit fu
 		}
 	}
 }
-
-
 
 // defaultReadyProbe returns a sensible readiness probe for well-known
 // service images so a job never races the service's own init (postgres

@@ -168,7 +168,7 @@ func ValidateCompiledJob(cj CompiledJob) error {
 			return fmt.Errorf("%s declares service aliases %q and %q that both resolve to %q", where, prev, svc.Name, canon)
 		}
 		seenAliases[canon] = svc.Name
-		if strings.TrimSpace(svc.Image) == "" {
+		if strings.TrimSpace(svc.Image) == "" && !svc.Native {
 			return fmt.Errorf("%s service %q has empty image", where, svc.Name)
 		}
 		if err := validateDuration(svc.Interval, where+" service "+svc.Name+" interval"); err != nil {

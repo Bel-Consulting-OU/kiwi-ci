@@ -473,7 +473,6 @@ func followLogsFiltered(ctx context.Context, c *opsClient, runID string, after i
 	return sc.Err()
 }
 
-
 // opsFlake prints flaky tests for a repository from the test-intelligence
 // store (tests that flip across runs). This is the CLI half of the JUnit
 // evidence contract: status descriptions and release gates must read this
@@ -488,11 +487,11 @@ func opsFlake(ctx context.Context, args []string) error {
 	}
 	repo := rest[0]
 	var out struct {
-		Repo        string   `json:"repo"`
-		Reports     int      `json:"reports"`
-		TotalTests  int      `json:"total_tests"`
-		Failures    int      `json:"failures"`
-		FlakyTests  []string `json:"flaky_tests"`
+		Repo       string   `json:"repo"`
+		Reports    int      `json:"reports"`
+		TotalTests int      `json:"total_tests"`
+		Failures   int      `json:"failures"`
+		FlakyTests []string `json:"flaky_tests"`
 	}
 	c := newOpsClient(serverURL, token)
 	path := "/api/v1/test-intelligence?repo=" + url.QueryEscape(repo)

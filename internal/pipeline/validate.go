@@ -193,6 +193,9 @@ func validateSpec(s *Spec, relaxComponentJobs bool) error {
 	if err := validateInputs(s); err != nil {
 		return err
 	}
+	if err := validateToolchains(s); err != nil {
+		return err
+	}
 	if err := validateCronTriggers(s); err != nil {
 		return err
 	}
@@ -755,7 +758,7 @@ func validateService(jobID string, svc *Service) error {
 	if !envNameRegexp.MatchString(svc.Name) {
 		return fmt.Errorf("job %q has invalid service alias %q", jobID, svc.Name)
 	}
-	if strings.TrimSpace(svc.Image) == "" {
+	if strings.TrimSpace(svc.Image) == "" && !svc.Native {
 		return fmt.Errorf("job %q service %q has empty image", jobID, svc.Name)
 	}
 	if err := validateDuration(svc.Interval, fmt.Sprintf("job %q service %q interval", jobID, svc.Name)); err != nil {
@@ -956,6 +959,59 @@ func checkInputNames(names []string) error {
 	return nil
 }
 
+// maxToolchains bounds the top-level toolchains map: each entry is verified
+// (and may be installed) before every job that references it, so an
+// unbounded map is pure pre-step friction.
+const maxToolchains = 32
+
+func validateToolchains(s *Spec) error {
+	if len(s.Toolchains) > maxToolchains {
+		return fmt.Errorf("toolchains declares %d entries, limit is %d", len(s.Toolchains), maxToolchains)
+	}
+	for name, tc := range s.Toolchains {
+		if !idRegexp.MatchString(name) {
+			return fmt.Errorf("toolchain name %q is invalid (must match %s)", name, idRegexp.String())
+		}
+		if tc.Install != nil {
+			if strings.TrimSpace(tc.Install.URL) == "" || strings.TrimSpace(tc.Install.SHA256) == "" || strings.TrimSpace(tc.Install.Bin) == "" {
+				return fmt.Errorf("toolchain %q install requires url, sha256 and bin", name)
+			}
+			switch tc.Install.Format {
+			case "", "raw", "tar.gz", "zip":
+			default:
+				return fmt.Errorf("toolchain %q install.format %q is unsupported (want raw, tar.gz or zip)", name, tc.Install.Format)
+			}
+		}
+	}
+	for id, j := range s.Jobs {
+		seen := map[string]bool{}
+		for _, name := range j.Toolchains {
+			if !seen[name] {
+				seen[name] = true
+			}
+			if _, ok := s.Toolchains[name]; !ok {
+				return fmt.Errorf("job %q references unknown toolchain %q", id, name)
+			}
+		}
+		for i, svc := range j.Services {
+			if !svc.Native {
+				continue
+			}
+			if j.Runtime != "" && j.Runtime != "native" {
+				return fmt.Errorf("job %q service %q is native but the job runtime is %q (native services require runtime: native)", id, svc.Name, j.Runtime)
+			}
+			if len(svc.Command) == 0 {
+				return fmt.Errorf("job %q service %q is native but has no command", id, svc.Name)
+			}
+			if svc.Image != "" {
+				return fmt.Errorf("job %q service %q is native and must not declare image", id, svc.Name)
+			}
+			_ = i
+		}
+	}
+	return nil
+}
+
 func validateRetry(r Retry, where string) error {
 	if r.Max < 0 {
 		return fmt.Errorf("%s max must not be negative", where)
@@ -998,7 +1054,6 @@ func portableAbsPath(p string) bool {
 	}
 	return false
 }
-
 
 // checkCachePaths allows absolute cache paths (tool caches live outside the
 // workspace) but still rejects empty entries and ".." traversal.

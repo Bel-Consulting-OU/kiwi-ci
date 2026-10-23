@@ -71,14 +71,14 @@ func Promote(ctx context.Context, args []string) error {
 	}
 
 	blessing := map[string]any{
-		"version":      1,
-		"environment":  *env,
-		"run_id":       runID,
-		"sha":          run.SHA,
-		"repo":         run.RepoFullName,
+		"version":       1,
+		"environment":   *env,
+		"run_id":        runID,
+		"sha":           run.SHA,
+		"repo":          run.RepoFullName,
 		"attested_jobs": attested,
-		"issued_at":    time.Now().UTC().Format(time.RFC3339),
-		"statement":    fmt.Sprintf("artifact %s may be promoted to %s because run %s verified it", run.SHA, *env, runID),
+		"issued_at":     time.Now().UTC().Format(time.RFC3339),
+		"statement":     fmt.Sprintf("artifact %s may be promoted to %s because run %s verified it", run.SHA, *env, runID),
 	}
 	body, _ := json.MarshalIndent(blessing, "", "  ")
 	digest := sha256.Sum256(body)

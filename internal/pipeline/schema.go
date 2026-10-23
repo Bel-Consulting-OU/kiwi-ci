@@ -75,6 +75,12 @@ const schemaSource = `{
         "$ref": "#/$defs/component"
       }
     },
+    "toolchains": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/toolchain"
+      }
+    },
     "jobs": {
       "type": "object",
       "minProperties": 1,
@@ -85,6 +91,48 @@ const schemaSource = `{
   },
   "additionalProperties": false,
   "$defs": {
+    "toolchain": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "type": "string"
+        },
+        "command": {
+          "$ref": "#/$defs/stringArray"
+        },
+        "path": {
+          "type": "string"
+        },
+        "install": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string"
+            },
+            "sha256": {
+              "type": "string"
+            },
+            "bin": {
+              "type": "string"
+            },
+            "format": {
+              "enum": [
+                "raw",
+                "tar.gz",
+                "zip"
+              ]
+            }
+          },
+          "required": [
+            "url",
+            "sha256",
+            "bin"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
     "duration": {
       "type": "string",
       "pattern": "^\\+?([0-9]+(\\.[0-9]+)?|\\.[0-9]+)(ns|us|\u00b5s|\u03bcs|ms|s|m|h)([0-9]+(\\.[0-9]+)?(ns|us|\u00b5s|\u03bcs|ms|s|m|h))*$"
@@ -545,9 +593,6 @@ const schemaSource = `{
     },
     "service": {
       "type": "object",
-      "required": [
-        "image"
-      ],
       "properties": {
         "name": {
           "type": "string"
@@ -580,6 +625,9 @@ const schemaSource = `{
         "retries": {
           "type": "integer",
           "minimum": 0
+        },
+        "native": {
+          "type": "boolean"
         }
       },
       "additionalProperties": false
@@ -817,6 +865,12 @@ const schemaSource = `{
           "$ref": "#/$defs/duration"
         },
         "tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "toolchains": {
           "type": "array",
           "items": {
             "type": "string"
@@ -1123,7 +1177,9 @@ func checkSchemaJob(id string, j *yaml.Node) []string {
 					continue
 				}
 				img := mappingValue(sn, "image")
-				if img == nil || img.Kind != yaml.ScalarNode || img.Tag == "!!null" || strings.TrimSpace(img.Value) == "" {
+				native := mappingValue(sn, "native")
+				isNative := native != nil && native.Kind == yaml.ScalarNode && native.Value == "true"
+				if !isNative && (img == nil || img.Kind != yaml.ScalarNode || img.Tag == "!!null" || strings.TrimSpace(img.Value) == "") {
 					errs = append(errs, fmt.Sprintf("%s has empty image", where))
 				}
 				if v := mappingValue(sn, "interval"); v != nil {

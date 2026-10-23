@@ -112,6 +112,9 @@ func CompileWithInputs(s *Spec, inputs map[string]string) (*Graph, error) {
 			for _, v := range variants {
 				cid := id + matrixSuffixWithKeys(v, keys)
 				cj := CompiledJob{ID: cid, BaseID: id, Job: interpolateJob(j, v, inputs), Matrix: v}
+				if err := bindToolchains(cid, &cj.Job, s); err != nil {
+					return nil, err
+				}
 				cj.Job.Env = mergeStringMaps(cj.Job.Env, matrixEnv(v))
 				if inputs != nil {
 					cj.Job.Env = mergeStringMaps(cj.Job.Env, inputEnv(inputs))
@@ -139,6 +142,24 @@ func CompileWithInputs(s *Spec, inputs map[string]string) (*Graph, error) {
 		g.Jobs[id] = cj
 	}
 	return g, nil
+}
+
+// bindToolchains resolves job.toolchains names against the pipeline's
+// top-level toolchains: map so the executor can verify them without
+// re-reading the Spec. Unknown names fail closed at compile time.
+func bindToolchains(jobID string, j *Job, s *Spec) error {
+	if len(j.Toolchains) == 0 || s == nil {
+		return nil
+	}
+	j.BoundToolchains = make([]Toolchain, 0, len(j.Toolchains))
+	for _, name := range j.Toolchains {
+		tc, ok := s.Toolchains[name]
+		if !ok {
+			return fmt.Errorf("job %q references unknown toolchain %q (declare it under top-level toolchains:)", jobID, name)
+		}
+		j.BoundToolchains = append(j.BoundToolchains, tc)
+	}
+	return nil
 }
 
 // shardVariants expands one matrix combination into its compile-time test

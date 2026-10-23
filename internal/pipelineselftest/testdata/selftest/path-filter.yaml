@@ -1,0 +1,25 @@
+version: 1
+name: selftest-path-filter
+on:
+  push: {}
+  pull_request: {}
+jobs:
+  site-only:
+    when:
+      event: [push, pull_request]
+      path:
+        - site/**
+    steps:
+      - run: "echo site"
+  rust-only:
+    when:
+      event: [push, pull_request]
+      path:
+        - rust/**
+    steps:
+      - run: "echo rust"
+  always-push:
+    when:
+      event: [push]
+    steps:
+      - run: "echo push"

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -79,15 +80,15 @@ type Options struct {
 	// selected job. Used by `kiwi replay RUN JOB STEP`. Steps that do not
 	// match are skipped without side effects; the matched step runs with
 	// dependency outputs interpolated as in the full job.
-	OnlyStep         string
-	Event            string
-	Branch           string
+	OnlyStep string
+	Event    string
+	Branch   string
 	// Git identity for jobs: SHA/ref/repo. Exposed as KIWI_GIT_*
 	// env and ${{ git.* }} so imported scripts need not re-derive them.
-	GitSHA           string
-	GitRef           string
-	RepoURL          string
-	RepoFullName     string
+	GitSHA       string
+	GitRef       string
+	RepoURL      string
+	RepoFullName string
 	// RunURL is the control-plane run link (CI_PIPELINE_URL /
 	// STATUS_TARGET_URL for forge commit-status scripts). Empty locally.
 	RunURL string
@@ -95,13 +96,13 @@ type Options struct {
 	// hosts without rootless docker (macOS/colima). The workspace
 	// step-boundary bound still applies.
 	AllowRootfulUntrusted bool
-	ChangedFiles     []string
-	SecretProvider   secrets.Provider
-	Logs             logging.Sink
-	Cache            *cache.Store
-	Artifacts        *artifact.Store
-	ArtifactCapture  *ArtifactCapture
-	ArtifactReporter func(jobID, name, path string) error
+	ChangedFiles          []string
+	SecretProvider        secrets.Provider
+	Logs                  logging.Sink
+	Cache                 *cache.Store
+	Artifacts             *artifact.Store
+	ArtifactCapture       *ArtifactCapture
+	ArtifactReporter      func(jobID, name, path string) error
 	// LocalDownloads enables restoring declared dependency downloads from
 	// this run's locally saved artifacts (kiwi run parity with the
 	// distributed runner's restoreDownloads). Off for the distributed
@@ -530,6 +531,7 @@ func (e *Executor) Run(ctx context.Context, g *pipeline.Graph) (map[string]model
 	}
 	return results, errors.Join(errs...)
 }
+
 // placementMismatch reports why this runner cannot host cj (empty = can run).
 // Required labels and placement labels/regions must all be carried by the
 // runner, matching the server's lease filter. Local kiwi run advertises
@@ -720,6 +722,15 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		}
 	}
 	jobEnv["KIWI_WORKSPACE"] = workspaceEnv
+	// First-class changed-file context: jobs see the run's change set
+	// without re-implementing git discovery.
+	changedJSON, _ := json.Marshal(struct {
+		Paths []string `json:"paths"`
+		Count int      `json:"count"`
+	}{Paths: e.Opt.ChangedFiles, Count: len(e.Opt.ChangedFiles)})
+	jobEnv["KIWI_CHANGED_FILES"] = strings.Join(e.Opt.ChangedFiles, "\n")
+	jobEnv["KIWI_CHANGED_COUNT"] = strconv.Itoa(len(e.Opt.ChangedFiles))
+	jobEnv["KIWI_CHANGED_JSON"] = string(changedJSON)
 	// Legacy CI_* / GITHUB_* names so imported Woodpecker/Drone/GitLab and
 	// GitHub-Actions-style scripts run unmodified. CI_WORKSPACE is the job
 	// workspace (the container's $PWD when the step runs at the workspace
@@ -883,13 +894,31 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	// the service containers started here and by the main container started
 	// below.
 	cgroupParent := ""
-	if len(cj.Job.Services) > 0 && !RuntimeRunsServices(cj.Job.Runtime) {
+	if len(cj.Job.Services) > 0 && !RuntimeRunsServices(cj.Job.Runtime) && !RuntimeMayRunNativeServices(cj.Job.Runtime, cj.Job.Services) {
 		// Fail closed: a declared-but-unprovisioned service is a silent
 		// absence today (no containers, no warning, names unresolvable).
 		// Every DB-backed gate then fails on a missing daemon.
 		res.Status = model.StatusFailure
-		res.Error = fmt.Sprintf("job %q declares %d service(s) but runtime %q cannot provision them (services require runtime: container)", cj.ID, len(cj.Job.Services), cj.Job.Runtime)
+		res.Error = fmt.Sprintf("job %q declares %d service(s) but runtime %q cannot provision them (container services require runtime: container; host services require runtime: native and native: true)", cj.ID, len(cj.Job.Services), cj.Job.Runtime)
 		return finish(res)
+	}
+	if RuntimeMayRunNativeServices(cj.Job.Runtime, cj.Job.Services) && len(cj.Job.Services) > 0 {
+		net, nativeEnv, cleanupNS, nerr := startNativeServices(ctx, cj.ID, cj.Job.Services, func(line string) { e.log(cj.ID, "service", line) })
+		if nerr != nil {
+			res.Status = model.StatusFailure
+			res.Error = nerr.Error()
+			return finish(res)
+		}
+		network = net
+		cleanupServices = cleanupNS
+		for k, v := range nativeEnv {
+			jobEnv[k] = v
+		}
+		defer func() {
+			if cerr := cleanupServices(); cerr != nil {
+				e.reportCleanupDebt(CleanupService, cj.ID, cerr)
+			}
+		}()
 	}
 	if RuntimeRunsServices(cj.Job.Runtime) && len(cj.Job.Services) > 0 {
 		// One job-scoped parent cgroup holds the main container AND every
@@ -1079,6 +1108,14 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		e.sessions.delete(cj.ID)
 	}()
 	stepOutputs := map[string]map[string]string{}
+	// Declared toolchains: entries are verified before step 1 (hermetic
+	// native jobs). Observed versions are recorded so the execution
+	// attestation can carry them.
+	if err := e.checkBoundToolchains(cj.ID, cj.Job.BoundToolchains); err != nil {
+		res.Status = model.StatusFailure
+		res.Error = err.Error()
+		return finish(res)
+	}
 	// Toolchain fingerprint gate: run before step 1, fail closed on a
 	// missing or wrong-version tool. Observed versions are recorded so the
 	// execution attestation can carry them.
@@ -1099,12 +1136,12 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		st.Name = pipeline.InterpolateOutputs(st.Name, needsOutputs, stepOutputs)
 		st.Run = pipeline.InterpolateOutputs(st.Run, needsOutputs, stepOutputs)
 		gitCtx := expr.Context{
-			Event:    e.Opt.Event,
-			Branch:   e.Opt.Branch,
-			Ref:      e.Opt.GitRef,
-			SHA:      e.Opt.GitSHA,
-			Repo:     e.Opt.RepoURL,
-			RepoFull: e.Opt.RepoFullName,
+			Event:     e.Opt.Event,
+			Branch:    e.Opt.Branch,
+			Ref:       e.Opt.GitRef,
+			SHA:       e.Opt.GitSHA,
+			Repo:      e.Opt.RepoURL,
+			RepoFull:  e.Opt.RepoFullName,
 			Workspace: workspace,
 		}
 		st.Run = pipeline.InterpolateGit(st.Run, gitCtx)
@@ -1470,7 +1507,6 @@ func (e *Executor) captureSnapshot(jobID, workspace string) {
 	e.log(jobID, "snapshot", "saved "+dest)
 }
 
-
 // checkToolFingerprint asserts each tools: entry ("docker=29.5") before any
 // step runs. The tool must exist and its --version output must contain the
 // declared version prefix. Observed versions are logged for the attestation.
@@ -1509,6 +1545,45 @@ func truncateVersion(s string) string {
 		return s[:120] + "..."
 	}
 	return s
+}
+
+// checkBoundToolchains verifies every declared toolchain before step 1 and
+// reports the observed version for the attestation. Fail-closed: a missing
+// binary or version mismatch stops the job before any step runs.
+func (e *Executor) checkBoundToolchains(jobID string, toolchains []pipeline.Toolchain) error {
+	for _, tc := range toolchains {
+		name := tc.Path
+		if name == "" {
+			// Prefer the command argv0 when present.
+			if len(tc.Command) > 0 {
+				name = tc.Command[0]
+			}
+		}
+		if name == "" {
+			return fmt.Errorf("toolchain has neither path nor command")
+		}
+		path, err := exec.LookPath(name)
+		if err != nil {
+			return fmt.Errorf("toolchain %s is required but not on PATH (pin install: or bootstrap with kiwi doctor --install-toolchains)", name)
+		}
+		args := tc.Command
+		if len(args) == 0 {
+			args = []string{path, "--version"}
+		} else {
+			args = append([]string{}, args...)
+			args[0] = path
+		}
+		out, verr := exec.Command(args[0], args[1:]...).Output()
+		if verr != nil {
+			out, verr = exec.Command(path, "-v").Output()
+		}
+		versionText := strings.TrimSpace(string(out))
+		if tc.Version != "" && !strings.Contains(versionText, tc.Version) {
+			return fmt.Errorf("toolchain %s version %q does not match required %q", name, truncateVersion(versionText), tc.Version)
+		}
+		e.log(jobID, "toolchain", name+" "+versionText+" ("+path+")")
+	}
+	return nil
 }
 
 // defaultCondition supplies the implicit step condition: a step without an
@@ -2058,8 +2133,6 @@ func (e *Executor) resolveSecrets(ctx context.Context, names []string, cache map
 	}
 	return out, nil
 }
-
-
 
 // isSecretNotFound reports whether err means "this secret is not
 // provisioned" (skip for optional job-level secrets) as opposed to a

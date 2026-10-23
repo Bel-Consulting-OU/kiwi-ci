@@ -21,6 +21,8 @@ import (
 type explainArgs struct {
 	Event  string
 	Branch string
+	// ChangedFiles overrides git detection when non-empty.
+	ChangedFiles []string
 }
 
 // explainWhy prints why one compiled job would (or would not) run for the
@@ -37,10 +39,14 @@ func explainWhy(g *pipeline.Graph, jobID string, args explainArgs) error {
 	if branch == "" {
 		branch = detectCurrentBranch(wd)
 	}
+	changed := args.ChangedFiles
+	if len(changed) == 0 {
+		changed = detectChangedFiles(wd)
+	}
 	w, err := explain.ExplainWhy(g.Spec, g, jobID, explain.ExplainContext{
 		Event:        args.Event,
 		Branch:       branch,
-		ChangedFiles: detectChangedFiles(wd),
+		ChangedFiles: changed,
 	})
 	if err != nil {
 		return err

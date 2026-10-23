@@ -147,7 +147,14 @@ type Spec struct {
 	Concurrency Concurrency             `yaml:"concurrency,omitempty" json:"concurrency,omitempty"`
 	Packages    map[string]Package      `yaml:"packages,omitempty" json:"packages,omitempty"`
 	Components  map[string]ComponentUse `yaml:"components,omitempty" json:"components,omitempty"`
-	Jobs        map[string]Job          `yaml:"jobs" json:"jobs"`
+	// Toolchains pins native host tools (rustc, zola, clickhouse, …) so a
+	// native job does not depend on whatever happens to be on the runner's
+	// PATH. Jobs reference them by name via job.toolchains; the executor
+	// fails closed before step 1 when a named toolchain is missing or its
+	// version does not match. Bootstrap installs land under ~/.kiwi/tools
+	// and are cached by name+version (see internal/toolchain).
+	Toolchains map[string]Toolchain `yaml:"toolchains,omitempty" json:"toolchains,omitempty"`
+	Jobs       map[string]Job       `yaml:"jobs" json:"jobs"`
 	// ProvidedInputs carries the validated run inputs resolved by
 	// ResolveInputs (server enqueue). Compile forwards it to
 	// CompileWithInputs so the effective compiled jobs, digests and payloads
@@ -474,35 +481,35 @@ type Job struct {
 	// canonicalized into Steps = [{run: Run}] at parse time (and is mutually
 	// exclusive with an explicit steps list). The simple case must be
 	// absurdly simple:  image + run  is a complete job.
-	Run          string            `yaml:"run,omitempty" json:"run,omitempty"`
-	Image        string            `yaml:"image,omitempty" json:"image,omitempty"`
-	Network      string            `yaml:"network,omitempty" json:"network,omitempty"`
-	VM           string            `yaml:"vm,omitempty" json:"vm,omitempty"`
-	Shell        string            `yaml:"shell,omitempty" json:"shell,omitempty"`
-	Timeout      Duration          `yaml:"timeout,omitempty" json:"timeout,omitempty"`
-	Retry        Retry             `yaml:"retry,omitempty" json:"retry,omitempty"`
-	Env          map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
-	Matrix       map[string][]any  `yaml:"matrix,omitempty" json:"matrix,omitempty"`
+	Run     string            `yaml:"run,omitempty" json:"run,omitempty"`
+	Image   string            `yaml:"image,omitempty" json:"image,omitempty"`
+	Network string            `yaml:"network,omitempty" json:"network,omitempty"`
+	VM      string            `yaml:"vm,omitempty" json:"vm,omitempty"`
+	Shell   string            `yaml:"shell,omitempty" json:"shell,omitempty"`
+	Timeout Duration          `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+	Retry   Retry             `yaml:"retry,omitempty" json:"retry,omitempty"`
+	Env     map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
+	Matrix  map[string][]any  `yaml:"matrix,omitempty" json:"matrix,omitempty"`
 	// When is a job-level filter block (Woodpecker-style): path / branch /
 	// event constraints that fold into Paths / PathsIgnore / If at parse.
-	When         *JobWhen          `yaml:"when,omitempty" json:"when,omitempty"`
+	When *JobWhen `yaml:"when,omitempty" json:"when,omitempty"`
 	// Concurrency is a job-level group (single-flight deploys): at most one
 	// run of the group is active; later ones cancel or queue.
-	Concurrency  *Concurrency      `yaml:"concurrency,omitempty" json:"concurrency,omitempty"`
-	Paths        []string          `yaml:"paths,omitempty" json:"paths,omitempty"`
-	PathsIgnore  []string          `yaml:"paths_ignore,omitempty" json:"paths_ignore,omitempty"`
-	Services     []Service         `yaml:"services,omitempty" json:"services,omitempty"`
-	Steps        []Step            `yaml:"steps" json:"steps"`
-	Cache        []Cache           `yaml:"cache,omitempty" json:"cache,omitempty"`
-	Artifacts    []Artifact        `yaml:"artifacts,omitempty" json:"artifacts,omitempty"`
-	Downloads    []ArtifactInput   `yaml:"downloads,omitempty" json:"downloads,omitempty"`
-	Clone        Clone             `yaml:"clone,omitempty" json:"clone,omitempty"`
-	Workspace    Workspace         `yaml:"workspace,omitempty" json:"workspace,omitempty"`
-	Volumes      []Volume          `yaml:"volumes,omitempty" json:"volumes,omitempty"`
-	Registries   []Registry        `yaml:"registries,omitempty" json:"registries,omitempty"`
-	TestReports  []string          `yaml:"test_reports,omitempty" json:"test_reports,omitempty"`
-	Environment  Environment       `yaml:"environment,omitempty" json:"environment,omitempty"`
-	InfraRetries int               `yaml:"infra_retries,omitempty" json:"infra_retries,omitempty"`
+	Concurrency  *Concurrency    `yaml:"concurrency,omitempty" json:"concurrency,omitempty"`
+	Paths        []string        `yaml:"paths,omitempty" json:"paths,omitempty"`
+	PathsIgnore  []string        `yaml:"paths_ignore,omitempty" json:"paths_ignore,omitempty"`
+	Services     []Service       `yaml:"services,omitempty" json:"services,omitempty"`
+	Steps        []Step          `yaml:"steps" json:"steps"`
+	Cache        []Cache         `yaml:"cache,omitempty" json:"cache,omitempty"`
+	Artifacts    []Artifact      `yaml:"artifacts,omitempty" json:"artifacts,omitempty"`
+	Downloads    []ArtifactInput `yaml:"downloads,omitempty" json:"downloads,omitempty"`
+	Clone        Clone           `yaml:"clone,omitempty" json:"clone,omitempty"`
+	Workspace    Workspace       `yaml:"workspace,omitempty" json:"workspace,omitempty"`
+	Volumes      []Volume        `yaml:"volumes,omitempty" json:"volumes,omitempty"`
+	Registries   []Registry      `yaml:"registries,omitempty" json:"registries,omitempty"`
+	TestReports  []string        `yaml:"test_reports,omitempty" json:"test_reports,omitempty"`
+	Environment  Environment     `yaml:"environment,omitempty" json:"environment,omitempty"`
+	InfraRetries int             `yaml:"infra_retries,omitempty" json:"infra_retries,omitempty"`
 	// InfraRetriesSet records whether infra_retries was explicitly present,
 	// so `infra_retries: 0` can mean "never requeue after a lost runner".
 	InfraRetriesSet bool              `yaml:"-" json:"-"`
@@ -524,6 +531,42 @@ type Job struct {
 	// Each entry is name=version-prefix. The job fails closed if a tool is
 	// missing or its version does not match.
 	Tools []string `yaml:"tools,omitempty" json:"tools,omitempty"`
+	// Toolchains names entries from the pipeline's top-level toolchains:
+	// map. Each named toolchain is verified (and optionally bootstrapped)
+	// before step 1, then its resolved PATH entry is prepended for the job.
+	Toolchains []string `yaml:"toolchains,omitempty" json:"toolchains,omitempty"`
+	// BoundToolchains is the compile-time resolution of Toolchains names
+	// against the pipeline's top-level toolchains: map. The executor
+	// verifies these before step 1. It is never part of the YAML surface.
+	BoundToolchains []Toolchain `yaml:"-" json:"bound_toolchains,omitempty"`
+}
+
+// Toolchain pins one native host tool for hermetic native jobs.
+type Toolchain struct {
+	// Version is the required version prefix (exact match on the check
+	// command's output). Empty means "must exist; any version".
+	Version string `yaml:"version,omitempty" json:"version,omitempty"`
+	// Command is the argv that prints the version. Empty means
+	// [name, "--version"] then [name, "-v"].
+	Command []string `yaml:"command,omitempty" json:"command,omitempty"`
+	// Path names the executable on PATH, or an absolute path. Empty means
+	// the toolchain key itself.
+	Path string `yaml:"path,omitempty" json:"path,omitempty"`
+	// Install optionally pins a bootstrap download for `kiwi doctor
+	// --install-toolchains` / runner bootstrap. Native runs stay fast when
+	// the host already has the tool; install is the hermetic fallback.
+	Install *ToolchainInstall `yaml:"install,omitempty" json:"install,omitempty"`
+}
+
+// ToolchainInstall is a checksum-pinned bootstrap download.
+type ToolchainInstall struct {
+	URL    string `yaml:"url" json:"url"`
+	SHA256 string `yaml:"sha256" json:"sha256"`
+	// Bin is the executable name inside the archive (or the downloaded file
+	// when format is raw). Required.
+	Bin string `yaml:"bin" json:"bin"`
+	// Format is "raw", "tar.gz", or "zip". Empty means raw.
+	Format string `yaml:"format,omitempty" json:"format,omitempty"`
 }
 
 type Service struct {
@@ -535,14 +578,19 @@ type Service struct {
 	// Ready is a native readiness probe: "tcp:5432", "http:8123/ping",
 	// or "pg_isready:5432". The executor waits for it before the job
 	// starts, replacing hand-rolled wait loops in pipelines.
-	Ready       string            `yaml:"ready,omitempty" json:"ready,omitempty"`
-	Healthcheck string            `yaml:"healthcheck,omitempty" json:"healthcheck,omitempty"`
-	Interval    Duration          `yaml:"interval,omitempty" json:"interval,omitempty"`
-	Timeout     Duration          `yaml:"timeout,omitempty" json:"timeout,omitempty"`
-	Retries     int               `yaml:"retries,omitempty" json:"retries,omitempty"`
+	Ready       string   `yaml:"ready,omitempty" json:"ready,omitempty"`
+	Healthcheck string   `yaml:"healthcheck,omitempty" json:"healthcheck,omitempty"`
+	Interval    Duration `yaml:"interval,omitempty" json:"interval,omitempty"`
+	Timeout     Duration `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+	Retries     int      `yaml:"retries,omitempty" json:"retries,omitempty"`
 	// RetriesSet records whether retries was explicitly present, so
 	// `retries: 0` can mean "one healthcheck attempt".
 	RetriesSet bool `yaml:"-" json:"-"`
+	// Native runs the service as a host process (no docker). Allowed only
+	// for jobs with runtime: native; Command is the full argv. The executor
+	// allocates a free port when the command needs one, waits for Ready,
+	// and tears the process down with the job.
+	Native bool `yaml:"native,omitempty" json:"native,omitempty"`
 }
 
 // UnmarshalYAML records the presence of "retries" alongside the decoded value.

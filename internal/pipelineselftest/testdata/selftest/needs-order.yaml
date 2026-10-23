@@ -1,0 +1,16 @@
+version: 1
+name: selftest-needs
+on:
+  push: {}
+jobs:
+  a:
+    steps:
+      - run: "echo a"
+  b:
+    needs: [a]
+    steps:
+      - run: "echo b"
+  c:
+    needs: [b]
+    steps:
+      - run: "echo c"

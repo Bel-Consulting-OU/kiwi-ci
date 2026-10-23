@@ -1,13 +1,13 @@
 package app
 
 import (
-	"github.com/Bel-Consulting-OU/kiwi-ci/internal/config"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/config"
 	"io"
 	"os"
 	"os/exec"
@@ -43,6 +43,7 @@ func RunLocal(ctx context.Context, args []string) error {
 	head := fs.String("head", "HEAD", "head ref for changed-file detection")
 	mergeBase := fs.String("merge-base", "", "compute the base as the merge base of HEAD and this ref")
 	changedFile := fs.String("changed-file", "", "explicit changed files (comma-separated); overrides git detection")
+	changedFiles := fs.String("changed-files", "", "alias for --changed-file (comma-separated workspace-relative paths)")
 	var inputs kvFlags
 	fs.Var(&inputs, "input", "pipeline input k=v (repeatable)")
 	if err := fs.Parse(args); err != nil {
@@ -105,7 +106,11 @@ func RunLocal(ctx context.Context, args []string) error {
 	logs := &logging.Console{Writer: os.Stdout, Masker: masker}
 	provider := secrets.Chain{secrets.EnvProvider{Prefix: "KIWI_SECRET_"}, secrets.MacKeychainProvider{Service: "kiwi-ci"}}
 	repoURL, repoFullName := detectGitRepo(wd)
-	opts := executor.Options{Workspace: wd, WorkspaceFor: func(jobID string) (string, func(), error) { return wm.Prepare(ctx, jobID) }, RunID: runID, MaxParallel: *parallel, OnlyJob: *job, ChangedFiles: detectChangedFilesOpts(wd, *base, *head, *mergeBase, *changedFile), SecretProvider: provider, Logs: logs, RepoURL: repoURL, RepoFullName: repoFullName,
+	explicitChanged := *changedFile
+	if explicitChanged == "" {
+		explicitChanged = *changedFiles
+	}
+	opts := executor.Options{Workspace: wd, WorkspaceFor: func(jobID string) (string, func(), error) { return wm.Prepare(ctx, jobID) }, RunID: runID, MaxParallel: *parallel, OnlyJob: *job, ChangedFiles: detectChangedFilesOpts(wd, *base, *head, *mergeBase, explicitChanged), SecretProvider: provider, Logs: logs, RepoURL: repoURL, RepoFullName: repoFullName,
 		// Local parity: job conditions evaluate against the same branch and
 		// event context `kiwi explain --why` uses (the git-detected branch,
 		// push event), so a branch/event condition cannot silently diverge
@@ -144,12 +149,12 @@ func RunLocal(ctx context.Context, args []string) error {
 		fmt.Println(string(b))
 	} else {
 		printSummary(res)
-	// A closed stdout pipe (kiwi run | head) used to swallow step output
-	// silently. Surface the writer failure so a "silent success" is
-	// explainable.
-	if werr := logs.WriteErr(); werr != nil {
-		fmt.Fprintf(os.Stderr, "kiwi: console output incomplete: %v\n", werr)
-	}
+		// A closed stdout pipe (kiwi run | head) used to swallow step output
+		// silently. Surface the writer failure so a "silent success" is
+		// explainable.
+		if werr := logs.WriteErr(); werr != nil {
+			fmt.Fprintf(os.Stderr, "kiwi: console output incomplete: %v\n", werr)
+		}
 	}
 	// A cancelled run is never a success: an interrupt (SIGINT/SIGTERM) or a
 	// parent-scoped cancellation must exit non-zero, or a `kiwi run && ...`
@@ -218,6 +223,8 @@ func Explain(args []string) error {
 	why := fs.String("why", "", "explain why one compiled job would run (event, branch, paths, condition, dependencies)")
 	event := fs.String("event", "push", "event name for --why evaluation")
 	branch := fs.String("branch", "", "branch name for --why evaluation")
+	changedFiles := fs.String("changed-files", "", "comma-separated changed paths for --why (overrides git detection)")
+	changedFile := fs.String("changed-file", "", "alias for --changed-files")
 	var inputs kvFlags
 	fs.Var(&inputs, "input", "pipeline input k=v (repeatable)")
 	if err := fs.Parse(args); err != nil {
@@ -238,8 +245,12 @@ func Explain(args []string) error {
 	if err != nil {
 		return err
 	}
+	changed := *changedFiles
+	if changed == "" {
+		changed = *changedFile
+	}
 	if *why != "" {
-		return explainWhy(g, *why, explainArgs{Event: *event, Branch: *branch})
+		return explainWhy(g, *why, explainArgs{Event: *event, Branch: *branch, ChangedFiles: parseCSVPaths(changed)})
 	}
 	wd, werr := os.Getwd()
 	if werr != nil {
@@ -316,6 +327,20 @@ func detectChangedFilesOpts(workspace, base, head, mergeBase, changedFile string
 	for _, s := range strings.Split(string(b), "\n") {
 		if s = strings.TrimSpace(s); s != "" {
 			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// parseCSVPaths splits a comma-separated path list (explain --changed-files).
+func parseCSVPaths(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
 		}
 	}
 	return out

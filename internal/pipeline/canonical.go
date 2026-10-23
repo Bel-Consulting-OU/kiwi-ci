@@ -156,7 +156,7 @@ type canonicalJob struct {
 	Component       string              `json:"component,omitempty"`
 	With            orderedMap          `json:"with,omitempty"`
 	QueueTimeout    canonicalDuration   `json:"queue_timeout,omitempty"`
-	Tools []string `json:"tools,omitempty"`
+	Tools           []string            `json:"tools,omitempty"`
 }
 
 type canonicalService struct {
@@ -231,7 +231,7 @@ func canonicalJobOf(j Job) canonicalJob {
 			Command: j.Services[i].Command,
 			Env:     pairs(j.Services[i].Env), Ready: j.Services[i].Ready,
 			Healthcheck: j.Services[i].Healthcheck,
-			Interval: durOf(j.Services[i].Interval), Timeout: durOf(j.Services[i].Timeout),
+			Interval:    durOf(j.Services[i].Interval), Timeout: durOf(j.Services[i].Timeout),
 			Retries: j.Services[i].Retries, RetriesSet: j.Services[i].RetriesSet,
 		}
 	}

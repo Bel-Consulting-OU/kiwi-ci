@@ -1,0 +1,19 @@
+version: 1
+name: selftest-hermetic
+on:
+  push: {}
+toolchains:
+  go:
+    version: "go1."
+    command: ["go", "version"]
+jobs:
+  live:
+    runtime: native
+    toolchains: [go]
+    services:
+      - name: echo
+        native: true
+        command: ["sleep", "30"]
+        ready: ""
+    steps:
+      - run: "echo $KIWI_SERVICE_ECHO_HOST"
