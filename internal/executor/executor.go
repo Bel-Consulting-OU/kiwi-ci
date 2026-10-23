@@ -723,13 +723,18 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	}
 	jobEnv["KIWI_WORKSPACE"] = workspaceEnv
 	// First-class changed-file context: jobs see the run's change set
-	// without re-implementing git discovery.
+	// without re-implementing git discovery. Empty change sets encode as
+	// [] not null so consumers never special-case null.
+	changedPaths := e.Opt.ChangedFiles
+	if changedPaths == nil {
+		changedPaths = []string{}
+	}
 	changedJSON, _ := json.Marshal(struct {
 		Paths []string `json:"paths"`
 		Count int      `json:"count"`
-	}{Paths: e.Opt.ChangedFiles, Count: len(e.Opt.ChangedFiles)})
-	jobEnv["KIWI_CHANGED_FILES"] = strings.Join(e.Opt.ChangedFiles, "\n")
-	jobEnv["KIWI_CHANGED_COUNT"] = strconv.Itoa(len(e.Opt.ChangedFiles))
+	}{Paths: changedPaths, Count: len(changedPaths)})
+	jobEnv["KIWI_CHANGED_FILES"] = strings.Join(changedPaths, "\n")
+	jobEnv["KIWI_CHANGED_COUNT"] = strconv.Itoa(len(changedPaths))
 	jobEnv["KIWI_CHANGED_JSON"] = string(changedJSON)
 	// Legacy CI_* / GITHUB_* names so imported Woodpecker/Drone/GitLab and
 	// GitHub-Actions-style scripts run unmodified. CI_WORKSPACE is the job
@@ -834,11 +839,21 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		e.log(cj.ID, "generate", "child job expansion is a control-plane feature; this local run executes the generator step only")
 	}
 	if e.Opt.LocalDownloads && len(cj.Job.Downloads) > 0 {
-		if err := e.restoreLocalDownloads(cj.Job.Downloads, workRoot); err != nil {
+		setupDownloads, failureDownloads := partitionDownloads(cj.Job.Downloads)
+		if err := e.restoreLocalDownloads(setupDownloads, workRoot); err != nil {
 			res.Status = model.StatusFailure
 			res.Error = err.Error()
 			return finish(res)
 		}
+		// failure()-gated downloads restore after the job has failed, so
+		// green runs never pull failure-only payloads.
+		defer func() {
+			if res.Status != model.StatusSuccess && res.Status != model.StatusSkipped && len(failureDownloads) > 0 {
+				if err := e.restoreLocalDownloads(failureDownloads, workRoot); err != nil {
+					e.log(cj.ID, "download", "failure download: "+err.Error())
+				}
+			}
+		}()
 	}
 	// Pre-execution checkpoint: exactly once per attempt, after every
 	// restore above and before any service container or step can touch the
@@ -1827,6 +1842,20 @@ func (e *Executor) saveArtifact(cj pipeline.CompiledJob, a pipeline.Artifact, wo
 			e.log(cj.ID, "artifact", "uploaded "+a.Name)
 		}
 	}
+}
+
+// partitionDownloads splits declared downloads into setup-time restores
+// (empty `if` or success()) and failure()-gated restores.
+func partitionDownloads(inputs []pipeline.ArtifactInput) (setup, onFailure []pipeline.ArtifactInput) {
+	for _, d := range inputs {
+		switch strings.TrimSpace(d.If) {
+		case "", "success()", "always()":
+			setup = append(setup, d)
+		default:
+			onFailure = append(onFailure, d)
+		}
+	}
+	return setup, onFailure
 }
 
 // restoreLocalDownloads restores the job's declared dependency downloads from

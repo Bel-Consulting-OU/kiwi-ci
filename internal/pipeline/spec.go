@@ -741,6 +741,11 @@ type ArtifactInput struct {
 	From string `yaml:"from" json:"from"`
 	Name string `yaml:"name" json:"name"`
 	Path string `yaml:"path,omitempty" json:"path,omitempty"`
+	// If gates when the dependency artifact is restored. Empty means the
+	// download runs during setup (before step 1). `failure()` defers the
+	// restore until the job has already failed (logs/diagnostics from a
+	// failed producer), so green runs never pull failure-only payloads.
+	If string `yaml:"if,omitempty" json:"if,omitempty"`
 }
 
 type Artifact struct {

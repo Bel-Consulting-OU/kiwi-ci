@@ -485,8 +485,6 @@ func convertGlobalWhen(res *importer.Result, when *yaml.Node, spec *pipeline.Spe
 	return supported
 }
 
-
-
 // importCaches emits the cache stanzas a Woodpecker container job needs so
 // a cold runner does not rebuild the world every push. Detected from the
 // workflow itself: Cargo (target/ + registry), Node, Python. Each stanza is

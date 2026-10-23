@@ -795,6 +795,9 @@ const schemaSource = `{
         },
         "path": {
           "type": "string"
+        },
+        "if": {
+          "type": "string"
         }
       },
       "additionalProperties": false

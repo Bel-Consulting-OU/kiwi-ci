@@ -31,9 +31,14 @@ func Doctor(args []string) error {
 	server := fs.String("server", "", "also diagnose a Kiwi control plane URL")
 	job := fs.String("job", "", "explain why a job can/cannot run: name the missing runner capability")
 	pipelineFile := fs.String("pipeline", "", "verify toolchains: declared in this pipeline (default .kiwi/pipeline.yaml when present)")
+	pipelineFileShort := fs.String("f", "", "alias for --pipeline")
 	installToolchains := fs.Bool("install-toolchains", false, "attempt checksum-pinned toolchain installs into ~/.kiwi/tools (requires network)")
+	requiredChecks := fs.String("required-checks", "", "JSON file of branch-protection required contexts; fail when a required context has no matching job")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *pipelineFile == "" {
+		pipelineFile = pipelineFileShort
 	}
 	fmt.Printf("OS: %s/%s  Go: %s\n", runtime.GOOS, runtime.GOARCH, runtime.Version())
 	localDoctor()
@@ -41,6 +46,15 @@ func Doctor(args []string) error {
 	// pinned tool is missing. Doctor surfaces that before the pipeline does.
 	if err := doctorPipelineToolchains(*pipelineFile, *installToolchains); err != nil {
 		return err
+	}
+	if *requiredChecks != "" {
+		args := []string{"--required-checks", *requiredChecks}
+		if *pipelineFile != "" {
+			args = append([]string{"-f", *pipelineFile}, args...)
+		}
+		if err := RequiredChecks(args); err != nil {
+			return err
+		}
 	}
 	// One endpoint resolution for the server and job probes.
 	base := *server

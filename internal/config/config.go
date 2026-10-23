@@ -203,8 +203,8 @@ type PolicyConfig struct {
 // jobs on hosts where rootless is unavailable (macOS/colima) — the
 // workspace quota step-boundary bound still applies.
 type RunnerConfig struct {
-	Trusted                bool `toml:"trusted"`
-	AllowRootfulUntrusted  bool `toml:"allow_rootful_untrusted"`
+	Trusted               bool `toml:"trusted"`
+	AllowRootfulUntrusted bool `toml:"allow_rootful_untrusted"`
 }
 
 type ObservabilityConfig struct {

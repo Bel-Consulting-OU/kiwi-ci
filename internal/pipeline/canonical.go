@@ -105,7 +105,11 @@ type canonicalSpec struct {
 	Inputs      orderedMap        `json:"inputs,omitempty"`
 	Packages    orderedMap        `json:"packages,omitempty"`
 	Components  orderedMap        `json:"components,omitempty"`
-	Jobs        orderedMap        `json:"jobs"`
+	// Toolchains pins native host tools as part of pipeline identity: two
+	// pipelines that differ only in a toolchain version/checksum are
+	// different pipelines.
+	Toolchains orderedMap `json:"toolchains,omitempty"`
+	Jobs       orderedMap `json:"jobs"`
 }
 
 type canonicalJob struct {
@@ -157,6 +161,10 @@ type canonicalJob struct {
 	With            orderedMap          `json:"with,omitempty"`
 	QueueTimeout    canonicalDuration   `json:"queue_timeout,omitempty"`
 	Tools           []string            `json:"tools,omitempty"`
+	// Toolchains is the DECLARED name list (job.toolchains), not the
+	// compile-time BoundToolchains resolution: the digest covers what the
+	// pipeline author wrote.
+	Toolchains []string `json:"toolchains,omitempty"`
 }
 
 type canonicalService struct {
@@ -171,6 +179,9 @@ type canonicalService struct {
 	Retries     int               `json:"retries,omitempty"`
 	// RetriesSet keeps `retries: 0` (one attempt) distinct from absent.
 	RetriesSet bool `json:"retries_set,omitempty"`
+	// Native marks a host-process service: identity differs from a
+	// same-named container service.
+	Native bool `json:"native,omitempty"`
 }
 
 type canonicalStep struct {
@@ -222,7 +233,7 @@ func canonicalJobOf(j Job) canonicalJob {
 		Outputs: pairs(j.Outputs), Sandbox: j.Sandbox, Placement: j.Placement,
 		Resources: j.Resources, Tests: j.Tests, Generate: j.Generate,
 		Snapshot: j.Snapshot, Component: j.Component, With: pairs(j.With),
-		QueueTimeout: durOf(j.QueueTimeout), Tools: j.Tools,
+		QueueTimeout: durOf(j.QueueTimeout), Tools: j.Tools, Toolchains: j.Toolchains,
 	}
 	c.Services = make([]canonicalService, len(j.Services))
 	for i := range j.Services {
@@ -233,6 +244,7 @@ func canonicalJobOf(j Job) canonicalJob {
 			Healthcheck: j.Services[i].Healthcheck,
 			Interval:    durOf(j.Services[i].Interval), Timeout: durOf(j.Services[i].Timeout),
 			Retries: j.Services[i].Retries, RetriesSet: j.Services[i].RetriesSet,
+			Native: j.Services[i].Native,
 		}
 	}
 	c.Steps = canonicalSteps(j.Steps)
@@ -274,7 +286,7 @@ func canonicalize(s *Spec) canonicalSpec {
 		Env: pairs(s.Env), Concurrency: s.Concurrency,
 		Defaults:    canonicalDefaults{Shell: s.Defaults.Shell, Timeout: durOf(s.Defaults.Timeout), Retry: retryOf(s.Defaults.Retry)},
 		Permissions: s.Permissions, On: pairs(s.On), Inputs: pairs(s.Inputs),
-		Packages: pairs(s.Packages),
+		Packages: pairs(s.Packages), Toolchains: pairs(s.Toolchains),
 	}
 	seenSecrets := map[string]bool{}
 	for _, name := range s.Secrets {

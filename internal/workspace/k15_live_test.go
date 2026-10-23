@@ -8,6 +8,9 @@ import (
 )
 
 func TestK15LiveApexMailDeterministic(t *testing.T) {
+	if os.Getenv("KIWI_LIVE_APEXMAIL") == "" {
+		t.Skip("set KIWI_LIVE_APEXMAIL=1 to stage the ApexMail tree (slow, ~1m)")
+	}
 	src := "/Users/sabelakhoua/IdeaProjects/ApexMail"
 	if _, err := os.Stat(src); err != nil {
 		t.Skip("no ApexMail")

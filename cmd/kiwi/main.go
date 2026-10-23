@@ -62,6 +62,8 @@ func dispatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return app.Explain(args[1:])
 	case "doctor":
 		return app.Doctor(args[1:])
+	case "test":
+		return app.Test(args[1:])
 	case "up":
 		return app.Up(ctx, args[1:])
 	case "server":
@@ -338,8 +340,9 @@ Usage:
   kiwi init     [--force] [-f .kiwi/pipeline.yaml]
   kiwi run      [-f .kiwi/pipeline.yaml] [--job NAME] [--max-parallel N] [--input k=v]
   kiwi validate [-f .kiwi/pipeline.yaml]
-  kiwi explain  [-f .kiwi/pipeline.yaml] [--input k=v] [--why JOB]
-  kiwi doctor
+  kiwi test     [-f .kiwi/pipeline.yaml] [--fixtures DIR]
+  kiwi doctor   [--pipeline FILE] [--required-checks FILE] [--install-toolchains]
+  kiwi explain  [-f .kiwi/pipeline.yaml] [--input k=v] [--why JOB] [--changed-files a,b]
   kiwi up       [--listen ADDR] [--data-dir DIR] [--token TOKEN] [--labels L]
   kiwi server   [--listen :8080] [--mode dev|production] [--database-url URL]
                 [--config kiwi.toml]

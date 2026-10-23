@@ -58,6 +58,13 @@ func NewManager(source string) (*Manager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("workspace source: %w", err)
 	}
+	// Resolve symlinks (macOS /tmp → /private/tmp, user symlinks, …).
+	// filepath.Walk does NOT follow a symlinked root: it visits only the
+	// symlink itself, copies nothing, and returns nil — which staged an
+	// empty workspace and only failed at verify (K15).
+	if resolved, rerr := filepath.EvalSymlinks(abs); rerr == nil {
+		abs = resolved
+	}
 	st, err := os.Stat(abs)
 	if err != nil {
 		return nil, fmt.Errorf("workspace source: %w", err)
@@ -374,6 +381,20 @@ func hasTrackedFiles(src, rel string) bool {
 // the repository): without it the walk descends into the half-copied
 // workspace and copies it into itself until the path length explodes.
 func copyTree(src, dst string) error {
+	// Resolve symlinked roots/components so Walk can descend (macOS /tmp,
+	// /var/folders) AND so destination-exclusion compares the same
+	// resolved paths. Without this: (1) a symlinked source stages zero
+	// files (K15), or (2) a TMPDIR destination under a symlinked parent
+	// is not recognized as under the source and gets copied into itself.
+	if resolved, err := filepath.EvalSymlinks(src); err == nil {
+		src = resolved
+	}
+	if resolved, err := filepath.EvalSymlinks(dst); err == nil {
+		dst = resolved
+	} else if parent, perr := filepath.EvalSymlinks(filepath.Dir(dst)); perr == nil {
+		// dst does not exist yet (normal); resolve its parent only.
+		dst = filepath.Join(parent, filepath.Base(dst))
+	}
 	dstAbs, err := filepath.Abs(dst)
 	if err != nil {
 		return err
@@ -384,6 +405,8 @@ func copyTree(src, dst string) error {
 			return err
 		}
 		if pathAbs, aerr := filepath.Abs(path); aerr == nil {
+			// src and dst are already EvalSymlinks-resolved above, so Walk
+			// emits resolved paths under src; dstAbs is the resolved dest.
 			if pathAbs == dstAbs || strings.HasPrefix(pathAbs, dstAbs+string(filepath.Separator)) {
 				if info.IsDir() {
 					return filepath.SkipDir

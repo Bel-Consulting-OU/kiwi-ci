@@ -1,8 +1,8 @@
 package policy
 
 import (
-	toml "github.com/pelletier/go-toml/v2"
 	"fmt"
+	toml "github.com/pelletier/go-toml/v2"
 	"os"
 	"reflect"
 	"strings"
