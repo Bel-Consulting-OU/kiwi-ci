@@ -39,6 +39,12 @@ integration:
 	@test -n "$$KIWI_TEST_POSTGRES_URL" || { echo "integration: set KIWI_TEST_POSTGRES_URL (e.g. postgres://postgres:pass@localhost:5432/kiwi?sslmode=disable)"; exit 1; }
 	go test -count=1 -timeout=90m -run Integration ./internal/storage ./internal/scheduler ./internal/server ./internal/app
 
+test-discovery:
+	./scripts/crash-matrix.sh
+	./scripts/resource-acquire-release.sh
+	./scripts/semantics-parity.sh
+	go test ./internal/lifecycle -count=1
+
 test-adversarial:
 	go test -run 'Adversarial|Security|Property|Fault|Symlink|Traversal|Tamper|Reject|Evil|Bomb' -shuffle=on ./...
 
@@ -451,7 +457,7 @@ generate:
 	go run ./cmd/filemap
 	KIWI_GEN=1 go test ./internal/version -run TestGenerateContractVersionsDoc -count=1
 
-precommit: generate docs-lint
+precommit: generate docs-lint test-discovery
 	go run ./cmd/filemap --check
 	./scripts/docs-links-check.sh
 

@@ -138,7 +138,11 @@ func (m *Manager) freezeLocked(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("run base: read source: %w", err)
 	}
-	before, err := freezeManifest(m.Source)
+	// When Root lives inside Source (HOME=project, TMPDIR fallback, …),
+	// creating run-base under Root mutates the source mid-freeze. Skip the
+	// manager's own Root in every manifest so that is not a false change.
+	skip := m.Root
+	before, err := freezeManifest(m.Source, skip)
 	if err != nil {
 		return fmt.Errorf("run base: source manifest: %w", err)
 	}
@@ -152,7 +156,7 @@ func (m *Manager) freezeLocked(ctx context.Context) error {
 		_ = os.RemoveAll(base)
 		return fmt.Errorf("run base snapshot: %w", err)
 	}
-	after, err := freezeManifest(m.Source)
+	after, err := freezeManifest(m.Source, skip)
 	if err != nil {
 		_ = os.RemoveAll(base)
 		return fmt.Errorf("run base: source re-manifest: %w", err)
@@ -163,7 +167,7 @@ func (m *Manager) freezeLocked(ctx context.Context) error {
 		// existed.
 		_ = os.RemoveAll(base)
 		base = filepath.Join(m.Root, "run-base")
-		before2, err := freezeManifest(m.Source)
+		before2, err := freezeManifest(m.Source, skip)
 		if err != nil {
 			return fmt.Errorf("run base: source manifest: %w", err)
 		}
@@ -172,7 +176,7 @@ func (m *Manager) freezeLocked(ctx context.Context) error {
 			_ = os.RemoveAll(base)
 			return fmt.Errorf("run base snapshot: %w", err)
 		}
-		after2, err := freezeManifest(m.Source)
+		after2, err := freezeManifest(m.Source, skip)
 		if err != nil {
 			_ = os.RemoveAll(base)
 			return fmt.Errorf("run base: source re-manifest: %w", err)
@@ -192,13 +196,24 @@ func (m *Manager) freezeLocked(ctx context.Context) error {
 }
 
 // freezeManifest is a deterministic digest of path/type/size/mtime for
-// every entry under root (symlinks record their target). Used to detect
-// concurrent mutation while the run-base is being copied.
-func freezeManifest(root string) (string, error) {
+// every entry under root (symlinks record their target). skip, when
+// non-empty and under root, is omitted (the manager's own Root under a
+// HOME-as-source layout). Used to detect concurrent mutation while the
+// run-base is being copied.
+func freezeManifest(root, skip string) (string, error) {
+	skip = filepath.Clean(skip)
 	h := sha256.New()
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
+		}
+		if skip != "" && skip != "." {
+			if path == skip || strings.HasPrefix(path, skip+string(filepath.Separator)) {
+				if info.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
 		}
 		rel, rerr := filepath.Rel(root, path)
 		if rerr != nil {
@@ -372,12 +387,18 @@ var snapshotCopyTree = copyTree
 const workspaceStrategyEnv = "KIWI_WORKSPACE_STRATEGY"
 
 func (m *Manager) snapshotFrom(ctx context.Context, src, target string, forceCopy bool) (string, error) {
-	// K15: staging must be deterministic. The historical clean-tree
-	// worktree path dropped ignored files (.env) and untracked files, so
-	// two identical probes flipped between a full working copy and a
-	// committed-only tree (and, under git races, worse). copyTree is the
-	// default for every local run. The worktree path is opt-in only and
-	// never used for the run-base freeze (forceCopy).
+	// K15: staging must be deterministic. copyTree is the default; the
+	// worktree path is opt-in only and never used for freeze (forceCopy).
+	//
+	// When Root lives inside src (HOME/TMPDIR under the project), walking
+	// src would also stage OTHER job workspaces under Root into this
+	// snapshot. Exclude Root from every copy.
+	skip := ""
+	if r := filepath.Clean(m.Root); r != "" && r != "." {
+		if r == filepath.Clean(src) || strings.HasPrefix(r, filepath.Clean(src)+string(filepath.Separator)) {
+			skip = r
+		}
+	}
 	if !forceCopy && os.Getenv(workspaceStrategyEnv) == "worktree" && gitRepo(ctx, src) {
 		clean, err := gitStatusClean(ctx, src)
 		if err == nil && clean {
@@ -391,10 +412,15 @@ func (m *Manager) snapshotFrom(ctx context.Context, src, target string, forceCop
 		}
 	}
 	// Prefer copyTree (skips build-output dirs). APFS reflink clones the
-	// ENTIRE tree including multi-GB target/ before any strip — on a dirty
-	// Rust checkout that materializes tens of gigabytes and looks hung.
-	// snapshotCopyTree is a test seam so fallback tests can force the
-	// reflink path without disabling copyTree in production.
+	// ENTIRE tree — never use it when we must exclude Root (skip), because
+	// `cp -R` cannot honor skip and would nest sibling workspaces.
+	if forceCopy || skip != "" {
+		if err := copyTreeSkip(src, target, skip); err != nil {
+			_ = os.RemoveAll(target)
+			return "", err
+		}
+		return "copy", nil
+	}
 	if err := snapshotCopyTree(src, target); err == nil {
 		return "copy", nil
 	}
@@ -526,6 +552,10 @@ func hasTrackedFiles(src, rel string) bool {
 // the repository): without it the walk descends into the half-copied
 // workspace and copies it into itself until the path length explodes.
 func copyTree(src, dst string) error {
+	return copyTreeSkip(src, dst, "")
+}
+
+func copyTreeSkip(src, dst, skip string) error {
 	// Resolve symlinked roots/components so Walk can descend (macOS /tmp,
 	// /var/folders) AND so destination-exclusion compares the same
 	// resolved paths. Without this: (1) a symlinked source stages zero
@@ -544,6 +574,15 @@ func copyTree(src, dst string) error {
 	if err != nil {
 		return err
 	}
+	// Resolve skip the same way as src/dst so a symlinked TMPDIR/HOME
+	// path prefix still matches during the walk.
+	if skip != "" {
+		if r, rerr := filepath.EvalSymlinks(skip); rerr == nil {
+			skip = r
+		} else {
+			skip = filepath.Clean(skip)
+		}
+	}
 	var preserveTrackedUnder []string
 	walkErr := filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -557,6 +596,14 @@ func copyTree(src, dst string) error {
 					return filepath.SkipDir
 				}
 				return nil
+			}
+			if skip != "" && skip != "." {
+				if pathAbs == skip || strings.HasPrefix(pathAbs, skip+string(filepath.Separator)) {
+					if info.IsDir() {
+						return filepath.SkipDir
+					}
+					return nil
+				}
 			}
 		}
 		rel, err := filepath.Rel(src, path)

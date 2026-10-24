@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -575,5 +576,29 @@ func TestProcessStartStampNonEmpty(t *testing.T) {
 	stamp := ProcessStartStamp(os.Getpid())
 	if stamp == "" {
 		t.Fatal("ProcessStartStamp(os.Getpid()) is empty")
+	}
+}
+
+func TestNativePortClaimConcurrentExactlyOneWins(t *testing.T) {
+	const port = 6431
+	var wg sync.WaitGroup
+	results := make([]error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i] = claimNativePort(port, fmt.Sprintf("job%d/svc", i))
+		}(i)
+	}
+	wg.Wait()
+	ok := 0
+	for _, err := range results {
+		if err == nil {
+			ok++
+		}
+	}
+	releaseNativePort(port)
+	if ok != 1 {
+		t.Fatalf("exactly one claim must win, got %d successes", ok)
 	}
 }

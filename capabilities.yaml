@@ -12,13 +12,17 @@
 version: 1
 capabilities:
   - id: cli.local
-    summary: "Local pipeline run / validate / explain / init / lock"
+    summary: "Local pipeline run / validate / explain / init / lock / static self-check"
     proofs: [unit, component]
-    covers: [cli:run, cli:validate, cli:explain, cli:init, cli:lock, cli:import]
+    covers: [cli:run, cli:validate, cli:explain, cli:init, cli:lock, cli:import, cli:test]
   - id: cli.ops
-    summary: "Remote ops commands (runs/jobs/logs/cancel/approve/rerun/artifacts/schedules/policy)"
+    summary: "Remote ops commands (runs/jobs/logs/cancel/approve/rerun/artifacts/schedules/policy/flake)"
     proofs: [unit, component]
-    covers: [cli:runs, cli:jobs, cli:logs, cli:cancel, cli:approve, cli:rerun, cli:artifacts, cli:schedules, cli:policy]
+    covers: [cli:runs, cli:jobs, cli:logs, cli:cancel, cli:approve, cli:rerun, cli:artifacts, cli:schedules, cli:policy, cli:flake]
+  - id: cli.promotion.deferred
+    summary: "kiwi promote is deferred: local blessing checksums are not a signed authority; the command fails closed"
+    proofs: [unit]
+    covers: [cli:promote]
   - id: cli.identity
     summary: "login / logout / context / secret explain"
     proofs: [unit]

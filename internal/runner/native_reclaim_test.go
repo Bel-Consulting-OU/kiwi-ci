@@ -42,3 +42,22 @@ func TestLedgerSetNativeServicesRoundtrip(t *testing.T) {
 		t.Fatalf("NativeServices = %+v", e.NativeServices)
 	}
 }
+
+func TestReclaimNativeRefusesUnverifiedLivePID(t *testing.T) {
+	// Our own PID is live; without a matching start stamp reclaim must
+	// refuse to kill rather than signal an arbitrary live process.
+	self := os.Getpid()
+	err := reclaimNativeServices([]NativeServiceLedger{{
+		Name: "self", PID: self, PGID: self, Start: "",
+	}})
+	if err == nil {
+		t.Fatal("empty start stamp on a live PID must be recovery debt, not a silent skip/kill")
+	}
+	// Mismatched stamp on a live PID: recycled — skip, no error.
+	err = reclaimNativeServices([]NativeServiceLedger{{
+		Name: "recycled", PID: self, PGID: self, Start: "t:1",
+	}})
+	if err != nil {
+		t.Fatalf("stamped mismatch on live pid should skip without error, got %v", err)
+	}
+}
