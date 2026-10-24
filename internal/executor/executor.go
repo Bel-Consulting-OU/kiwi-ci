@@ -936,7 +936,12 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		return finish(res)
 	}
 	if RuntimeMayRunNativeServices(cj.Job.Runtime, cj.Job.Services) && len(cj.Job.Services) > 0 {
-		net, nativeEnv, natInfos, cleanupNS, nerr := startNativeServices(ctx, cj.ID, workRoot, serviceEnvFor(jobEnv, jobSecrets), cj.Job.Services, func(line string) { e.log(cj.ID, "service", line) })
+		net, nativeEnv, _, cleanupNS, nerr := startNativeServices(ctx, cj.ID, workRoot, serviceEnvFor(jobEnv, jobSecrets), cj.Job.Services, func(list []NativeServiceInfo) error {
+			if e.Opt.OnNativeServices != nil {
+				return e.Opt.OnNativeServices(cj.ID, list)
+			}
+			return nil
+		}, func(line string) { e.log(cj.ID, "service", line) })
 		if nerr != nil {
 			res.Status = model.StatusFailure
 			res.Error = nerr.Error()
@@ -944,17 +949,6 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		}
 		network = net
 		cleanupServices = cleanupNS
-		if e.Opt.OnNativeServices != nil && len(natInfos) > 0 {
-			if lerr := e.Opt.OnNativeServices(cj.ID, natInfos); lerr != nil {
-				// Tear down already-started services before failing the job.
-				if cleanupServices != nil {
-					_ = cleanupServices()
-				}
-				res.Status = model.StatusFailure
-				res.Error = fmt.Sprintf("record native service ownership: %v", lerr)
-				return finish(res)
-			}
-		}
 		for k, v := range nativeEnv {
 			jobEnv[k] = v
 		}

@@ -97,7 +97,7 @@ func RunLocal(ctx context.Context, args []string) error {
 	// spec, and completeness is enforced BEFORE compile. Executor-time
 	// rewrites are not authority — the compiled graph's identity must
 	// describe what actually executes.
-	if err := applyLocalImageLock(spec, lockRootFor(*file)); err != nil {
+	if err := applyLocalImageLock(spec, lockRootFor(fileToLoad)); err != nil {
 		return err
 	}
 	// The same input contract the server enforces at enqueue: defaults are

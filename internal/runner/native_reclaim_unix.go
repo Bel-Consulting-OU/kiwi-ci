@@ -4,10 +4,8 @@ package runner
 
 import (
 	"fmt"
-	"os"
-	"os/exec"
-	"strconv"
-	"strings"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executor"
 	"syscall"
 )
 
@@ -21,7 +19,7 @@ func reclaimNativeServices(svcs []NativeServiceLedger) error {
 			continue
 		}
 		if ns.Start != "" {
-			if stamp := processStartStamp(ns.PID); stamp != "" && stamp != ns.Start {
+			if stamp := executor.ProcessStartStamp(ns.PID); stamp != "" && stamp != ns.Start {
 				continue
 			}
 		}
@@ -33,24 +31,4 @@ func reclaimNativeServices(svcs []NativeServiceLedger) error {
 		}
 	}
 	return firstErr
-}
-
-func processStartStamp(pid int) string {
-	if pid <= 0 {
-		return ""
-	}
-	if b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid)); err == nil {
-		s := string(b)
-		if i := strings.LastIndex(s, ")"); i >= 0 {
-			fields := strings.Fields(s[i+1:])
-			if len(fields) > 19 {
-				return "t:" + fields[19]
-			}
-		}
-	}
-	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "start=").Output()
-	if err == nil {
-		return "ps:" + strings.TrimSpace(string(out))
-	}
-	return ""
 }

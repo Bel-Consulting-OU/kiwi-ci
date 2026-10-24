@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -277,7 +278,7 @@ func TestNativeServiceTeardownReapsPID(t *testing.T) {
 		Ready:   "tcp:6403",
 		Command: []string{"python3", "-c", "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6403)); s.listen(1); time.sleep(120)"},
 	}
-	_, env, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svc}, func(string) {})
+	_, env, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svc}, nil, func(string) {})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +327,7 @@ func TestNativeServiceHonorsDeclaredReadyPort(t *testing.T) {
 		Command: []string{"python3", "-c", "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6399)); s.listen(1); time.sleep(60)"},
 		Ready:   "tcp:6399",
 	}
-	_, env, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svc}, func(string) {})
+	_, env, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svc}, nil, func(string) {})
 	if err != nil {
 		t.Fatalf("startNativeServices: %v", err)
 	}
@@ -345,7 +346,7 @@ func TestNativeServicesSameReadyPortFailsLoudly(t *testing.T) {
 	// 200ms liveness window must catch the death).
 	svcB := pipeline.Service{Name: "b", Native: true,
 		Command: []string{"python3", "-c", "import socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6401))"}}
-	_, _, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svcA, svcB}, func(string) {})
+	_, _, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svcA, svcB}, nil, func(string) {})
 	if cleanup != nil {
 		defer cleanup()
 	}
@@ -430,7 +431,7 @@ func TestNativeReadyFailsWhenChildExits(t *testing.T) {
 	// may still fail with in use depending on OS. Force exit on bind fail.
 	svc.Command = []string{"python3", "-c", "import socket,sys; s=socket.socket();\ntry:\n s.bind(('127.0.0.1',6410))\nexcept OSError:\n sys.exit(1)\ns.listen(1)\nimport time; time.sleep(30)"}
 
-	_, _, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svc}, func(string) {})
+	_, _, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svc}, nil, func(string) {})
 	if cleanup != nil {
 		defer cleanup()
 	}
@@ -474,7 +475,7 @@ func TestNativePortReleasedAfterFailedStart(t *testing.T) {
 		Ready:   "tcp:" + itoa(port),
 		Command: []string{"python3", "-c", "import time; time.sleep(5)"},
 	}
-	_, _, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svc}, nil)
+	_, _, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svc}, nil, nil)
 	if cleanup != nil {
 		_ = cleanup()
 	}
@@ -501,7 +502,7 @@ func TestNativeStartRollsBackOnMidFailure(t *testing.T) {
 		Name: "b", Native: true, Ready: "tcp:6421",
 		Command: []string{"definitely-missing-native-service-binary-xyz"},
 	}
-	_, _, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), map[string]string{"PATH": "/usr/bin:/bin"}, []pipeline.Service{svcA, svcB}, nil)
+	_, _, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), map[string]string{"PATH": "/usr/bin:/bin"}, []pipeline.Service{svcA, svcB}, nil, nil)
 	if err == nil {
 		t.Fatal("missing binary for service B must fail the whole start")
 	}
@@ -539,5 +540,40 @@ func TestLookPathWithEnvUsesExplicitPathOnly(t *testing.T) {
 	}
 	if _, err := lookPathWithEnv("kiwi-fake-shell", "/usr/bin:/bin"); err == nil {
 		t.Fatal("binary must not resolve when absent from given PATH")
+	}
+}
+
+// onStart (durable ledger) failure after A started must roll back A.
+func TestNativeOnStartLedgerFailRollsBack(t *testing.T) {
+	svc := pipeline.Service{
+		Name: "a", Native: true, Ready: "tcp:6422",
+		Command: []string{"python3", "-c", "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6422)); s.listen(1); time.sleep(30)"},
+	}
+	_, _, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(),
+		map[string]string{"PATH": "/usr/bin:/bin"},
+		[]pipeline.Service{svc},
+		func([]NativeServiceInfo) error { return fmt.Errorf("ledger unavailable") },
+		nil)
+	if err == nil || !strings.Contains(err.Error(), "ledger unavailable") {
+		t.Fatalf("err = %v, want ledger failure", err)
+	}
+	if cleanup != nil {
+		_ = cleanup()
+	}
+	if cerr := claimNativePort(6422, "later"); cerr != nil {
+		t.Fatalf("port still claimed after onStart fail: %v", cerr)
+	}
+	releaseNativePort(6422)
+	if conn, derr := net.DialTimeout("tcp", "127.0.0.1:6422", 300*time.Millisecond); derr == nil {
+		_ = conn.Close()
+		t.Fatal("service still listening after onStart failure")
+	}
+}
+
+func TestProcessStartStampNonEmpty(t *testing.T) {
+	// Live process start identity must be non-empty (rely on it for PID reuse).
+	stamp := ProcessStartStamp(os.Getpid())
+	if stamp == "" {
+		t.Fatal("ProcessStartStamp(os.Getpid()) is empty")
 	}
 }

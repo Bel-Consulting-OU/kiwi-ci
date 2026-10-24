@@ -105,7 +105,10 @@ type NativeServiceInfo struct {
 	Start string `json:"start,omitempty"`
 }
 
-func startNativeServices(ctx context.Context, jobID, workRoot string, baseEnv map[string]string, services []pipeline.Service, emit func(string)) (string, map[string]string, []NativeServiceInfo, func() error, error) {
+// onStart is invoked after EACH successfully started service with the
+// identity list so far, so a crash between starts still leaves durable
+// records. Returning an error rolls the whole start back.
+func startNativeServices(ctx context.Context, jobID, workRoot string, baseEnv map[string]string, services []pipeline.Service, onStart func([]NativeServiceInfo) error, emit func(string)) (string, map[string]string, []NativeServiceInfo, func() error, error) {
 	if len(services) == 0 {
 		return "", nil, nil, func() error { return nil }, nil
 	}
@@ -259,8 +262,13 @@ func startNativeServices(ctx context.Context, jobID, workRoot string, baseEnv ma
 		infos = append(infos, NativeServiceInfo{
 			Name: svc.Name, Port: port,
 			PID: cmd.Process.Pid, PGID: pgid,
-			Start: processStartStamp(cmd.Process.Pid),
+			Start: ProcessStartStamp(cmd.Process.Pid),
 		})
+		if onStart != nil {
+			if oerr := onStart(append([]NativeServiceInfo{}, infos...)); oerr != nil {
+				return fail("job %s native service %s record ownership: %w", jobID, svc.Name, oerr)
+			}
+		}
 	}
 
 	for _, p := range procs {
@@ -410,10 +418,10 @@ func readyProbePort(probe string) (int, bool) {
 	return int(p.Port), true
 }
 
-// processStartStamp is a best-effort identity for a live PID so crash
+// ProcessStartStamp is a best-effort identity for a live PID so crash
 // recovery can refuse to kill a recycled PID. Linux uses /proc starttime;
 // other Unixes fall back to `ps -o start=`.
-func processStartStamp(pid int) string {
+func ProcessStartStamp(pid int) string {
 	if pid <= 0 {
 		return ""
 	}
