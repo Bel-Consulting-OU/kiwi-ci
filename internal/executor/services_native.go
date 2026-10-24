@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -192,7 +191,7 @@ func startNativeServices(ctx context.Context, jobID, workRoot string, baseEnv ma
 		args := append([]string{}, svc.Command...)
 		// Resolve argv0 against the effective environment PATH (not the
 		// runner daemon's ambient PATH).
-		bin, rerr := lookPathWithEnv(args[0], baseEnv["PATH"])
+		bin, rerr := lookPathWithEnv(args[0], baseEnv["PATH"], baseEnv["PATHEXT"])
 		if rerr != nil {
 			return failInfo("job %s native service %s: %w", jobID, svc.Name, rerr)
 		}
@@ -280,34 +279,6 @@ func startNativeServices(ctx context.Context, jobID, workRoot string, baseEnv ma
 		}
 	}
 	return "native-services", env, infos, cleanup, nil
-}
-
-// lookPathWithEnv resolves name against an explicit PATH (colon-separated),
-// like exec.LookPath but never consulting the process ambient environment.
-func lookPathWithEnv(name, pathEnv string) (string, error) {
-	if name == "" {
-		return "", fmt.Errorf("empty executable name")
-	}
-	if strings.ContainsRune(name, os.PathSeparator) || (len(name) > 1 && name[1] == ':') {
-		// Absolute or explicit relative path: use as-is if executable.
-		if st, err := os.Stat(name); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
-			return name, nil
-		}
-		return "", fmt.Errorf("executable %s not found or not executable", name)
-	}
-	if pathEnv == "" {
-		pathEnv = "/usr/local/bin:/usr/bin:/bin"
-	}
-	for _, dir := range filepath.SplitList(pathEnv) {
-		if dir == "" {
-			continue
-		}
-		cand := filepath.Join(dir, name)
-		if st, err := os.Stat(cand); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
-			return cand, nil
-		}
-	}
-	return "", fmt.Errorf("%s not found on execution PATH %q", name, pathEnv)
 }
 
 func envMapToSlice(m map[string]string) []string {

@@ -5,18 +5,17 @@ package runner
 import (
 	"fmt"
 	"syscall"
+	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executor"
 )
 
 // reclaimNativeServices kills leftover native-service process groups from a
-// previous runner incarnation.
-//
-// Safety rules (PID reuse):
-//   - never kill without a recorded start stamp;
-//   - kill only when the live stamp still matches the recorded stamp;
-//   - a dead PID is success (already gone); a live PID that cannot be
-//     verified is recovery debt, not a blind kill.
+// previous runner incarnation, but ONLY when the recorded start stamp still
+// matches (PID-reuse guard). SIGKILL success is not proof of death: poll
+// until the leader is gone or a bounded timeout elapses. A still-live tree
+// after the timeout is recovery debt (error) so the caller retains the
+// ledger entry instead of retiring it.
 func reclaimNativeServices(svcs []NativeServiceLedger) error {
 	var firstErr error
 	for _, ns := range svcs {
@@ -44,20 +43,41 @@ func reclaimNativeServices(svcs []NativeServiceLedger) error {
 			continue
 		}
 		if ns.PGID > 1 {
-			_ = syscall.Kill(-ns.PGID, syscall.SIGKILL)
+			if err := syscall.Kill(-ns.PGID, syscall.SIGKILL); err != nil && err != syscall.ESRCH && firstErr == nil {
+				firstErr = fmt.Errorf("kill group pgid %d (%s): %w", ns.PGID, ns.Name, err)
+			}
 		}
 		if err := syscall.Kill(ns.PID, syscall.SIGKILL); err != nil && err != syscall.ESRCH && firstErr == nil {
 			firstErr = fmt.Errorf("kill native service %s pid %d: %w", ns.Name, ns.PID, err)
 		}
+		// Prove the leader is gone (or keep debt).
+		if err := waitForPIDGone(ns.PID, 2*time.Second); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("native service %s pid %d still alive after SIGKILL: %w", ns.Name, ns.PID, err)
+			}
+		}
 	}
 	return firstErr
+}
+
+func waitForPIDGone(pid int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !processAliveUnix(pid) {
+			return nil
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !processAliveUnix(pid) {
+		return nil
+	}
+	return fmt.Errorf("pid %d still present", pid)
 }
 
 func processAliveUnix(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	// Signal 0: existence/permission probe without delivering a signal.
 	err := syscall.Kill(pid, 0)
 	if err == nil {
 		return true
@@ -65,6 +85,5 @@ func processAliveUnix(pid int) bool {
 	if err == syscall.ESRCH {
 		return false
 	}
-	// EPERM means the process exists but is not ours.
 	return err == syscall.EPERM
 }

@@ -936,7 +936,47 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		return finish(res)
 	}
 	if RuntimeMayRunNativeServices(cj.Job.Runtime, cj.Job.Services) && len(cj.Job.Services) > 0 {
+		// Durable ownership BEFORE any child is spawned: create the job
+		// cgroup (even with no declared limits) and record it in the crash
+		// ledger. Children are migrated into the cgroup immediately after
+		// Start; a hard crash then reclaims via cgroup emptiness, not PID
+		// guesswork. When the host has no cgroup v2, Parent stays empty and
+		// the PID+start-stamp ledger remains a weaker fallback.
+		cgStatus, cgCleanup := jobCgroupSetup(ctx, jobCgroupRequest{
+			JobID:  cj.ID,
+			CPU:    cj.Job.Resources.CPU,
+			Memory: int64(cj.Job.Resources.Memory),
+			PIDs:   cj.Job.Resources.PIDs,
+			Force:  true,
+		})
+		if cgStatus.Enabled && cgCleanup != nil {
+			cgroupParent = cgStatus.Parent
+			if e.Opt.OnCgroupCreated != nil {
+				if hookErr := e.Opt.OnCgroupCreated(cgStatus.Parent); hookErr != nil {
+					if cerr := cgCleanup(); cerr != nil {
+						e.log(cj.ID, "service", "job cgroup rollback after ownership failure: "+cerr.Error())
+					}
+					res.Status = model.StatusFailure
+					res.Error = fmt.Sprintf("record job cgroup ownership: %v", hookErr)
+					return finish(res)
+				}
+			}
+			defer func() {
+				if cerr := cgCleanup(); cerr != nil {
+					e.log(cj.ID, "service", "job cgroup cleanup warning: "+cerr.Error())
+					e.reportCleanupDebt(CleanupCgroup, cgroupParent, cerr)
+				}
+			}()
+			e.log(cj.ID, "service", "native job cgroup: "+cgStatus.Detail)
+		} else {
+			e.log(cj.ID, "service", "native job cgroup unavailable ("+cgStatus.Detail+"); PID+start-stamp ledger is the fallback")
+		}
 		net, nativeEnv, _, cleanupNS, nerr := startNativeServices(ctx, cj.ID, workRoot, serviceEnvFor(jobEnv, jobSecrets), cj.Job.Services, func(list []NativeServiceInfo) error {
+			if cgroupParent != "" && len(list) > 0 {
+				if err := addPIDToJobCgroup(cgroupParent, list[len(list)-1].PID); err != nil {
+					return fmt.Errorf("add native service to job cgroup: %w", err)
+				}
+			}
 			if e.Opt.OnNativeServices != nil {
 				return e.Opt.OnNativeServices(cj.ID, list)
 			}

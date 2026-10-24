@@ -2,24 +2,15 @@
 
 package runner
 
-import "os"
-
-// Windows native services are supervised by a Job Object with
-// KILL_ON_JOB_CLOSE: losing the runner process already kills the tree.
-// Ledger reclamation is a no-op beyond a direct PID kill attempt.
+// reclaimNativeServices on Windows does NOT kill by PID.
+//
+// Recorded native children were assigned to a Job Object with
+// JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: losing the runner already terminates
+// that tree. Killing a raw PID after crash has no start-identity check here
+// and can destroy an unrelated process that reused the PID (P0 host-safety).
+// Ledger entries are still retired by the caller once workspace/cgroup
+// reclaim succeeds; a leftover Job Object dies with the runner handle.
 func reclaimNativeServices(svcs []NativeServiceLedger) error {
-	var firstErr error
-	for _, ns := range svcs {
-		if ns.PID <= 0 {
-			continue
-		}
-		p, err := os.FindProcess(ns.PID)
-		if err != nil {
-			continue
-		}
-		if err := p.Kill(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
+	_ = svcs
+	return nil
 }

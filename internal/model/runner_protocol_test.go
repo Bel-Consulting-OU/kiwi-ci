@@ -54,8 +54,8 @@ func TestRunnerProtocolVersionAdditiveJSON(t *testing.T) {
 // or compiled jobs are interpreted must bump this constant deliberately (and
 // update the reproducibility-boundary documentation).
 func TestExecutionSemanticsConstants(t *testing.T) {
-	if ExecutionSemanticsVersion != "kiwi.execution.v2" {
-		t.Fatalf("ExecutionSemanticsVersion = %q, want %q (bump deliberately, document the new semantics, and expect exact replay to refuse old records)", ExecutionSemanticsVersion, "kiwi.execution.v2")
+	if ExecutionSemanticsVersion != "kiwi.execution.v3" {
+		t.Fatalf("ExecutionSemanticsVersion = %q, want %q (bump deliberately, document the new semantics, and expect exact replay to refuse old records)", ExecutionSemanticsVersion, "kiwi.execution.v3")
 	}
 }
 

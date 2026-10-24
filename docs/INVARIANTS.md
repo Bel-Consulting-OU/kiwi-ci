@@ -484,7 +484,7 @@ replay pipeline export), not process suspension.
 
 **Statement (semantics).** Every run and job Kiwi creates carries an explicit
 execution-engine semantic version: `model.ExecutionSemanticsVersion`
-(`kiwi.execution.v2`). It is deliberately not the wire/serialization schema
+(`kiwi.execution.v3`). It is deliberately not the wire/serialization schema
 (`model.RunnerProtocolVersion` plus the per-record `schemaVersion` fields).
 Two builds may exchange the same fields while interpreting durable state or a
 compiled job differently. The stamp is durable state. It travels into the

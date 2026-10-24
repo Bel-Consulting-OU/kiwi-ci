@@ -53,11 +53,15 @@ type jobCgroupRequest struct {
 	CPU    float64
 	Memory int64
 	PIDs   int
+	// Force creates the cgroup even when no resource axis is declared.
+	// Native services use this so ownership is kernel-durable (cgroup)
+	// BEFORE any child is spawned, not only a PID ledger entry.
+	Force bool
 }
 
 // declared reports whether the job declared at least one enforceable axis.
 func (r jobCgroupRequest) declared() bool {
-	return r.CPU > 0 || r.Memory > 0 || r.PIDs > 0
+	return r.Force || r.CPU > 0 || r.Memory > 0 || r.PIDs > 0
 }
 
 // JobCgroupStatus is the outcome of one job-scoped parent cgroup attempt.
@@ -317,4 +321,14 @@ var jobCgroupSuffix = func() string {
 		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b)
+}
+
+// addPIDToJobCgroup adds pid to the cgroup identified by parent ("/rel/path"
+// from setup). No-op when parent is empty. Platform behavior lives in
+// jobcgroup_pid_*.go.
+func addPIDToJobCgroup(parent string, pid int) error {
+	if parent == "" || pid <= 0 {
+		return nil
+	}
+	return writePIDToJobCgroup(parent, pid)
 }

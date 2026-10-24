@@ -279,7 +279,7 @@ func TestNativeServiceTeardownReapsPID(t *testing.T) {
 		Ready:   "tcp:6403",
 		Command: []string{"python3", "-c", "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6403)); s.listen(1); time.sleep(120)"},
 	}
-	_, env, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svc}, nil, func(string) {})
+	_, env, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), map[string]string{"PATH": "/usr/bin:/bin"}, []pipeline.Service{svc}, nil, func(string) {})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -328,7 +328,7 @@ func TestNativeServiceHonorsDeclaredReadyPort(t *testing.T) {
 		Command: []string{"python3", "-c", "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6399)); s.listen(1); time.sleep(60)"},
 		Ready:   "tcp:6399",
 	}
-	_, env, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svc}, nil, func(string) {})
+	_, env, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), map[string]string{"PATH": "/usr/bin:/bin"}, []pipeline.Service{svc}, nil, func(string) {})
 	if err != nil {
 		t.Fatalf("startNativeServices: %v", err)
 	}
@@ -347,7 +347,7 @@ func TestNativeServicesSameReadyPortFailsLoudly(t *testing.T) {
 	// 200ms liveness window must catch the death).
 	svcB := pipeline.Service{Name: "b", Native: true,
 		Command: []string{"python3", "-c", "import socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6401))"}}
-	_, _, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svcA, svcB}, nil, func(string) {})
+	_, _, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), map[string]string{"PATH": "/usr/bin:/bin"}, []pipeline.Service{svcA, svcB}, nil, func(string) {})
 	if cleanup != nil {
 		defer cleanup()
 	}
@@ -432,7 +432,7 @@ func TestNativeReadyFailsWhenChildExits(t *testing.T) {
 	// may still fail with in use depending on OS. Force exit on bind fail.
 	svc.Command = []string{"python3", "-c", "import socket,sys; s=socket.socket();\ntry:\n s.bind(('127.0.0.1',6410))\nexcept OSError:\n sys.exit(1)\ns.listen(1)\nimport time; time.sleep(30)"}
 
-	_, _, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svc}, nil, func(string) {})
+	_, _, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), map[string]string{"PATH": "/usr/bin:/bin"}, []pipeline.Service{svc}, nil, func(string) {})
 	if cleanup != nil {
 		defer cleanup()
 	}
@@ -476,7 +476,7 @@ func TestNativePortReleasedAfterFailedStart(t *testing.T) {
 		Ready:   "tcp:" + itoa(port),
 		Command: []string{"python3", "-c", "import time; time.sleep(5)"},
 	}
-	_, _, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svc}, nil, nil)
+	_, _, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), map[string]string{"PATH": "/usr/bin:/bin"}, []pipeline.Service{svc}, nil, nil)
 	if cleanup != nil {
 		_ = cleanup()
 	}
@@ -531,15 +531,15 @@ func TestLookPathWithEnvUsesExplicitPathOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Empty PATH must not fall back to ambient env (which might find /bin/sh).
-	if _, err := lookPathWithEnv("kiwi-fake-shell", ""); err == nil {
+	if _, err := lookPathWithEnv("kiwi-fake-shell", "", ""); err == nil {
 		// default PATH /usr/local/bin:/usr/bin:/bin — binary is in temp dir
 		// so expect failure unless default accidentally includes temp.
 		t.Fatal("empty PATH must not resolve a temp-dir binary")
 	}
-	if _, err := lookPathWithEnv("kiwi-fake-shell", dir); err != nil {
+	if _, err := lookPathWithEnv("kiwi-fake-shell", dir, ""); err != nil {
 		t.Fatalf("lookPathWithEnv with correct PATH: %v", err)
 	}
-	if _, err := lookPathWithEnv("kiwi-fake-shell", "/usr/bin:/bin"); err == nil {
+	if _, err := lookPathWithEnv("kiwi-fake-shell", "/usr/bin:/bin", ""); err == nil {
 		t.Fatal("binary must not resolve when absent from given PATH")
 	}
 }

@@ -26,6 +26,7 @@ func TestJobCgroupDeclaredEnvelope(t *testing.T) {
 		{"cpu only", jobCgroupRequest{CPU: 0.5}, true},
 		{"memory only", jobCgroupRequest{Memory: 1}, true},
 		{"pids only", jobCgroupRequest{PIDs: 1}, true},
+		{"force without axes (native services)", jobCgroupRequest{Force: true}, true},
 	}
 	for _, tc := range cases {
 		if got := tc.req.declared(); got != tc.want {

@@ -2,6 +2,7 @@ package executor
 
 import (
 	"os"
+	"runtime"
 	"sort"
 	"strings"
 )
@@ -11,13 +12,22 @@ import (
 // variable are deliberately excluded; the host environment must never leak
 // into a distributed runner job.
 func cleanExecutionEnv() map[string]string {
-	return map[string]string{
-		"PATH":   "/usr/local/bin:/usr/bin:/bin",
+	m := map[string]string{
 		"LANG":   "C.UTF-8",
 		"LC_ALL": "C.UTF-8",
 		"CI":     "true",
 		"KIWI":   "true",
 	}
+	if runtime.GOOS == "windows" {
+		// Windows native steps/services resolve executables with PATH
+		// separators ';'. A POSIX PATH would make lookPathWithExt walk
+		// one giant directory name.
+		m["PATH"] = `C:\Windows\system32;C:\Windows`
+		m["PATHEXT"] = ".COM;.EXE;.BAT;.CMD"
+	} else {
+		m["PATH"] = "/usr/local/bin:/usr/bin:/bin"
+	}
+	return m
 }
 
 // containerSafeEnv drops host-only variables that must never enter a

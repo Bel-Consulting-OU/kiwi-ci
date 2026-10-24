@@ -109,7 +109,7 @@ same durable state differently, and vice versa.
 | Dimension | Current value | Carrier | Bump rule |
 |---|---|---|---|
 | Runner transport protocol | `model.RunnerProtocolVersion = 2` | runner registration and `/next` negotiation; a runner below `JobRequiresProtocol` is refused with 409 `RUNNER_PROTOCOL_UNSUPPORTED` | any wire-shape change the negotiation must gate |
-| Execution semantics | `"kiwi.execution.v2"` (`model.ExecutionSemanticsVersion`) | `Run.ExecutionSemantics`, `Job.ExecutionSemantics`, snapshot `execution_semantics`, artifact + attestation `executionSemantics` | any change to how the scheduler/runner/executor INTERPRET durable state, not additive fields the old semantics safely ignore |
+| Execution semantics | `"kiwi.execution.v3"` (`model.ExecutionSemanticsVersion`) | `Run.ExecutionSemantics`, `Job.ExecutionSemantics`, snapshot `execution_semantics`, artifact + attestation `executionSemantics` | any change to how the scheduler/runner/executor INTERPRET durable state, not additive fields the old semantics safely ignore |
 | Event schema | `model.ExecutionEvent.SchemaVersion` (1) | PostgreSQL `execution_events` rows and the fs event journal | any change to event payload semantics |
 | Snapshot schema | `snapshot.ManifestVersion = 1` | `model.SnapshotRecord.Version` | any change to the workspace manifest encoding |
 | Graph / pipeline schema | pipeline `Spec.Version` (1) and `model.CompiledJobPayload.SchemaVersion` (1) | persisted pipelines, compiled payloads, fragment wire bodies | any change to pipeline or compiled-job semantics |
@@ -393,7 +393,7 @@ kiwi verify --server https://kiwi.example.com --attestation <job-id>
 # Verify a local envelope against a pinned key (offline).
 kiwi verify --trusted-key provenance.pub --attestation-file attestation.json
 # Verify artifact provenance by artifact ID and constrain the execution semantics.
-kiwi verify --server https://kiwi.example.com --execution-semantics kiwi.execution.v2 <artifact-id>
+kiwi verify --server https://kiwi.example.com --execution-semantics kiwi.execution.v3 <artifact-id>
 # Fetch the forensic materialization (signed envelope + referenced streams).
 curl -H "Authorization: Bearer $TOKEN" \
   "https://kiwi.example.com/api/v1/jobs/<job-id>/attestation?profile=forensic"

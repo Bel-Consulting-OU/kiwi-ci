@@ -92,7 +92,11 @@ const JobRequiresProtocol = RunnerProtocolVersion
 // non-empty value: a historical execution reproduced by a different
 // interpreter is not the same execution. A record persisted before stamping
 // (empty value) predates this boundary; replay proceeds with a warning.
-const ExecutionSemanticsVersion = "kiwi.execution.v2"
+// v3: changed-file unknown ≠ empty; native service exec/lifecycle
+// (fail-closed PATH, ledger+cgroup ownership, transactional start);
+// local freeze-before-compile run identity. v2 records must not replay
+// under this interpreter (documented in ExecutionSemanticsVersion comment).
+const ExecutionSemanticsVersion = "kiwi.execution.v3"
 
 type Run struct {
 	ID string `json:"id"`

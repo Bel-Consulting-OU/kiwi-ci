@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
@@ -161,19 +160,23 @@ func (*NativeBackend) Run(ctx context.Context, c Command, emit func(string)) err
 	// Resolve the shell against the materialized execution PATH so the
 	// binary that runs is the one the job environment claims, not whatever
 	// the runner daemon's ambient PATH would pick.
-	pathVal := ""
-	if len(c.Env) > 0 {
-		// c.Env is a slice of KEY=VALUE; recover PATH if present.
-		for _, kv := range c.Env {
-			if strings.HasPrefix(kv, "PATH=") {
-				pathVal = strings.TrimPrefix(kv, "PATH=")
-				break
-			}
+	pathVal := pathFromEnv(c.Env, "PATH")
+	pathExt := pathFromEnv(c.Env, "PATHEXT")
+	if c.Env == nil {
+		// No executor-supplied environment (direct backend/test call):
+		// ambient PATH is the documented local contract. When Env IS set,
+		// a missing PATH never falls back — that would be the ambient
+		// escape the effective-PATH authority exists to stop.
+		pathVal = os.Getenv("PATH")
+		if pathExt == "" {
+			pathExt = os.Getenv("PATHEXT")
 		}
 	}
-	if resolved, rerr := lookPathWithEnv(shell, pathVal); rerr == nil {
-		shell = resolved
+	resolved, rerr := lookPathWithEnv(shell, pathVal, pathExt)
+	if rerr != nil {
+		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("resolve shell %q against execution PATH: %w", shell, rerr)}
 	}
+	shell = resolved
 	cmd := exec.Command(shell, args...)
 	cmd.Dir = c.Dir
 	cmd.Env = c.Env

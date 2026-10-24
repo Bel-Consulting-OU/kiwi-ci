@@ -80,13 +80,26 @@ func RunLocal(ctx context.Context, args []string) error {
 				if frozen := filepath.Join(baseDir, rel); fileExists(frozen) {
 					fileToLoad = frozen
 				}
+			} else {
+				// External pipeline: adopt bytes into the frozen run-base.
+				adopted, aerr2 := wm.AdoptFile(abs)
+				if aerr2 != nil {
+					return fmt.Errorf("freeze external pipeline: %w", aerr2)
+				}
+				fileToLoad = adopted
 			}
 		}
 	}
-	// Git/changed-file discovery uses the frozen tree, not the live one.
+	// Git identity is whatever Freeze captured from the SOURCE — never a
+	// re-read of copied .git (linked worktrees can move HEAD after freeze).
+	fg := wm.FrozenGitInfo()
 	gitDir := wd
-	if baseDir != "" {
+	if baseDir != "" && fg.Captured {
 		gitDir = baseDir
+	}
+	if !fg.Captured {
+		// No repo at freeze: keep wd-based detection (unknown/empty).
+		gitDir = wd
 	}
 	spec, err := pipeline.Load(fileToLoad)
 	if err != nil {
@@ -97,7 +110,13 @@ func RunLocal(ctx context.Context, args []string) error {
 	// spec, and completeness is enforced BEFORE compile. Executor-time
 	// rewrites are not authority — the compiled graph's identity must
 	// describe what actually executes.
-	if err := applyLocalImageLock(spec, lockRootFor(fileToLoad)); err != nil {
+	lockRoot := lockRootFor(fileToLoad)
+	if strings.Contains(fileToLoad, string(filepath.Separator)+".kiwi-frozen"+string(filepath.Separator)) {
+		// Adopted external pipeline: project lock lives with the original
+		// path / working tree, not the copy.
+		lockRoot = lockRootFor(*file)
+	}
+	if err := applyLocalImageLock(spec, lockRoot); err != nil {
 		return err
 	}
 	// The same input contract the server enforces at enqueue: defaults are
@@ -137,16 +156,27 @@ func RunLocal(ctx context.Context, args []string) error {
 	if explicitChanged == "" {
 		explicitChanged = *changedFiles
 	}
-	changedList, changedKnown := detectChangedFilesOpts(gitDir, *base, *head, *mergeBase, explicitChanged)
+	changedList := fg.ChangedFiles
+	changedKnown := fg.ChangedKnown
+	if len(explicitChanged) > 0 {
+		changedList, changedKnown = detectChangedFilesOpts(gitDir, *base, *head, *mergeBase, explicitChanged)
+	} else if !fg.Captured {
+		changedList, changedKnown = detectChangedFilesOpts(gitDir, *base, *head, *mergeBase, "")
+	} else if *base != "" || *mergeBase != "" || *head != "HEAD" {
+		// Explicit base/head/merge-base still recomputed against frozen git.
+		// (`--head` alone used to be ignored and silently fell back to the
+		// captured HEAD~1 range.)
+		changedList, changedKnown = detectChangedFilesOpts(gitDir, *base, *head, *mergeBase, "")
+	}
 	opts := executor.Options{Workspace: wd, WorkspaceFor: func(jobID string) (string, func(), error) { return wm.Prepare(ctx, jobID) }, RunID: runID, MaxParallel: *parallel, OnlyJob: *job, ChangedFiles: changedList, ChangedFilesKnown: changedKnown, SecretProvider: provider, Logs: logs, RepoURL: repoURL, RepoFullName: repoFullName,
 		// Local parity: job conditions evaluate against the same branch and
 		// event context `kiwi explain --why` uses (the git-detected branch,
 		// push event), so a branch/event condition cannot silently diverge
 		// between explain, local runs and the control plane.
-		Branch: detectCurrentBranch(gitDir),
+		Branch: frozenBranch(fg, gitDir),
 		Event:  "push",
-		GitSHA: detectGitSHA(gitDir),
-		GitRef: detectGitRef(gitDir),
+		GitSHA: frozenSHA(fg, gitDir),
+		GitRef: frozenRef(fg, gitDir),
 		// Declared dependency downloads are restored from this run's local
 		// artifact store (the distributed runner restores them through the
 		// control plane).
@@ -165,8 +195,12 @@ func RunLocal(ctx context.Context, args []string) error {
 	opts.RunnerRegions = []string{"local"}
 	// [runner] allow_rootful_untrusted lifts the sandbox.rootless gate on
 	// hosts without rootless docker (macOS/colima). Read from kiwi.toml.
-	if _, serr := os.Stat("kiwi.toml"); serr == nil {
-		if cfg, cerr := config.Load("kiwi.toml"); cerr == nil {
+	cfgPath := "kiwi.toml"
+	if baseDir != "" && fileExists(filepath.Join(baseDir, "kiwi.toml")) {
+		cfgPath = filepath.Join(baseDir, "kiwi.toml")
+	}
+	if _, serr := os.Stat(cfgPath); serr == nil {
+		if cfg, cerr := config.Load(cfgPath); cerr == nil {
 			opts.AllowRootfulUntrusted = cfg.Runner.AllowRootfulUntrusted
 		}
 	}
@@ -424,4 +458,25 @@ var _ = filepath.Separator
 func fileExists(path string) bool {
 	st, err := os.Stat(path)
 	return err == nil && !st.IsDir()
+}
+
+func frozenBranch(fg workspace.FrozenGit, gitDir string) string {
+	if fg.Captured && fg.Branch != "" {
+		return fg.Branch
+	}
+	return detectCurrentBranch(gitDir)
+}
+
+func frozenSHA(fg workspace.FrozenGit, gitDir string) string {
+	if fg.Captured {
+		return fg.SHA
+	}
+	return detectGitSHA(gitDir)
+}
+
+func frozenRef(fg workspace.FrozenGit, gitDir string) string {
+	if fg.Captured && fg.Ref != "" {
+		return fg.Ref
+	}
+	return detectGitRef(gitDir)
 }

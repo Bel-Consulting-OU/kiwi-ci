@@ -55,6 +55,29 @@ type Manager struct {
 	base string
 	// baseEntries is the source top-level listing captured at Freeze time.
 	baseEntries []os.DirEntry
+	// git is the Git context captured FROM THE SOURCE during Freeze, so
+	// RunLocal never trusts a copied .git (linked worktrees point at live
+	// admin dirs and can change HEAD after freeze).
+	git FrozenGit
+}
+
+// FrozenGit is the identity captured at freeze time from the source tree.
+type FrozenGit struct {
+	Captured     bool     `json:"captured"`
+	SHA          string   `json:"sha,omitempty"`
+	Ref          string   `json:"ref,omitempty"`
+	Branch       string   `json:"branch,omitempty"`
+	ChangedFiles []string `json:"changed_files,omitempty"`
+	ChangedKnown bool     `json:"changed_known"`
+}
+
+// FrozenGitInfo returns the Git context captured at Freeze (zero if none).
+func (m *Manager) FrozenGitInfo() FrozenGit {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	g := m.git
+	g.ChangedFiles = append([]string(nil), m.git.ChangedFiles...)
+	return g
 }
 
 // NewManager validates the source directory and creates a fresh,
@@ -146,6 +169,9 @@ func (m *Manager) freezeLocked(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("run base: source manifest: %w", err)
 	}
+	// Capture Git identity from the SOURCE before copying. Never use the
+	// copied .git later: a linked worktree's gitdir stays on the live repo.
+	m.git = captureFrozenGit(m.Source)
 	base := filepath.Join(m.Root, "run-base")
 	// Freeze ALWAYS uses a plain working-tree copy (never the opt-in
 	// worktree strategy): run-base must match the developer's source
@@ -224,6 +250,11 @@ func freezeManifest(root, skip string) (string, error) {
 		}
 		kind := "f"
 		if info.IsDir() {
+			// Align with copyTree's build-output exclusions so a busy
+			// `cargo build` writing target/ cannot flip freeze stability.
+			if copyTreeSkipDirs[info.Name()] {
+				return filepath.SkipDir
+			}
 			kind = "d"
 		} else if info.Mode()&os.ModeSymlink != 0 {
 			kind = "l"
@@ -234,7 +265,16 @@ func freezeManifest(root, skip string) (string, error) {
 			fmt.Fprintf(h, "%s\x00%s\x00%s\n", rel, kind, target)
 			return nil
 		}
-		fmt.Fprintf(h, "%s\x00%s\x00%d\x00%d\x00%016x\n", rel, kind, info.Size(), info.Mode().Perm(), info.ModTime().UnixNano())
+		fmt.Fprintf(h, "%s\x00%s\x00%d\x00%d\x00%016x", rel, kind, info.Size(), info.Mode().Perm(), info.ModTime().UnixNano())
+		// Content digest for modest files: size+mtime can miss a same-size
+		// rewrite (P2 determinism). Cap the read so huge blobs stay cheap.
+		if kind == "f" && info.Size() > 0 && info.Size() <= 1<<20 {
+			if b, rerr := os.ReadFile(path); rerr == nil {
+				sum := sha256.Sum256(b)
+				fmt.Fprintf(h, "\x00%x", sum[:8])
+			}
+		}
+		fmt.Fprint(h, "\n")
 		return nil
 	})
 	if err != nil {
@@ -653,7 +693,7 @@ func copyTreeSkip(src, dst, skip string) error {
 			if err := mkdirParents(filepath.Dir(target), info.Mode().Perm()); err != nil {
 				return err
 			}
-			return os.Symlink(link, target)
+			return materializeSymlink(path, link, src, dst, target)
 		case info.IsDir():
 			return os.MkdirAll(target, info.Mode().Perm())
 		default:
@@ -788,4 +828,106 @@ func sanitizeJobIDBare(id string) string {
 		out = "job"
 	}
 	return out
+}
+
+// captureFrozenGit records HEAD SHA/ref/branch and the changed-file set
+// from dir (the SOURCE, before copy). known is false when git cannot
+// produce a trustworthy diff.
+func captureFrozenGit(dir string) FrozenGit {
+	g := FrozenGit{}
+	if !gitRepo(context.Background(), dir) {
+		return g
+	}
+	g.Captured = true
+	if out, err := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output(); err == nil {
+		g.SHA = strings.TrimSpace(string(out))
+	}
+	if out, err := exec.Command("git", "-C", dir, "symbolic-ref", "-q", "HEAD").Output(); err == nil {
+		g.Ref = strings.TrimSpace(string(out))
+	} else if g.SHA != "" {
+		g.Ref = g.SHA
+	}
+	if out, err := exec.Command("git", "-C", dir, "symbolic-ref", "--short", "-q", "HEAD").Output(); err == nil {
+		g.Branch = strings.TrimSpace(string(out))
+	}
+	// Changed files: HEAD~1..HEAD like the local default, from SOURCE.
+	out, err := exec.Command("git", "-C", dir, "diff", "--name-only", "HEAD~1", "HEAD").Output()
+	if err != nil {
+		g.ChangedKnown = false
+		g.ChangedFiles = nil
+		return g
+	}
+	g.ChangedKnown = true
+	for _, s := range strings.Split(string(out), "\n") {
+		if s = strings.TrimSpace(s); s != "" {
+			g.ChangedFiles = append(g.ChangedFiles, s)
+		}
+	}
+	return g
+}
+
+// materializeSymlink writes a freeze-safe link (or file snapshot) instead of
+// blindly copying Readlink bytes. A link that still points at the live
+// source or an external path would let job A and job B see different
+// contents despite one run-base (deterministic-local P1).
+//
+//   - target inside src (after resolve): rewrite to a relative link under dst
+//   - target is a regular file outside src: snapshot the bytes into dst
+//   - target is a directory outside src: refuse (cannot snapshot cheaply)
+//   - dangling: keep the original link string (explicit unresolved link)
+func materializeSymlink(path, link, src, dst, target string) error {
+	res, rerr := filepath.EvalSymlinks(path)
+	if rerr != nil {
+		// Dangling or unreadable target: preserve the link as-is.
+		return os.Symlink(link, target)
+	}
+	absSrc, _ := filepath.Abs(src)
+	absRes, _ := filepath.Abs(res)
+	inside := absRes == absSrc || strings.HasPrefix(absRes, absSrc+string(filepath.Separator))
+	if inside {
+		relIn, err := filepath.Rel(absSrc, absRes)
+		if err != nil {
+			return err
+		}
+		absTarget, _ := filepath.Abs(filepath.Join(dst, relIn))
+		relLink, err := filepath.Rel(filepath.Dir(target), absTarget)
+		if err != nil {
+			relLink = relIn
+		}
+		return os.Symlink(relLink, target)
+	}
+	// Outside the source: snapshot regular files; refuse external directories.
+	st, err := os.Stat(res)
+	if err != nil {
+		return os.Symlink(link, target)
+	}
+	if st.IsDir() {
+		return fmt.Errorf("freeze: symlink %q points outside the source to directory %q; refusing a non-deterministic run-base", path, res)
+	}
+	return copyFile(res, target, st.Mode().Perm())
+}
+
+// AdoptFile copies an external file (e.g. -f ../shared/pipeline.yaml) into
+// the frozen run-base so the run identity covers the pipeline bytes.
+func (m *Manager) AdoptFile(srcPath string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.base == "" {
+		return "", fmt.Errorf("AdoptFile: freeze first")
+	}
+	abs, err := filepath.Abs(srcPath)
+	if err != nil {
+		return "", err
+	}
+	name := filepath.Base(abs)
+	// Keep a stable subdirectory for adopted authority files.
+	rel := filepath.Join(".kiwi-frozen", name)
+	dst := filepath.Join(m.base, rel)
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return "", err
+	}
+	if err := copyFile(abs, dst, 0o644); err != nil {
+		return "", err
+	}
+	return dst, nil
 }

@@ -11,7 +11,7 @@ Do not hand-edit `docs/CONTRACTS.md` — run `KIWI_GEN=1 go test ./internal/vers
 | `event_schema` | `1` |
 | `evidence_root_digest` | `kiwi-ci/execution-evidence-root/v1` |
 | `evidence_schema` | `6` |
-| `execution_semantics` | `kiwi.execution.v2` |
+| `execution_semantics` | `kiwi.execution.v3` |
 | `observed_runtime_digest_v1` | `kiwi-ci/observed-runtime/v1` |
 | `observed_runtime_digest_v2` | `kiwi-ci/observed-runtime/v2` |
 | `pipeline_schema` | `1` |
