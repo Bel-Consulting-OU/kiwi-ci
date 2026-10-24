@@ -132,12 +132,20 @@ func (m *Manager) Prepare(ctx context.Context, jobID string) (string, func(), er
 	if _, err := os.Lstat(target); err == nil {
 		return "", nil, fmt.Errorf("job workspace %q already exists", target)
 	}
+	// Freeze the source top-level listing BEFORE the copy. Verifying
+	// against a post-copy listing fails whenever the source gains a
+	// directory during staging (or loses one mid-walk on a mutable tree
+	// like /tmp): that is a false truncation, not a lost directory.
+	srcBefore, err := os.ReadDir(m.Source)
+	if err != nil {
+		return "", nil, fmt.Errorf("prepare workspace for %q: read source: %w", jobID, err)
+	}
 	strategy, err := m.snapshot(ctx, target)
 	if err != nil {
 		_ = os.RemoveAll(target)
 		return "", nil, fmt.Errorf("prepare workspace for %q: %w", jobID, err)
 	}
-	if err := verifyStagedTree(m.Source, target, strategy); err != nil {
+	if err := verifyStagedTree(m.Source, srcBefore, target, strategy); err != nil {
 		_ = os.RemoveAll(target)
 		return "", nil, fmt.Errorf("prepare workspace for %q: %w", jobID, err)
 	}
@@ -150,13 +158,10 @@ func (m *Manager) Prepare(ctx context.Context, jobID string) (string, func(), er
 }
 
 // verifyStagedTree fails closed when a snapshot lost top-level directories
-// or produced an implausibly small tree. A racy walk or a silent skip must
-// never hand a job a 23-file stub while the source is a full repository.
-func verifyStagedTree(src, target, strategy string) error {
-	srcEntries, err := os.ReadDir(src)
-	if err != nil {
-		return fmt.Errorf("verify staged tree: read source: %w", err)
-	}
+// from the pre-copied source listing or produced an implausibly small tree.
+// srcEntries must be the listing taken BEFORE the copy so concurrent
+// source mutations cannot invent phantom missing directories.
+func verifyStagedTree(src string, srcEntries []os.DirEntry, target, strategy string) error {
 	dstEntries, err := os.ReadDir(target)
 	if err != nil {
 		return fmt.Errorf("verify staged tree: read target: %w", err)

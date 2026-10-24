@@ -142,7 +142,11 @@ func TestK15VerifyRejectsTruncatedTree(t *testing.T) {
 	writeK15(t, filepath.Join(bad, "root.txt"), "x")
 	writeK15(t, filepath.Join(bad, "orphan1.txt"), "x")
 
-	err := verifyStagedTree(src, bad, "copy")
+	entries, rerr := os.ReadDir(src)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	err := verifyStagedTree(src, entries, bad, "copy")
 	if err == nil || !strings.Contains(err.Error(), "truncated") {
 		t.Fatalf("verifyStagedTree(truncated) = %v, want truncated error", err)
 	}
@@ -152,7 +156,7 @@ func TestK15VerifyRejectsTruncatedTree(t *testing.T) {
 	writeK15(t, filepath.Join(good, "services", "migrations", "001.sql"), "x")
 	writeK15(t, filepath.Join(good, "apps", "x.txt"), "x")
 	writeK15(t, filepath.Join(good, "root.txt"), "x")
-	if err := verifyStagedTree(src, good, "copy"); err != nil {
+	if err := verifyStagedTree(src, entries, good, "copy"); err != nil {
 		t.Fatalf("verifyStagedTree(good) = %v", err)
 	}
 }
