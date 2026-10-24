@@ -1,9 +1,13 @@
 package pipeline
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 )
 
 // Adversarial: pipelines that differ ONLY in toolchain pins must not share
@@ -302,5 +306,91 @@ jobs:
 		if cj.Job.BoundToolchains[0].Version != "go1." {
 			t.Fatalf("%s version = %q", id, cj.Job.BoundToolchains[0].Version)
 		}
+	}
+}
+
+// Adversarial: toolchains on container/tart jobs must be refused — a host
+// PATH check cannot prove what is inside the image.
+func TestToolchainsRejectedOnContainerAndTart(t *testing.T) {
+	for _, rt := range []string{"container", "tart"} {
+		yamlSrc := "version: 1\ntoolchains:\n  go:\n    version: \"go1.\"\n    command: [\"go\", \"version\"]\njobs:\n  a:\n    runtime: " + rt + "\n"
+		if rt == "container" {
+			yamlSrc += "    image: alpine:3.20\n"
+		} else {
+			yamlSrc += "    vm: ventura\n"
+		}
+		yamlSrc += "    toolchains: [go]\n    steps: [{run: \"true\"}]\n"
+		_, err := Parse([]byte(yamlSrc))
+		if err == nil || !strings.Contains(err.Error(), "toolchain") {
+			t.Fatalf("runtime %s: err = %v, want toolchain refusal", rt, err)
+		}
+	}
+}
+
+// Adversarial: native (or empty) runtime accepts toolchains.
+func TestToolchainsAllowedOnNative(t *testing.T) {
+	if _, err := Parse([]byte(`version: 1
+toolchains:
+  go:
+    version: "go1."
+    command: ["go", "version"]
+jobs:
+  a:
+    toolchains: [go]
+    steps: [{run: "true"}]
+`)); err != nil {
+		t.Fatalf("native default runtime: %v", err)
+	}
+}
+
+// Adversarial: a compiled payload carrying BoundToolchains must verify
+// against a local recompile (JobDigest covers EffectiveJob JSON including
+// bound_toolchains).
+func TestCompiledPayloadWithBoundToolchainsVerifies(t *testing.T) {
+	specBytes := []byte(`version: 1
+toolchains:
+  go:
+    version: "go1."
+    command: ["go", "version"]
+jobs:
+  build:
+    toolchains: [go]
+    steps: [{run: "true"}]
+`)
+	s, err := Parse(specBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := Compile(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cj := g.Jobs["build"]
+	raw, err := json.Marshal(cj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) == 0 || raw[0] != '{' {
+		t.Fatalf("EffectiveJob JSON must be an object, got %q", string(raw[:min(80, len(raw))]))
+	}
+	sum := sha256.Sum256(raw)
+	// Pipeline digest must be CanonicalJSON-based (spec identity).
+	pd, err := PipelineDigest(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := &model.CompiledJobPayload{
+		SchemaVersion:   model.CompiledJobPayloadSchemaVersion,
+		CompilerVersion: "test",
+		PipelineDigest:  pd,
+		JobDigest:       hex.EncodeToString(sum[:]),
+		EffectiveJob:    json.RawMessage(raw),
+	}
+	got, err := VerifyCompiledJobBinding(s, "build", payload)
+	if err != nil {
+		t.Fatalf("VerifyCompiledJobBinding: %v", err)
+	}
+	if len(got.Job.BoundToolchains) != 1 || got.Job.BoundToolchains[0].Version != "go1." {
+		t.Fatalf("roundtrip BoundToolchains = %+v", got.Job.BoundToolchains)
 	}
 }

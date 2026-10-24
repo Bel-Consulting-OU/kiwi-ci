@@ -1,0 +1,25 @@
+version: 1
+name: selftest-empty-diff
+on:
+  push: {}
+  pull_request: {}
+jobs:
+  rust-only:
+    when:
+      event: [push, pull_request]
+      path:
+        - rust/**
+    steps:
+      - run: "echo rust"
+  site-only:
+    when:
+      event: [push, pull_request]
+      path:
+        - site/**
+    steps:
+      - run: "echo site"
+  always-pr:
+    when:
+      event: [pull_request]
+    steps:
+      - run: "echo pr"

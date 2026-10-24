@@ -1,0 +1,13 @@
+version: 1
+name: selftest-missing-tool
+on:
+  push: {}
+toolchains:
+  definitely-not-installed:
+    version: "9.9.9"
+    command: ["kiwi-selftest-missing-tool-xyz", "--version"]
+jobs:
+  uses-missing-tool:
+    toolchains: [definitely-not-installed]
+    steps:
+      - run: "echo should-not-run-on-host-without-tool"

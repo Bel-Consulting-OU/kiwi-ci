@@ -62,9 +62,17 @@ func startNativeServices(ctx context.Context, jobID string, services []pipeline.
 		if len(svc.Command) == 0 {
 			return "", nil, cleanup, fmt.Errorf("job %s native service %s has no command", jobID, svc.Name)
 		}
-		port, perr := freeTCPPort()
-		if perr != nil {
-			return "", nil, cleanup, fmt.Errorf("job %s native service %s allocate port: %w", jobID, svc.Name, perr)
+		// Prefer an explicit port from the ready probe (tcp:N / http:N/...).
+		// Otherwise allocate an ephemeral port and publish it as PORT.
+		// Probing a declared 6399 while the process was told PORT=ephemeral
+		// (or the reverse) is how services timed out forever.
+		port, hasDeclared := readyProbePort(svc.Ready)
+		if !hasDeclared {
+			p, perr := freeTCPPort()
+			if perr != nil {
+				return "", nil, cleanup, fmt.Errorf("job %s native service %s allocate port: %w", jobID, svc.Name, perr)
+			}
+			port = p
 		}
 		args := append([]string{}, svc.Command...)
 		cmd := exec.CommandContext(ctx, args[0], args[1:]...)
@@ -106,6 +114,27 @@ func startNativeServices(ctx context.Context, jobID string, services []pipeline.
 		}
 	}
 	return "native-services", env, cleanup, nil
+}
+
+// readyProbePort extracts a concrete TCP/HTTP port from a ready probe.
+// Returns (0,false) when the probe has no numeric port (caller allocates).
+func readyProbePort(probe string) (int, bool) {
+	kind, rest, ok := strings.Cut(probe, ":")
+	if !ok {
+		return 0, false
+	}
+	if kind != "tcp" && kind != "http" {
+		return 0, false
+	}
+	n := rest
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		n = rest[:i]
+	}
+	port, err := strconv.Atoi(n)
+	if err != nil || port <= 0 || port > 65535 {
+		return 0, false
+	}
+	return port, true
 }
 
 func waitNativeReady(ctx context.Context, probe, host string, port int) error {

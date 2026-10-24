@@ -839,7 +839,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		e.log(cj.ID, "generate", "child job expansion is a control-plane feature; this local run executes the generator step only")
 	}
 	if e.Opt.LocalDownloads && len(cj.Job.Downloads) > 0 {
-		setupDownloads, failureDownloads := partitionDownloads(cj.Job.Downloads)
+		setupDownloads, failureDownloads := pipeline.ArtifactInputsPartition(cj.Job.Downloads)
 		if err := e.restoreLocalDownloads(setupDownloads, workRoot); err != nil {
 			res.Status = model.StatusFailure
 			res.Error = err.Error()
@@ -1126,7 +1126,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	// Declared toolchains: entries are verified before step 1 (hermetic
 	// native jobs). Observed versions are recorded so the execution
 	// attestation can carry them.
-	if err := e.checkBoundToolchains(cj.ID, cj.Job.BoundToolchains); err != nil {
+	if err := e.checkBoundToolchains(ctx, cj.ID, cj.Job.BoundToolchains); err != nil {
 		res.Status = model.StatusFailure
 		res.Error = err.Error()
 		return finish(res)
@@ -1564,8 +1564,10 @@ func truncateVersion(s string) string {
 
 // checkBoundToolchains verifies every declared toolchain before step 1 and
 // reports the observed version for the attestation. Fail-closed: a missing
-// binary or version mismatch stops the job before any step runs.
-func (e *Executor) checkBoundToolchains(jobID string, toolchains []pipeline.Toolchain) error {
+// binary or version mismatch stops the job before any step runs. The
+// version probe runs under the job context so a hung `--version` cannot
+// outlive the job deadline.
+func (e *Executor) checkBoundToolchains(ctx context.Context, jobID string, toolchains []pipeline.Toolchain) error {
 	for _, tc := range toolchains {
 		name := tc.Path
 		if name == "" {
@@ -1588,9 +1590,12 @@ func (e *Executor) checkBoundToolchains(jobID string, toolchains []pipeline.Tool
 			args = append([]string{}, args...)
 			args[0] = path
 		}
-		out, verr := exec.Command(args[0], args[1:]...).Output()
+		out, verr := exec.CommandContext(ctx, args[0], args[1:]...).Output()
 		if verr != nil {
-			out, verr = exec.Command(path, "-v").Output()
+			out, verr = exec.CommandContext(ctx, path, "-v").Output()
+			if verr != nil && ctx.Err() != nil {
+				return ctx.Err()
+			}
 		}
 		versionText := strings.TrimSpace(string(out))
 		if tc.Version != "" && !strings.Contains(versionText, tc.Version) {
@@ -1842,20 +1847,6 @@ func (e *Executor) saveArtifact(cj pipeline.CompiledJob, a pipeline.Artifact, wo
 			e.log(cj.ID, "artifact", "uploaded "+a.Name)
 		}
 	}
-}
-
-// partitionDownloads splits declared downloads into setup-time restores
-// (empty `if` or success()) and failure()-gated restores.
-func partitionDownloads(inputs []pipeline.ArtifactInput) (setup, onFailure []pipeline.ArtifactInput) {
-	for _, d := range inputs {
-		switch strings.TrimSpace(d.If) {
-		case "", "success()", "always()":
-			setup = append(setup, d)
-		default:
-			onFailure = append(onFailure, d)
-		}
-	}
-	return setup, onFailure
 }
 
 // restoreLocalDownloads restores the job's declared dependency downloads from

@@ -992,6 +992,13 @@ func validateToolchains(s *Spec) error {
 			if _, ok := s.Toolchains[name]; !ok {
 				return fmt.Errorf("job %q references unknown toolchain %q", id, name)
 			}
+			// Toolchains are verified on the HOST PATH before step 1. That
+			// only describes the workload for native jobs; a container/tart
+			// job's tools live inside the (digest-pinned) image, and a host
+			// check would claim hermeticity the image does not provide.
+			if j.Runtime != "" && j.Runtime != "native" {
+				return fmt.Errorf("job %q references toolchain %q but runtime is %q (toolchains: pin host tools for native jobs; container/tart jobs must bake tools into the image)", id, name, j.Runtime)
+			}
 		}
 		for i, svc := range j.Services {
 			if !svc.Native {

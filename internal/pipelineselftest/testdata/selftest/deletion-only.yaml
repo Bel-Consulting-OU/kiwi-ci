@@ -1,0 +1,21 @@
+version: 1
+name: selftest-deletion-only
+on:
+  pull_request: {}
+jobs:
+  reacts-to-delete:
+    when:
+      event: [pull_request]
+      path:
+        - rust/crates/**
+    steps:
+      - run: "echo crate-path"
+  ignores-elsewhere:
+    when:
+      event: [pull_request]
+      path_ignore:
+        - docs/**
+      path:
+        - docs/**
+    steps:
+      - run: "echo never"

@@ -132,3 +132,109 @@ func TestSelfTestNeedsOrder(t *testing.T) {
 		t.Fatalf("b.Needs = %v, want a", b.Needs)
 	}
 }
+
+// Empty diff: path-gated jobs must NOT select; unconditional event jobs still do.
+func TestSelfTestEmptyDiffSelection(t *testing.T) {
+	s, err := pipeline.Load(filepath.Join("testdata", "selftest", "empty-diff.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := pipeline.Compile(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := explain.ExplainContext{Event: "pull_request", Branch: "main", ChangedFiles: []string{}}
+	for _, id := range []string{"rust-only", "site-only"} {
+		w, err := explain.ExplainWhy(s, g, id, ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w.PathMatched {
+			t.Fatalf("%s must not path-match an empty diff: %+v", id, w)
+		}
+	}
+	w, err := explain.ExplainWhy(s, g, "always-pr", ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !w.EventMatched {
+		t.Fatalf("always-pr should event-match: %+v", w)
+	}
+	if w.PathRule != "" && !w.PathMatched {
+		// no path rule on always-pr
+	}
+}
+
+// Deletion-only: a deleted path still participates in path selection.
+func TestSelfTestDeletionOnlySelection(t *testing.T) {
+	s, err := pipeline.Load(filepath.Join("testdata", "selftest", "deletion-only.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := pipeline.Compile(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleted := []string{"rust/crates/apex-api/src/lib.rs"}
+	w, err := explain.ExplainWhy(s, g, "reacts-to-delete", explain.ExplainContext{
+		Event: "pull_request", Branch: "main", ChangedFiles: deleted,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !w.PathMatched {
+		t.Fatalf("deleted crate path must still select: %+v", w)
+	}
+	// path_ignore docs/** with empty path docs/** — still not selected without changes
+	w2, err := explain.ExplainWhy(s, g, "ignores-elsewhere", explain.ExplainContext{
+		Event: "pull_request", Branch: "main", ChangedFiles: []string{"docs/new.md"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// When both path and path_ignore list docs/**, behavior depends on
+	// PathsMatch: ignore should win for docs/new.md.
+	if w2.PathMatched {
+		t.Fatalf("path_ignore docs/** must suppress docs change: %+v", w2)
+	}
+}
+
+// Missing declared toolchain: pipeline still COMPILES (declaration is not
+// presence); the executor is what fails closed at step 1.
+func TestSelfTestMissingToolCompiles(t *testing.T) {
+	s, err := pipeline.Load(filepath.Join("testdata", "selftest", "missing-tool.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := pipeline.Compile(s)
+	if err != nil {
+		t.Fatalf("missing toolchain binary must still compile: %v", err)
+	}
+	cj := g.Jobs["uses-missing-tool"]
+	if len(cj.Job.BoundToolchains) != 1 {
+		t.Fatalf("BoundToolchains = %+v", cj.Job.BoundToolchains)
+	}
+}
+
+// Failing job graph: dependency gating blocks the child; if:false never runs.
+func TestSelfTestFailingJobGates(t *testing.T) {
+	s, err := pipeline.Load(filepath.Join("testdata", "selftest", "failing-job.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := pipeline.Compile(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, ok := g.Jobs["never-runs"]
+	if !ok || len(child.Needs) == 0 {
+		t.Fatalf("never-runs needs = %+v", child)
+	}
+	if child.Job.If != "success()" {
+		t.Fatalf("if = %q", child.Job.If)
+	}
+	gated := g.Jobs["gated-off"]
+	if gated.Job.If != "false" {
+		t.Fatalf("gated-off if = %q", gated.Job.If)
+	}
+}

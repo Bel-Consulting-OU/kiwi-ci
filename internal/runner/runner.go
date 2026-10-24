@@ -1521,7 +1521,8 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 			return
 		}
 	}
-	if err := r.restoreDownloads(setupCtx, t, cj.Job.Downloads, tmp); err != nil {
+	setupDownloads, failureDownloads := pipeline.ArtifactInputsPartition(cj.Job.Downloads)
+	if err := r.restoreDownloads(setupCtx, t, setupDownloads, tmp); err != nil {
 		// setupCtx is the same context checkout runs under, so the same
 		// status rule applies: a deadline/cancellation that ended a
 		// dependency download is a CANCELLATION, not a failure. Without
@@ -1840,6 +1841,17 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 		if status == model.StatusSuccess {
 			status = model.StatusFailure
 		}
+	}
+	// failure()-gated dependency downloads restore only after the job has a
+	// terminal non-success status (same contract as the local executor).
+	// A failed diagnostic restore is a log warning, never a status change:
+	// the job has already failed for its own reason.
+	if len(failureDownloads) > 0 && status != model.StatusSuccess && status != model.StatusSkipped {
+		fctx, fcancel := context.WithTimeout(context.WithoutCancel(parent), 30*time.Second)
+		if err := r.restoreDownloads(fctx, t, failureDownloads, tmp); err != nil {
+			sink.WriteLine(cj.ID, "download", "failure download: "+err.Error())
+		}
+		fcancel()
 	}
 	r.complete(parent, t, status, runErr, res.Outputs, res.ObservedRuntime)
 }

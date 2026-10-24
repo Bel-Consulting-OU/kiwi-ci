@@ -1,0 +1,18 @@
+version: 1
+name: selftest-failing-job
+on:
+  push: {}
+jobs:
+  always-fails:
+    steps:
+      - name: boom
+        run: "exit 1"
+  never-runs:
+    needs: [always-fails]
+    if: "success()"
+    steps:
+      - run: "echo must-be-blocked"
+  gated-off:
+    if: "false"
+    steps:
+      - run: "echo must-not-run"

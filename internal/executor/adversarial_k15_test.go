@@ -291,3 +291,61 @@ func TestNativeServiceTeardownReapsPID(t *testing.T) {
 		t.Fatal("missing host env")
 	}
 }
+
+func TestReadyProbePortParsing(t *testing.T) {
+	cases := []struct {
+		probe string
+		port  int
+		ok    bool
+	}{
+		{"tcp:6399", 6399, true},
+		{"http:8123/ping", 8123, true},
+		{"tcp:0", 0, false},
+		{"tcp:notaport", 0, false},
+		{"", 0, false},
+		{"pg_isready:5432", 0, false}, // kind not tcp/http
+	}
+	for _, c := range cases {
+		p, ok := readyProbePort(c.probe)
+		if p != c.port || ok != c.ok {
+			t.Fatalf("readyProbePort(%q) = (%d,%v), want (%d,%v)", c.probe, p, ok, c.port, c.ok)
+		}
+	}
+}
+
+// Live: ready tcp:N must bind N (not an ephemeral PORT) so a hardcoded
+// listener and the probe agree.
+func TestNativeServiceHonorsDeclaredReadyPort(t *testing.T) {
+	svc := pipeline.Service{
+		Name:    "hard",
+		Native:  true,
+		Command: []string{"python3", "-c", "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6399)); s.listen(1); time.sleep(60)"},
+		Ready:   "tcp:6399",
+	}
+	_, env, cleanup, err := startNativeServices(context.Background(), "j", []pipeline.Service{svc}, func(string) {})
+	if err != nil {
+		t.Fatalf("startNativeServices: %v", err)
+	}
+	defer cleanup()
+	if env["KIWI_SERVICE_HARD_PORT"] != "6399" {
+		t.Fatalf("PORT env = %q, want 6399", env["KIWI_SERVICE_HARD_PORT"])
+	}
+}
+
+// Two native services cannot share a declared ready port: the second bind
+// must fail the job loudly (not silently probe the first).
+func TestNativeServicesSameReadyPortFailsLoudly(t *testing.T) {
+	svcA := pipeline.Service{Name: "a", Native: true, Ready: "tcp:6401",
+		Command: []string{"python3", "-c", "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6401)); s.listen(5); time.sleep(30)"}}
+	// Second claims the same port and exits if bind fails (no Ready: the
+	// 200ms liveness window must catch the death).
+	svcB := pipeline.Service{Name: "b", Native: true,
+		Command: []string{"python3", "-c", "import socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6401))"}}
+	_, _, cleanup, err := startNativeServices(context.Background(), "j", []pipeline.Service{svcA, svcB}, func(string) {})
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err == nil {
+		t.Fatal("second service on occupied tcp:6401 must fail")
+	}
+}
