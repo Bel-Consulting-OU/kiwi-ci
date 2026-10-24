@@ -94,7 +94,7 @@ Check the host, then validate and run the example pipeline:
 ./kiwi doctor
 ./kiwi validate -f examples/kiwi.yaml
 ./kiwi explain --why test -f examples/kiwi.yaml
-./kiwi test
+./kiwi test    # static pipeline load/compile/DAG self-check
 ./kiwi run -f examples/kiwi.yaml
 ```
 

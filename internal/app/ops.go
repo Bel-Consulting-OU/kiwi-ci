@@ -60,11 +60,20 @@ type opsClient struct {
 }
 
 func newOpsClient(serverURL, token string) *opsClient {
+	// JSON ops calls stay short-timeout. Log follow uses a separate client
+	// without a total response-body deadline (see streamClient).
 	return &opsClient{
 		base:   strings.TrimRight(serverURL, "/"),
 		token:  token,
 		client: server.NoRedirectClient(&http.Client{Timeout: 30 * time.Second}),
 	}
+}
+
+// streamClient is the SSE client for log follow: connect/TLS may still be
+// bounded by Transport, but there is no total http.Client.Timeout that
+// would kill a healthy long stream at 30s.
+func (c *opsClient) streamClient() *http.Client {
+	return server.NoRedirectClient(&http.Client{})
 }
 
 // do performs one JSON request against the server.
@@ -443,7 +452,7 @@ func followLogsFiltered(ctx context.Context, c *opsClient, runID string, after i
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
-	resp, err := c.client.Do(req)
+	resp, err := c.streamClient().Do(req)
 	if err != nil {
 		return err
 	}

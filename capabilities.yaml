@@ -74,7 +74,7 @@ capabilities:
     covers: [pkg:internal/scheduler, pkg:internal/storage]
     scenarios: [DF-LEASE-001, DF-LEASE-002, TestSysDFChaos001]
   - id: storage.durability
-    summary: "Postgres/fs stores, DR restore, N-1 upgrade, HA blob topology"
+    summary: "Postgres/fs stores, DR restore, HA blob topology"
     proofs: [unit, system, release]
     covers: [pkg:internal/storage, pkg:internal/blob, pkg:internal/cas]
     scenarios: [DF-UPGRADE-001, TestSysDFDr001PostgresObjectStore, TestSysDFUpgrade002NMinusOne, TestSysDFCanonicalReleaseScenario]

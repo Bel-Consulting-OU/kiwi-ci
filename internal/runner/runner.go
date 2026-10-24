@@ -2197,6 +2197,15 @@ func (r *Runner) checkout(ctx context.Context, j model.Job, root string, clone p
 	if ref == "" {
 		ref = "HEAD"
 	}
+	// Shallow clones may not contain the requested SHA (PR/feature commit
+	// outside the default tip history). Fetch it explicitly before checkout
+	// so a valid run target is not reported as a missing object.
+	if j.SHA != "" {
+		cmdFetch := exec.CommandContext(ctx, "git", "-C", dir, "fetch", "--depth", "1", "origin", j.SHA)
+		cmdFetch.Env = gitEnv
+		// Best-effort: a full (non-shallow) clone already has the object.
+		_, _, _ = executil.CaptureBounded(cmdFetch, maxGitDiagnosticBytes)
+	}
 	cmd := exec.CommandContext(ctx, "git", "-C", dir, "checkout", "--force", ref)
 	cmd.Env = gitEnv
 	if out, truncated, err := executil.CaptureBounded(cmd, maxGitDiagnosticBytes); err != nil {
@@ -2233,7 +2242,10 @@ func (r *Runner) checkout(ctx context.Context, j model.Job, root string, clone p
 	// must not run the job against /workspace with files=0. Sparse paths that
 	// match nothing, a wrong ref that produced no files, or a mount/permission
 	// glitch all look like "no checkout" to the operator otherwise.
-	if empty, err := dirIsEmpty(dir); err != nil {
+	// A successful clone always has .git (even with --no-checkout).
+	// Treat a .git-only tree as an empty materialized checkout: the job
+	// would run with zero working files.
+	if empty, err := dirHasOnlyGit(dir); err != nil {
 		return fmt.Errorf("checkout produced no readable workspace at %s: %w", dir, err)
 	} else if empty {
 		return fmt.Errorf("checkout produced an empty workspace at %s (repo=%q ref=%q sha=%q sparse=%v): refusing to run the job with files=0", dir, j.RepoURL, j.Ref, j.SHA, clone.SparsePaths)
@@ -2256,6 +2268,27 @@ func dirIsEmpty(dir string) (bool, error) {
 		return false, err
 	}
 	return len(names) == 0, nil
+}
+
+// dirHasOnlyGit reports whether dir has no entries other than `.git`.
+// `git clone --no-checkout` leaves exactly that shape when nothing was
+// checked out; dirIsEmpty would wrongly accept it as a non-empty tree.
+func dirHasOnlyGit(dir string) (bool, error) {
+	f, err := os.Open(dir)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	names, err := f.Readdirnames(-1)
+	if err != nil {
+		return false, err
+	}
+	for _, n := range names {
+		if n != ".git" {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // gitEnvForRepo builds the environment for git clone/checkout commands from

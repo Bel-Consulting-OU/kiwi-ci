@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
@@ -28,10 +27,11 @@ func startNativeServices(ctx context.Context, jobID string, services []pipeline.
 		return "", nil, func() error { return nil }, nil
 	}
 	type running struct {
-		svc  pipeline.Service
-		cmd  *exec.Cmd
-		port int
-		done chan error
+		svc     pipeline.Service
+		cmd     *exec.Cmd
+		port    int
+		done    chan error
+		release func()
 	}
 	var procs []*running
 	env := map[string]string{}
@@ -39,16 +39,18 @@ func startNativeServices(ctx context.Context, jobID string, services []pipeline.
 		var firstErr error
 		for i := len(procs) - 1; i >= 0; i-- {
 			p := procs[i]
-			if p.cmd != nil && p.cmd.Process != nil {
-				// SIGKILL the whole process group (sleep and its children).
-				_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
-				_ = syscall.Kill(p.cmd.Process.Pid, syscall.SIGKILL)
+			if p.cmd != nil {
+				_ = terminateProcess(p.cmd)
+				_ = killProcess(p.cmd)
+			}
+			if p.release != nil {
+				p.release()
 			}
 			select {
 			case <-p.done:
 			case <-time.After(3 * time.Second):
 				if firstErr == nil {
-					firstErr = fmt.Errorf("native service %s did not exit after SIGKILL", p.svc.Name)
+					firstErr = fmt.Errorf("native service %s did not exit after kill", p.svc.Name)
 				}
 			}
 		}
@@ -78,14 +80,23 @@ func startNativeServices(ctx context.Context, jobID string, services []pipeline.
 		cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 		cmd.Dir = os.TempDir()
 		cmd.Env = append(os.Environ(), fmt.Sprintf("PORT=%d", port))
+		// User env is applied AFTER PORT so an explicit PORT= in service.env
+		// would override Kiwi's authoritative port. Re-apply PORT last so the
+		// probe and the process cannot disagree.
 		for k, v := range svc.Env {
 			cmd.Env = append(cmd.Env, k+"="+v)
 		}
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.Env = append(cmd.Env, fmt.Sprintf("PORT=%d", port))
+		configureProcess(cmd)
 		if err := cmd.Start(); err != nil {
 			return "", nil, cleanup, fmt.Errorf("job %s native service %s start %s: %w", jobID, svc.Name, args[0], err)
 		}
-		p := &running{svc: svc, cmd: cmd, port: port, done: make(chan error, 1)}
+		release, serr := superviseChild(cmd)
+		if serr != nil {
+			_ = killProcess(cmd)
+			return "", nil, cleanup, fmt.Errorf("job %s native service %s supervise: %w", jobID, svc.Name, serr)
+		}
+		p := &running{svc: svc, cmd: cmd, port: port, done: make(chan error, 1), release: release}
 		go func(c *exec.Cmd, ch chan error) { ch <- c.Wait() }(cmd, p.done)
 		procs = append(procs, p)
 		if emit != nil {
@@ -175,12 +186,19 @@ func waitNativeReady(ctx context.Context, probe, host string, port int) error {
 				lastErr = err
 				break
 			}
-			resp, err := http.DefaultClient.Do(req)
-			if err == nil {
-				_ = resp.Body.Close()
+			client := &http.Client{Timeout: 2 * time.Second}
+			resp, err := client.Do(req)
+			if err != nil {
+				lastErr = err
+				break
+			}
+			_ = resp.Body.Close()
+			// Only 2xx counts as ready: a 503 from a half-booted service
+			// is not readiness.
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 				return nil
 			}
-			lastErr = err
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
 		default:
 			return fmt.Errorf("unsupported ready probe kind %q", kind)
 		}

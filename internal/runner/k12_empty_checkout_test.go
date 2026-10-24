@@ -45,3 +45,26 @@ func TestK12CheckoutSkipIsExplicit(t *testing.T) {
 		t.Fatalf("clone.Skip checkout = %v, want nil", err)
 	}
 }
+
+// .git-only is the real empty clone shape: must be refused, not accepted.
+func TestDirHasOnlyGit(t *testing.T) {
+	d := t.TempDir()
+	got, err := dirHasOnlyGit(d)
+	if err != nil || !got {
+		t.Fatalf("empty dir hasOnlyGit=%v err=%v, want true", got, err)
+	}
+	if err := os.Mkdir(filepath.Join(d, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got, err = dirHasOnlyGit(d)
+	if err != nil || !got {
+		t.Fatalf(".git-only hasOnlyGit=%v err=%v, want true", got, err)
+	}
+	if err := os.WriteFile(filepath.Join(d, "README"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err = dirHasOnlyGit(d)
+	if err != nil || got {
+		t.Fatalf("non-empty hasOnlyGit=%v err=%v, want false", got, err)
+	}
+}

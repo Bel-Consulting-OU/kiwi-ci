@@ -77,8 +77,9 @@ func dispatch(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	case "replay":
 		return app.Replay(ctx, args[1:])
 	case "verify":
-		// `kiwi verify --since ...` walks the blessing ledger; anything else
-		// is the artifact/attestation verifier.
+		// Blessing-ledger verification is deferred with promote; keep the
+		// flags so operators get the explicit deferred error rather than
+		// "unknown flag" on the attestation verifier.
 		for _, a := range args[1:] {
 			if a == "--since" || strings.HasPrefix(a, "--since=") ||
 				a == "--ledger" || strings.HasPrefix(a, "--ledger=") {
@@ -364,8 +365,7 @@ Usage:
   kiwi jobs RUN [--server URL] [--token ADMIN_TOKEN]
   kiwi logs RUN [--job KEY] [--step NAME] [--follow] [--interactive] [--server URL] [--token ADMIN_TOKEN]
   kiwi flake REPO [--server URL] [--token ADMIN_TOKEN]
-  kiwi promote RUN --env ENV [--sha SHA] [--server URL]
-  kiwi verify --since [RFC3339] [--ledger DIR]
+  # promote / verify --since: deferred (local blessing ledger was not a signed chain)
   kiwi tui RUN [--job KEY] [--follow] [--search TEXT] [--server URL] [--token ADMIN_TOKEN]
   kiwi cancel RUN | kiwi rerun RUN | kiwi approve JOB | kiwi artifacts RUN
   kiwi schedules list|trigger

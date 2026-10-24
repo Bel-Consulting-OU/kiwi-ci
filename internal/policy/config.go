@@ -1,12 +1,13 @@
 package policy
 
 import (
+	"bytes"
 	"fmt"
-	toml "github.com/pelletier/go-toml/v2"
 	"os"
 	"reflect"
 	"strings"
 
+	toml "github.com/pelletier/go-toml/v2"
 	"gopkg.in/yaml.v3"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/auth"
@@ -17,23 +18,23 @@ import (
 // is a restriction: anything absent stays at the platform default. Unknown
 // keys are rejected so policy typos fail closed.
 type Config struct {
-	AllowedCloneHosts  []string              `yaml:"allowed_clone_hosts"`
-	AllowedRunnerPools []string              `yaml:"allowed_runner_pools"`
-	AllowedRegions     []string              `yaml:"allowed_regions"`
-	RequireDigestPins  bool                  `yaml:"require_digest_pins"`
-	RequireRootless    bool                  `yaml:"require_rootless"`
-	Network            string                `yaml:"network"`
-	SecretAllowlist    []string              `yaml:"secret_allowlist"`
-	OIDCAudiences      []string              `yaml:"oidc_audiences"`
-	EnvironmentRules   map[string]EnvRule    `yaml:"environment_rules"`
-	Repositories       map[string]RepoPolicy `yaml:"repositories"`
+	AllowedCloneHosts  []string              `yaml:"allowed_clone_hosts" toml:"allowed_clone_hosts"`
+	AllowedRunnerPools []string              `yaml:"allowed_runner_pools" toml:"allowed_runner_pools"`
+	AllowedRegions     []string              `yaml:"allowed_regions" toml:"allowed_regions"`
+	RequireDigestPins  bool                  `yaml:"require_digest_pins" toml:"require_digest_pins"`
+	RequireRootless    bool                  `yaml:"require_rootless" toml:"require_rootless"`
+	Network            string                `yaml:"network" toml:"network"`
+	SecretAllowlist    []string              `yaml:"secret_allowlist" toml:"secret_allowlist"`
+	OIDCAudiences      []string              `yaml:"oidc_audiences" toml:"oidc_audiences"`
+	EnvironmentRules   map[string]EnvRule    `yaml:"environment_rules" toml:"environment_rules"`
+	Repositories       map[string]RepoPolicy `yaml:"repositories" toml:"repositories"`
 
 	// OPAFile is the path to a Rego policy loaded at startup. OPA is a
 	// fail-closed deny gate evaluated before admission; see CompileOPA.
-	OPAFile string `yaml:"opa_file"`
+	OPAFile string `yaml:"opa_file" toml:"opa_file"`
 	// OPARules embeds the Rego policy source inline. Mutually exclusive
 	// with OPAFile.
-	OPARules string `yaml:"opa_rules"`
+	OPARules string `yaml:"opa_rules" toml:"opa_rules"`
 
 	// opaFileSet/opaRulesSet record that the opa_file/opa_rules KEY was
 	// present in the loaded document, even when its value is the empty
@@ -47,25 +48,25 @@ type Config struct {
 
 // EnvRule restricts a named deployment environment.
 type EnvRule struct {
-	AllowedBranches   []string `yaml:"allowed_branches"`
-	RequiredApprovers int      `yaml:"required_approvers"`
-	Concurrency       int      `yaml:"concurrency"`
-	OIDCAudiences     []string `yaml:"oidc_audiences"`
+	AllowedBranches   []string `yaml:"allowed_branches" toml:"allowed_branches"`
+	RequiredApprovers int      `yaml:"required_approvers" toml:"required_approvers"`
+	Concurrency       int      `yaml:"concurrency" toml:"concurrency"`
+	OIDCAudiences     []string `yaml:"oidc_audiences" toml:"oidc_audiences"`
 }
 
 // RepoPolicy carries per-repository restrictions.
 type RepoPolicy struct {
-	AllowedCloneHosts  []string `yaml:"allowed_clone_hosts"`
-	AllowedRunnerPools []string `yaml:"allowed_runner_pools"`
-	AllowedRegions     []string `yaml:"allowed_regions"`
-	RequireDigestPins  *bool    `yaml:"require_digest_pins"`
-	RequireRootless    *bool    `yaml:"require_rootless"`
-	Network            string   `yaml:"network"`
-	SecretAllowlist    []string `yaml:"secret_allowlist"`
-	OIDCAudiences      []string `yaml:"oidc_audiences"`
-	Deployments        *bool    `yaml:"deployments"`
-	CrossRepoTrigger   *bool    `yaml:"cross_repo_trigger"`
-	GenerateChildGraph *bool    `yaml:"generate_child_graph"`
+	AllowedCloneHosts  []string `yaml:"allowed_clone_hosts" toml:"allowed_clone_hosts"`
+	AllowedRunnerPools []string `yaml:"allowed_runner_pools" toml:"allowed_runner_pools"`
+	AllowedRegions     []string `yaml:"allowed_regions" toml:"allowed_regions"`
+	RequireDigestPins  *bool    `yaml:"require_digest_pins" toml:"require_digest_pins"`
+	RequireRootless    *bool    `yaml:"require_rootless" toml:"require_rootless"`
+	Network            string   `yaml:"network" toml:"network"`
+	SecretAllowlist    []string `yaml:"secret_allowlist" toml:"secret_allowlist"`
+	OIDCAudiences      []string `yaml:"oidc_audiences" toml:"oidc_audiences"`
+	Deployments        *bool    `yaml:"deployments" toml:"deployments"`
+	CrossRepoTrigger   *bool    `yaml:"cross_repo_trigger" toml:"cross_repo_trigger"`
+	GenerateChildGraph *bool    `yaml:"generate_child_graph" toml:"generate_child_graph"`
 }
 
 // knownConfigKeys is the strict allowlist for the policy file: unknown keys
@@ -117,10 +118,16 @@ func validateConfigNode(n *yaml.Node, section string, depth int) error {
 	}
 	for i := 0; i+1 < len(n.Content); i += 2 {
 		key := n.Content[i].Value
-		// The repositories map is keyed by arbitrary repository names; its
-		// values follow the repository-policy shape.
+		// repositories and environment_rules are maps keyed by arbitrary
+		// names; their values follow the respective section shape.
 		if section == "repositories" {
 			if err := validateConfigNode(n.Content[i+1], "repo", depth+1); err != nil {
+				return err
+			}
+			continue
+		}
+		if section == "environment_rules" {
+			if err := validateConfigNode(n.Content[i+1], "environment_rules", depth+1); err != nil {
 				return err
 			}
 			continue
@@ -207,81 +214,30 @@ func looksLikeTOML(data []byte) bool {
 	return false
 }
 
-// loadTOML decodes a policy.toml into Config. Secret_allowlist and the
-// repositories map follow the same shapes as the YAML form.
+// loadTOML decodes a policy.toml into Config with the SAME typed schema as
+// YAML: unknown keys are rejected, every restriction field is copied, and
+// explicit opa_file/opa_rules presence is preserved. A map[string]any
+// field-by-field decoder previously dropped most security fields and
+// accepted misspelled keys (fail open).
 func loadTOML(data []byte) (*Config, error) {
-	var raw map[string]any
-	if err := toml.Unmarshal(data, &raw); err != nil {
+	// Presence of OPA keys is observed on a throwaway typed document so an
+	// explicitly empty opa_file/opa_rules still trips Validate.
+	var probe struct {
+		OPAFile  *string `toml:"opa_file"`
+		OPARules *string `toml:"opa_rules"`
+	}
+	if err := toml.Unmarshal(data, &probe); err != nil {
 		return nil, err
 	}
 	cfg := &Config{}
-	if v, ok := raw["secret_allowlist"]; ok {
-		cfg.SecretAllowlist = anyToStrings(v)
+	dec := toml.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(cfg); err != nil {
+		return nil, err
 	}
-	if v, ok := raw["oidc_audiences"]; ok {
-		cfg.OIDCAudiences = anyToStrings(v)
-	}
-	if v, ok := raw["allowed_clone_hosts"]; ok {
-		cfg.AllowedCloneHosts = anyToStrings(v)
-	}
-	if v, ok := raw["allowed_runner_pools"]; ok {
-		cfg.AllowedRunnerPools = anyToStrings(v)
-	}
-	if v, ok := raw["allowed_regions"]; ok {
-		cfg.AllowedRegions = anyToStrings(v)
-	}
-	if v, ok := raw["require_digest_pins"]; ok {
-		cfg.RequireDigestPins, _ = v.(bool)
-	}
-	if v, ok := raw["require_rootless"]; ok {
-		cfg.RequireRootless, _ = v.(bool)
-	}
-	if v, ok := raw["network"].(string); ok {
-		cfg.Network = v
-	}
-	if v, ok := raw["opa_file"].(string); ok {
-		cfg.OPAFile = v
-	}
-	if v, ok := raw["opa_rules"].(string); ok {
-		cfg.OPARules = v
-	}
-	if v, ok := raw["repositories"].(map[string]any); ok {
-		cfg.Repositories = map[string]RepoPolicy{}
-		for name, rv := range v {
-			rm, _ := rv.(map[string]any)
-			rp := RepoPolicy{}
-			if x, ok := rm["secret_allowlist"]; ok {
-				rp.SecretAllowlist = anyToStrings(x)
-			}
-			if x, ok := rm["oidc_audiences"]; ok {
-				rp.OIDCAudiences = anyToStrings(x)
-			}
-			if x, ok := rm["allowed_clone_hosts"]; ok {
-				rp.AllowedCloneHosts = anyToStrings(x)
-			}
-			if x, ok := rm["allowed_regions"]; ok {
-				rp.AllowedRegions = anyToStrings(x)
-			}
-			cfg.Repositories[name] = rp
-		}
-	}
+	cfg.opaFileSet = probe.OPAFile != nil
+	cfg.opaRulesSet = probe.OPARules != nil
 	return cfg, nil
-}
-
-func anyToStrings(v any) []string {
-	switch x := v.(type) {
-	case []any:
-		out := make([]string, 0, len(x))
-		for _, e := range x {
-			if s, ok := e.(string); ok {
-				out = append(out, s)
-			}
-		}
-		return out
-	case []string:
-		return x
-	}
-	return nil
 }
 
 func topLevelKeysSet(doc *yaml.Node, keys ...string) (present []bool) {

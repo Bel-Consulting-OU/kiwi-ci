@@ -95,7 +95,7 @@ parse_median <"$OUT" | sort >"$CUR"
 if [ "$UPDATE" = "1" ]; then
 	mkdir -p bench
 	{
-		echo "# perf baseline contract=$contract count=$count threshold=$threshold"
+		echo "# perf baseline contract=$CONTRACT count=$COUNT threshold=$THRESHOLD"
 		echo "# regenerate with: scripts/perf-compare.sh --update (on a quiet machine)"
 		cat "$CUR"
 	} >"$BASELINE"
@@ -109,7 +109,7 @@ fi
 
 [ -f "$BASELINE" ] || die "missing $BASELINE (run scripts/perf-compare.sh --update to create it)"
 
-BASE_CONTRACT="$(awk -F= '/^# perf baseline contract=/{print $2; exit}' "$baseline" | awk '{print $1}')"
+BASE_CONTRACT="$(awk -F= '/^# perf baseline contract=/{print $2; exit}' "$BASELINE" | awk '{print $1}')"
 if [ -n "$BASE_CONTRACT" ] && [ "$BASE_CONTRACT" != "$CONTRACT" ]; then
 	die "baseline contract=$BASE_CONTRACT != current $CONTRACT (regenerate with --update)"
 fi
@@ -144,7 +144,7 @@ if [ -n "$MISSING" ]; then
 	FAIL=1
 else
 	awk '
-		NR==FNR { if ($0 !~ /^#/ && nf>=2) base[$1]=$2; next }
+		NR==FNR { if ($0 !~ /^#/ && NF>=2) base[$1]=$2; next }
 		{ printf "perf-compare: ok   %s median %s ns/op (baseline %s, budget %s)\n", $1, $2, base[$1], base[$1]*(1+t/100.0) }
 	' t="$THRESHOLD" "$BASELINE" "$CUR"
 fi
