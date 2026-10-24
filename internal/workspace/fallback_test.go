@@ -285,7 +285,7 @@ func TestPrepareSnapshotFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, _, err = m.Prepare(context.Background(), "gone")
-	if err == nil || !strings.Contains(err.Error(), "prepare workspace") {
+	if err == nil || !(strings.Contains(err.Error(), "prepare workspace") || strings.Contains(err.Error(), "run base")) {
 		t.Fatalf("Prepare = %v, want a wrapped snapshot error", err)
 	}
 }

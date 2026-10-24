@@ -18,23 +18,27 @@ import (
 
 // Why is the explanation data model for one job.
 type Why struct {
-	JobID           string   `json:"job_id"`
-	EventMatched    bool     `json:"event_matched"`
-	BranchMatched   bool     `json:"branch_matched"`
-	PathMatched     bool     `json:"path_matched"`
-	TriggerKey      string   `json:"trigger_key,omitempty"`
-	PathRule        string   `json:"path_rule,omitempty"`
-	ChangedPaths    []string `json:"changed_paths,omitempty"`
-	Packages        []string `json:"packages,omitempty"`
-	Condition       string   `json:"condition,omitempty"`
-	ConditionResult bool     `json:"condition_result"`
-	Needs           []string `json:"needs,omitempty"`
-	Approval        bool     `json:"approval"`
-	RequiredLabels  []string `json:"required_labels,omitempty"`
-	Regions         []string `json:"regions,omitempty"`
-	CacheKeys       []string `json:"cache_keys,omitempty"`
-	Policy          []string `json:"policy,omitempty"`
-	QueueReason     string   `json:"queue_reason,omitempty"`
+	JobID         string `json:"job_id"`
+	EventMatched  bool   `json:"event_matched"`
+	BranchMatched bool   `json:"branch_matched"`
+	PathMatched   bool   `json:"path_matched"`
+	// ChangedFilesKnown is false when the caller could not compute a
+	// trustworthy diff. PathMatched is then indeterminate: execution runs
+	// path-restricted jobs conservatively rather than skipping them.
+	ChangedFilesKnown bool     `json:"changed_files_known"`
+	TriggerKey        string   `json:"trigger_key,omitempty"`
+	PathRule          string   `json:"path_rule,omitempty"`
+	ChangedPaths      []string `json:"changed_paths,omitempty"`
+	Packages          []string `json:"packages,omitempty"`
+	Condition         string   `json:"condition,omitempty"`
+	ConditionResult   bool     `json:"condition_result"`
+	Needs             []string `json:"needs,omitempty"`
+	Approval          bool     `json:"approval"`
+	RequiredLabels    []string `json:"required_labels,omitempty"`
+	Regions           []string `json:"regions,omitempty"`
+	CacheKeys         []string `json:"cache_keys,omitempty"`
+	Policy            []string `json:"policy,omitempty"`
+	QueueReason       string   `json:"queue_reason,omitempty"`
 }
 
 // ExplainContext is the event context the explanation is evaluated against.
@@ -42,6 +46,10 @@ type ExplainContext struct {
 	Event        string
 	Branch       string
 	ChangedFiles []string
+	// ChangedFilesUnknown marks the change set as incompletely known (git
+	// failed, shallow history, bad --base). When false (default), the
+	// change set is treated as a complete diff.
+	ChangedFilesUnknown bool
 }
 
 // ExplainWhy evaluates why compiled job jobID would run for ctx. spec and g
@@ -60,23 +68,24 @@ func ExplainWhy(spec *pipeline.Spec, g *pipeline.Graph, jobID string, ctx Explai
 	}
 	j := cj.Job
 	w := &Why{
-		JobID:          jobID,
-		ChangedPaths:   append([]string(nil), ctx.ChangedFiles...),
-		Condition:      j.If,
-		Needs:          append([]string(nil), cj.Needs...),
-		Approval:       j.Environment.Approval,
-		RequiredLabels: labelsForJob(j),
-		Regions:        append([]string(nil), j.Placement.Regions...),
-		QueueReason:    "",
+		JobID:             jobID,
+		ChangedPaths:      append([]string(nil), ctx.ChangedFiles...),
+		ChangedFilesKnown: !ctx.ChangedFilesUnknown,
+		Condition:         j.If,
+		Needs:             append([]string(nil), cj.Needs...),
+		Approval:          j.Environment.Approval,
+		RequiredLabels:    labelsForJob(j),
+		Regions:           append([]string(nil), j.Placement.Regions...),
+		QueueReason:       "",
 	}
 
 	// Trigger evaluation reuses the forge evaluator so explain and the
-	// webhook path decide identically. The explanation's change set is
-	// explicit caller input, so it is a complete diff.
+	// webhook path decide identically. Complete mirrors the known/unknown
+	// change-set state (unknown ⇒ forge must not treat the set as authoritative).
 	matched, triggerKey := forge.MatchesTrigger(spec.On, forge.EventContext{
 		Event:        ctx.Event,
 		Ref:          "refs/heads/" + ctx.Branch,
-		ChangedFiles: forge.ChangedFilesResult{Files: ctx.ChangedFiles, Complete: true},
+		ChangedFiles: forge.ChangedFilesResult{Files: ctx.ChangedFiles, Complete: !ctx.ChangedFilesUnknown},
 	})
 	w.EventMatched = matched
 	w.TriggerKey = triggerKey
@@ -90,13 +99,20 @@ func ExplainWhy(spec *pipeline.Spec, g *pipeline.Graph, jobID string, ctx Explai
 
 	// Job-level path filter is the authoritative rule for this job; the
 	// trigger-level path rule is reported as a fallback.
-	w.PathMatched = pipeline.PathsMatch(ctx.ChangedFiles, j.Paths, j.PathsIgnore)
-	if rule, ok := firstMatchingPathRule(ctx.ChangedFiles, j.Paths, j.PathsIgnore); ok {
-		w.PathRule = rule
-	} else if matched {
-		if trg, ok := spec.On[triggerKey]; ok && triggerKey != "" {
-			if rule, ok := firstMatchingPathRule(ctx.ChangedFiles, trg.Paths, trg.PathsIgnore); ok {
-				w.PathRule = rule
+	if ctx.ChangedFilesUnknown && (len(j.Paths) > 0 || len(j.PathsIgnore) > 0) {
+		// Unknown diff: path match is indeterminate; execution runs
+		// conservatively (same as executor ChangedFilesKnown=false).
+		w.PathMatched = false
+		w.PathRule = "indeterminate (changed-file set unknown; execution runs conservatively)"
+	} else {
+		w.PathMatched = pipeline.PathsMatch(ctx.ChangedFiles, j.Paths, j.PathsIgnore)
+		if rule, ok := firstMatchingPathRule(ctx.ChangedFiles, j.Paths, j.PathsIgnore); ok {
+			w.PathRule = rule
+		} else if matched {
+			if trg, ok := spec.On[triggerKey]; ok && triggerKey != "" {
+				if rule, ok := firstMatchingPathRule(ctx.ChangedFiles, trg.Paths, trg.PathsIgnore); ok {
+					w.PathRule = rule
+				}
 			}
 		}
 	}

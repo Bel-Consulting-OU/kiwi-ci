@@ -98,6 +98,14 @@ func RunLocal(ctx context.Context, args []string) error {
 		return err
 	}
 	defer wm.Close()
+	// One immutable run-base for every job in this run: later source-tree
+	// edits cannot change what job A already staged vs job B.
+	if err := wm.Freeze(ctx); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("run cancelled: %w", ctx.Err())
+		}
+		return err
+	}
 	runID, err := newLocalRunID()
 	if err != nil {
 		return err

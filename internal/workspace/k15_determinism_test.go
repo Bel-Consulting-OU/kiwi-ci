@@ -198,21 +198,48 @@ func TestK15CleanAndDirtyProduceSameTrackedLayout(t *testing.T) {
 	}
 	defer m.Close()
 
-	// Clean
+	// Untracked files present BEFORE freeze must appear in every job.
+	writeK15(t, filepath.Join(src, "untracked.tmp"), "x")
+	if err := m.Freeze(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(m.BasePath(), "untracked.tmp")); err != nil {
+		t.Fatalf("run-base missing untracked.tmp after Freeze: %v", err)
+	}
+
 	dir1, c1, err := m.Prepare(context.Background(), "clean")
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := os.Stat(filepath.Join(dir1, "untracked.tmp")); err != nil {
+		t.Fatalf("first job missing pre-freeze untracked file: %v", err)
+	}
 	n1, tops1 := countK15Files(t, dir1)
 	c1()
 
-	// Dirty
-	writeK15(t, filepath.Join(src, "untracked.tmp"), "x")
+	// Mutating the source AFTER freeze must not change later jobs.
+	writeK15(t, filepath.Join(src, "after-freeze.tmp"), "x")
 	dir2, c2, err := m.Prepare(context.Background(), "dirty")
 	if err != nil {
 		t.Fatal(err)
 	}
 	n2, tops2 := countK15Files(t, dir2)
+	if _, err := os.Stat(filepath.Join(dir2, "untracked.tmp")); err != nil {
+		baseList, _ := os.ReadDir(m.BasePath())
+		var names []string
+		for _, e := range baseList {
+			names = append(names, e.Name())
+		}
+		jobList, _ := os.ReadDir(dir2)
+		var jn []string
+		for _, e := range jobList {
+			jn = append(jn, e.Name())
+		}
+		t.Fatalf("pre-freeze untracked file missing from job workspace: %v; base=%v job=%v", err, names, jn)
+	}
+	if _, err := os.Stat(filepath.Join(dir2, "after-freeze.tmp")); err == nil {
+		t.Fatal("post-freeze source edit leaked into a later job workspace")
+	}
 	c2()
 
 	for _, d := range []string{"services", "README.md"} {
@@ -223,8 +250,7 @@ func TestK15CleanAndDirtyProduceSameTrackedLayout(t *testing.T) {
 			t.Fatalf("dirty staging missing %q (tops=%v n=%d)", d, tops2, n2)
 		}
 	}
-	// Dirty must be a SUPERSET (has the untracked file) of clean's tracked layout.
-	if n2 <= n1 {
-		t.Fatalf("dirty staging (%d files) is not larger than clean (%d) — untracked content missing", n2, n1)
+	if n1 != n2 {
+		t.Fatalf("jobs in one run staged different counts: first=%d second=%d (run-base not immutable)", n1, n2)
 	}
 }

@@ -575,9 +575,12 @@ type Service struct {
 	// Command overrides the image entrypoint (Woodpecker service commands).
 	Command []string          `yaml:"command,omitempty" json:"command,omitempty"`
 	Env     map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
-	// Ready is a native readiness probe: "tcp:5432", "http:8123/ping",
-	// or "pg_isready:5432". The executor waits for it before the job
-	// starts, replacing hand-rolled wait loops in pipelines.
+	// Ready is a readiness probe. Container services: "tcp:5432",
+	// "http:8123/ping", or a helper form such as "pg_isready:5432".
+	// Native services MUST use "tcp:<port>" or "http:<port>/<path>" with
+	// a concrete port (validated at compile time); Kiwi never allocates
+	// an ephemeral host port. The executor waits for Ready (racing child
+	// exit) before the job starts.
 	Ready       string   `yaml:"ready,omitempty" json:"ready,omitempty"`
 	Healthcheck string   `yaml:"healthcheck,omitempty" json:"healthcheck,omitempty"`
 	Interval    Duration `yaml:"interval,omitempty" json:"interval,omitempty"`
@@ -587,9 +590,9 @@ type Service struct {
 	// `retries: 0` can mean "one healthcheck attempt".
 	RetriesSet bool `yaml:"-" json:"-"`
 	// Native runs the service as a host process (no docker). Allowed only
-	// for jobs with runtime: native; Command is the full argv. The executor
-	// allocates a free port when the command needs one, waits for Ready,
-	// and tears the process down with the job.
+	// for jobs with runtime: native; Command is the full argv. The process
+	// starts in the job workspace with the executor-resolved environment,
+	// must bind the port named by Ready, and is torn down with the job.
 	Native bool `yaml:"native,omitempty" json:"native,omitempty"`
 }
 

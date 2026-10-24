@@ -2,6 +2,7 @@ package explain
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
@@ -175,5 +176,37 @@ func TestExplainWhyMatrixJob(t *testing.T) {
 	// Empty on-section matches everything.
 	if !w.EventMatched || w.TriggerKey != "" || !w.BranchMatched {
 		t.Fatalf("empty on-section: %+v", w)
+	}
+}
+
+func TestExplainUnknownChangedFiles(t *testing.T) {
+	spec, err := pipeline.Parse([]byte(`version: 1
+on:
+  push: {}
+jobs:
+  gated:
+    paths: [src/**]
+    steps: [{run: "true"}]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := pipeline.Compile(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := ExplainWhy(spec, g, "gated", ExplainContext{
+		Event: "push", Branch: "main",
+		ChangedFiles:        nil,
+		ChangedFilesUnknown: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.ChangedFilesKnown {
+		t.Fatal("ChangedFilesKnown must be false")
+	}
+	if !strings.Contains(w.PathRule, "indeterminate") {
+		t.Fatalf("PathRule = %q", w.PathRule)
 	}
 }

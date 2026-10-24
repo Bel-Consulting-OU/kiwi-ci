@@ -80,7 +80,7 @@ func TestNativeServicesStartAndTeardown(t *testing.T) {
 		Command: []string{"python3", "-c", "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6402)); s.listen(1); time.sleep(60)"},
 		Ready:   "tcp:6402",
 	}
-	envNet, env, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), []pipeline.Service{svc}, func(string) {})
+	envNet, env, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svc}, func(string) {})
 	if err != nil {
 		t.Fatalf("startNativeServices: %v", err)
 	}

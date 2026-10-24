@@ -3,12 +3,14 @@ package executor
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
@@ -18,44 +20,108 @@ import (
 // KIWI_SERVICE_<NAME>_HOST / _PORT always appear when a port was allocated.
 const nativeServiceEnvPrefix = "KIWI_SERVICE_"
 
-// startNativeServices launches host-process services for a native job,
-// waits for each readiness probe, and returns a teardown that kills every
-// process group. Failures are loud: a service that never becomes ready
-// fails the job before step 1. workRoot is the job workspace (services
-// start there so relative command paths resolve like the job's steps).
-// Every native service must declare a ready probe with a concrete port;
-// Kiwi never allocates an ephemeral port (TOCTOU free).
-func startNativeServices(ctx context.Context, jobID string, workRoot string, services []pipeline.Service, emit func(string)) (string, map[string]string, func() error, error) {
+// nativePortClaims is the process-wide host-port ownership table for
+// native services. Two concurrent jobs (matrix variants) must not both
+// believe they own tcp:5432 on the same runner host.
+var nativePortClaims = struct {
+	sync.Mutex
+	byPort map[int]string
+}{byPort: map[int]string{}}
+
+func claimNativePort(port int, owner string) error {
+	nativePortClaims.Lock()
+	defer nativePortClaims.Unlock()
+	if prev, ok := nativePortClaims.byPort[port]; ok {
+		return fmt.Errorf("host port %d already claimed by %s", port, prev)
+	}
+	nativePortClaims.byPort[port] = owner
+	return nil
+}
+
+func releaseNativePort(port int) {
+	nativePortClaims.Lock()
+	defer nativePortClaims.Unlock()
+	delete(nativePortClaims.byPort, port)
+}
+
+// childProc tracks one native service process so readiness can race
+// process lifetime: a child that exits while the port probe succeeds
+// (another process answering) must fail, never certify the wrong listener.
+type childProc struct {
+	cmd  *exec.Cmd
+	done chan struct{}
+	mu   sync.Mutex
+	err  error
+}
+
+func (c *childProc) wait() error {
+	err := c.cmd.Wait()
+	c.mu.Lock()
+	c.err = err
+	c.mu.Unlock()
+	close(c.done)
+	return err
+}
+
+func (c *childProc) exited() bool {
+	select {
+	case <-c.done:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *childProc) exitErr() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.err
+}
+
+// startNativeServices launches host-process services for a native job.
+//
+// Environment is whatever the executor already materialized (clean base +
+// job env); os.Environ() is never imported. workRoot is the job workspace.
+// Every service must declare a concrete ready port (validated in the
+// pipeline); the port is claimed in the process-wide registry before start.
+// Readiness races child exit so a port owned by some other process can
+// never certify the service Kiwi launched.
+func startNativeServices(ctx context.Context, jobID, workRoot string, baseEnv map[string]string, services []pipeline.Service, emit func(string)) (string, map[string]string, func() error, error) {
 	if len(services) == 0 {
 		return "", nil, func() error { return nil }, nil
 	}
 	type running struct {
 		svc     pipeline.Service
-		cmd     *exec.Cmd
+		child   *childProc
 		port    int
-		done    chan error
 		release func()
 	}
 	var procs []*running
 	env := map[string]string{}
+	claimed := []int{}
 	cleanup := func() error {
 		var firstErr error
 		for i := len(procs) - 1; i >= 0; i-- {
 			p := procs[i]
-			if p.cmd != nil {
-				_ = terminateProcess(p.cmd)
-				_ = killProcess(p.cmd)
+			if p.child != nil && p.child.cmd != nil {
+				_ = terminateProcess(p.child.cmd)
+				_ = killProcess(p.child.cmd)
 			}
 			if p.release != nil {
 				p.release()
 			}
-			select {
-			case <-p.done:
-			case <-time.After(3 * time.Second):
-				if firstErr == nil {
-					firstErr = fmt.Errorf("native service %s did not exit after kill", p.svc.Name)
+			if p.child != nil {
+				select {
+				case <-p.child.done:
+				case <-time.After(3 * time.Second):
+					if firstErr == nil {
+						firstErr = fmt.Errorf("native service %s did not exit after kill", p.svc.Name)
+					}
 				}
 			}
+		}
+		for _, port := range claimed {
+			releaseNativePort(port)
 		}
 		return firstErr
 	}
@@ -67,13 +133,22 @@ func startNativeServices(ctx context.Context, jobID string, workRoot string, ser
 		if len(svc.Command) == 0 {
 			return "", nil, cleanup, fmt.Errorf("job %s native service %s has no command", jobID, svc.Name)
 		}
-		// Prefer an explicit port from the ready probe (tcp:N / http:N/...).
-		// Validation requires that port for native services so there is no
-		// ephemeral free-port TOCTOU.
-		port, hasDeclared := readyProbePort(svc.Ready)
-		if !hasDeclared {
-			return "", nil, cleanup, fmt.Errorf("job %s native service %s: ready probe must declare a concrete port (tcp:<port> or http:<port>/<path>)", jobID, svc.Name)
+		probe, perr := pipeline.ParseReadyProbe(svc.Ready)
+		if perr != nil {
+			return "", nil, cleanup, fmt.Errorf("job %s native service %s: %w", jobID, svc.Name, perr)
 		}
+		port := int(probe.Port)
+		owner := jobID + "/" + svc.Name
+		if err := claimNativePort(port, owner); err != nil {
+			return "", nil, cleanup, fmt.Errorf("job %s native service %s: %w", jobID, svc.Name, err)
+		}
+		claimed = append(claimed, port)
+		// Fail early if something else already listens on the claimed port.
+		if conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), 200*time.Millisecond); err == nil {
+			_ = conn.Close()
+			return "", nil, cleanup, fmt.Errorf("job %s native service %s: host port %d is already in use before start", jobID, svc.Name, port)
+		}
+
 		args := append([]string{}, svc.Command...)
 		cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 		if workRoot != "" {
@@ -81,26 +156,59 @@ func startNativeServices(ctx context.Context, jobID string, workRoot string, ser
 		} else {
 			cmd.Dir = os.TempDir()
 		}
-		cmd.Env = append(os.Environ(), fmt.Sprintf("PORT=%d", port))
-		// User env is applied AFTER PORT so an explicit PORT= in service.env
-		// would override Kiwi's authoritative port. Re-apply PORT last so the
-		// probe and the process cannot disagree.
+		// Executor-resolved environment only (never os.Environ).
+		cmd.Env = envMapToSlice(baseEnv)
 		for k, v := range svc.Env {
 			cmd.Env = append(cmd.Env, k+"="+v)
 		}
+		// PORT last so service.env cannot override the authoritative port.
 		cmd.Env = append(cmd.Env, fmt.Sprintf("PORT=%d", port))
 		configureProcess(cmd)
+
+		stdoutR, stdoutW, perr := os.Pipe()
+		if perr != nil {
+			return "", nil, cleanup, fmt.Errorf("job %s native service %s stdout pipe: %w", jobID, svc.Name, perr)
+		}
+		stderrR, stderrW, perr := os.Pipe()
+		if perr != nil {
+			_ = stdoutR.Close()
+			_ = stdoutW.Close()
+			return "", nil, cleanup, fmt.Errorf("job %s native service %s stderr pipe: %w", jobID, svc.Name, perr)
+		}
+		cmd.Stdout = stdoutW
+		cmd.Stderr = stderrW
+
 		if err := cmd.Start(); err != nil {
+			_ = stdoutW.Close()
+			_ = stderrW.Close()
+			_ = stdoutR.Close()
+			_ = stderrR.Close()
 			return "", nil, cleanup, fmt.Errorf("job %s native service %s start %s: %w", jobID, svc.Name, args[0], err)
 		}
+		// Parent closes writer ends so streamLines sees EOF when the child exits.
+		_ = stdoutW.Close()
+		_ = stderrW.Close()
+		if emit != nil {
+			logPrefix := func(s string) string { return s }
+			go streamLines(stdoutR, defaultMaxLine, func(line string) {
+				emit(logPrefix("[" + svc.Name + "/out] " + line))
+			})
+			go streamLines(stderrR, defaultMaxLine, func(line string) {
+				emit(logPrefix("[" + svc.Name + "/err] " + line))
+			})
+		} else {
+			go func() { _, _ = io.Copy(io.Discard, stdoutR) }()
+			go func() { _, _ = io.Copy(io.Discard, stderrR) }()
+		}
+
 		release, serr := superviseChild(cmd)
 		if serr != nil {
 			_ = killProcess(cmd)
 			return "", nil, cleanup, fmt.Errorf("job %s native service %s supervise: %w", jobID, svc.Name, serr)
 		}
-		p := &running{svc: svc, cmd: cmd, port: port, done: make(chan error, 1), release: release}
-		go func(c *exec.Cmd, ch chan error) { ch <- c.Wait() }(cmd, p.done)
-		procs = append(procs, p)
+		ch := &childProc{cmd: cmd, done: make(chan struct{})}
+		go ch.wait()
+		procs = append(procs, &running{svc: svc, child: ch, port: port, release: release})
 		if emit != nil {
 			emit(fmt.Sprintf("started native %s pid=%d port=%d", svc.Name, cmd.Process.Pid, port))
 		}
@@ -110,79 +218,63 @@ func startNativeServices(ctx context.Context, jobID string, workRoot string, ser
 	}
 
 	for _, p := range procs {
-		probe := p.svc.Ready
-		if probe == "" {
-			select {
-			case err := <-p.done:
-				return "", nil, cleanup, fmt.Errorf("job %s native service %s exited before ready: %v", jobID, p.svc.Name, err)
-			case <-time.After(200 * time.Millisecond):
-			}
-			continue
-		}
-		if err := waitNativeReady(ctx, probe, "127.0.0.1", p.port); err != nil {
+		if err := waitNativeReady(ctx, p.svc.Ready, "127.0.0.1", p.port, p.child); err != nil {
 			return "", nil, cleanup, fmt.Errorf("job %s native service %s ready probe: %w", jobID, p.svc.Name, err)
 		}
 		if emit != nil {
-			emit(fmt.Sprintf("ready %s (%s)", p.svc.Name, probe))
+			emit(fmt.Sprintf("ready %s (%s)", p.svc.Name, p.svc.Ready))
 		}
 	}
 	return "native-services", env, cleanup, nil
 }
 
-// readyProbePort extracts a concrete TCP/HTTP port from a ready probe.
-// Returns (0,false) when the probe has no numeric port (caller allocates).
-func readyProbePort(probe string) (int, bool) {
-	kind, rest, ok := strings.Cut(probe, ":")
-	if !ok {
-		return 0, false
+func envMapToSlice(m map[string]string) []string {
+	if len(m) == 0 {
+		return nil
 	}
-	if kind != "tcp" && kind != "http" {
-		return 0, false
+	out := make([]string, 0, len(m))
+	for k, v := range m {
+		out = append(out, k+"="+v)
 	}
-	n := rest
-	if i := strings.IndexByte(rest, '/'); i >= 0 {
-		n = rest[:i]
-	}
-	port, err := strconv.Atoi(n)
-	if err != nil || port <= 0 || port > 65535 {
-		return 0, false
-	}
-	return port, true
+	return out
 }
 
-func waitNativeReady(ctx context.Context, probe, host string, port int) error {
-	kind, rest, ok := strings.Cut(probe, ":")
-	if !ok {
-		return fmt.Errorf("ready probe %q must look like tcp:PORT or http:PORT/path", probe)
+// waitNativeReady races the ready probe against child exit. A successful
+// TCP/HTTP answer while the child has exited means the port belongs to
+// some other process; that must never count as ready for this service.
+func waitNativeReady(ctx context.Context, probeSpec, host string, port int, child *childProc) error {
+	probe, err := pipeline.ParseReadyProbe(probeSpec)
+	if err != nil {
+		return err
 	}
 	deadline := time.Now().Add(serviceReadyTimeout)
 	var lastErr error
+	checkAlive := func() error {
+		if child != nil && child.exited() {
+			return fmt.Errorf("process exited before ready (exit=%v)", child.exitErr())
+		}
+		return nil
+	}
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		switch kind {
-		case "tcp":
-			p := rest
-			if port > 0 {
-				p = strconv.Itoa(port)
-			}
-			conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, p), time.Second)
+		if err := checkAlive(); err != nil {
+			return err
+		}
+		switch probe.Kind {
+		case pipeline.ReadyProbeTCP:
+			conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(int(probe.Port))), time.Second)
 			if err == nil {
 				_ = conn.Close()
+				if err := checkAlive(); err != nil {
+					return err
+				}
 				return nil
 			}
 			lastErr = err
-		case "http":
-			p := port
-			path := rest
-			if i := strings.IndexByte(rest, '/'); i > 0 {
-				if n, err := strconv.Atoi(rest[:i]); err == nil {
-					p = n
-					path = rest[i:]
-				}
-			}
-			url := fmt.Sprintf("http://%s:%d%s", host, p, path)
+		case pipeline.ReadyProbeHTTP:
+			url := fmt.Sprintf("http://%s:%d%s", host, probe.Port, probe.Path)
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 			if err != nil {
 				lastErr = err
@@ -195,20 +287,24 @@ func waitNativeReady(ctx context.Context, probe, host string, port int) error {
 				break
 			}
 			_ = resp.Body.Close()
-			// Only 2xx counts as ready: a 503 from a half-booted service
-			// is not readiness.
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				if err := checkAlive(); err != nil {
+					return err
+				}
 				return nil
 			}
 			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
 		default:
-			return fmt.Errorf("unsupported ready probe kind %q", kind)
+			return fmt.Errorf("unsupported ready probe kind %q", probe.Kind)
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(serviceReadyPoll):
 		}
+	}
+	if err := checkAlive(); err != nil {
+		return err
 	}
 	return fmt.Errorf("timed out after %s: %w", serviceReadyTimeout, lastErr)
 }
@@ -229,4 +325,13 @@ func sanitizeServiceEnv(name string) string {
 		prev = false
 	}
 	return b.String()
+}
+
+// readyProbePort is the executor-local shim over the shared pipeline parser.
+func readyProbePort(probe string) (int, bool) {
+	p, err := pipeline.ParseReadyProbe(probe)
+	if err != nil || (p.Kind != pipeline.ReadyProbeTCP && p.Kind != pipeline.ReadyProbeHTTP) || p.Port == 0 {
+		return 0, false
+	}
+	return int(p.Port), true
 }

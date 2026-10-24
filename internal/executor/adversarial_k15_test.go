@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -275,7 +276,7 @@ func TestNativeServiceTeardownReapsPID(t *testing.T) {
 		Ready:   "tcp:6403",
 		Command: []string{"python3", "-c", "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6403)); s.listen(1); time.sleep(120)"},
 	}
-	_, env, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), []pipeline.Service{svc}, func(string) {})
+	_, env, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svc}, func(string) {})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -324,7 +325,7 @@ func TestNativeServiceHonorsDeclaredReadyPort(t *testing.T) {
 		Command: []string{"python3", "-c", "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6399)); s.listen(1); time.sleep(60)"},
 		Ready:   "tcp:6399",
 	}
-	_, env, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), []pipeline.Service{svc}, func(string) {})
+	_, env, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svc}, func(string) {})
 	if err != nil {
 		t.Fatalf("startNativeServices: %v", err)
 	}
@@ -343,7 +344,7 @@ func TestNativeServicesSameReadyPortFailsLoudly(t *testing.T) {
 	// 200ms liveness window must catch the death).
 	svcB := pipeline.Service{Name: "b", Native: true,
 		Command: []string{"python3", "-c", "import socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6401))"}}
-	_, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), []pipeline.Service{svcA, svcB}, func(string) {})
+	_, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svcA, svcB}, func(string) {})
 	if cleanup != nil {
 		defer cleanup()
 	}
@@ -395,5 +396,60 @@ jobs:
 	res2 := ex2.RunCompiledJob(context.Background(), g.Spec, g.Jobs["gated"])
 	if res2.Status != model.StatusSkipped {
 		t.Fatalf("known-empty path job = %+v, want skipped", res2)
+	}
+}
+
+// A service whose child dies while another process answers the port must
+// NOT be certified ready (wrong-process / port stolen).
+func TestNativeReadyFailsWhenChildExits(t *testing.T) {
+	// Occupy 6410 with a real listener (the "old postgres").
+	ln, err := net.Listen("tcp", "127.0.0.1:6410")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+
+	// Our service fails to bind 6410 and exits immediately.
+	svc := pipeline.Service{
+		Name:    "ghost",
+		Native:  true,
+		Ready:   "tcp:6410",
+		Command: []string{"python3", "-c", "import socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6410)); s.listen(1)"},
+	}
+	// Without SO_REUSEADDR the bind fails... Python default SO_REUSEADDR
+	// may still fail with in use depending on OS. Force exit on bind fail.
+	svc.Command = []string{"python3", "-c", "import socket,sys; s=socket.socket();\ntry:\n s.bind(('127.0.0.1',6410))\nexcept OSError:\n sys.exit(1)\ns.listen(1)\nimport time; time.sleep(30)"}
+
+	_, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svc}, func(string) {})
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err == nil {
+		t.Fatal("readiness must fail when the owned child exits even if the port answers")
+	}
+	if !strings.Contains(err.Error(), "exited") && !strings.Contains(err.Error(), "already in use") && !strings.Contains(err.Error(), "ready") {
+		t.Fatalf("error = %v, want exit or pre-start occupancy", err)
+	}
+}
+
+// Two jobs cannot claim the same host port.
+func TestNativePortClaimConflicts(t *testing.T) {
+	const port = 6411
+	if err := claimNativePort(port, "jobA/postgres"); err != nil {
+		t.Fatal(err)
+	}
+	defer releaseNativePort(port)
+	err := claimNativePort(port, "jobB/postgres")
+	if err == nil || !strings.Contains(err.Error(), "already claimed") {
+		t.Fatalf("second claim = %v", err)
 	}
 }

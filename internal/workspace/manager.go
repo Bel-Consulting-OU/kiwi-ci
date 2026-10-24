@@ -49,6 +49,12 @@ type Manager struct {
 	Root string
 
 	mu sync.Mutex
+	// base is the immutable run-base snapshot (Root/run-base) once Freeze
+	// has run. Job workspaces are copied from base, not from the live
+	// source tree, so every job in one run sees the same source state.
+	base string
+	// baseEntries is the source top-level listing captured at Freeze time.
+	baseEntries []os.DirEntry
 }
 
 // NewManager validates the source directory and creates a fresh,
@@ -110,15 +116,62 @@ func (m *Manager) Close() error {
 	return os.RemoveAll(m.Root)
 }
 
+// Freeze captures ONE immutable run-base snapshot of Source under
+// Root/run-base. Subsequent Prepare calls copy from that base, so a single
+// `kiwi run` always stages the same source state for every job even if an
+// editor or build tool mutates the working tree mid-run. Freeze is
+// idempotent; the first call wins.
+func (m *Manager) Freeze(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.freezeLocked(ctx)
+}
+
+func (m *Manager) freezeLocked(ctx context.Context) error {
+	if m.base != "" {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(m.Source)
+	if err != nil {
+		return fmt.Errorf("run base: read source: %w", err)
+	}
+	base := filepath.Join(m.Root, "run-base")
+	strategy, err := m.snapshotFrom(ctx, m.Source, base)
+	if err != nil {
+		_ = os.RemoveAll(base)
+		return fmt.Errorf("run base snapshot: %w", err)
+	}
+	if err := verifyStagedTree(m.Source, entries, base, strategy); err != nil {
+		_ = os.RemoveAll(base)
+		return fmt.Errorf("run base verify: %w", err)
+	}
+	m.base = base
+	m.baseEntries = entries
+	return nil
+}
+
+// BasePath returns the immutable run-base directory, or "" if Freeze has
+// not run. Useful for local execution metadata and replay.
+func (m *Manager) BasePath() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.base
+}
+
 // Prepare creates an isolated workspace for one job and returns its path,
 // a cleanup function that removes it, and any error. The cleanup function
 // is idempotent. Callers should invoke it exactly once, after the job's
 // steps, artifacts, and caches have been collected.
 //
-// Staging is deterministic (K15): every Prepare of the same source produces
-// the same file set (the working tree via copyTree), and a snapshot that
-// lost top-level directories fails closed instead of handing the job a
-// silently truncated workspace.
+// When Freeze has run, the job is staged from the immutable run-base so
+// every job in one run shares one source state. Otherwise the live source
+// is snapshotted (legacy / unfrozen callers).
+//
+// Staging is deterministic (K15): a snapshot that lost top-level
+// directories fails closed instead of handing the job a truncated tree.
 func (m *Manager) Prepare(ctx context.Context, jobID string) (string, func(), error) {
 	if err := ctx.Err(); err != nil {
 		return "", nil, err
@@ -128,24 +181,32 @@ func (m *Manager) Prepare(ctx context.Context, jobID string) (string, func(), er
 	if err := ctx.Err(); err != nil {
 		return "", nil, err
 	}
+	if m.base == "" {
+		if err := m.freezeLocked(ctx); err != nil {
+			return "", nil, err
+		}
+	}
 	target := filepath.Join(m.Root, sanitizeJobID(jobID))
 	if _, err := os.Lstat(target); err == nil {
 		return "", nil, fmt.Errorf("job workspace %q already exists", target)
 	}
-	// Freeze the source top-level listing BEFORE the copy. Verifying
-	// against a post-copy listing fails whenever the source gains a
-	// directory during staging (or loses one mid-walk on a mutable tree
-	// like /tmp): that is a false truncation, not a lost directory.
-	srcBefore, err := os.ReadDir(m.Source)
-	if err != nil {
-		return "", nil, fmt.Errorf("prepare workspace for %q: read source: %w", jobID, err)
+	// Verify against the listing captured at freeze time (immutable base).
+	srcEntries := m.baseEntries
+	srcPath := m.base
+	if srcEntries == nil {
+		var err error
+		srcEntries, err = os.ReadDir(m.Source)
+		if err != nil {
+			return "", nil, fmt.Errorf("prepare workspace for %q: read source: %w", jobID, err)
+		}
+		srcPath = m.Source
 	}
-	strategy, err := m.snapshot(ctx, target)
+	strategy, err := m.snapshotFrom(ctx, srcPath, target)
 	if err != nil {
 		_ = os.RemoveAll(target)
 		return "", nil, fmt.Errorf("prepare workspace for %q: %w", jobID, err)
 	}
-	if err := verifyStagedTree(m.Source, srcBefore, target, strategy); err != nil {
+	if err := verifyStagedTree(srcPath, srcEntries, target, strategy); err != nil {
 		_ = os.RemoveAll(target)
 		return "", nil, fmt.Errorf("prepare workspace for %q: %w", jobID, err)
 	}
@@ -232,16 +293,16 @@ var snapshotCopyTree = copyTree
 // into the clean-tree `git worktree add` snapshot (committed files only).
 const workspaceStrategyEnv = "KIWI_WORKSPACE_STRATEGY"
 
-func (m *Manager) snapshot(ctx context.Context, target string) (string, error) {
+func (m *Manager) snapshotFrom(ctx context.Context, src, target string) (string, error) {
 	// K15: staging must be deterministic. The historical clean-tree
 	// worktree path dropped ignored files (.env) and untracked files, so
 	// two identical probes flipped between a full working copy and a
 	// committed-only tree (and, under git races, worse). copyTree is the
 	// default for every local run. The worktree path is opt-in only.
-	if os.Getenv(workspaceStrategyEnv) == "worktree" && gitRepo(ctx, m.Source) {
-		clean, err := gitStatusClean(ctx, m.Source)
+	if os.Getenv(workspaceStrategyEnv) == "worktree" && gitRepo(ctx, src) {
+		clean, err := gitStatusClean(ctx, src)
 		if err == nil && clean {
-			cmd := exec.CommandContext(ctx, "git", "-C", m.Source, "worktree", "add", "--detach", target, "HEAD")
+			cmd := exec.CommandContext(ctx, "git", "-C", src, "worktree", "add", "--detach", target, "HEAD")
 			if err := cmd.Run(); err == nil {
 				return "worktree", nil
 			} else if ctx.Err() != nil {
@@ -255,17 +316,17 @@ func (m *Manager) snapshot(ctx context.Context, target string) (string, error) {
 	// Rust checkout that materializes tens of gigabytes and looks hung.
 	// snapshotCopyTree is a test seam so fallback tests can force the
 	// reflink path without disabling copyTree in production.
-	if err := snapshotCopyTree(m.Source, target); err == nil {
+	if err := snapshotCopyTree(src, target); err == nil {
 		return "copy", nil
 	}
 	_ = os.RemoveAll(target)
 	if runtime.GOOS == "darwin" {
 		if _, err := exec.LookPath("cp"); err == nil {
-			cmd := exec.CommandContext(ctx, "cp", "-c", "-R", m.Source, target)
+			cmd := exec.CommandContext(ctx, "cp", "-c", "-R", src, target)
 			if err := cmd.Run(); err == nil {
 				_ = os.RemoveAll(filepath.Join(target, ".git"))
 				_ = os.RemoveAll(filepath.Join(target, ".kiwi", "cache"))
-				stripBuildOutputDirs(target, m.Source)
+				stripBuildOutputDirs(target, src)
 				return "reflink", nil
 			} else if ctx.Err() != nil {
 				_ = os.RemoveAll(target)
@@ -274,7 +335,7 @@ func (m *Manager) snapshot(ctx context.Context, target string) (string, error) {
 			_ = os.RemoveAll(target)
 		}
 	}
-	return "", fmt.Errorf("workspace snapshot failed for %s", m.Source)
+	return "", fmt.Errorf("workspace snapshot failed for %s", src)
 }
 
 // gitRepo reports whether dir is inside a git working tree.
@@ -405,7 +466,7 @@ func copyTree(src, dst string) error {
 		return err
 	}
 	var preserveTrackedUnder []string
-	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+	walkErr := filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -473,6 +534,15 @@ func copyTree(src, dst string) error {
 			return copyFile(path, target, info.Mode().Perm())
 		}
 	})
+	if walkErr != nil {
+		return walkErr
+	}
+	// An empty source (or a walk that only skipped) never creates dst via
+	// mkdirParents: materialize it so Freeze/verify always see a directory.
+	if _, serr := os.Stat(dst); serr != nil {
+		return os.MkdirAll(dst, 0o755)
+	}
+	return nil
 }
 
 // stripBuildOutputDirs removes build-output directory names from a

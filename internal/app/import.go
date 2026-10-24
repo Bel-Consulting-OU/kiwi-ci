@@ -117,17 +117,25 @@ func incompleteImportHeader(res *importer.Result) string {
 	var b strings.Builder
 	b.WriteString("# incomplete import — do not treat as an exact conversion.\n")
 	b.WriteString("# Re-run `kiwi import ... --list-unsupported` for the full gap list.\n")
-	for _, u := range res.Unsupported {
-		fmt.Fprintf(&b, "# unsupported: %s\n", u)
-	}
-	for _, u := range res.Unsafe {
-		fmt.Fprintf(&b, "# unsafe: %s\n", u)
-	}
-	for _, t := range res.TODOs {
-		fmt.Fprintf(&b, "# TODO: %s\n", t)
-	}
+	commentLines(&b, "unsupported: ", res.Unsupported)
+	commentLines(&b, "unsafe: ", res.Unsafe)
+	commentLines(&b, "TODO: ", res.TODOs)
 	b.WriteString("\n")
 	return b.String()
+}
+
+// commentLines prefixes every physical line of each diagnostic with # so a
+// diagnostic containing a newline cannot break out of the YAML comment.
+func commentLines(b *strings.Builder, prefix string, items []string) {
+	for _, item := range items {
+		for i, line := range strings.Split(item, "\n") {
+			if i == 0 {
+				fmt.Fprintf(b, "# %s%s\n", prefix, line)
+			} else {
+				fmt.Fprintf(b, "#   %s\n", line)
+			}
+		}
+	}
 }
 
 // detectImportSource finds the conventional configuration file for a tool in

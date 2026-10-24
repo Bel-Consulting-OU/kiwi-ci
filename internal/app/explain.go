@@ -23,6 +23,8 @@ type explainArgs struct {
 	Branch string
 	// ChangedFiles overrides git detection when non-empty.
 	ChangedFiles []string
+	// ChangedUnknown forces the unknown-diff presentation (git failed).
+	ChangedUnknown bool
 }
 
 // explainWhy prints why one compiled job would (or would not) run for the
@@ -40,13 +42,17 @@ func explainWhy(g *pipeline.Graph, jobID string, args explainArgs) error {
 		branch = detectCurrentBranch(wd)
 	}
 	changed := args.ChangedFiles
-	if len(changed) == 0 {
-		changed = detectChangedFiles(wd)
+	changedUnknown := args.ChangedUnknown
+	if len(changed) == 0 && !args.ChangedUnknown {
+		var known bool
+		changed, known = detectChangedFilesOpts(wd, "", "HEAD", "", "")
+		changedUnknown = !known
 	}
 	w, err := explain.ExplainWhy(g.Spec, g, jobID, explain.ExplainContext{
-		Event:        args.Event,
-		Branch:       branch,
-		ChangedFiles: changed,
+		Event:               args.Event,
+		Branch:              branch,
+		ChangedFiles:        changed,
+		ChangedFilesUnknown: changedUnknown,
 	})
 	if err != nil {
 		return err
@@ -70,7 +76,13 @@ func printWhy(w *explain.Why) {
 		fmt.Printf("  trigger key: %s\n", w.TriggerKey)
 	}
 	fmt.Printf("  branch matched: %s\n", yes(w.BranchMatched))
-	fmt.Printf("  path matched: %s\n", yes(w.PathMatched))
+	if !w.ChangedFilesKnown {
+		fmt.Printf("  changed paths known: no\n")
+		fmt.Printf("  path match: indeterminate (execution runs conservatively)\n")
+	} else {
+		fmt.Printf("  changed paths known: yes\n")
+		fmt.Printf("  path matched: %s\n", yes(w.PathMatched))
+	}
 	if w.PathRule != "" {
 		fmt.Printf("  path rule: %s\n", w.PathRule)
 	}

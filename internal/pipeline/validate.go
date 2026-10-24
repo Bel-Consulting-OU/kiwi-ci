@@ -762,7 +762,7 @@ func validateService(jobID string, svc *Service) error {
 		return fmt.Errorf("job %q service %q has empty image", jobID, svc.Name)
 	}
 	if svc.Ready != "" {
-		if err := validateReadyProbe(svc.Ready); err != nil {
+		if _, err := ParseReadyProbe(svc.Ready); err != nil {
 			return fmt.Errorf("job %q service %q: %w", jobID, svc.Name, err)
 		}
 	}
