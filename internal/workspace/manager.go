@@ -138,6 +138,10 @@ func (m *Manager) freezeLocked(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("run base: read source: %w", err)
 	}
+	before, err := freezeManifest(m.Source)
+	if err != nil {
+		return fmt.Errorf("run base: source manifest: %w", err)
+	}
 	base := filepath.Join(m.Root, "run-base")
 	// Freeze ALWAYS uses a plain working-tree copy (never the opt-in
 	// worktree strategy): run-base must match the developer's source
@@ -148,6 +152,36 @@ func (m *Manager) freezeLocked(ctx context.Context) error {
 		_ = os.RemoveAll(base)
 		return fmt.Errorf("run base snapshot: %w", err)
 	}
+	after, err := freezeManifest(m.Source)
+	if err != nil {
+		_ = os.RemoveAll(base)
+		return fmt.Errorf("run base: source re-manifest: %w", err)
+	}
+	if before != after {
+		// One retry: a transient editor write during the copy. After that,
+		// refuse a hybrid snapshot rather than invent a tree that never
+		// existed.
+		_ = os.RemoveAll(base)
+		base = filepath.Join(m.Root, "run-base")
+		before2, err := freezeManifest(m.Source)
+		if err != nil {
+			return fmt.Errorf("run base: source manifest: %w", err)
+		}
+		strategy, err = m.snapshotFrom(ctx, m.Source, base, true)
+		if err != nil {
+			_ = os.RemoveAll(base)
+			return fmt.Errorf("run base snapshot: %w", err)
+		}
+		after2, err := freezeManifest(m.Source)
+		if err != nil {
+			_ = os.RemoveAll(base)
+			return fmt.Errorf("run base: source re-manifest: %w", err)
+		}
+		if before2 != after2 {
+			_ = os.RemoveAll(base)
+			return fmt.Errorf("run base: source tree changed during freeze (retry also unstable); re-run when the working tree is quiet")
+		}
+	}
 	if err := verifyStagedTree(m.Source, entries, base, strategy); err != nil {
 		_ = os.RemoveAll(base)
 		return fmt.Errorf("run base verify: %w", err)
@@ -155,6 +189,43 @@ func (m *Manager) freezeLocked(ctx context.Context) error {
 	m.base = base
 	m.baseEntries = entries
 	return nil
+}
+
+// freezeManifest is a deterministic digest of path/type/size/mtime for
+// every entry under root (symlinks record their target). Used to detect
+// concurrent mutation while the run-base is being copied.
+func freezeManifest(root string) (string, error) {
+	h := sha256.New()
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, rerr := filepath.Rel(root, path)
+		if rerr != nil {
+			return rerr
+		}
+		if rel == "." {
+			return nil
+		}
+		kind := "f"
+		if info.IsDir() {
+			kind = "d"
+		} else if info.Mode()&os.ModeSymlink != 0 {
+			kind = "l"
+			target, lerr := os.Readlink(path)
+			if lerr != nil {
+				return lerr
+			}
+			fmt.Fprintf(h, "%s\x00%s\x00%s\n", rel, kind, target)
+			return nil
+		}
+		fmt.Fprintf(h, "%s\x00%s\x00%d\x00%d\x00%016x\n", rel, kind, info.Size(), info.Mode().Perm(), info.ModTime().UnixNano())
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // BasePath returns the immutable run-base directory, or "" if Freeze has

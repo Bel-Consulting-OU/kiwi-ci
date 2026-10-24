@@ -53,6 +53,19 @@ type runtimeLedgerEntry struct {
 	// proven gone.
 	Cgroup    string    `json:"cgroup,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
+	// NativeServices records host-process service identity (port, pid,
+	// process-group, start stamp) so a crashed runner's orphaned native
+	// services can be reclaimed without killing a recycled PID.
+	NativeServices []NativeServiceLedger `json:"native_services,omitempty"`
+}
+
+// NativeServiceLedger is one native sidecar recorded for crash recovery.
+type NativeServiceLedger struct {
+	Name  string `json:"name"`
+	Port  int    `json:"port"`
+	PID   int    `json:"pid"`
+	PGID  int    `json:"pgid"`
+	Start string `json:"start,omitempty"`
 }
 
 // runtimeLedgerDir returns the ledger directory for THIS runner. The
@@ -169,6 +182,24 @@ func (r *Runner) ledgerSetCgroup(id, cgroup string) error {
 	})
 }
 
+// ledgerSetNativeServices records started native services for crash
+// recovery. Failures are returned so the runner can refuse to continue
+// without a durable ownership record (same policy as XFS/cgroup).
+func (r *Runner) ledgerSetNativeServices(id string, svcs []executor.NativeServiceInfo) error {
+	if len(svcs) == 0 {
+		return nil
+	}
+	out := make([]NativeServiceLedger, 0, len(svcs))
+	for _, s := range svcs {
+		out = append(out, NativeServiceLedger{
+			Name: s.Name, Port: s.Port, PID: s.PID, PGID: s.PGID, Start: s.Start,
+		})
+	}
+	return r.ledgerUpdate(id, func(entry *runtimeLedgerEntry) {
+		entry.NativeServices = out
+	})
+}
+
 // ledgerRemove retires a completed job's entry. It is deliberately
 // best-effort: a failed removal leaves the entry for the next incarnation's
 // reclaim, which is safe because every reclaim step is idempotent.
@@ -261,6 +292,13 @@ func (r *Runner) reconcileRuntimeLedger(runInstanceID string) (ledgerReconcileRe
 			continue
 		}
 		if entry.Instance == runInstanceID {
+			continue
+		}
+		// Native sidecars first: orphaned host processes must die before
+		// we drop the record that knows their PID/start identity.
+		if err := reclaimNativeServices(entry.NativeServices); err != nil {
+			res.Pending++
+			res.Errors = append(res.Errors, fmt.Errorf("reclaim native services (%s): %w", f.Name(), err))
 			continue
 		}
 		if entry.Cgroup != "" {

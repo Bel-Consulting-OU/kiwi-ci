@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
@@ -156,6 +157,22 @@ func (*NativeBackend) Run(ctx context.Context, c Command, emit func(string)) err
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(c.TimeoutSeconds)*time.Second)
 		defer cancel()
+	}
+	// Resolve the shell against the materialized execution PATH so the
+	// binary that runs is the one the job environment claims, not whatever
+	// the runner daemon's ambient PATH would pick.
+	pathVal := ""
+	if len(c.Env) > 0 {
+		// c.Env is a slice of KEY=VALUE; recover PATH if present.
+		for _, kv := range c.Env {
+			if strings.HasPrefix(kv, "PATH=") {
+				pathVal = strings.TrimPrefix(kv, "PATH=")
+				break
+			}
+		}
+	}
+	if resolved, rerr := lookPathWithEnv(shell, pathVal); rerr == nil {
+		shell = resolved
 	}
 	cmd := exec.Command(shell, args...)
 	cmd.Dir = c.Dir

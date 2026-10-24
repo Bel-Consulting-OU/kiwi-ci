@@ -277,7 +277,7 @@ func TestNativeServiceTeardownReapsPID(t *testing.T) {
 		Ready:   "tcp:6403",
 		Command: []string{"python3", "-c", "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6403)); s.listen(1); time.sleep(120)"},
 	}
-	_, env, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svc}, func(string) {})
+	_, env, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svc}, func(string) {})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +326,7 @@ func TestNativeServiceHonorsDeclaredReadyPort(t *testing.T) {
 		Command: []string{"python3", "-c", "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6399)); s.listen(1); time.sleep(60)"},
 		Ready:   "tcp:6399",
 	}
-	_, env, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svc}, func(string) {})
+	_, env, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svc}, func(string) {})
 	if err != nil {
 		t.Fatalf("startNativeServices: %v", err)
 	}
@@ -345,7 +345,7 @@ func TestNativeServicesSameReadyPortFailsLoudly(t *testing.T) {
 	// 200ms liveness window must catch the death).
 	svcB := pipeline.Service{Name: "b", Native: true,
 		Command: []string{"python3", "-c", "import socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6401))"}}
-	_, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svcA, svcB}, func(string) {})
+	_, _, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svcA, svcB}, func(string) {})
 	if cleanup != nil {
 		defer cleanup()
 	}
@@ -430,7 +430,7 @@ func TestNativeReadyFailsWhenChildExits(t *testing.T) {
 	// may still fail with in use depending on OS. Force exit on bind fail.
 	svc.Command = []string{"python3", "-c", "import socket,sys; s=socket.socket();\ntry:\n s.bind(('127.0.0.1',6410))\nexcept OSError:\n sys.exit(1)\ns.listen(1)\nimport time; time.sleep(30)"}
 
-	_, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svc}, func(string) {})
+	_, _, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svc}, func(string) {})
 	if cleanup != nil {
 		defer cleanup()
 	}
@@ -474,7 +474,7 @@ func TestNativePortReleasedAfterFailedStart(t *testing.T) {
 		Ready:   "tcp:" + itoa(port),
 		Command: []string{"python3", "-c", "import time; time.sleep(5)"},
 	}
-	_, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svc}, nil)
+	_, _, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svc}, nil)
 	if cleanup != nil {
 		_ = cleanup()
 	}
@@ -489,3 +489,55 @@ func TestNativePortReleasedAfterFailedStart(t *testing.T) {
 }
 
 func itoa(n int) string { return strconv.Itoa(n) }
+
+// Transactional start: if service B fails after A started, A must be
+// reaped and both port claims released before the error is returned.
+func TestNativeStartRollsBackOnMidFailure(t *testing.T) {
+	svcA := pipeline.Service{
+		Name: "a", Native: true, Ready: "tcp:6420",
+		Command: []string{"python3", "-c", "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6420)); s.listen(1); time.sleep(30)"},
+	}
+	svcB := pipeline.Service{
+		Name: "b", Native: true, Ready: "tcp:6421",
+		Command: []string{"definitely-missing-native-service-binary-xyz"},
+	}
+	_, _, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), map[string]string{"PATH": "/usr/bin:/bin"}, []pipeline.Service{svcA, svcB}, nil)
+	if err == nil {
+		t.Fatal("missing binary for service B must fail the whole start")
+	}
+	if cleanup != nil {
+		// Contract: error means already rolled back; extra call must be safe
+		// if we ever pass cleanup through anyway.
+		_ = cleanup()
+	}
+	// Port 6420 must be free for a later claim.
+	if cerr := claimNativePort(6420, "later/job"); cerr != nil {
+		t.Fatalf("port 6420 still claimed after rollback: %v", cerr)
+	}
+	releaseNativePort(6420)
+	// A's listener must be gone: dial fails.
+	if conn, derr := net.DialTimeout("tcp", "127.0.0.1:6420", 300*time.Millisecond); derr == nil {
+		_ = conn.Close()
+		t.Fatal("service A still listening after transactional rollback")
+	}
+}
+
+func TestLookPathWithEnvUsesExplicitPathOnly(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "kiwi-fake-shell")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Empty PATH must not fall back to ambient env (which might find /bin/sh).
+	if _, err := lookPathWithEnv("kiwi-fake-shell", ""); err == nil {
+		// default PATH /usr/local/bin:/usr/bin:/bin — binary is in temp dir
+		// so expect failure unless default accidentally includes temp.
+		t.Fatal("empty PATH must not resolve a temp-dir binary")
+	}
+	if _, err := lookPathWithEnv("kiwi-fake-shell", dir); err != nil {
+		t.Fatalf("lookPathWithEnv with correct PATH: %v", err)
+	}
+	if _, err := lookPathWithEnv("kiwi-fake-shell", "/usr/bin:/bin"); err == nil {
+		t.Fatal("binary must not resolve when absent from given PATH")
+	}
+}

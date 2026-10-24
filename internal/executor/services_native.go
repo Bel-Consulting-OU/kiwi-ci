@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,7 +23,9 @@ const nativeServiceEnvPrefix = "KIWI_SERVICE_"
 
 // nativePortClaims is the process-wide host-port ownership table for
 // native services. Two concurrent jobs (matrix variants) must not both
-// believe they own tcp:5432 on the same runner host.
+// believe they own tcp:5432 on the same runner host. This is NOT
+// host-wide across distinct runner processes; the pre-start dial still
+// catches foreign listeners.
 var nativePortClaims = struct {
 	sync.Mutex
 	byPort map[int]string
@@ -80,15 +83,31 @@ func (c *childProc) exitErr() error {
 
 // startNativeServices launches host-process services for a native job.
 //
-// Environment is whatever the executor already materialized (clean base +
-// job env); os.Environ() is never imported. workRoot is the job workspace.
-// Every service must declare a concrete ready port (validated in the
-// pipeline); the port is claimed in the process-wide registry before start.
-// Readiness races child exit so a port owned by some other process can
-// never certify the service Kiwi launched.
-func startNativeServices(ctx context.Context, jobID, workRoot string, baseEnv map[string]string, services []pipeline.Service, emit func(string)) (string, map[string]string, func() error, error) {
+// CONTRACT (transactional):
+//   - On error, every resource acquired during this call (child process,
+//     supervision handle, pipe, host-port claim) has already been rolled
+//     back before the error is returned. Callers must NOT invoke a
+//     returned cleanup after a non-nil error.
+//   - On success, the returned cleanup is idempotent and must run when the
+//     job finishes (it releases processes, supervision, and port claims).
+//
+// Environment is executor-materialized (never os.Environ()). Executables
+// resolve against that environment's PATH so the child cannot run a
+// different binary than the effective toolchain claims.
+// Readiness races child exit so a foreign listener cannot certify our child.
+// NativeServiceInfo is the durable identity of one started native service
+// recorded in the runner's runtime ledger for crash recovery.
+type NativeServiceInfo struct {
+	Name  string `json:"name"`
+	Port  int    `json:"port"`
+	PID   int    `json:"pid"`
+	PGID  int    `json:"pgid"`
+	Start string `json:"start,omitempty"`
+}
+
+func startNativeServices(ctx context.Context, jobID, workRoot string, baseEnv map[string]string, services []pipeline.Service, emit func(string)) (string, map[string]string, []NativeServiceInfo, func() error, error) {
 	if len(services) == 0 {
-		return "", nil, func() error { return nil }, nil
+		return "", nil, nil, func() error { return nil }, nil
 	}
 	type running struct {
 		svc     pipeline.Service
@@ -99,102 +118,123 @@ func startNativeServices(ctx context.Context, jobID, workRoot string, baseEnv ma
 	var procs []*running
 	env := map[string]string{}
 	claimed := []int{}
+	var once sync.Once
+	var cleanupErr error
 	cleanup := func() error {
-		var firstErr error
-		for i := len(procs) - 1; i >= 0; i-- {
-			p := procs[i]
-			if p.child != nil && p.child.cmd != nil {
-				_ = terminateProcess(p.child.cmd)
-				_ = killProcess(p.child.cmd)
-			}
-			if p.release != nil {
-				p.release()
-			}
-			if p.child != nil {
-				select {
-				case <-p.child.done:
-				case <-time.After(3 * time.Second):
-					if firstErr == nil {
-						firstErr = fmt.Errorf("native service %s did not exit after kill", p.svc.Name)
+		once.Do(func() {
+			var firstErr error
+			for i := len(procs) - 1; i >= 0; i-- {
+				p := procs[i]
+				if p.child != nil && p.child.cmd != nil {
+					_ = terminateProcess(p.child.cmd)
+					_ = killProcess(p.child.cmd)
+				}
+				if p.release != nil {
+					p.release()
+				}
+				if p.child != nil {
+					select {
+					case <-p.child.done:
+					case <-time.After(3 * time.Second):
+						if firstErr == nil {
+							firstErr = fmt.Errorf("native service %s did not exit after kill", p.svc.Name)
+						}
 					}
 				}
 			}
-		}
-		for _, port := range claimed {
-			releaseNativePort(port)
-		}
-		return firstErr
+			for _, port := range claimed {
+				releaseNativePort(port)
+			}
+			cleanupErr = firstErr
+		})
+		return cleanupErr
 	}
+	// Transactional: any error path rolls back before the caller sees it.
+	var err error
+	defer func() {
+		if err != nil {
+			_ = cleanup()
+		}
+	}()
+	var infos []NativeServiceInfo
+	fail := func(format string, a ...any) (string, map[string]string, []NativeServiceInfo, func() error, error) {
+		err = fmt.Errorf(format, a...)
+		return "", nil, nil, nil, err
+	}
+	failInfo := fail
 
 	for _, svc := range services {
 		if !svc.Native {
-			return "", nil, cleanup, fmt.Errorf("job %s service %s is not native; only native: true services can run on runtime native", jobID, svc.Name)
+			return failInfo("job %s service %s is not native; only native: true services can run on runtime native", jobID, svc.Name)
 		}
 		if len(svc.Command) == 0 {
-			return "", nil, cleanup, fmt.Errorf("job %s native service %s has no command", jobID, svc.Name)
+			return failInfo("job %s native service %s has no command", jobID, svc.Name)
 		}
 		probe, perr := pipeline.ParseReadyProbe(svc.Ready)
 		if perr != nil {
-			return "", nil, cleanup, fmt.Errorf("job %s native service %s: %w", jobID, svc.Name, perr)
+			return failInfo("job %s native service %s: %w", jobID, svc.Name, perr)
 		}
 		port := int(probe.Port)
 		owner := jobID + "/" + svc.Name
-		if err := claimNativePort(port, owner); err != nil {
-			return "", nil, cleanup, fmt.Errorf("job %s native service %s: %w", jobID, svc.Name, err)
+		if cerr := claimNativePort(port, owner); cerr != nil {
+			return failInfo("job %s native service %s: %w", jobID, svc.Name, cerr)
 		}
 		claimed = append(claimed, port)
 		// Fail early if something else already listens on the claimed port.
-		if conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), 200*time.Millisecond); err == nil {
+		if conn, derr := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), 200*time.Millisecond); derr == nil {
 			_ = conn.Close()
-			return "", nil, cleanup, fmt.Errorf("job %s native service %s: host port %d is already in use before start", jobID, svc.Name, port)
+			return failInfo("job %s native service %s: host port %d is already in use before start", jobID, svc.Name, port)
 		}
 
 		args := append([]string{}, svc.Command...)
+		// Resolve argv0 against the effective environment PATH (not the
+		// runner daemon's ambient PATH).
+		bin, rerr := lookPathWithEnv(args[0], baseEnv["PATH"])
+		if rerr != nil {
+			return failInfo("job %s native service %s: %w", jobID, svc.Name, rerr)
+		}
+		args[0] = bin
 		cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 		if workRoot != "" {
 			cmd.Dir = workRoot
 		} else {
 			cmd.Dir = os.TempDir()
 		}
-		// Executor-resolved environment only (never os.Environ).
 		cmd.Env = envMapToSlice(baseEnv)
 		for k, v := range svc.Env {
 			cmd.Env = append(cmd.Env, k+"="+v)
 		}
-		// PORT last so service.env cannot override the authoritative port.
 		cmd.Env = append(cmd.Env, fmt.Sprintf("PORT=%d", port))
 		configureProcess(cmd)
 
 		stdoutR, stdoutW, perr := os.Pipe()
 		if perr != nil {
-			return "", nil, cleanup, fmt.Errorf("job %s native service %s stdout pipe: %w", jobID, svc.Name, perr)
+			return failInfo("job %s native service %s stdout pipe: %w", jobID, svc.Name, perr)
 		}
 		stderrR, stderrW, perr := os.Pipe()
 		if perr != nil {
 			_ = stdoutR.Close()
 			_ = stdoutW.Close()
-			return "", nil, cleanup, fmt.Errorf("job %s native service %s stderr pipe: %w", jobID, svc.Name, perr)
+			return failInfo("job %s native service %s stderr pipe: %w", jobID, svc.Name, perr)
 		}
 		cmd.Stdout = stdoutW
 		cmd.Stderr = stderrW
 
-		if err := cmd.Start(); err != nil {
+		if serr := cmd.Start(); serr != nil {
 			_ = stdoutW.Close()
 			_ = stderrW.Close()
 			_ = stdoutR.Close()
 			_ = stderrR.Close()
-			return "", nil, cleanup, fmt.Errorf("job %s native service %s start %s: %w", jobID, svc.Name, args[0], err)
+			return failInfo("job %s native service %s start %s: %w", jobID, svc.Name, bin, serr)
 		}
-		// Parent closes writer ends so streamLines sees EOF when the child exits.
 		_ = stdoutW.Close()
 		_ = stderrW.Close()
 		if emit != nil {
-			logPrefix := func(s string) string { return s }
 			go streamLines(stdoutR, defaultMaxLine, func(line string) {
-				emit(logPrefix("[" + svc.Name + "/out] " + line))
+				emit("[" + svc.Name + "/out] " + line)
 			})
 			go streamLines(stderrR, defaultMaxLine, func(line string) {
-				emit(logPrefix("[" + svc.Name + "/err] " + line))
+				emit("[" + svc.Name + "/err] " + line)
 			})
 		} else {
 			go func() { _, _ = io.Copy(io.Discard, stdoutR) }()
@@ -204,7 +244,7 @@ func startNativeServices(ctx context.Context, jobID, workRoot string, baseEnv ma
 		release, serr := superviseChild(cmd)
 		if serr != nil {
 			_ = killProcess(cmd)
-			return "", nil, cleanup, fmt.Errorf("job %s native service %s supervise: %w", jobID, svc.Name, serr)
+			return failInfo("job %s native service %s supervise: %w", jobID, svc.Name, serr)
 		}
 		ch := &childProc{cmd: cmd, done: make(chan struct{})}
 		go ch.wait()
@@ -215,17 +255,51 @@ func startNativeServices(ctx context.Context, jobID, workRoot string, baseEnv ma
 		key := strings.ToUpper(sanitizeServiceEnv(svc.Name))
 		env[nativeServiceEnvPrefix+key+"_HOST"] = "127.0.0.1"
 		env[nativeServiceEnvPrefix+key+"_PORT"] = strconv.Itoa(port)
+		pgid := cmd.Process.Pid // Setpgid: child is group leader
+		infos = append(infos, NativeServiceInfo{
+			Name: svc.Name, Port: port,
+			PID: cmd.Process.Pid, PGID: pgid,
+			Start: processStartStamp(cmd.Process.Pid),
+		})
 	}
 
 	for _, p := range procs {
-		if err := waitNativeReady(ctx, p.svc.Ready, "127.0.0.1", p.port, p.child); err != nil {
-			return "", nil, cleanup, fmt.Errorf("job %s native service %s ready probe: %w", jobID, p.svc.Name, err)
+		if rerr := waitNativeReady(ctx, p.svc.Ready, "127.0.0.1", p.port, p.child); rerr != nil {
+			return failInfo("job %s native service %s ready probe: %w", jobID, p.svc.Name, rerr)
 		}
 		if emit != nil {
 			emit(fmt.Sprintf("ready %s (%s)", p.svc.Name, p.svc.Ready))
 		}
 	}
-	return "native-services", env, cleanup, nil
+	return "native-services", env, infos, cleanup, nil
+}
+
+// lookPathWithEnv resolves name against an explicit PATH (colon-separated),
+// like exec.LookPath but never consulting the process ambient environment.
+func lookPathWithEnv(name, pathEnv string) (string, error) {
+	if name == "" {
+		return "", fmt.Errorf("empty executable name")
+	}
+	if strings.ContainsRune(name, os.PathSeparator) || (len(name) > 1 && name[1] == ':') {
+		// Absolute or explicit relative path: use as-is if executable.
+		if st, err := os.Stat(name); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
+			return name, nil
+		}
+		return "", fmt.Errorf("executable %s not found or not executable", name)
+	}
+	if pathEnv == "" {
+		pathEnv = "/usr/local/bin:/usr/bin:/bin"
+	}
+	for _, dir := range filepath.SplitList(pathEnv) {
+		if dir == "" {
+			continue
+		}
+		cand := filepath.Join(dir, name)
+		if st, err := os.Stat(cand); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
+			return cand, nil
+		}
+	}
+	return "", fmt.Errorf("%s not found on execution PATH %q", name, pathEnv)
 }
 
 func envMapToSlice(m map[string]string) []string {
@@ -334,4 +408,29 @@ func readyProbePort(probe string) (int, bool) {
 		return 0, false
 	}
 	return int(p.Port), true
+}
+
+// processStartStamp is a best-effort identity for a live PID so crash
+// recovery can refuse to kill a recycled PID. Linux uses /proc starttime;
+// other Unixes fall back to `ps -o start=`.
+func processStartStamp(pid int) string {
+	if pid <= 0 {
+		return ""
+	}
+	if b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid)); err == nil {
+		s := string(b)
+		if i := strings.LastIndex(s, ")"); i >= 0 {
+			fields := strings.Fields(s[i+1:])
+			// fields[0] is state after comm; starttime is the 20th field
+			// after comm (index 19 in this slice).
+			if len(fields) > 19 {
+				return "t:" + fields[19]
+			}
+		}
+	}
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "start=").Output()
+	if err == nil {
+		return "ps:" + strings.TrimSpace(string(out))
+	}
+	return ""
 }

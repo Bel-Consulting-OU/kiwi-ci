@@ -1651,7 +1651,9 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// require image references pinned by digest. The untrusted floor is
 	// unconditional here: nothing may override RequireImmutableImages for
 	// an untrusted job.
-	opts := executor.Options{Workspace: tmp, RunID: t.Job.RunID, RunnerID: r.ID, InstanceID: r.instanceID, Event: t.Job.Event, Branch: branchFromRef(t.Job.Ref), ChangedFiles: resolvedChangedFiles, ChangedFilesKnown: changedFilesKnown, SecretProvider: provider, Logs: logging.Func(func(job, step, line string) { sink.WriteLine(job, step, line) }), Cache: cacheStore, Artifacts: artifactStore, ArtifactReporter: reporter, DependencyStatus: t.Job.DependencyStatus, NeedsOutputs: t.Job.NeedsOutputs, CacheNamespace: cacheNamespace(t.Job), LifecycleContext: parent, OnCgroupCreated: func(parent string) error { return r.ledgerSetCgroup(ledgerID, parent) }, RequireJobCgroup: t.JobCgroup, AllowRootfulUntrusted: r.AllowRootfulUntrusted}
+	opts := executor.Options{Workspace: tmp, RunID: t.Job.RunID, RunnerID: r.ID, InstanceID: r.instanceID, Event: t.Job.Event, Branch: branchFromRef(t.Job.Ref), ChangedFiles: resolvedChangedFiles, ChangedFilesKnown: changedFilesKnown, SecretProvider: provider, Logs: logging.Func(func(job, step, line string) { sink.WriteLine(job, step, line) }), Cache: cacheStore, Artifacts: artifactStore, ArtifactReporter: reporter, DependencyStatus: t.Job.DependencyStatus, NeedsOutputs: t.Job.NeedsOutputs, CacheNamespace: cacheNamespace(t.Job), LifecycleContext: parent, OnCgroupCreated: func(parent string) error { return r.ledgerSetCgroup(ledgerID, parent) }, OnNativeServices: func(_ string, svcs []executor.NativeServiceInfo) error {
+		return r.ledgerSetNativeServices(ledgerID, svcs)
+	}, RequireJobCgroup: t.JobCgroup, AllowRootfulUntrusted: r.AllowRootfulUntrusted}
 	if artifactStore != nil {
 		// Capture is bounded by the job context while it is alive (so a job
 		// that exceeds its declared lifetime stops publishing) and by the

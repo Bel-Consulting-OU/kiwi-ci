@@ -49,7 +49,46 @@ func RunLocal(ctx context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	spec, err := pipeline.Load(*file)
+	wd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	// ONE run identity: freeze the working tree BEFORE loading the
+	// pipeline, compiling, or reading Git metadata. Every later fact
+	// (pipeline, image lock, graph, SHA/ref/branch, changed files, job
+	// workspaces) is derived from that frozen run-base so a single
+	// `kiwi run` cannot execute source state B with pipeline state A
+	// while claiming Git state C.
+	wm, err := workspace.NewManager(wd)
+	if err != nil {
+		return err
+	}
+	defer wm.Close()
+	if err := wm.Freeze(ctx); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("run cancelled: %w", ctx.Err())
+		}
+		return err
+	}
+	baseDir := wm.BasePath()
+	// Prefer the pipeline bytes as frozen in the run-base when the file
+	// lives under the working tree.
+	fileToLoad := *file
+	if baseDir != "" {
+		if abs, aerr := filepath.Abs(*file); aerr == nil {
+			if rel, rerr := filepath.Rel(wd, abs); rerr == nil && !strings.HasPrefix(rel, "..") {
+				if frozen := filepath.Join(baseDir, rel); fileExists(frozen) {
+					fileToLoad = frozen
+				}
+			}
+		}
+	}
+	// Git/changed-file discovery uses the frozen tree, not the live one.
+	gitDir := wd
+	if baseDir != "" {
+		gitDir = baseDir
+	}
+	spec, err := pipeline.Load(fileToLoad)
 	if err != nil {
 		return err
 	}
@@ -86,26 +125,6 @@ func RunLocal(ctx context.Context, args []string) error {
 			return fmt.Errorf("job %q references component %q, which requires the control plane: run it through kiwi dispatch/server", cj.ID, cj.Job.Component)
 		}
 	}
-	wd, err := os.Getwd()
-	if err != nil {
-		return err
-	}
-	// Local runs get per-job workspaces: parallel matrix jobs must never
-	// share one checkout. The manager snapshots the current directory for
-	// each job and cleans every workspace up when the run finishes.
-	wm, err := workspace.NewManager(wd)
-	if err != nil {
-		return err
-	}
-	defer wm.Close()
-	// One immutable run-base for every job in this run: later source-tree
-	// edits cannot change what job A already staged vs job B.
-	if err := wm.Freeze(ctx); err != nil {
-		if ctx.Err() != nil {
-			return fmt.Errorf("run cancelled: %w", ctx.Err())
-		}
-		return err
-	}
 	runID, err := newLocalRunID()
 	if err != nil {
 		return err
@@ -113,21 +132,21 @@ func RunLocal(ctx context.Context, args []string) error {
 	masker := &secrets.Masker{}
 	logs := &logging.Console{Writer: os.Stdout, Masker: masker}
 	provider := secrets.Chain{secrets.EnvProvider{Prefix: "KIWI_SECRET_"}, secrets.MacKeychainProvider{Service: "kiwi-ci"}}
-	repoURL, repoFullName := detectGitRepo(wd)
+	repoURL, repoFullName := detectGitRepo(gitDir)
 	explicitChanged := *changedFile
 	if explicitChanged == "" {
 		explicitChanged = *changedFiles
 	}
-	changedList, changedKnown := detectChangedFilesOpts(wd, *base, *head, *mergeBase, explicitChanged)
+	changedList, changedKnown := detectChangedFilesOpts(gitDir, *base, *head, *mergeBase, explicitChanged)
 	opts := executor.Options{Workspace: wd, WorkspaceFor: func(jobID string) (string, func(), error) { return wm.Prepare(ctx, jobID) }, RunID: runID, MaxParallel: *parallel, OnlyJob: *job, ChangedFiles: changedList, ChangedFilesKnown: changedKnown, SecretProvider: provider, Logs: logs, RepoURL: repoURL, RepoFullName: repoFullName,
 		// Local parity: job conditions evaluate against the same branch and
 		// event context `kiwi explain --why` uses (the git-detected branch,
 		// push event), so a branch/event condition cannot silently diverge
 		// between explain, local runs and the control plane.
-		Branch: detectCurrentBranch(wd),
+		Branch: detectCurrentBranch(gitDir),
 		Event:  "push",
-		GitSHA: detectGitSHA(wd),
-		GitRef: detectGitRef(wd),
+		GitSHA: detectGitSHA(gitDir),
+		GitRef: detectGitRef(gitDir),
 		// Declared dependency downloads are restored from this run's local
 		// artifact store (the distributed runner restores them through the
 		// control plane).
@@ -401,3 +420,8 @@ func defaultString(s, d string) string {
 }
 
 var _ = filepath.Separator
+
+func fileExists(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && !st.IsDir()
+}

@@ -50,6 +50,9 @@ type Options struct {
 	// as it exists so the caller (the runner's runtime ledger) can reclaim it
 	// after a hard crash.
 	OnCgroupCreated func(parent string) error
+	// OnNativeServices receives durable native-service identity after a
+	// successful start so the runner can record it in the crash ledger.
+	OnNativeServices func(jobID string, svcs []NativeServiceInfo) error
 	// RequireJobCgroup makes the job-scoped parent cgroup MANDATORY for a
 	// job whose runtime starts services: when the setup seam reports it
 	// unavailable, the job fails with an infra error BEFORE any service or
@@ -933,7 +936,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		return finish(res)
 	}
 	if RuntimeMayRunNativeServices(cj.Job.Runtime, cj.Job.Services) && len(cj.Job.Services) > 0 {
-		net, nativeEnv, cleanupNS, nerr := startNativeServices(ctx, cj.ID, workRoot, serviceEnvFor(jobEnv, jobSecrets), cj.Job.Services, func(line string) { e.log(cj.ID, "service", line) })
+		net, nativeEnv, natInfos, cleanupNS, nerr := startNativeServices(ctx, cj.ID, workRoot, serviceEnvFor(jobEnv, jobSecrets), cj.Job.Services, func(line string) { e.log(cj.ID, "service", line) })
 		if nerr != nil {
 			res.Status = model.StatusFailure
 			res.Error = nerr.Error()
@@ -941,6 +944,17 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		}
 		network = net
 		cleanupServices = cleanupNS
+		if e.Opt.OnNativeServices != nil && len(natInfos) > 0 {
+			if lerr := e.Opt.OnNativeServices(cj.ID, natInfos); lerr != nil {
+				// Tear down already-started services before failing the job.
+				if cleanupServices != nil {
+					_ = cleanupServices()
+				}
+				res.Status = model.StatusFailure
+				res.Error = fmt.Sprintf("record native service ownership: %v", lerr)
+				return finish(res)
+			}
+		}
 		for k, v := range nativeEnv {
 			jobEnv[k] = v
 		}
