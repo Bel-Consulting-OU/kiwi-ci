@@ -933,7 +933,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		return finish(res)
 	}
 	if RuntimeMayRunNativeServices(cj.Job.Runtime, cj.Job.Services) && len(cj.Job.Services) > 0 {
-		net, nativeEnv, cleanupNS, nerr := startNativeServices(ctx, cj.ID, workRoot, jobEnv, cj.Job.Services, func(line string) { e.log(cj.ID, "service", line) })
+		net, nativeEnv, cleanupNS, nerr := startNativeServices(ctx, cj.ID, workRoot, serviceEnvFor(jobEnv, jobSecrets), cj.Job.Services, func(line string) { e.log(cj.ID, "service", line) })
 		if nerr != nil {
 			res.Status = model.StatusFailure
 			res.Error = nerr.Error()

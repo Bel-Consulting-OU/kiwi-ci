@@ -116,3 +116,23 @@ func TestRuntimeMayRunNativeServices(t *testing.T) {
 	_ = filepath.Join
 	_ = os.TempDir
 }
+
+func TestServiceEnvForStripsJobSecrets(t *testing.T) {
+	jobEnv := map[string]string{
+		"PATH":                     "/usr/bin",
+		"GITHUB_TOKEN":             "gh-secret",
+		"KIWI_SECRET_GITHUB_TOKEN": "gh-secret",
+		"SAFE":                     "ok",
+	}
+	secrets := map[string]string{"GITHUB_TOKEN": "gh-secret"}
+	svc := serviceEnvFor(jobEnv, secrets)
+	if _, ok := svc["GITHUB_TOKEN"]; ok {
+		t.Fatal("job secret bare name leaked into native service env")
+	}
+	if _, ok := svc["KIWI_SECRET_GITHUB_TOKEN"]; ok {
+		t.Fatal("KIWI_SECRET_* leaked into native service env")
+	}
+	if svc["SAFE"] != "ok" || svc["PATH"] != "/usr/bin" {
+		t.Fatalf("non-secret env lost: %v", svc)
+	}
+}

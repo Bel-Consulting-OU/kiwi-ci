@@ -64,6 +64,24 @@ func mergeEnvMap(base map[string]string, maps ...map[string]string) map[string]s
 	return out
 }
 
+// serviceEnvFor builds the environment native sidecar processes receive:
+// the job env minus every resolved secret key (both KIWI_SECRET_* and the
+// bare declared name). Repository-controlled services must not inherit
+// job secrets just because they share the job's environment map.
+func serviceEnvFor(jobEnv, jobSecrets map[string]string) map[string]string {
+	out := make(map[string]string, len(jobEnv))
+	for k, v := range jobEnv {
+		out[k] = v
+	}
+	for k := range jobSecrets {
+		delete(out, k)
+		if secret := secretEnvName(k); secret != k {
+			delete(out, secret)
+		}
+	}
+	return out
+}
+
 // envSlice converts an env map to a sorted KEY=VALUE slice suitable for
 // exec.Cmd.Env.
 func envSlice(m map[string]string) []string {

@@ -139,7 +139,11 @@ func (m *Manager) freezeLocked(ctx context.Context) error {
 		return fmt.Errorf("run base: read source: %w", err)
 	}
 	base := filepath.Join(m.Root, "run-base")
-	strategy, err := m.snapshotFrom(ctx, m.Source, base)
+	// Freeze ALWAYS uses a plain working-tree copy (never the opt-in
+	// worktree strategy): run-base must match the developer's source
+	// listing including ignored/untracked files, and a worktree of HEAD
+	// would silently drop them before any job runs.
+	strategy, err := m.snapshotFrom(ctx, m.Source, base, true)
 	if err != nil {
 		_ = os.RemoveAll(base)
 		return fmt.Errorf("run base snapshot: %w", err)
@@ -201,7 +205,7 @@ func (m *Manager) Prepare(ctx context.Context, jobID string) (string, func(), er
 		}
 		srcPath = m.Source
 	}
-	strategy, err := m.snapshotFrom(ctx, srcPath, target)
+	strategy, err := m.snapshotFrom(ctx, srcPath, target, false)
 	if err != nil {
 		_ = os.RemoveAll(target)
 		return "", nil, fmt.Errorf("prepare workspace for %q: %w", jobID, err)
@@ -212,7 +216,10 @@ func (m *Manager) Prepare(ctx context.Context, jobID string) (string, func(), er
 	}
 	switch strategy {
 	case "worktree":
-		return target, func() { removeWorktree(m.Source, target) }, nil
+		// Worktree was created from the snapshot source (run-base or the
+		// live source), not always m.Source — cleanup must match.
+		wtSrc := srcPath
+		return target, func() { removeWorktree(wtSrc, target) }, nil
 	default:
 		return target, func() { _ = os.RemoveAll(target) }, nil
 	}
@@ -293,13 +300,14 @@ var snapshotCopyTree = copyTree
 // into the clean-tree `git worktree add` snapshot (committed files only).
 const workspaceStrategyEnv = "KIWI_WORKSPACE_STRATEGY"
 
-func (m *Manager) snapshotFrom(ctx context.Context, src, target string) (string, error) {
+func (m *Manager) snapshotFrom(ctx context.Context, src, target string, forceCopy bool) (string, error) {
 	// K15: staging must be deterministic. The historical clean-tree
 	// worktree path dropped ignored files (.env) and untracked files, so
 	// two identical probes flipped between a full working copy and a
 	// committed-only tree (and, under git races, worse). copyTree is the
-	// default for every local run. The worktree path is opt-in only.
-	if os.Getenv(workspaceStrategyEnv) == "worktree" && gitRepo(ctx, src) {
+	// default for every local run. The worktree path is opt-in only and
+	// never used for the run-base freeze (forceCopy).
+	if !forceCopy && os.Getenv(workspaceStrategyEnv) == "worktree" && gitRepo(ctx, src) {
 		clean, err := gitStatusClean(ctx, src)
 		if err == nil && clean {
 			cmd := exec.CommandContext(ctx, "git", "-C", src, "worktree", "add", "--detach", target, "HEAD")

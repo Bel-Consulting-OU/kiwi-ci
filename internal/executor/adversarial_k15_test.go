@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -453,3 +454,38 @@ func TestNativePortClaimConflicts(t *testing.T) {
 		t.Fatalf("second claim = %v", err)
 	}
 }
+
+// After a failed native start, the host-port claim must be released so a
+// subsequent job can own the same port.
+func TestNativePortReleasedAfterFailedStart(t *testing.T) {
+	const port = 6412
+	// Occupy the port so pre-start dial succeeds and start fails...
+	// Actually pre-start dial fails closed with already in use - that path
+	// must also release. Simulate via claim + cleanup from a failed start.
+	// Direct: claim then release then claim again after a failed job's cleanup.
+	ln, err := net.Listen("tcp", "127.0.0.1:"+itoa(port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	svc := pipeline.Service{
+		Name:    "busy",
+		Native:  true,
+		Ready:   "tcp:" + itoa(port),
+		Command: []string{"python3", "-c", "import time; time.sleep(5)"},
+	}
+	_, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), nil, []pipeline.Service{svc}, nil)
+	if cleanup != nil {
+		_ = cleanup()
+	}
+	if err == nil {
+		t.Fatal("occupied port must fail start")
+	}
+	// Claim must be free again.
+	if err := claimNativePort(port, "other/redis"); err != nil {
+		t.Fatalf("claim after failed start: %v", err)
+	}
+	releaseNativePort(port)
+}
+
+func itoa(n int) string { return strconv.Itoa(n) }
