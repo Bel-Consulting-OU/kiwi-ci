@@ -100,8 +100,8 @@ workflow:
 
 ```
 compat/woodpecker/<name>/
-    .woodpecker.yml     # source workflow
-    expected.json       # normalized Kiwi outcome trace (schema below)
+    source.yml         # upstream Woodpecker workflow text
+    expected.json      # normalized Kiwi outcome trace (schema below)
 ```
 
 The machine-checked claim is: importing the source and compiling it in Kiwi

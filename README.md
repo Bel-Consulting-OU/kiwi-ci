@@ -94,6 +94,7 @@ Check the host, then validate and run the example pipeline:
 ./kiwi doctor
 ./kiwi validate -f examples/kiwi.yaml
 ./kiwi explain --why test -f examples/kiwi.yaml
+./kiwi test
 ./kiwi run -f examples/kiwi.yaml
 ```
 
@@ -268,7 +269,9 @@ Manual dispatch:
 ## CLI overview
 
 ```
-kiwi init | run | validate | explain [--why JOB] | doctor
+kiwi init | run | validate | test [--fixtures DIR]
+kiwi explain [--why JOB] [--changed-files a,b]
+kiwi doctor [--pipeline FILE] [--required-checks FILE] [--install-toolchains]
 kiwi up [--listen ADDR] [--data-dir DIR] [--token TOKEN] [--labels L]
 kiwi server [--mode dev|production] [--config kiwi.toml]
 kiwi config check | kiwi database migrate|status

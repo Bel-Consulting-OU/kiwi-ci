@@ -76,6 +76,7 @@ jobs:
 | `concurrency` | object | Run-level concurrency group. |
 | `packages` | map | Declared monorepo packages with paths and dependencies. |
 | `components` | map | Component references (`ref`, `with`). |
+| `toolchains` | map | Named host tools (`version`, `command`, `path`, optional `install`) for native jobs. |
 | `jobs` | map | Required. At least one job. |
 
 ## Jobs
@@ -119,7 +120,13 @@ A job has a `steps` list (required, at least one step) plus:
 
 - `paths`, `paths_ignore` — glob filters over the event's changed files.
 
-- `services` — sidecar containers (see below).
+- `services` — sidecar containers or native host processes (see below).
+
+- `tools` — host fingerprints (`name=version-prefix`) checked before step 1.
+
+- `toolchains` — names from top-level `toolchains` verified on the host
+  before step 1 (native jobs only; container and tart jobs bake tools
+  into the image).
 
 - `cache` — cache restore/save declarations.
 
@@ -212,6 +219,17 @@ per-runtime default (`sh` for containers, `bash` for Tart, `pwsh` on
 native Windows, `bash` otherwise). Allowed names: `bash`, `sh`, `zsh`,
 `pwsh`, `powershell`, `fish`, `dash`, `ksh`, `python`.
 
+Changed-file context is always injected:
+
+| Variable | Meaning |
+|---|---|
+| `KIWI_CHANGED_FILES` | Newline-separated workspace-relative paths. |
+| `KIWI_CHANGED_COUNT` | Decimal count of those paths. |
+| `KIWI_CHANGED_JSON` | Object `{"paths":[...],"count":N}` (empty list, never `null`). |
+
+Local runs accept `--changed-files a,b,c` (alias `--changed-file`).
+`kiwi explain --why JOB --changed-files a,b` overrides git detection.
+
 Alpine (and other bash-less) images must use `shell: sh` — or rely on
 the container default, which is already `sh`. A pipeline-level
 `defaults.shell: bash` will break those images.
@@ -261,6 +279,48 @@ Untrusted pipelines may declare at most **8 services per job**.
 A ninth service is rejected at admission — before the run is signed, persisted or queued — with `400` and reason `untrusted_service_ceiling_exceeded`.
  the executor additionally re-checks the same ceiling immediately before it starts any service container, so a job can never reach execution with an unenforceable service fan-out.
 Trusted pipelines keep the absolute `32`-service limit.
+
+#### Native services
+
+`runtime: native` jobs may declare host processes instead of containers:
+
+```yaml
+services:
+  - name: redis
+    native: true
+    command: ["redis-server", "--port", "6379"]
+    ready: "tcp:6379"
+```
+
+The executor starts each command on the host, sets `PORT` when the
+ready probe names a port (otherwise an ephemeral port), waits for
+`ready` (`tcp:N` or `http:N/path`), and tears every process group down
+with the job. Each service publishes `KIWI_SERVICE_<NAME>_HOST` and
+`KIWI_SERVICE_<NAME>_PORT`. `native: true` is refused when the job
+runtime is not native. Container services still require `image`.
+
+#### Host toolchains
+
+Top-level `toolchains` pins native tools so a job does not depend on
+whatever the host happens to ship:
+
+```yaml
+toolchains:
+  go:
+    version: "go1.28"
+    command: ["go", "version"]
+jobs:
+  test:
+    toolchains: [go]
+    steps:
+      - run: go test ./...
+```
+
+`kiwi doctor --pipeline FILE` checks every pin. Optional `install`
+blocks (`url`, `sha256`, `bin`, format `raw`) bootstrap into
+`~/.kiwi/tools` with `kiwi doctor --install-toolchains`. The executor
+fails closed before step 1 when a named toolchain is missing or its
+version does not match.
 
 
 ### Resources
@@ -340,12 +400,16 @@ artifacts:
 downloads:
   - from: build
     name: app
-    path: .
+    path: .           # extract directory under the workspace
+    if: failure()     # optional; restore only after the job fails
 ```
 
-`downloads.from` must be a declared `needs` dependency. Retention
-accepts Go durations or `forever`/`infinite`/`never`. See
-[artifacts.md](artifacts.md).
+`downloads.from` must be a declared `needs` dependency. `path` is the
+extract directory (the archive members appear beneath it). Empty `if`,
+`success()`, or `always()` restore during setup; `failure()` restores
+after a non-success job status so green runs never pull failure-only
+payloads. Retention accepts Go durations or
+`forever`/`infinite`/`never`. See [artifacts.md](artifacts.md).
 
 ### Deployment
 
