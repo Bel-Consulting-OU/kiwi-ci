@@ -110,7 +110,8 @@ func RunLocal(ctx context.Context, args []string) error {
 	if explicitChanged == "" {
 		explicitChanged = *changedFiles
 	}
-	opts := executor.Options{Workspace: wd, WorkspaceFor: func(jobID string) (string, func(), error) { return wm.Prepare(ctx, jobID) }, RunID: runID, MaxParallel: *parallel, OnlyJob: *job, ChangedFiles: detectChangedFilesOpts(wd, *base, *head, *mergeBase, explicitChanged), SecretProvider: provider, Logs: logs, RepoURL: repoURL, RepoFullName: repoFullName,
+	changedList, changedKnown := detectChangedFilesOpts(wd, *base, *head, *mergeBase, explicitChanged)
+	opts := executor.Options{Workspace: wd, WorkspaceFor: func(jobID string) (string, func(), error) { return wm.Prepare(ctx, jobID) }, RunID: runID, MaxParallel: *parallel, OnlyJob: *job, ChangedFiles: changedList, ChangedFilesKnown: changedKnown, SecretProvider: provider, Logs: logs, RepoURL: repoURL, RepoFullName: repoFullName,
 		// Local parity: job conditions evaluate against the same branch and
 		// event context `kiwi explain --why` uses (the git-detected branch,
 		// push event), so a branch/event condition cannot silently diverge
@@ -292,13 +293,15 @@ func explainGraph(out io.Writer, g *pipeline.Graph, workspace string) error {
 }
 
 func detectChangedFiles(workspace string) []string {
-	return detectChangedFilesOpts(workspace, "", "HEAD", "", "")
+	files, _ := detectChangedFilesOpts(workspace, "", "HEAD", "", "")
+	return files
 }
 
 // detectChangedFilesOpts resolves the changed-file list from explicit input
-// or git. For PR/MR execution forge changed-file data is authoritative; these
-// flags cover local parity.
-func detectChangedFilesOpts(workspace, base, head, mergeBase, changedFile string) []string {
+// or git. known is false when git could not produce a trustworthy diff
+// (shallow history, missing HEAD~1, bad --base). Callers must treat
+// known=false as "unknown", never as "empty".
+func detectChangedFilesOpts(workspace, base, head, mergeBase, changedFile string) ([]string, bool) {
 	if strings.TrimSpace(changedFile) != "" {
 		var out []string
 		for _, s := range strings.Split(changedFile, ",") {
@@ -306,12 +309,12 @@ func detectChangedFilesOpts(workspace, base, head, mergeBase, changedFile string
 				out = append(out, s)
 			}
 		}
-		return out
+		return out, true
 	}
 	if mergeBase != "" {
 		b, err := exec.Command("git", "-C", workspace, "merge-base", "HEAD", mergeBase).Output()
 		if err != nil {
-			return nil
+			return nil, false
 		}
 		base = strings.TrimSpace(string(b))
 	}
@@ -321,7 +324,9 @@ func detectChangedFilesOpts(workspace, base, head, mergeBase, changedFile string
 	cmd := exec.Command("git", "-C", workspace, "diff", "--name-only", base, head)
 	b, err := cmd.Output()
 	if err != nil {
-		return nil
+		// Single-commit repos, shallow clones, bad --base, non-git dirs:
+		// the diff is unknown, not empty.
+		return nil, false
 	}
 	var out []string
 	for _, s := range strings.Split(string(b), "\n") {
@@ -329,7 +334,7 @@ func detectChangedFilesOpts(workspace, base, head, mergeBase, changedFile string
 			out = append(out, s)
 		}
 	}
-	return out
+	return out, true
 }
 
 // parseCSVPaths splits a comma-separated path list (explain --changed-files).

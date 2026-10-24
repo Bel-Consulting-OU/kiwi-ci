@@ -21,8 +21,11 @@ const nativeServiceEnvPrefix = "KIWI_SERVICE_"
 // startNativeServices launches host-process services for a native job,
 // waits for each readiness probe, and returns a teardown that kills every
 // process group. Failures are loud: a service that never becomes ready
-// fails the job before step 1.
-func startNativeServices(ctx context.Context, jobID string, services []pipeline.Service, emit func(string)) (string, map[string]string, func() error, error) {
+// fails the job before step 1. workRoot is the job workspace (services
+// start there so relative command paths resolve like the job's steps).
+// Every native service must declare a ready probe with a concrete port;
+// Kiwi never allocates an ephemeral port (TOCTOU free).
+func startNativeServices(ctx context.Context, jobID string, workRoot string, services []pipeline.Service, emit func(string)) (string, map[string]string, func() error, error) {
 	if len(services) == 0 {
 		return "", nil, func() error { return nil }, nil
 	}
@@ -65,20 +68,19 @@ func startNativeServices(ctx context.Context, jobID string, services []pipeline.
 			return "", nil, cleanup, fmt.Errorf("job %s native service %s has no command", jobID, svc.Name)
 		}
 		// Prefer an explicit port from the ready probe (tcp:N / http:N/...).
-		// Otherwise allocate an ephemeral port and publish it as PORT.
-		// Probing a declared 6399 while the process was told PORT=ephemeral
-		// (or the reverse) is how services timed out forever.
+		// Validation requires that port for native services so there is no
+		// ephemeral free-port TOCTOU.
 		port, hasDeclared := readyProbePort(svc.Ready)
 		if !hasDeclared {
-			p, perr := freeTCPPort()
-			if perr != nil {
-				return "", nil, cleanup, fmt.Errorf("job %s native service %s allocate port: %w", jobID, svc.Name, perr)
-			}
-			port = p
+			return "", nil, cleanup, fmt.Errorf("job %s native service %s: ready probe must declare a concrete port (tcp:<port> or http:<port>/<path>)", jobID, svc.Name)
 		}
 		args := append([]string{}, svc.Command...)
 		cmd := exec.CommandContext(ctx, args[0], args[1:]...)
-		cmd.Dir = os.TempDir()
+		if workRoot != "" {
+			cmd.Dir = workRoot
+		} else {
+			cmd.Dir = os.TempDir()
+		}
 		cmd.Env = append(os.Environ(), fmt.Sprintf("PORT=%d", port))
 		// User env is applied AFTER PORT so an explicit PORT= in service.env
 		// would override Kiwi's authoritative port. Re-apply PORT last so the
@@ -209,15 +211,6 @@ func waitNativeReady(ctx context.Context, probe, host string, port int) error {
 		}
 	}
 	return fmt.Errorf("timed out after %s: %w", serviceReadyTimeout, lastErr)
-}
-
-func freeTCPPort() (int, error) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
-	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port, nil
 }
 
 func sanitizeServiceEnv(name string) string {

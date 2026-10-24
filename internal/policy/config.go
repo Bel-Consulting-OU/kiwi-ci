@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 
@@ -157,11 +158,20 @@ func Load(path string) (*Config, error) {
 	if len(data) > 1<<20 {
 		return nil, fmt.Errorf("policy: file exceeds 1 MiB")
 	}
-	// policy.toml is TOML; also accept YAML for hand-edited files. Detect
-	// by trying YAML first only when the file does not look like TOML
-	// (bare `key =` or `[section]` lines).
+	// Format is chosen by extension first (deterministic), then by content
+	// sniffing only when the extension is not .toml/.yaml/.yml.
+	ext := strings.ToLower(filepath.Ext(path))
 	var root yaml.Node
-	if looksLikeTOML(data) {
+	useTOML := false
+	switch ext {
+	case ".toml":
+		useTOML = true
+	case ".yaml", ".yml":
+		useTOML = false
+	default:
+		useTOML = looksLikeTOML(data)
+	}
+	if useTOML {
 		cfg, err := loadTOML(data)
 		if err != nil {
 			return nil, fmt.Errorf("policy: %w", err)

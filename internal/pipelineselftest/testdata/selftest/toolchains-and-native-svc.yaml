@@ -13,7 +13,7 @@ jobs:
     services:
       - name: echo
         native: true
-        command: ["sleep", "30"]
-        ready: ""
+        command: ["python3", "-c", "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6405)); s.listen(1); time.sleep(30)"]
+        ready: "tcp:6405"
     steps:
       - run: "echo $KIWI_SERVICE_ECHO_HOST"

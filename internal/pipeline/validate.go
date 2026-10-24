@@ -761,6 +761,18 @@ func validateService(jobID string, svc *Service) error {
 	if strings.TrimSpace(svc.Image) == "" && !svc.Native {
 		return fmt.Errorf("job %q service %q has empty image", jobID, svc.Name)
 	}
+	if svc.Ready != "" {
+		if err := validateReadyProbe(svc.Ready); err != nil {
+			return fmt.Errorf("job %q service %q: %w", jobID, svc.Name, err)
+		}
+	}
+	if svc.Native {
+		// Native services need a concrete port in the ready probe so Kiwi
+		// never races an ephemeral free-port bind against another process.
+		if _, ok := readyProbePort(svc.Ready); !ok {
+			return fmt.Errorf("job %q native service %q must declare ready as tcp:<port> or http:<port>/<path> (no ephemeral port race)", jobID, svc.Name)
+		}
+	}
 	if err := validateDuration(svc.Interval, fmt.Sprintf("job %q service %q interval", jobID, svc.Name)); err != nil {
 		return err
 	}

@@ -773,7 +773,9 @@ func TestRunJobConditionAndPathBranches(t *testing.T) {
 	if res.Status != model.StatusSkipped {
 		t.Fatalf("false condition = %+v", res)
 	}
-	// Path filters skip the job and log the reason.
+	// Known-empty path filters skip the job; unknown diffs must not (see
+	// TestUnknownChangedFilesRunsPathJob).
+	ex = &Executor{Opt: Options{Workspace: ws, Logs: sink, RunID: "r", ChangedFiles: nil, ChangedFilesKnown: true}, Masker: &secrets.Masker{}}
 	res = ex.runJob(context.Background(), &pipeline.Spec{}, pipeline.CompiledJob{
 		ID: "j", Job: pipeline.Job{Paths: []string{"src/**"}, Steps: []pipeline.Step{{Run: "true"}}},
 	}, model.StatusSuccess, nil)

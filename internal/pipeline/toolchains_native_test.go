@@ -80,6 +80,7 @@ jobs:
       - name: redis
         native: true
         command: ["redis-server"]
+        ready: "tcp:6379"
     steps:
       - run: "true"
 `))

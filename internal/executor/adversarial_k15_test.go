@@ -169,6 +169,7 @@ jobs:
     services:
       - name: nope
         native: true
+        ready: "tcp:6404"
         command: ["kiwi-definitely-missing-svc-bin-xyz"]
     steps:
       - name: must-not-run
@@ -271,9 +272,10 @@ func TestNativeServiceTeardownReapsPID(t *testing.T) {
 	svc := pipeline.Service{
 		Name:    "sleeper",
 		Native:  true,
-		Command: []string{"sleep", "120"},
+		Ready:   "tcp:6403",
+		Command: []string{"python3", "-c", "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6403)); s.listen(1); time.sleep(120)"},
 	}
-	_, env, cleanup, err := startNativeServices(context.Background(), "j", []pipeline.Service{svc}, func(string) {})
+	_, env, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), []pipeline.Service{svc}, func(string) {})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -322,7 +324,7 @@ func TestNativeServiceHonorsDeclaredReadyPort(t *testing.T) {
 		Command: []string{"python3", "-c", "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6399)); s.listen(1); time.sleep(60)"},
 		Ready:   "tcp:6399",
 	}
-	_, env, cleanup, err := startNativeServices(context.Background(), "j", []pipeline.Service{svc}, func(string) {})
+	_, env, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), []pipeline.Service{svc}, func(string) {})
 	if err != nil {
 		t.Fatalf("startNativeServices: %v", err)
 	}
@@ -341,11 +343,57 @@ func TestNativeServicesSameReadyPortFailsLoudly(t *testing.T) {
 	// 200ms liveness window must catch the death).
 	svcB := pipeline.Service{Name: "b", Native: true,
 		Command: []string{"python3", "-c", "import socket; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('127.0.0.1',6401))"}}
-	_, _, cleanup, err := startNativeServices(context.Background(), "j", []pipeline.Service{svcA, svcB}, func(string) {})
+	_, _, cleanup, err := startNativeServices(context.Background(), "j", t.TempDir(), []pipeline.Service{svcA, svcB}, func(string) {})
 	if cleanup != nil {
 		defer cleanup()
 	}
 	if err == nil {
 		t.Fatal("second service on occupied tcp:6401 must fail")
+	}
+}
+
+// Unknown changed-file set must not silently skip a path-restricted job.
+func TestUnknownChangedFilesRunsPathJob(t *testing.T) {
+	ws := t.TempDir()
+	spec, err := pipeline.Parse([]byte(`version: 1
+jobs:
+  gated:
+    paths: [src/**]
+    steps:
+      - run: "echo RAN"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := pipeline.Compile(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lines []string
+	ex := &Executor{Opt: Options{
+		Workspace: ws, RunID: "r",
+		ChangedFiles: nil, ChangedFilesKnown: false,
+		Logs: logging.Func(func(_, _, l string) { lines = append(lines, l) }),
+	}}
+	res := ex.RunCompiledJob(context.Background(), g.Spec, g.Jobs["gated"])
+	if res.Status != model.StatusSuccess {
+		t.Fatalf("unknown-diff path job = %+v", res)
+	}
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "unknown") {
+		t.Fatalf("expected unknown-diff log, got:\n%s", joined)
+	}
+	if !strings.Contains(joined, "RAN") {
+		t.Fatalf("job did not run:\n%s", joined)
+	}
+	// Known empty: path job must skip.
+	ex2 := &Executor{Opt: Options{
+		Workspace: ws, RunID: "r",
+		ChangedFiles: nil, ChangedFilesKnown: true,
+		Logs: logging.Func(func(string, string, string) {}),
+	}}
+	res2 := ex2.RunCompiledJob(context.Background(), g.Spec, g.Jobs["gated"])
+	if res2.Status != model.StatusSkipped {
+		t.Fatalf("known-empty path job = %+v, want skipped", res2)
 	}
 }

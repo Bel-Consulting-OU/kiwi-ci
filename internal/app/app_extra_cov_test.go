@@ -110,16 +110,29 @@ func TestForgeAdapterForMatrix(t *testing.T) {
 }
 
 func TestImportWarningsAndWriteErrors(t *testing.T) {
-	// A workflow with unsupported constructs yields warnings/unsupported
-	// entries on both the write and --list-unsupported paths.
+	// A workflow with unsupported constructs must refuse to write the
+	// canonical pipeline unless --allow-partial is set.
 	body := "name: ci\non:\n  push:\n  schedule:\n    - cron: '0 3 * * 1'\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n"
 	src := filepath.Join(t.TempDir(), "ci.yml")
 	if err := os.WriteFile(src, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	out := filepath.Join(t.TempDir(), "out.yaml")
-	if err := Import([]string{"github-actions", "--file", src, "--out", out}); err != nil {
-		t.Fatalf("import with unsupported constructs: %v", err)
+	if err := Import([]string{"github-actions", "--file", src, "--out", out}); err == nil {
+		t.Fatal("unsupported constructs must refuse to write without --allow-partial")
+	}
+	if _, err := os.Stat(out); err == nil {
+		t.Fatal("refused import still wrote the output file")
+	}
+	if err := Import([]string{"github-actions", "--file", src, "--out", out, "--allow-partial"}); err != nil {
+		t.Fatalf("import with --allow-partial: %v", err)
+	}
+	raw, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "incomplete import") {
+		t.Fatal("partial import YAML missing incomplete header")
 	}
 	if err := Import([]string{"github-actions", "--file", src, "--list-unsupported"}); err != nil {
 		t.Fatalf("import --list-unsupported: %v", err)
@@ -137,7 +150,7 @@ func TestImportWarningsAndWriteErrors(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(blocked, "out"), []byte("file"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := Import([]string{"github-actions", "--file", src, "--out", filepath.Join(blocked, "out", "pipeline.yaml")}); err == nil {
+	if err := Import([]string{"github-actions", "--file", src, "--out", filepath.Join(blocked, "out", "pipeline.yaml"), "--allow-partial"}); err == nil {
 		t.Fatal("output under a file accepted")
 	}
 	// The output directory is read-only: os.WriteFile fails.
@@ -149,7 +162,7 @@ func TestImportWarningsAndWriteErrors(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("running as root: read-only directory is writable")
 	}
-	if err := Import([]string{"github-actions", "--file", src, "--out", filepath.Join(readonly, "pipeline.yaml")}); err == nil {
+	if err := Import([]string{"github-actions", "--file", src, "--out", filepath.Join(readonly, "pipeline.yaml"), "--allow-partial"}); err == nil {
 		t.Fatal("write into a read-only directory accepted")
 	}
 }
@@ -214,7 +227,7 @@ func TestDetectChangedFilesOptsMergeBaseFailure(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "a.txt"), "1")
 	initGitRepo(t, dir)
-	if got := detectChangedFilesOpts(dir, "", "HEAD", "no-such-ref", ""); got != nil {
+	if got, _ := detectChangedFilesOpts(dir, "", "HEAD", "no-such-ref", ""); got != nil {
 		t.Fatalf("bad merge base = %v", got)
 	}
 }

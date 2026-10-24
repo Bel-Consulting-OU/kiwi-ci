@@ -242,7 +242,7 @@ func TestPrintCacheInputsUnreadableLockfile(t *testing.T) {
 }
 
 func TestDetectChangedFilesOpts(t *testing.T) {
-	if got := detectChangedFilesOpts("/nonexistent", "", "HEAD", "", "a.go, b.go ,,"); len(got) != 2 || got[0] != "a.go" || got[1] != "b.go" {
+	if got, _ := detectChangedFilesOpts("/nonexistent", "", "HEAD", "", "a.go, b.go ,,"); len(got) != 2 || got[0] != "a.go" || got[1] != "b.go" {
 		t.Fatalf("explicit changed files = %v", got)
 	}
 	if got := detectChangedFiles("/nonexistent-repo"); got != nil {
@@ -254,15 +254,15 @@ func TestDetectChangedFilesOpts(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "second.txt"), "2")
 	runGit(t, dir, "add", ".")
 	runGit(t, dir, "commit", "-q", "-m", "two")
-	got := detectChangedFilesOpts(dir, "HEAD~1", "HEAD", "", "")
+	got, _ := detectChangedFilesOpts(dir, "HEAD~1", "HEAD", "", "")
 	if len(got) != 1 || got[0] != "second.txt" {
 		t.Fatalf("git diff changed files = %v", got)
 	}
-	got = detectChangedFilesOpts(dir, "", "HEAD", "HEAD", "")
+	got, _ = detectChangedFilesOpts(dir, "", "HEAD", "HEAD", "")
 	if len(got) != 0 {
 		t.Fatalf("merge-base HEAD diff = %v, want empty", got)
 	}
-	if got := detectChangedFilesOpts(dir, "no-such-ref", "HEAD", "", ""); got != nil {
+	if got, _ := detectChangedFilesOpts(dir, "no-such-ref", "HEAD", "", ""); got != nil {
 		t.Fatalf("bad ref changed files = %v", got)
 	}
 }

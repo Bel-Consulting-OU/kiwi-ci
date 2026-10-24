@@ -116,6 +116,7 @@ jobs:
       - name: redis
         native: true
         command: ["true"]
+        ready: "tcp:6379"
     steps: [{run: "true"}]
 `
 	mixedB := `version: 1
@@ -126,6 +127,7 @@ jobs:
       - name: redis
         native: true
         command: ["true"]
+        ready: "tcp:6379"
         env:
           A: "1"
     steps: [{run: "true"}]
@@ -167,6 +169,7 @@ jobs:
       - name: db
         native: true
         command: ["true"]
+        ready: "tcp:6501"
     steps: [{run: "true"}]
 `))
 	if err != nil {
@@ -181,6 +184,7 @@ jobs:
       - name: db
         native: true
         command: ["false"]
+        ready: "tcp:6501"
     steps: [{run: "true"}]
 `))
 	if err != nil {

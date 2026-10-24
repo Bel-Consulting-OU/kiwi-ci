@@ -97,12 +97,16 @@ type Options struct {
 	// step-boundary bound still applies.
 	AllowRootfulUntrusted bool
 	ChangedFiles          []string
-	SecretProvider        secrets.Provider
-	Logs                  logging.Sink
-	Cache                 *cache.Store
-	Artifacts             *artifact.Store
-	ArtifactCapture       *ArtifactCapture
-	ArtifactReporter      func(jobID, name, path string) error
+	// ChangedFilesKnown distinguishes a computed empty diff from a failed
+	// git discovery. When false, path-restricted jobs run rather than being
+	// skipped against an unknown (empty) change set.
+	ChangedFilesKnown bool
+	SecretProvider    secrets.Provider
+	Logs              logging.Sink
+	Cache             *cache.Store
+	Artifacts         *artifact.Store
+	ArtifactCapture   *ArtifactCapture
+	ArtifactReporter  func(jobID, name, path string) error
 	// LocalDownloads enables restoring declared dependency downloads from
 	// this run's locally saved artifacts (kiwi run parity with the
 	// distributed runner's restoreDownloads). Off for the distributed
@@ -592,10 +596,16 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		res.Status = model.StatusSkipped
 		return finish(res)
 	}
-	if (len(cj.Job.Paths) > 0 || len(cj.Job.PathsIgnore) > 0) && !pipeline.PathsMatch(e.Opt.ChangedFiles, cj.Job.Paths, cj.Job.PathsIgnore) {
-		e.log(cj.ID, "scheduler", "skipped: changed paths do not match job filters")
-		res.Status = model.StatusSkipped
-		return finish(res)
+	if len(cj.Job.Paths) > 0 || len(cj.Job.PathsIgnore) > 0 {
+		if !e.Opt.ChangedFilesKnown {
+			// Unknown diff must never silently drop a path-restricted job.
+			// Conservative: run it (same as a matching change set).
+			e.log(cj.ID, "scheduler", "changed-file set is unknown; running path-restricted job (diff could not be computed)")
+		} else if !pipeline.PathsMatch(e.Opt.ChangedFiles, cj.Job.Paths, cj.Job.PathsIgnore) {
+			e.log(cj.ID, "scheduler", "skipped: changed paths do not match job filters")
+			res.Status = model.StatusSkipped
+			return finish(res)
+		}
 	}
 	// The context received here is the RUNNER/PROCESS context (for the
 	// distributed runner it already carries the declared job deadline; for
@@ -736,6 +746,11 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	jobEnv["KIWI_CHANGED_FILES"] = strings.Join(changedPaths, "\n")
 	jobEnv["KIWI_CHANGED_COUNT"] = strconv.Itoa(len(changedPaths))
 	jobEnv["KIWI_CHANGED_JSON"] = string(changedJSON)
+	if e.Opt.ChangedFilesKnown {
+		jobEnv["KIWI_CHANGED_KNOWN"] = "1"
+	} else {
+		jobEnv["KIWI_CHANGED_KNOWN"] = "0"
+	}
 	// Legacy CI_* / GITHUB_* names so imported Woodpecker/Drone/GitLab and
 	// GitHub-Actions-style scripts run unmodified. CI_WORKSPACE is the job
 	// workspace (the container's $PWD when the step runs at the workspace
@@ -918,7 +933,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		return finish(res)
 	}
 	if RuntimeMayRunNativeServices(cj.Job.Runtime, cj.Job.Services) && len(cj.Job.Services) > 0 {
-		net, nativeEnv, cleanupNS, nerr := startNativeServices(ctx, cj.ID, cj.Job.Services, func(line string) { e.log(cj.ID, "service", line) })
+		net, nativeEnv, cleanupNS, nerr := startNativeServices(ctx, cj.ID, workRoot, cj.Job.Services, func(line string) { e.log(cj.ID, "service", line) })
 		if nerr != nil {
 			res.Status = model.StatusFailure
 			res.Error = nerr.Error()

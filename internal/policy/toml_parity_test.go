@@ -202,3 +202,25 @@ network = "services-only"
 		t.Fatalf("repo network: yaml=%q toml=%q", yRepo.Network, tRepo.Network)
 	}
 }
+
+// Extension-driven detection: network="none" without spaces around =
+// is still valid TOML when the file is named policy.toml.
+func TestTOMLExtensionDetectionNoSpaceAssign(t *testing.T) {
+	path := writePolicyFile(t, "policy.toml", "network=\"none\"\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load no-space TOML: %v", err)
+	}
+	if cfg.Network != "none" {
+		t.Fatalf("Network = %q", cfg.Network)
+	}
+	// YAML extension must not be parsed as TOML even if it looks assignment-like.
+	yp := writePolicyFile(t, "policy.yaml", "network: none\n")
+	ycfg, err := Load(yp)
+	if err != nil {
+		t.Fatalf("Load YAML: %v", err)
+	}
+	if ycfg.Network != "none" {
+		t.Fatalf("YAML Network = %q", ycfg.Network)
+	}
+}

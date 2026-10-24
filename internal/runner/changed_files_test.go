@@ -18,36 +18,40 @@ func TestEffectiveChangedFilesKnownEmptyNoGitFallback(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "git-invoked")
 	withFakeGit(t, marker, func() {
 		// Known-empty: no git invocation, empty result.
-		got := effectiveChangedFiles(context.Background(), nil, true, dir)
-		if len(got) != 0 {
-			t.Fatalf("known-empty with nil = %v, want empty", got)
+		got, known := effectiveChangedFiles(context.Background(), nil, true, dir)
+		if len(got) != 0 || !known {
+			t.Fatalf("known-empty with nil = %v known=%v", got, known)
 		}
-		got = effectiveChangedFiles(context.Background(), []string{}, true, dir)
-		if len(got) != 0 {
-			t.Fatalf("known-empty with empty list = %v, want empty", got)
+		got, known = effectiveChangedFiles(context.Background(), []string{}, true, dir)
+		if len(got) != 0 || !known {
+			t.Fatalf("known-empty with empty list = %v known=%v", got, known)
 		}
 		// Known non-empty: returned as-is, no git call.
-		got = effectiveChangedFiles(context.Background(), []string{"a.go"}, true, dir)
-		if len(got) != 1 || got[0] != "a.go" {
+		got, known = effectiveChangedFiles(context.Background(), []string{"a.go"}, true, dir)
+		if len(got) != 1 || got[0] != "a.go" || !known {
 			t.Fatalf("known non-empty = %v", got)
 		}
 		if _, err := os.Stat(marker); err == nil {
 			t.Fatal("known lists must never invoke git")
 		}
 		// Unknown with a non-empty server list: no git call either.
-		got = effectiveChangedFiles(context.Background(), []string{"b.go"}, false, dir)
-		if len(got) != 1 || got[0] != "b.go" {
+		got, known = effectiveChangedFiles(context.Background(), []string{"b.go"}, false, dir)
+		if len(got) != 1 || got[0] != "b.go" || !known {
 			t.Fatalf("unknown non-empty = %v", got)
 		}
 		if _, err := os.Stat(marker); err == nil {
 			t.Fatal("non-empty unknown lists must not invoke git")
 		}
 		// Unknown with an EMPTY list: the fallback path runs git.
-		got = effectiveChangedFiles(context.Background(), nil, false, dir)
+		got, known = effectiveChangedFiles(context.Background(), nil, false, dir)
 		if _, err := os.Stat(marker); err != nil {
 			t.Fatal("unknown empty list must fall back to the local git diff")
 		}
-		_ = got
+		// Fake git exits 0 with no output: diff succeeded but is empty.
+		if !known {
+			// fake git produced no error path for HEAD~1... actually exit 0 empty => known true
+			t.Fatalf("empty successful git diff should be known, got files=%v known=%v", got, known)
+		}
 	})
 }
 

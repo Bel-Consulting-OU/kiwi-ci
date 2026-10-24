@@ -1538,7 +1538,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// live timer and context) through the rest of the job. The git fallback
 	// runs inside the phase it belongs to, and the resolved list is passed to
 	// the executor as a value.
-	resolvedChangedFiles := effectiveChangedFiles(setupCtx, t.Job.ChangedFiles, t.Job.ChangedFilesKnown, tmp)
+	resolvedChangedFiles, changedFilesKnown := effectiveChangedFiles(setupCtx, t.Job.ChangedFiles, t.Job.ChangedFilesKnown, tmp)
 	setupCancel()
 	// The sink spools lines in memory and a dedicated sender drains them:
 	// pipe readers must never block on control-plane delivery, so a slow log
@@ -1651,7 +1651,7 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 	// require image references pinned by digest. The untrusted floor is
 	// unconditional here: nothing may override RequireImmutableImages for
 	// an untrusted job.
-	opts := executor.Options{Workspace: tmp, RunID: t.Job.RunID, RunnerID: r.ID, InstanceID: r.instanceID, Event: t.Job.Event, Branch: branchFromRef(t.Job.Ref), ChangedFiles: resolvedChangedFiles, SecretProvider: provider, Logs: logging.Func(func(job, step, line string) { sink.WriteLine(job, step, line) }), Cache: cacheStore, Artifacts: artifactStore, ArtifactReporter: reporter, DependencyStatus: t.Job.DependencyStatus, NeedsOutputs: t.Job.NeedsOutputs, CacheNamespace: cacheNamespace(t.Job), LifecycleContext: parent, OnCgroupCreated: func(parent string) error { return r.ledgerSetCgroup(ledgerID, parent) }, RequireJobCgroup: t.JobCgroup, AllowRootfulUntrusted: r.AllowRootfulUntrusted}
+	opts := executor.Options{Workspace: tmp, RunID: t.Job.RunID, RunnerID: r.ID, InstanceID: r.instanceID, Event: t.Job.Event, Branch: branchFromRef(t.Job.Ref), ChangedFiles: resolvedChangedFiles, ChangedFilesKnown: changedFilesKnown, SecretProvider: provider, Logs: logging.Func(func(job, step, line string) { sink.WriteLine(job, step, line) }), Cache: cacheStore, Artifacts: artifactStore, ArtifactReporter: reporter, DependencyStatus: t.Job.DependencyStatus, NeedsOutputs: t.Job.NeedsOutputs, CacheNamespace: cacheNamespace(t.Job), LifecycleContext: parent, OnCgroupCreated: func(parent string) error { return r.ledgerSetCgroup(ledgerID, parent) }, RequireJobCgroup: t.JobCgroup, AllowRootfulUntrusted: r.AllowRootfulUntrusted}
 	if artifactStore != nil {
 		// Capture is bounded by the job context while it is alive (so a job
 		// that exceeds its declared lifetime stops publishing) and by the
@@ -2128,28 +2128,27 @@ func cacheNamespace(j model.Job) string {
 func branchFromRef(ref string) string {
 	return strings.TrimPrefix(strings.TrimPrefix(ref, "refs/heads/"), "refs/")
 }
-func effectiveChangedFiles(ctx context.Context, serverFiles []string, known bool, dir string) []string {
+func effectiveChangedFiles(ctx context.Context, serverFiles []string, known bool, dir string) ([]string, bool) {
 	// ChangedFilesKnown marks the server-side list as the authoritative
 	// forge-fetched diff: it is returned as-is, so a known-EMPTY list stays
 	// empty (no local git fallback). The fallback applies only when the
 	// server did not authoritatively know the diff.
 	if known {
-		return append([]string{}, serverFiles...)
+		return append([]string{}, serverFiles...), true
 	}
 	if len(serverFiles) > 0 {
-		return append([]string{}, serverFiles...)
+		return append([]string{}, serverFiles...), true
 	}
-	return changedFiles(ctx, dir)
+	files, gitOK := changedFiles(ctx, dir)
+	return files, gitOK
 }
 
-// changedFiles is the local git fallback for changed-file discovery. It runs
-// under the setup-phase context (exec.CommandContext, never a bare
-// exec.Command): a git process that stalls must be torn down by the phase
-// deadline instead of hanging the job's setup forever.
-func changedFiles(ctx context.Context, dir string) []string {
+// changedFiles is the local git fallback for changed-file discovery. ok is
+// false when git could not produce a trustworthy diff (unknown, not empty).
+func changedFiles(ctx context.Context, dir string) ([]string, bool) {
 	b, err := exec.CommandContext(ctx, "git", "-C", dir, "diff", "--name-only", "HEAD~1", "HEAD").Output()
 	if err != nil {
-		return nil
+		return nil, false
 	}
 	var out []string
 	for _, s := range strings.Split(string(b), "\n") {
@@ -2157,7 +2156,7 @@ func changedFiles(ctx context.Context, dir string) []string {
 			out = append(out, s)
 		}
 	}
-	return out
+	return out, true
 }
 
 func (r *Runner) checkout(ctx context.Context, j model.Job, root string, clone pipeline.Clone, ws pipeline.Workspace) error {
@@ -2197,19 +2196,28 @@ func (r *Runner) checkout(ctx context.Context, j model.Job, root string, clone p
 	if ref == "" {
 		ref = "HEAD"
 	}
-	// Shallow clones may not contain the requested SHA (PR/feature commit
-	// outside the default tip history). Fetch it explicitly before checkout
-	// so a valid run target is not reported as a missing object.
-	if j.SHA != "" {
-		cmdFetch := exec.CommandContext(ctx, "git", "-C", dir, "fetch", "--depth", "1", "origin", j.SHA)
+	// Shallow clones may not contain the requested SHA or a non-default ref
+	// (PR/feature branch outside the default tip history). Fetch the
+	// explicit target before checkout so a valid run object is present.
+	// Best-effort: a full (non-shallow) clone already has it. The error is
+	// kept for diagnosis if checkout then fails.
+	var fetchDiag string
+	fetchTarget := j.SHA
+	if fetchTarget == "" {
+		fetchTarget = ref
+	}
+	if fetchTarget != "" && fetchTarget != "HEAD" {
+		cmdFetch := exec.CommandContext(ctx, "git", "-C", dir, "fetch", "--depth", "1", "origin", fetchTarget)
 		cmdFetch.Env = gitEnv
-		// Best-effort: a full (non-shallow) clone already has the object.
-		_, _, _ = executil.CaptureBounded(cmdFetch, maxGitDiagnosticBytes)
+		if out, _, ferr := executil.CaptureBounded(cmdFetch, maxGitDiagnosticBytes); ferr != nil {
+			fetchDiag = fmt.Sprintf(" (pre-checkout fetch %s: %v)", fetchTarget, ferr)
+			_ = out
+		}
 	}
 	cmd := exec.CommandContext(ctx, "git", "-C", dir, "checkout", "--force", ref)
 	cmd.Env = gitEnv
 	if out, truncated, err := executil.CaptureBounded(cmd, maxGitDiagnosticBytes); err != nil {
-		return fmt.Errorf("git checkout: %v: %s%s", err, out, truncationMarker(truncated))
+		return fmt.Errorf("git checkout: %v:%s %s%s", err, fetchDiag, out, truncationMarker(truncated))
 	}
 	if len(clone.SparsePaths) > 0 {
 		cmdSparseInit := exec.CommandContext(ctx, "git", "-C", dir, "sparse-checkout", "init", "--cone")
