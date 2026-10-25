@@ -60,7 +60,7 @@ func TestIntegrationResourceAdmissionServerEndToEnd(t *testing.T) {
 		t.Fatalf("bind profile = %d %s", w.Code, w.Body.String())
 	}
 	w := pgITDo(t, s, http.MethodPost, "/api/v1/runners/register", "token",
-		`{"name":"res-runner","cert_serial":"`+serial+`","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":8,"capabilities":["native","container"]}`, nil)
+		`{"name":"res-runner","cert_serial":"`+serial+`","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":8,"capabilities":["native","container"]}`, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register = %d %s", w.Code, w.Body.String())
 	}

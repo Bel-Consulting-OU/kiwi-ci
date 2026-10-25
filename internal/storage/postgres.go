@@ -2609,8 +2609,16 @@ func (s *PostgresStore) CompleteJob(ctx context.Context, jobID string, generatio
 	j.AttemptRunnerID = runnerID
 	// The executor-observed runtime identity of this attempt is completion
 	// evidence: it rides the completion transaction's payload write, so a
-	// rolled-back completion leaves no evidence behind.
+	// rolled-back completion leaves no evidence behind. The receipt carries
+	// the validated observed interpreter stamp (or empty for legacy); fall
+	// back to the job's requested stamp so a stamped completion always
+	// records requested == observed.
 	j.ObservedRuntime = observed
+	if sem := receipt.ObservedExecutionSemantics; sem != "" {
+		j.ObservedExecutionSemantics = sem
+	} else if j.ExecutionSemantics != "" {
+		j.ObservedExecutionSemantics = j.ExecutionSemantics
+	}
 	newPayload, err := jsonMarshal(j)
 	if err != nil {
 		return err

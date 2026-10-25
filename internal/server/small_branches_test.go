@@ -128,7 +128,7 @@ func TestCaptureStateRollbackClones(t *testing.T) {
 	exp := time.Now().UTC().Add(time.Hour)
 	s.runs["run-1"] = model.Run{ID: "run-1", Status: model.StatusRunning}
 	s.jobs["job-1"] = model.Job{ID: "job-1", RunID: "run-1"}
-	s.runners["runner-1"] = model.Runner{ProtocolVersion: 2, ID: "runner-1", ActiveJobs: []string{"job-1"}}
+	s.runners["runner-1"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "runner-1", ActiveJobs: []string{"job-1"}}
 	rb := s.captureStateRollbackLocked()
 	// Mutating the live state must not touch the capture.
 	s.runs["run-1"] = model.Run{ID: "run-1", Status: model.StatusCancelled}
@@ -151,7 +151,7 @@ func TestCaptureStateRollbackClones(t *testing.T) {
 func TestRollbackLeaseLockedDeletesAbsentEntries(t *testing.T) {
 	s := New("secret")
 	s.runs["run-1"] = model.Run{ID: "run-1"}
-	s.runners["runner-1"] = model.Runner{ProtocolVersion: 2, ID: "runner-1"}
+	s.runners["runner-1"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "runner-1"}
 	s.deployments["job-1"] = model.Deployment{ID: "job-1"}
 	s.rollbackLeaseLocked(leaseRollback{
 		jobID: "job-1", job: model.Job{ID: "job-1"},
@@ -335,13 +335,13 @@ func TestRunnerIncarnationCompatibility(t *testing.T) {
 		t.Fatal("unknown memory runner admitted with an incarnation")
 	}
 	s.mu.Lock()
-	s.runners["r1"] = model.Runner{ProtocolVersion: 2, ID: "r1"}
+	s.runners["r1"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "r1"}
 	s.mu.Unlock()
 	if !s.runnerIncarnationCurrent(ctx, "r1", "any") {
 		t.Fatal("pre-incarnation runner row must stay compatible")
 	}
 	s.mu.Lock()
-	s.runners["r1"] = model.Runner{ProtocolVersion: 2, ID: "r1", Incarnation: "inc-1"}
+	s.runners["r1"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "r1", Incarnation: "inc-1"}
 	s.mu.Unlock()
 	if !s.runnerIncarnationCurrent(ctx, "r1", "inc-1") {
 		t.Fatal("matching incarnation refused")
@@ -357,13 +357,13 @@ func TestRunnerIncarnationCompatibility(t *testing.T) {
 		t.Fatal("unknown durable runner admitted with an incarnation")
 	}
 	f.mu.Lock()
-	f.runners["r2"] = model.Runner{ProtocolVersion: 2, ID: "r2", Incarnation: ""}
+	f.runners["r2"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "r2", Incarnation: ""}
 	f.mu.Unlock()
 	if !s.runnerIncarnationCurrent(ctx, "r2", "inc") {
 		t.Fatal("pre-incarnation durable row must stay compatible")
 	}
 	f.mu.Lock()
-	f.runners["r2"] = model.Runner{ProtocolVersion: 2, ID: "r2", Incarnation: "inc-db"}
+	f.runners["r2"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "r2", Incarnation: "inc-db"}
 	f.mu.Unlock()
 	if s.runnerIncarnationCurrent(ctx, "r2", "other") {
 		t.Fatal("mismatched durable incarnation admitted")

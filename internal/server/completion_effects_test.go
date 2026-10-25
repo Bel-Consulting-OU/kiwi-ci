@@ -56,7 +56,7 @@ func effectsFixture(t *testing.T, f *dbFakeStore) (*Server, string, Task) {
 		t.Fatalf("enqueue: %v", err)
 	}
 	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
-		`{"name":"r1","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2,"cost_per_hour":10,"power_watts":50}`)
+		`{"name":"r1","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2,"cost_per_hour":10,"power_watts":50}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d %s", w.Code, w.Body.String())
 	}

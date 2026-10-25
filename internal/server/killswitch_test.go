@@ -20,7 +20,7 @@ func seedDBRunningJob(t *testing.T, s *Server, f *dbFakeStore, jobID, runID, run
 	f.jobs[jobID] = model.Job{ID: jobID, RunID: runID, Key: "build", RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r",
 		Status: model.StatusRunning, Attempts: attempts, MaxInfraRetries: maxRetries,
 		LeaseRunnerID: runnerID, LeaseTokenHash: []byte{1, 2, 3}, LeaseGeneration: 2, LeaseExpiresAt: &exp}
-	f.runners[runnerID] = model.Runner{ProtocolVersion: 2, ID: runnerID, Name: runnerID, Capacity: 1, ActiveJobs: []string{jobID}, Busy: true}
+	f.runners[runnerID] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: runnerID, Name: runnerID, Capacity: 1, ActiveJobs: []string{jobID}, Busy: true}
 	f.mu.Unlock()
 }
 
@@ -121,7 +121,7 @@ func TestRunnerDisableRequiresRunnerManageRole(t *testing.T) {
 	}
 	// A runner-manage principal may.
 	s.mu.Lock()
-	s.runners["r1"] = model.Runner{ProtocolVersion: 2, ID: "r1", Name: "r1", Capacity: 1}
+	s.runners["r1"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "r1", Name: "r1", Capacity: 1}
 	s.mu.Unlock()
 	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/r1/disable", "manage-tok", "{}"); w.Code != http.StatusOK {
 		t.Fatalf("manage principal disable: want 200 got %d: %s", w.Code, w.Body.String())
@@ -137,7 +137,7 @@ func TestMemoryRunnerDisableStillCancels(t *testing.T) {
 	exp := time.Now().UTC().Add(time.Hour)
 	s.runs["run-1"] = model.Run{ID: "run-1", Repo: "https://github.com/o/r.git", RepoFullName: "o/r", Status: model.StatusRunning}
 	s.jobs["job-1"] = model.Job{ID: "job-1", RunID: "run-1", Key: "build", Status: model.StatusRunning, LeaseRunnerID: "runner-1", LeaseTokenHash: []byte{1}, LeaseGeneration: 1, LeaseExpiresAt: &exp}
-	s.runners["runner-1"] = model.Runner{ProtocolVersion: 2, ID: "runner-1", Name: "runner-1", Capacity: 1, ActiveJobs: []string{"job-1"}}
+	s.runners["runner-1"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "runner-1", Name: "runner-1", Capacity: 1, ActiveJobs: []string{"job-1"}}
 	s.mu.Unlock()
 	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/runner-1/disable", "admin-tok", "{}"); w.Code != http.StatusOK {
 		t.Fatalf("disable = %d: %s", w.Code, w.Body.String())

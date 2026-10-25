@@ -337,7 +337,7 @@ func TestForkPRPolicyIdentityIsBaseCheckoutIsHead(t *testing.T) {
 
 	// The leased task delivers the CHECKOUT URL to the runner, never the
 	// policy identity. The runner registers with the server's admin bearer.
-	w = doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "runner-secret", `{"name":"fork-runner","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2}`)
+	w = doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "runner-secret", `{"name":"fork-runner","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register runner = %d: %s", w.Code, w.Body.String())
 	}

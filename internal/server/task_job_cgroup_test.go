@@ -60,7 +60,7 @@ func TestMemoryNextAdvertisesJobCgroupCapability(t *testing.T) {
 	})
 	bindRunnerProfile(t, s, "cg-mem", "runner-a", "admin-tok")
 	registerWithToken(t, s, map[string]any{
-		"id": "runner-a", "name": "ra", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3,
+		"id": "runner-a", "name": "ra", "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3,
 		"capabilities": []string{"native", "container"},
 	}, "token-a")
 
@@ -102,7 +102,7 @@ func TestDBNextAdvertisesJobCgroupCapability(t *testing.T) {
 	})
 	bindRunnerProfile(t, s, "cg-db", "runner-a", "admin-tok")
 	registerWithToken(t, s, map[string]any{
-		"id": "runner-a", "name": "ra", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3,
+		"id": "runner-a", "name": "ra", "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3,
 		"capabilities": []string{"native", "container"},
 	}, "token-a")
 

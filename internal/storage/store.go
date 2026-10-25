@@ -1721,6 +1721,11 @@ type LeaseClaim struct {
 	ConcurrencyScope string
 	RepoConcurrency  float64
 	TeamConcurrency  float64
+	// ExecutionSemantics is the job's stamped engine version (model.Job).
+	// The shared lease predicates refuse a job the runner's advertised
+	// SupportedExecutionSemantics cannot interpret (empty job stamp is
+	// pre-stamp legacy and always admitted).
+	ExecutionSemantics string
 
 	CPURequest    float64
 	MemoryRequest int64

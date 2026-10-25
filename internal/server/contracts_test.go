@@ -52,7 +52,7 @@ jobs:
 // job, returning the runner ID and the task (with the raw lease token).
 func leaseArtifactJob(t *testing.T, s *Server, pipelineText string) (string, Task) {
 	t.Helper()
-	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token", `{"name":"r1","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2}`)
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token", `{"name":"r1","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d %s", w.Code, w.Body.String())
 	}
@@ -172,7 +172,7 @@ func TestArtifactContractEnforcedInDBMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Register a runner, submit, and lease through the scheduler.
-	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token", `{"name":"r1","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2}`)
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token", `{"name":"r1","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d %s", w.Code, w.Body.String())
 	}

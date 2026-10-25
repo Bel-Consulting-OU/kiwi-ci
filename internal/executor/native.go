@@ -177,10 +177,36 @@ func (*NativeBackend) Run(ctx context.Context, c Command, emit func(string)) err
 		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("resolve shell %q against execution PATH: %w", shell, rerr)}
 	}
 	shell = resolved
-	cmd := exec.Command(shell, args...)
-	cmd.Dir = c.Dir
-	cmd.Env = c.Env
-	configureProcess(cmd)
+	// Prefer clone-into-cgroup (Linux): the step is born inside the durable
+	// job cgroup. On platforms without UseCgroupFD this is a no-op beyond
+	// Setpgid; the post-Start addPID remains the fallback.
+	//
+	// Go forbids a second cmd.Start() even after a failed first call
+	// (startCalled is set unconditionally). A UseCgroupFD failure (kernel
+	// < 5.7, bad FD) therefore must rebuild a FRESH command rather than
+	// retry the same *exec.Cmd — otherwise every cgroup-attached native
+	// step would die with "exec: already started".
+	closeCgroupFD := func() {}
+	// Deferred close reads the VARIABLE at return time, so a fallback can
+	// reassign it to a no-op after the FD is already released.
+	defer func() { closeCgroupFD() }()
+	newCmd := func() *exec.Cmd {
+		cmd := exec.Command(shell, args...)
+		cmd.Dir = c.Dir
+		cmd.Env = c.Env
+		return cmd
+	}
+	cmd := newCmd()
+	if c.CgroupParent != "" {
+		cl, err := configureProcessCgroup(cmd, c.CgroupParent)
+		if err != nil {
+			configureProcess(cmd)
+		} else {
+			closeCgroupFD = cl
+		}
+	} else {
+		configureProcess(cmd)
+	}
 	// Parent-owned pipes: cmd.StdoutPipe would make Wait responsible for
 	// closing the read ends, and Wait closes them as soon as it observes the
 	// child exit — which can discard buffered output when Wait wins the race
@@ -199,12 +225,42 @@ func (*NativeBackend) Run(ctx context.Context, c Command, emit func(string)) err
 	}
 	cmd.Stdout = stdoutW
 	cmd.Stderr = stderrW
-	if err := cmd.Start(); err != nil {
+	usedCgroupFD := cgroupFDActive(cmd)
+	started := cmd.Start()
+	if started != nil && usedCgroupFD {
+		// Kernel rejected clone-into-cgroup: release the FD and start a
+		// FRESH command (Start is single-shot) with Setpgid only; the
+		// post-Start addPID below migrates the child.
+		closeCgroupFD()
+		closeCgroupFD = func() {}
+		cmd = newCmd()
+		configureProcess(cmd)
+		cmd.Stdout = stdoutW
+		cmd.Stderr = stderrW
+		usedCgroupFD = false
+		started = cmd.Start()
+	}
+	if started != nil {
 		stdoutR.Close()
 		stdoutW.Close()
 		stderrR.Close()
 		stderrW.Close()
-		return &RunError{Kind: ErrorInfra, Err: err}
+		return &RunError{Kind: ErrorInfra, Err: started}
+	}
+	// Durable ownership: when clone-into-cgroup was unavailable, migrate
+	// after Start. When it succeeded the process is already inside the
+	// recorded cgroup; addPID is a redundant confirm and a failure here
+	// (process already gone) must not tear down a correct spawn.
+	if c.CgroupParent != "" && cmd.Process != nil && !usedCgroupFD {
+		if err := addPIDToJobCgroup(c.CgroupParent, cmd.Process.Pid); err != nil {
+			_ = terminateProcess(cmd)
+			_ = killProcess(cmd)
+			stdoutR.Close()
+			stdoutW.Close()
+			stderrR.Close()
+			stderrW.Close()
+			return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("add step to job cgroup: %w", err)}
+		}
 	}
 	stdoutW.Close()
 	stderrW.Close()

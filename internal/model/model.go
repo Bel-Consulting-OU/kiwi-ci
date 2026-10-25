@@ -98,6 +98,31 @@ const JobRequiresProtocol = RunnerProtocolVersion
 // under this interpreter (documented in ExecutionSemanticsVersion comment).
 const ExecutionSemanticsVersion = "kiwi.execution.v3"
 
+// LegacyExecutionSemanticsVersion is the engine version a runner implements
+// when it never advertised supported_execution_semantics (pre-field binaries).
+const LegacyExecutionSemanticsVersion = "kiwi.execution.v2"
+
+// SupportsExecutionSemantics reports whether this runner's registration
+// claims it can INTERPRET jobSemantics. An empty advertisement is the
+// legacy contract: only kiwi.execution.v2 (the last wire-compatible engine
+// before supported_execution_semantics existed). An empty job stamp
+// (pre-stamp legacy records) is always admitted; the decision table for
+// those lives in replay, not the lease.
+func SupportsExecutionSemantics(supported []string, jobSemantics string) bool {
+	if jobSemantics == "" {
+		return true
+	}
+	if len(supported) == 0 {
+		return jobSemantics == LegacyExecutionSemanticsVersion
+	}
+	for _, s := range supported {
+		if s == jobSemantics {
+			return true
+		}
+	}
+	return false
+}
+
 type Run struct {
 	ID string `json:"id"`
 	// RepoID is the immutable canonical repository identity, derived ONCE at
@@ -385,6 +410,14 @@ type Job struct {
 	// empty for records persisted before the field existed (see
 	// Run.ExecutionSemantics).
 	ExecutionSemantics string `json:"execution_semantics,omitempty"`
+	// ObservedExecutionSemantics is the interpreter version the completing
+	// runner actually used. The server requires equality with
+	// ExecutionSemantics (or fills it from the stamp when the runner omits
+	// the field) before accepting a completion, so requested and observed
+	// can never diverge on a signed record. Additive: empty when no
+	// completion has been observed or when the completing binary predates
+	// the field.
+	ObservedExecutionSemantics string `json:"observed_execution_semantics,omitempty"`
 	// CreatedByNode, CreatedByMutation and ExternalContext record the graph
 	// causality of a dynamically generated job. CreatedByNode is the
 	// generating parent job ID; CreatedByMutation is the canonical
@@ -519,6 +552,15 @@ type Runner struct {
 	// as legacy v1 by lease admission. Additive: no migration, the value
 	// rides the runner payload in every store.
 	ProtocolVersion int `json:"protocol_version,omitempty"`
+	// SupportedExecutionSemantics lists the execution-engine semantic
+	// versions this runner's BINARY implements (see
+	// ExecutionSemanticsVersion). Registration populates it from the local
+	// constant. An empty list means a legacy runner that has never
+	// advertised semantics: it is treated as implementing only the
+	// pre-v3 engine (`kiwi.execution.v2`) so a v3 job is never leased to
+	// a v2 interpreter. Additive: old servers ignore the field; old
+	// runners omit it and therefore never receive stamped v3 work.
+	SupportedExecutionSemantics []string `json:"supported_execution_semantics,omitempty"`
 	// Capabilities is the EFFECTIVE runtime capability set the scheduler
 	// decides on. When CapabilitiesEnforced is true it is the hardware claim
 	// (ReportedCapabilities) intersected with the linked profile's ceiling;
@@ -872,6 +914,14 @@ type CompletionReceipt struct {
 	RunnerID          string `json:"runner_id"`
 	ResultHash        string `json:"result_hash"`
 	ResultHashVersion int    `json:"result_hash_version,omitempty"`
+	// ObservedExecutionSemantics is the interpreter stamp the completion
+	// reported (validated for equality against the job stamp by the server
+	// before the receipt is built). It rides the receipt so the DB
+	// completion transaction can persist Job.ObservedExecutionSemantics
+	// without a second API. Additive: empty on legacy receipts; a job with
+	// a requested stamp still records requested == observed when this is
+	// empty. It is NOT part of the idempotency key or the result hash.
+	ObservedExecutionSemantics string `json:"observed_execution_semantics,omitempty"`
 }
 
 // Deployment is the server-side record of one environment deployment. It is

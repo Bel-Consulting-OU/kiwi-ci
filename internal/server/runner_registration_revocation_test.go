@@ -32,7 +32,7 @@ func TestRegisterRevokesPredecessorLeasesDB(t *testing.T) {
 	ctx := context.Background()
 	exp := time.Now().UTC().Add(time.Minute)
 	f.mu.Lock()
-	f.runners["r1"] = model.Runner{ProtocolVersion: 2, ID: "r1", Capacity: 1, ActiveJobs: []string{"j1"}}
+	f.runners["r1"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "r1", Capacity: 1, ActiveJobs: []string{"j1"}}
 	f.runs["run1"] = model.Run{ID: "run1", RepoFullName: "o/r", Ref: "main", Status: model.StatusRunning}
 	f.jobs["j1"] = model.Job{
 		ID: "j1", RunID: "run1", Key: "build", Status: model.StatusRunning,
@@ -42,7 +42,7 @@ func TestRegisterRevokesPredecessorLeasesDB(t *testing.T) {
 	f.mu.Unlock()
 
 	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
-		`{"id":"r1","name":"r1","protocol_version": 2, "protocol_min":3,"protocol_max":3,"capacity":1}`)
+		`{"id":"r1","name":"r1","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"capacity":1}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register = %d: %s", w.Code, w.Body.String())
 	}
@@ -88,7 +88,7 @@ func TestRegisterRevokesPredecessorLeasesMemory(t *testing.T) {
 	register := func() registerResponse {
 		t.Helper()
 		w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "runner-tok",
-			`{"id":"r1","name":"r1","protocol_version": 2, "protocol_min":3,"protocol_max":3,"capacity":1}`)
+			`{"id":"r1","name":"r1","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"capacity":1}`)
 		if w.Code != http.StatusOK {
 			t.Fatalf("register = %d: %s", w.Code, w.Body.String())
 		}
@@ -163,7 +163,7 @@ func TestSupersededIncarnationRefusedOnSensitiveEndpoints(t *testing.T) {
 	)
 	pinIncarnation := func(s *Server) {
 		s.mu.Lock()
-		s.runners["runner-1"] = model.Runner{ProtocolVersion: 2, ID: "runner-1", Incarnation: incB, Capacity: 1}
+		s.runners["runner-1"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "runner-1", Incarnation: incB, Capacity: 1}
 		s.mu.Unlock()
 		// Two recorded registrations make the modern session superseded:
 		// protocol-3 headerless requests are refused too.

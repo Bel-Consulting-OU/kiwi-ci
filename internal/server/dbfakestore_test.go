@@ -815,6 +815,11 @@ func (f *dbFakeStore) CompleteJob(ctx context.Context, jobID string, generation 
 	j.LeaseTokenHash = nil
 	j.LeaseExpiresAt = nil
 	j.ObservedRuntime = observed
+	if sem := receipt.ObservedExecutionSemantics; sem != "" {
+		j.ObservedExecutionSemantics = sem
+	} else if j.ExecutionSemantics != "" {
+		j.ObservedExecutionSemantics = j.ExecutionSemantics
+	}
 	f.jobs[jobID] = j
 	f.receipts[key] = receipt
 	// The completed job releases its reserved running quota slot in the same

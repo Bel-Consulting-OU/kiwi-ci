@@ -92,7 +92,7 @@ func TestIntegrationRunnerProfileBindingPostgres(t *testing.T) {
 
 	// Attack: the low-privilege bearer submits the pre-bound serial.
 	low := pgITRegisterBearer(t, s, "token-low",
-		`{"id":"`+lowID+`","name":"low","protocol_version": 2, "protocol_min":3,"protocol_max":3,"cert_serial":"0priv-pg","labels":["self"],"capacity":9}`)
+		`{"id":"`+lowID+`","name":"low","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"cert_serial":"0priv-pg","labels":["self"],"capacity":9}`)
 	assertNoPrivilegeInheritance(t, "pg attacker", low)
 
 	// The admin certificate binding is untouched by the attack.
@@ -106,7 +106,7 @@ func TestIntegrationRunnerProfileBindingPostgres(t *testing.T) {
 		t.Fatalf("durable runner binding = (%+v, %v, %v)", p, ok, err)
 	}
 	priv := pgITRegisterBearer(t, s, "token-priv",
-		`{"id":"`+privID+`","name":"rp","protocol_version": 2, "protocol_min":3,"protocol_max":3,"cert_serial":"0priv-pg","capabilities":["native","tart"]}`)
+		`{"id":"`+privID+`","name":"rp","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"cert_serial":"0priv-pg","capabilities":["native","tart"]}`)
 	if len(priv.Labels) != 1 || priv.Labels[0] != "container" || priv.Region != "own" || priv.Capacity != 2 {
 		t.Fatalf("bound bearer runner profile not applied: %+v", priv)
 	}
@@ -158,7 +158,7 @@ func TestIntegrationRunnerProfileUnlinkPostgres(t *testing.T) {
 	}
 
 	ri := pgITRegisterBearer(t, s, "token-a",
-		`{"id":"`+runnerID+`","name":"ra","protocol_version": 2, "protocol_min":3,"protocol_max":3}`)
+		`{"id":"`+runnerID+`","name":"ra","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3}`)
 	if len(ri.Labels) != 1 || ri.Capacity != 3 {
 		t.Fatalf("bound profile not applied: %+v", ri)
 	}
@@ -171,7 +171,7 @@ func TestIntegrationRunnerProfileUnlinkPostgres(t *testing.T) {
 	}
 
 	ri = pgITRegisterBearer(t, s, "token-a",
-		`{"id":"`+runnerID+`","name":"ra","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["self"],"capacity":9}`)
+		`{"id":"`+runnerID+`","name":"ra","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"labels":["self"],"capacity":9}`)
 	assertNoPrivilegeInheritance(t, "unlinked pg runner", ri)
 
 	// The unlink is idempotent through the API as well.

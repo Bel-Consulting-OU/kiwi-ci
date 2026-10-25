@@ -170,6 +170,12 @@ type Complete struct {
 	// input is refused with 400. Additive: runners that capture nothing omit
 	// it.
 	ObservedRuntime *model.ObservedRuntime `json:"observed_runtime,omitempty"`
+	// ExecutionSemantics is the engine version this runner used to
+	// interpret the job. When the job carries a stamp, the server requires
+	// equality before accepting the completion (requested == observed
+	// interpreter). Additive: older runners omit it and cannot complete
+	// stamped jobs.
+	ExecutionSemantics string `json:"execution_semantics,omitempty"`
 }
 
 // EnrollRequest asks the control plane to sign a runner's certificate

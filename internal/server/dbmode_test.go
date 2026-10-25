@@ -111,7 +111,7 @@ func TestDBModeSmoke(t *testing.T) {
 
 	// Register a runner, then lease through next().
 	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
-		`{"name":"runner1","labels":["container"],"protocol_version": 2, "protocol_min":3,"protocol_max":3}`); w.Code != http.StatusOK {
+		`{"name":"runner1","labels":["container"],"protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3}`); w.Code != http.StatusOK {
 		t.Fatalf("register = %d: %s", w.Code, w.Body.String())
 	}
 	var ri model.Runner
@@ -246,7 +246,7 @@ func TestDBModeStandbyAndPromotion(t *testing.T) {
 		t.Fatal("expected standby after SwitchToDB")
 	}
 	f.mu.Lock()
-	f.runners["runner1"] = model.Runner{ProtocolVersion: 2, ID: "runner1", Name: "runner1", Capacity: 1}
+	f.runners["runner1"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "runner1", Name: "runner1", Capacity: 1}
 	f.mu.Unlock()
 	// Standby refuses to lease.
 	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/runner1/next", "token", ""); w.Code != http.StatusServiceUnavailable {

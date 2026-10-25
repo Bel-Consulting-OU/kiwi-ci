@@ -66,7 +66,7 @@ func leaseNextRollbackTask(t *testing.T, s *Server, runnerID string) Task {
 func registerRollbackRunner(t *testing.T, s *Server, capacity int) string {
 	t.Helper()
 	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
-		fmt.Sprintf(`{"name":"rb","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":%d}`, capacity))
+		fmt.Sprintf(`{"name":"rb","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":%d}`, capacity))
 	if w.Code != http.StatusOK {
 		t.Fatalf("register = %d, want 200: %s", w.Code, w.Body.String())
 	}

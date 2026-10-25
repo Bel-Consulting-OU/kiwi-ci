@@ -234,7 +234,7 @@ func pgITDo(t *testing.T, s *Server, method, path, bearer, body string, headers 
 func pgITRegisterRunner(t *testing.T, s *Server) string {
 	t.Helper()
 	w := pgITDo(t, s, http.MethodPost, "/api/v1/runners/register", "token",
-		`{"name":"r1","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2}`, nil)
+		`{"name":"r1","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2}`, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d %s", w.Code, w.Body.String())
 	}

@@ -197,6 +197,9 @@ func (m *Manager) freezeLocked(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("run base: source manifest: %w", err)
 		}
+		// Recapture Git AFTER mutation so FrozenGit matches the tree that
+		// actually won the retry (not the pre-retry sampling).
+		m.git = captureFrozenGit(m.Source)
 		strategy, err = m.snapshotFrom(ctx, m.Source, base, true)
 		if err != nil {
 			_ = os.RemoveAll(base)
@@ -216,9 +219,36 @@ func (m *Manager) freezeLocked(ctx context.Context) error {
 		_ = os.RemoveAll(base)
 		return fmt.Errorf("run base verify: %w", err)
 	}
+	// A linked worktree's .git is a FILE pointing at a live administration
+	// directory outside the freeze tree. Leaving it lets any job run
+	// `git rev-parse` / `git status` against the moving original checkout.
+	// FrozenGit is the sole authority; the pointer is removed so Git inside
+	// the run-base fails closed instead of lying.
+	if err := stripLiveGitPointer(base); err != nil {
+		_ = os.RemoveAll(base)
+		return fmt.Errorf("run base freeze git pointer: %w", err)
+	}
 	m.base = base
 	m.baseEntries = entries
 	return nil
+}
+
+// stripLiveGitPointer removes a linked-worktree .git FILE (not directory)
+// from the frozen tree. A real .git directory (normal clone with its own
+// admin dir under the tree) is left intact.
+func stripLiveGitPointer(base string) error {
+	p := filepath.Join(base, ".git")
+	st, err := os.Lstat(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if st.Mode().IsDir() {
+		return nil
+	}
+	return os.Remove(p)
 }
 
 // freezeManifest is a deterministic digest of path/type/size/mtime for
@@ -248,11 +278,22 @@ func freezeManifest(root, skip string) (string, error) {
 		if rel == "." {
 			return nil
 		}
+		// Same inclusion rule as copyTree: .kiwi/cache never enters the
+		// snapshot, so a busy cache must not fail the freeze stability
+		// oracle either.
+		cacheRel := filepath.Join(".kiwi", "cache")
+		if rel == cacheRel || strings.HasPrefix(rel, cacheRel+string(filepath.Separator)) {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 		kind := "f"
 		if info.IsDir() {
-			// Align with copyTree's build-output exclusions so a busy
-			// `cargo build` writing target/ cannot flip freeze stability.
-			if copyTreeSkipDirs[info.Name()] {
+			// Same inclusion rule as copyTree: a skip-name directory is
+			// omitted unless git tracks paths under it (tracked dist/ etc.
+			// must stay visible to the stability oracle).
+			if copyTreeSkipDirs[info.Name()] && !hasTrackedFiles(root, rel) {
 				return filepath.SkipDir
 			}
 			kind = "d"
@@ -266,12 +307,13 @@ func freezeManifest(root, skip string) (string, error) {
 			return nil
 		}
 		fmt.Fprintf(h, "%s\x00%s\x00%d\x00%d\x00%016x", rel, kind, info.Size(), info.Mode().Perm(), info.ModTime().UnixNano())
-		// Content digest for modest files: size+mtime can miss a same-size
-		// rewrite (P2 determinism). Cap the read so huge blobs stay cheap.
-		if kind == "f" && info.Size() > 0 && info.Size() <= 1<<20 {
-			if b, rerr := os.ReadFile(path); rerr == nil {
-				sum := sha256.Sum256(b)
-				fmt.Fprintf(h, "\x00%x", sum[:8])
+		// Content digest: size+mtime can miss a same-size rewrite (P2
+		// determinism). Regular files are streamed (not capped at 1 MiB) up
+		// to freezeContentHashMax; larger blobs get a head+tail sample plus
+		// size so multi-gigabyte artifacts cannot pin the freeze walk.
+		if kind == "f" && info.Size() > 0 {
+			if d, ok := freezeContentDigest(path, info.Size()); ok {
+				fmt.Fprintf(h, "\x00%s", d)
 			}
 		}
 		fmt.Fprint(h, "\n")
@@ -281,6 +323,43 @@ func freezeManifest(root, skip string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// freezeContentHashMax is the largest file freeze content-hashes in full by
+// streaming. Beyond this size only a head/tail sample is hashed so a multi-GB
+// cache blob cannot pin the freeze stability walk (the sample still catches
+// same-size same-mtime rewrites at either end, which is where editors and
+// build tools touch files).
+const freezeContentHashMax = 64 << 20 // 64 MiB
+
+// freezeContentDigest returns a short hex digest of path's content for the
+// freeze manifest. ok is false when the file cannot be read (size/mtime
+// rows still bind the entry).
+func freezeContentDigest(path string, size int64) (string, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	if size <= freezeContentHashMax {
+		h := sha256.New()
+		if _, err := io.Copy(h, f); err != nil {
+			return "", false
+		}
+		return hex.EncodeToString(h.Sum(nil)[:8]), true
+	}
+	// Head + tail sample for oversized files.
+	h := sha256.New()
+	if _, err := io.CopyN(h, f, 32<<10); err != nil {
+		return "", false
+	}
+	if _, err := f.Seek(size-(32<<10), io.SeekStart); err != nil {
+		return "", false
+	}
+	if _, err := io.CopyN(h, f, 32<<10); err != nil && err != io.EOF {
+		return "", false
+	}
+	return hex.EncodeToString(h.Sum(nil)[:8]), true
 }
 
 // BasePath returns the immutable run-base directory, or "" if Freeze has
@@ -833,26 +912,52 @@ func sanitizeJobIDBare(id string) string {
 // captureFrozenGit records HEAD SHA/ref/branch and the changed-file set
 // from dir (the SOURCE, before copy). known is false when git cannot
 // produce a trustworthy diff.
+//
+// Atomicity: HEAD is sampled once and every subsequent command must still
+// resolve to that same SHA. On a linked worktree the administration
+// directory lives outside the freeze tree and can move mid-read; a
+// mismatched sample is treated as "not captured" rather than a hybrid of
+// two Git states.
 func captureFrozenGit(dir string) FrozenGit {
 	g := FrozenGit{}
 	if !gitRepo(context.Background(), dir) {
 		return g
 	}
+	headOut, err := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
+	if err != nil {
+		// Repo exists but HEAD is unreadable (empty, mid-rebase): refuse
+		// a partial capture.
+		return g
+	}
+	head := strings.TrimSpace(string(headOut))
+	if head == "" {
+		return g
+	}
 	g.Captured = true
-	if out, err := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output(); err == nil {
-		g.SHA = strings.TrimSpace(string(out))
+	g.SHA = head
+	// Bracket: every further Git read must still see the same HEAD.
+	sameHEAD := func() bool {
+		out, err := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
+		return err == nil && strings.TrimSpace(string(out)) == head
 	}
 	if out, err := exec.Command("git", "-C", dir, "symbolic-ref", "-q", "HEAD").Output(); err == nil {
 		g.Ref = strings.TrimSpace(string(out))
-	} else if g.SHA != "" {
-		g.Ref = g.SHA
+	} else {
+		g.Ref = head
+	}
+	if !sameHEAD() {
+		// HEAD moved between samples: abandon rather than mix states.
+		return FrozenGit{}
 	}
 	if out, err := exec.Command("git", "-C", dir, "symbolic-ref", "--short", "-q", "HEAD").Output(); err == nil {
 		g.Branch = strings.TrimSpace(string(out))
 	}
+	if !sameHEAD() {
+		return FrozenGit{}
+	}
 	// Changed files: HEAD~1..HEAD like the local default, from SOURCE.
 	out, err := exec.Command("git", "-C", dir, "diff", "--name-only", "HEAD~1", "HEAD").Output()
-	if err != nil {
+	if err != nil || !sameHEAD() {
 		g.ChangedKnown = false
 		g.ChangedFiles = nil
 		return g
@@ -872,13 +977,18 @@ func captureFrozenGit(dir string) FrozenGit {
 // contents despite one run-base (deterministic-local P1).
 //
 //   - target inside src (after resolve): rewrite to a relative link under dst
-//   - target is a regular file outside src: snapshot the bytes into dst
+//   - target is a regular file outside src: snapshot bytes into a hidden
+//     store under dst and rewrite as a relative symlink to that snapshot
+//     (filesystem semantics preserved: the entry stays a symlink)
 //   - target is a directory outside src: refuse (cannot snapshot cheaply)
-//   - dangling: keep the original link string (explicit unresolved link)
+//   - dangling / lexically escaping: refuse (a later-created external path
+//     would re-enter the supposedly immutable run-base)
 func materializeSymlink(path, link, src, dst, target string) error {
 	res, rerr := filepath.EvalSymlinks(path)
 	if rerr != nil {
-		// Dangling or unreadable target: preserve the link as-is.
+		if filepath.IsAbs(link) || escapesFrozen(link) {
+			return fmt.Errorf("freeze: symlink %q is dangling and escapes the frozen tree (target %q); refusing a non-deterministic run-base", path, link)
+		}
 		return os.Symlink(link, target)
 	}
 	absSrc, _ := filepath.Abs(src)
@@ -896,15 +1006,42 @@ func materializeSymlink(path, link, src, dst, target string) error {
 		}
 		return os.Symlink(relLink, target)
 	}
-	// Outside the source: snapshot regular files; refuse external directories.
 	st, err := os.Stat(res)
 	if err != nil {
+		if filepath.IsAbs(link) || escapesFrozen(link) {
+			return fmt.Errorf("freeze: symlink %q target %q is unreadable and escapes the frozen tree", path, res)
+		}
 		return os.Symlink(link, target)
 	}
 	if st.IsDir() {
 		return fmt.Errorf("freeze: symlink %q points outside the source to directory %q; refusing a non-deterministic run-base", path, res)
 	}
-	return copyFile(res, target, st.Mode().Perm())
+	sum := sha256.Sum256([]byte(absRes))
+	storeRel := filepath.Join(".kiwi-frozen-link-targets", hex.EncodeToString(sum[:8]))
+	storeAbs := filepath.Join(dst, storeRel)
+	if err := mkdirParents(filepath.Dir(storeAbs), 0o755); err != nil {
+		return err
+	}
+	if _, serr := os.Stat(storeAbs); serr != nil {
+		if err := copyFile(res, storeAbs, st.Mode().Perm()); err != nil {
+			return err
+		}
+	}
+	relLink, err := filepath.Rel(filepath.Dir(target), storeAbs)
+	if err != nil {
+		return err
+	}
+	return os.Symlink(relLink, target)
+}
+
+// escapesFrozen reports whether a relative link target can climb out of the
+// run-base via ".." components.
+func escapesFrozen(link string) bool {
+	if link == "" {
+		return false
+	}
+	clean := filepath.Clean(link)
+	return clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator))
 }
 
 // AdoptFile copies an external file (e.g. -f ../shared/pipeline.yaml) into
@@ -919,6 +1056,13 @@ func (m *Manager) AdoptFile(srcPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	st, err := os.Stat(abs)
+	if err != nil {
+		return "", err
+	}
+	if st.IsDir() {
+		return "", fmt.Errorf("AdoptFile: %s is a directory; adopt the specific file", abs)
+	}
 	name := filepath.Base(abs)
 	// Keep a stable subdirectory for adopted authority files.
 	rel := filepath.Join(".kiwi-frozen", name)
@@ -930,4 +1074,38 @@ func (m *Manager) AdoptFile(srcPath string) (string, error) {
 		return "", err
 	}
 	return dst, nil
+}
+
+// AdoptLock freezes an image lockfile into a self-contained lock root under
+// the run-base and returns the root directory to pass to applyLocalImageLock
+// (Join(root, ".kiwi/lock.json") must resolve to the adopted bytes). This
+// preserves the lockfilePath layout instead of flattening lock.json next to
+// the pipeline, and never leaves the live original path as authority.
+func (m *Manager) AdoptLock(srcLockFile string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.base == "" {
+		return "", fmt.Errorf("AdoptLock: freeze first")
+	}
+	abs, err := filepath.Abs(srcLockFile)
+	if err != nil {
+		return "", err
+	}
+	st, err := os.Stat(abs)
+	if err != nil {
+		return "", err
+	}
+	if st.IsDir() {
+		return "", fmt.Errorf("AdoptLock: %s is a directory, not a lockfile", abs)
+	}
+	// Structured destination: <base>/.kiwi-frozen/lockroot/.kiwi/lock.json
+	root := filepath.Join(m.base, ".kiwi-frozen", "lockroot")
+	dst := filepath.Join(root, ".kiwi", "lock.json")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return "", err
+	}
+	if err := copyFile(abs, dst, 0o644); err != nil {
+		return "", err
+	}
+	return root, nil
 }

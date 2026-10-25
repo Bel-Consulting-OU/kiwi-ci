@@ -15,9 +15,14 @@ const defaultPathExt = ".COM;.EXE;.BAT;.CMD"
 
 func lookPathWithExt(name, pathEnv, pathExt string) (string, error) {
 	if name == "" {
-		return "", fmt.Errorf("empty executable name")
+		return "", errEmptyExecutable
 	}
-	// Explicit path (contains separator or drive colon): try extensions.
+	// Explicit path (contains separator or drive colon): try PATHEXT forms.
+	// Empty pathExt still gets the platform default so a bare "tool" resolves
+	// to tool.COM/.EXE/.BAT/.CMD, matching Go LookPath.
+	if pathExt == "" {
+		pathExt = defaultPathExt
+	}
 	hasSep := strings.ContainsAny(name, `/\`)
 	isAbs := len(name) >= 2 && name[1] == ':'
 	if hasSep || isAbs {
@@ -32,9 +37,6 @@ func lookPathWithExt(name, pathEnv, pathExt string) (string, error) {
 		// Fail closed: no ambient fallback. Callers must supply PATH.
 		return "", fmt.Errorf("%s: execution PATH is empty", name)
 	}
-	if pathExt == "" {
-		pathExt = defaultPathExt
-	}
 	for _, dir := range filepath.SplitList(pathEnv) {
 		if dir == "" {
 			continue
@@ -46,5 +48,5 @@ func lookPathWithExt(name, pathEnv, pathExt string) (string, error) {
 			}
 		}
 	}
-	return "", fmt.Errorf("%s not found on execution PATH %q (PATHEXT=%q)", name, pathEnv, pathExt)
+	return "", errNotFoundOnPath(name, pathEnv, pathExt)
 }

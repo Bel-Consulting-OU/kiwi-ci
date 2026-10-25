@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Environment overrides for the job-scoped parent cgroup (see jobcgroup.go):
@@ -67,7 +68,10 @@ func setupJobCgroup(ctx context.Context, req jobCgroupRequest) (JobCgroupStatus,
 		return JobCgroupStatus{Detail: fmt.Sprintf("cgroup v2 unified hierarchy is not available at %s: %v", root, err)}, nil
 	}
 	parentOverride := strings.TrimSpace(os.Getenv(jobCgroupParentEnv))
-	if parentOverride == "" {
+	// Native-only job cgroups never feed docker --cgroup-parent, so the
+	// Docker driver probe is irrelevant and must not weaken ownership on
+	// a Docker-less (or systemd-driver) Linux host.
+	if parentOverride == "" && !req.NativeOnly {
 		if err := dockerAcceptsCgroupPath(ctx); err != nil {
 			return JobCgroupStatus{Detail: err.Error()}, nil
 		}
@@ -192,6 +196,25 @@ func ReclaimJobCgroup(parent string) error {
 	rel, err := filepath.Rel(root, dir)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return fmt.Errorf("job cgroup %q escapes the cgroup root %s", parent, root)
+	}
+	// Terminate anything still in the durably recorded group (crash
+	// recovery when PID ledger is missing) before rmdir: cgroup.kill is
+	// available on cgroup v2; a busy cgroup would otherwise leave debt
+	// with no self-repair path.
+	killPath := filepath.Join(dir, "cgroup.kill")
+	if err := os.WriteFile(killPath, []byte("1"), 0o644); err == nil {
+		deadline := time.Now().Add(2 * time.Second)
+		procs := filepath.Join(dir, "cgroup.procs")
+		for time.Now().Before(deadline) {
+			b, rerr := os.ReadFile(procs)
+			if rerr != nil || len(strings.TrimSpace(string(b))) == 0 {
+				break
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+	} else if !os.IsNotExist(err) {
+		// cgroup.kill missing (older v1/v2): fall through to rmdir.
+		_ = err
 	}
 	if err := os.Remove(dir); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove job cgroup %s: %w", dir, err)

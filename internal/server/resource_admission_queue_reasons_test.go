@@ -50,7 +50,7 @@ func TestQueueReasonResourceAdmissionDBMode(t *testing.T) {
 	f.mu.Lock()
 	f.profiles["resource-prof"] = model.RunnerProfile{ID: "resource-prof", Capabilities: []string{"native"}, MaxCapacity: 8, MaxMemory: 4 << 30}
 	f.certProfiles[serial] = "resource-prof"
-	f.runners["runner-res"] = model.Runner{ProtocolVersion: 2, ID: "runner-res", Name: "runner-res", Capacity: 8, CertSerial: serial, ReportedCapabilities: []string{"native"}}
+	f.runners["runner-res"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "runner-res", Name: "runner-res", Capacity: 8, CertSerial: serial, ReportedCapabilities: []string{"native"}}
 	f.runs["run-res"] = model.Run{ID: "run-res", Status: model.StatusQueued}
 	f.jobs["job-over"] = model.Job{ID: "job-over", RunID: "run-res", Key: "over", Status: model.StatusQueued, MemoryRequest: 8 << 30, CreatedAt: time.Now().UTC()}
 	f.jobs["job-wait"] = model.Job{ID: "job-wait", RunID: "run-res", Key: "wait", Status: model.StatusQueued, MemoryRequest: 4 << 30, CreatedAt: time.Now().UTC().Add(time.Second)}
@@ -86,7 +86,7 @@ func TestQueueReasonResourceAdmissionCapacityLessRunner(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.mu.Lock()
-	f.runners["runner-plain"] = model.Runner{ProtocolVersion: 2, ID: "runner-plain", Name: "runner-plain", Capacity: 2}
+	f.runners["runner-plain"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "runner-plain", Name: "runner-plain", Capacity: 2}
 	f.runs["run-plain"] = model.Run{ID: "run-plain", Status: model.StatusQueued}
 	f.jobs["job-big"] = model.Job{ID: "job-big", RunID: "run-plain", Key: "big", Status: model.StatusQueued, RequiredLabels: []string{"gpu"}, MemoryRequest: 512 << 30, CreatedAt: time.Now().UTC()}
 	f.mu.Unlock()

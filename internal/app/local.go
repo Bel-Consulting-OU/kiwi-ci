@@ -74,11 +74,23 @@ func RunLocal(ctx context.Context, args []string) error {
 	// Prefer the pipeline bytes as frozen in the run-base when the file
 	// lives under the working tree.
 	fileToLoad := *file
+	adoptedPipeline := false
 	if baseDir != "" {
 		if abs, aerr := filepath.Abs(*file); aerr == nil {
 			if rel, rerr := filepath.Rel(wd, abs); rerr == nil && !strings.HasPrefix(rel, "..") {
-				if frozen := filepath.Join(baseDir, rel); fileExists(frozen) {
+				frozen := filepath.Join(baseDir, rel)
+				if fileExists(frozen) {
 					fileToLoad = frozen
+				} else {
+					// Under the working tree but omitted from Freeze (e.g.
+					// untracked under target/). Live bytes would still change
+					// the run identity: adopt them into the frozen base.
+					adopted, aerr2 := wm.AdoptFile(abs)
+					if aerr2 != nil {
+						return fmt.Errorf("freeze in-tree pipeline: %w", aerr2)
+					}
+					fileToLoad = adopted
+					adoptedPipeline = true
 				}
 			} else {
 				// External pipeline: adopt bytes into the frozen run-base.
@@ -87,6 +99,7 @@ func RunLocal(ctx context.Context, args []string) error {
 					return fmt.Errorf("freeze external pipeline: %w", aerr2)
 				}
 				fileToLoad = adopted
+				adoptedPipeline = true
 			}
 		}
 	}
@@ -111,10 +124,41 @@ func RunLocal(ctx context.Context, args []string) error {
 	// rewrites are not authority — the compiled graph's identity must
 	// describe what actually executes.
 	lockRoot := lockRootFor(fileToLoad)
-	if strings.Contains(fileToLoad, string(filepath.Separator)+".kiwi-frozen"+string(filepath.Separator)) {
-		// Adopted external pipeline: project lock lives with the original
-		// path / working tree, not the copy.
-		lockRoot = lockRootFor(*file)
+	switch {
+	case adoptedPipeline && baseDir != "":
+		// Adopted pipeline: resolve the lock against the ORIGINAL project
+		// layout, but load bytes from a frozen copy. Never fall back to the
+		// live original path (that reopens the pipeline/lock split).
+		origRoot := lockRootFor(*file)
+		if origRoot == "" {
+			origRoot = wd
+		}
+		origLock := filepath.Join(origRoot, ".kiwi", "lock.json")
+		if fileExists(origLock) {
+			frozenRoot, aerr := wm.AdoptLock(origLock)
+			if aerr != nil {
+				return fmt.Errorf("freeze image lock: %w", aerr)
+			}
+			lockRoot = frozenRoot
+		} else {
+			// No lock at the original location: point at a root with no
+			// lockfile so applyLocalImageLock takes the documented
+			// "no lockfile" path without reading the live tree.
+			lockRoot = filepath.Join(baseDir, ".kiwi-frozen", "lockroot-absent")
+		}
+	case baseDir != "" && fileToLoad != *file:
+		// Frozen in-tree pipeline: a lock that exists in the live working
+		// tree but was absent at freeze must not silently apply (or be
+		// silently dropped) — fail closed, same rule as kiwi.toml.
+		origRoot := lockRootFor(*file)
+		if origRoot == "" {
+			origRoot = wd
+		}
+		liveLock := filepath.Join(origRoot, ".kiwi", "lock.json")
+		frozenLock := filepath.Join(lockRoot, ".kiwi", "lock.json")
+		if fileExists(liveLock) && !fileExists(frozenLock) && filepath.Clean(liveLock) != filepath.Clean(frozenLock) {
+			return fmt.Errorf("image lockfile %s exists in the working tree but was not present at freeze time; re-run so the lock is part of the frozen run identity", liveLock)
+		}
 	}
 	if err := applyLocalImageLock(spec, lockRoot); err != nil {
 		return err
@@ -194,12 +238,27 @@ func RunLocal(ctx context.Context, args []string) error {
 	opts.RunnerLabels = []string{"native", "local"}
 	opts.RunnerRegions = []string{"local"}
 	// [runner] allow_rootful_untrusted lifts the sandbox.rootless gate on
-	// hosts without rootless docker (macOS/colima). Read from kiwi.toml.
-	cfgPath := "kiwi.toml"
-	if baseDir != "" && fileExists(filepath.Join(baseDir, "kiwi.toml")) {
-		cfgPath = filepath.Join(baseDir, "kiwi.toml")
+	// hosts without rootless docker (macOS/colima). Read ONLY from the
+	// frozen run-base when Freeze ran: a kiwi.toml created after Freeze in
+	// the live CWD must not change AllowRootfulUntrusted for this run.
+	cfgPath := ""
+	if baseDir != "" {
+		if frozenCfg := filepath.Join(baseDir, "kiwi.toml"); fileExists(frozenCfg) {
+			cfgPath = frozenCfg
+		} else if !fileExists(filepath.Join(wd, "kiwi.toml")) {
+			// Absent both in the frozen tree and the live source at load
+			// time: nothing to apply.
+			cfgPath = ""
+		} else {
+			// Present in live CWD but absent from the freeze: the file was
+			// created after Freeze. Fail closed rather than let a late
+			// write flip a security gate.
+			return fmt.Errorf("kiwi.toml exists in the working tree but was not present at freeze time; re-run so the config is part of the frozen run identity")
+		}
+	} else if fileExists("kiwi.toml") {
+		cfgPath = "kiwi.toml"
 	}
-	if _, serr := os.Stat(cfgPath); serr == nil {
+	if cfgPath != "" {
 		if cfg, cerr := config.Load(cfgPath); cerr == nil {
 			opts.AllowRootfulUntrusted = cfg.Runner.AllowRootfulUntrusted
 		}

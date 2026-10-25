@@ -398,7 +398,7 @@ func fsCaseJobLease() fsMutationCase {
 					// degraded gate, so a succeeding persist (a healing
 					// registration) must clear it before /next is accepted.
 					if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
-						`{"name":"lease-heal","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`); w.Code != http.StatusOK {
+						`{"name":"lease-heal","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`); w.Code != http.StatusOK {
 						t.Fatalf("healing register: %d %s", w.Code, w.Body.String())
 					}
 					w := doJSON(t, s, http.MethodPost, "/api/v1/runners/"+runnerID+"/next", "token", "")
@@ -678,7 +678,7 @@ func fsCaseRunnerRegister() fsMutationCase {
 	return fsMutationCase{
 		name: "runner.register",
 		drive: func(t *testing.T, s *Server) *fsMutationDrive {
-			const body = `{"name":"fs-matrix-register","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`
+			const body = `{"name":"fs-matrix-register","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`
 			var runnerID string
 			return &fsMutationDrive{
 				invoke: func(t *testing.T, s *Server) {
@@ -710,7 +710,7 @@ func fsCaseRunnerRegister() fsMutationCase {
 				},
 				heal: func(t *testing.T, s *Server) {
 					w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
-						fmt.Sprintf(`{"id":%q,"name":"fs-matrix-register","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`, runnerID))
+						fmt.Sprintf(`{"id":%q,"name":"fs-matrix-register","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`, runnerID))
 					fsMatrixAssertStatus(t, w, http.StatusOK)
 				},
 				durable: func(t *testing.T, dir string, s *Server) {

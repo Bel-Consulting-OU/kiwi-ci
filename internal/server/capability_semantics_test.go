@@ -31,7 +31,7 @@ func TestRegistrationCapabilityIntersectionPersistsAndStaysNarrow(t *testing.T) 
 	bindRunnerProfile(t, s, "cap-prof", "runner-a", "admin-tok")
 
 	ri := registerWithToken(t, s, map[string]any{
-		"id": "runner-a", "name": "ra", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3,
+		"id": "runner-a", "name": "ra", "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3,
 		"capabilities":          []string{"native"},
 		"reported_capabilities": []string{"tart"},
 		"capabilities_enforced": false,
@@ -94,7 +94,7 @@ func TestDBRegistrationCapabilityIntersectionPersists(t *testing.T) {
 	bindRunnerProfile(t, s, "cap-db-prof", "runner-a", "admin-tok")
 
 	ri := registerWithToken(t, s, map[string]any{
-		"id": "runner-a", "name": "ra", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3,
+		"id": "runner-a", "name": "ra", "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3,
 		"capabilities": []string{"container"},
 	}, "token-a")
 	if !reflect.DeepEqual(ri.Capabilities, []string{"container"}) || !ri.CapabilitiesEnforced {
@@ -169,7 +169,7 @@ func TestMemoryQueueReasonRuntimeCapabilityFromProfile(t *testing.T) {
 		Capabilities: []string{"native"}, MaxCapacity: 1,
 	})
 	bindRunnerProfile(t, s, "q-cap-prof", "runner-a", "admin-tok")
-	ri := model.Runner{ProtocolVersion: 2, ID: "runner-a", Capacity: 1, Labels: []string{"snapshot"}, ReportedCapabilities: []string{"native"}}
+	ri := model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "runner-a", Capacity: 1, Labels: []string{"snapshot"}, ReportedCapabilities: []string{"native"}}
 	seedLiveRunner(t, s, ri)
 	s.mu.Lock()
 	s.jobs["job-q"] = model.Job{
@@ -194,7 +194,7 @@ func TestMemoryQueueReasonRuntimeCapabilityFromProfile(t *testing.T) {
 func TestRegistrationMalformedCapabilityPayload(t *testing.T) {
 	s := perRunnerTokenServer(t, map[string]string{"runner-a": "token-a"})
 	w := pkiRequest(t, s.Handler(), http.MethodPost, "/api/v1/runners/register",
-		map[string]any{"id": "runner-a", "name": "ra", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3,
+		map[string]any{"id": "runner-a", "name": "ra", "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3,
 			"capabilities": map[string]any{"native": true}},
 		"token-a", nil)
 	if w.Code != http.StatusBadRequest {

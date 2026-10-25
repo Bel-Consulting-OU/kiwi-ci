@@ -2,12 +2,14 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,28 +24,111 @@ const nativeServiceEnvPrefix = "KIWI_SERVICE_"
 
 // nativePortClaims is the process-wide host-port ownership table for
 // native services. Two concurrent jobs (matrix variants) must not both
-// believe they own tcp:5432 on the same runner host. This is NOT
-// host-wide across distinct runner processes; the pre-start dial still
-// catches foreign listeners.
+// believe they own tcp:5432 on the same runner host. The in-memory map is
+// the fast path; claimNativePort also takes a durable per-port lock file
+// under the system temp dir so TWO RUNNER PROCESSES on one host cannot
+// both claim the same port (the previous process-local gap). A lock whose
+// recorded owner PID is dead is reclaimed; a live foreign owner fails
+// closed. The pre-start dial still catches foreign listeners that never
+// took the lock.
 var nativePortClaims = struct {
 	sync.Mutex
 	byPort map[int]string
 }{byPort: map[int]string{}}
 
+// nativePortClaimDir is the host-wide lock directory for native port
+// ownership (one file per TCP port). Empty owner/pid means invalid.
+var nativePortClaimDir = func() string {
+	return filepath.Join(os.TempDir(), "kiwi-native-port-claims")
+}
+
 func claimNativePort(port int, owner string) error {
+	if port <= 0 || port > 65535 {
+		return fmt.Errorf("invalid host port %d", port)
+	}
 	nativePortClaims.Lock()
-	defer nativePortClaims.Unlock()
 	if prev, ok := nativePortClaims.byPort[port]; ok {
+		nativePortClaims.Unlock()
 		return fmt.Errorf("host port %d already claimed by %s", port, prev)
 	}
+	// Durable cross-process claim before accepting the in-memory one.
+	if err := claimNativePortFile(port, owner); err != nil {
+		nativePortClaims.Unlock()
+		return err
+	}
 	nativePortClaims.byPort[port] = owner
+	nativePortClaims.Unlock()
 	return nil
 }
 
 func releaseNativePort(port int) {
 	nativePortClaims.Lock()
-	defer nativePortClaims.Unlock()
 	delete(nativePortClaims.byPort, port)
+	nativePortClaims.Unlock()
+	releaseNativePortFile(port)
+}
+
+// claimNativePortFile takes O_CREATE|O_EXCL ownership of port in the
+// host-wide claim directory. A lock left by a dead PID is reclaimed; a
+// lock held by a live process fails closed.
+func claimNativePortFile(port int, owner string) error {
+	dir := nativePortClaimDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("host port %d claim dir: %w", port, err)
+	}
+	path := filepath.Join(dir, fmt.Sprintf("%d.lock", port))
+	payload := []byte(fmt.Sprintf("pid=%d\nowner=%s\n", os.Getpid(), owner))
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err == nil {
+		_, werr := f.Write(payload)
+		cerr := f.Close()
+		return errors.Join(werr, cerr)
+	}
+	if !os.IsExist(err) {
+		return fmt.Errorf("host port %d claim: %w", port, err)
+	}
+	// Existing lock: reclaim only when the recorded owner process is gone.
+	b, rerr := os.ReadFile(path)
+	if rerr != nil {
+		return fmt.Errorf("host port %d already claimed (unreadable lock): %w", port, rerr)
+	}
+	var lockPID int
+	var lockOwner string
+	for _, line := range strings.Split(string(b), "\n") {
+		if strings.HasPrefix(line, "pid=") {
+			fmt.Sscanf(line, "pid=%d", &lockPID)
+		}
+		if strings.HasPrefix(line, "owner=") {
+			lockOwner = strings.TrimPrefix(line, "owner=")
+		}
+	}
+	if lockPID > 0 && processAlive(lockPID) {
+		return fmt.Errorf("host port %d already claimed by %s (pid %d)", port, lockOwner, lockPID)
+	}
+	// Stale lock (dead owner): take it over.
+	if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+		return fmt.Errorf("host port %d stale lock remove: %w", port, rmErr)
+	}
+	f, err = os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return fmt.Errorf("host port %d claim after stale release: %w", port, err)
+	}
+	_, werr := f.Write(payload)
+	cerr := f.Close()
+	return errors.Join(werr, cerr)
+}
+
+func releaseNativePortFile(port int) {
+	path := filepath.Join(nativePortClaimDir(), fmt.Sprintf("%d.lock", port))
+	// Only remove OUR lock: a foreign live owner must keep its file.
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	if !strings.Contains(string(b), fmt.Sprintf("pid=%d\n", os.Getpid())) {
+		return
+	}
+	_ = os.Remove(path)
 }
 
 // childProc tracks one native service process so readiness can race
@@ -104,10 +189,10 @@ type NativeServiceInfo struct {
 	Start string `json:"start,omitempty"`
 }
 
-// onStart is invoked after EACH successfully started service with the
-// identity list so far, so a crash between starts still leaves durable
-// records. Returning an error rolls the whole start back.
-func startNativeServices(ctx context.Context, jobID, workRoot string, baseEnv map[string]string, services []pipeline.Service, onStart func([]NativeServiceInfo) error, emit func(string)) (string, map[string]string, []NativeServiceInfo, func() error, error) {
+// startNativeServices launches host-process services for a native job.
+// cgroupParent, when non-empty, is the durable job cgroup the children are
+// clone-into'd (Linux UseCgroupFD) before any userspace instruction runs.
+func startNativeServices(ctx context.Context, jobID, workRoot string, baseEnv map[string]string, services []pipeline.Service, cgroupParent string, onStart func([]NativeServiceInfo) error, emit func(string)) (string, map[string]string, []NativeServiceInfo, func() error, error) {
 	if len(services) == 0 {
 		return "", nil, nil, func() error { return nil }, nil
 	}
@@ -189,32 +274,51 @@ func startNativeServices(ctx context.Context, jobID, workRoot string, baseEnv ma
 		}
 
 		args := append([]string{}, svc.Command...)
-		// Resolve argv0 against the effective environment PATH (not the
-		// runner daemon's ambient PATH).
-		bin, rerr := lookPathWithEnv(args[0], baseEnv["PATH"], baseEnv["PATHEXT"])
+		// Fully merged effective environment: svc.Env may change PATH, so
+		// resolve argv0 against base+svc (not base alone). Relative paths
+		// ("./bin/tool") resolve against cmd.Dir, matching Go's Dir
+		// contract for the process that will actually run.
+		workDir := workRoot
+		if workDir == "" {
+			workDir = os.TempDir()
+		}
+		effectiveEnv := mergeEnvMap(baseEnv, svc.Env)
+		bin, rerr := resolveExecutable(args[0], workDir, effectiveEnv)
 		if rerr != nil {
 			return failInfo("job %s native service %s: %w", jobID, svc.Name, rerr)
 		}
 		args[0] = bin
-		cmd := exec.CommandContext(ctx, args[0], args[1:]...)
-		if workRoot != "" {
-			cmd.Dir = workRoot
+		envSlice := envMapToSlice(effectiveEnv)
+		envSlice = append(envSlice, fmt.Sprintf("PORT=%d", port))
+		closeCgroupFD := func() {}
+		// Start is single-shot: a UseCgroupFD failure must rebuild a fresh
+		// command (see native.go), not call Start twice on the same Cmd.
+		newCmd := func() *exec.Cmd {
+			cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+			cmd.Dir = workDir
+			cmd.Env = envSlice
+			return cmd
+		}
+		cmd := newCmd()
+		if cgroupParent != "" {
+			cl, err := configureProcessCgroup(cmd, cgroupParent)
+			if err != nil {
+				configureProcess(cmd)
+			} else {
+				closeCgroupFD = cl
+			}
 		} else {
-			cmd.Dir = os.TempDir()
+			configureProcess(cmd)
 		}
-		cmd.Env = envMapToSlice(baseEnv)
-		for k, v := range svc.Env {
-			cmd.Env = append(cmd.Env, k+"="+v)
-		}
-		cmd.Env = append(cmd.Env, fmt.Sprintf("PORT=%d", port))
-		configureProcess(cmd)
 
 		stdoutR, stdoutW, perr := os.Pipe()
 		if perr != nil {
+			closeCgroupFD()
 			return failInfo("job %s native service %s stdout pipe: %w", jobID, svc.Name, perr)
 		}
 		stderrR, stderrW, perr := os.Pipe()
 		if perr != nil {
+			closeCgroupFD()
 			_ = stdoutR.Close()
 			_ = stdoutW.Close()
 			return failInfo("job %s native service %s stderr pipe: %w", jobID, svc.Name, perr)
@@ -222,13 +326,27 @@ func startNativeServices(ctx context.Context, jobID, workRoot string, baseEnv ma
 		cmd.Stdout = stdoutW
 		cmd.Stderr = stderrW
 
-		if serr := cmd.Start(); serr != nil {
+		usedCgroupFD := cgroupFDActive(cmd)
+		serr := cmd.Start()
+		if serr != nil && usedCgroupFD {
+			closeCgroupFD()
+			closeCgroupFD = func() {}
+			cmd = newCmd()
+			configureProcess(cmd)
+			cmd.Stdout = stdoutW
+			cmd.Stderr = stderrW
+			usedCgroupFD = false
+			serr = cmd.Start()
+		}
+		if serr != nil {
+			closeCgroupFD()
 			_ = stdoutW.Close()
 			_ = stderrW.Close()
 			_ = stdoutR.Close()
 			_ = stderrR.Close()
 			return failInfo("job %s native service %s start %s: %w", jobID, svc.Name, bin, serr)
 		}
+		closeCgroupFD()
 		_ = stdoutW.Close()
 		_ = stderrW.Close()
 		if emit != nil {
@@ -245,7 +363,15 @@ func startNativeServices(ctx context.Context, jobID, workRoot string, baseEnv ma
 
 		release, serr := superviseChild(cmd)
 		if serr != nil {
+			// Same contract as the ordinary native-step path: an unsupervised
+			// child must not run. Terminate the tree, force-kill, and reap
+			// through the bounded primitive so no zombie or unsupervised
+			// process survives a Windows Job Object assign failure.
+			_ = terminateProcess(cmd)
 			_ = killProcess(cmd)
+			_ = reapKilledCommand(cmd, killGrace)
+			_ = stdoutR.Close()
+			_ = stderrR.Close()
 			return failInfo("job %s native service %s supervise: %w", jobID, svc.Name, serr)
 		}
 		ch := &childProc{cmd: cmd, done: make(chan struct{})}

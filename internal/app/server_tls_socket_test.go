@@ -329,7 +329,7 @@ func TestTLSSocketRunnerMTLSIdentity(t *testing.T) {
 
 	// Certificate-only registration adopts the certificate identity.
 	resp, body := doSocketJSON(t, client1, http.MethodPost, base+"/api/v1/runners/register", "",
-		`{"name":"runner-1","protocol_version":2,"protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
+		`{"name":"runner-1","protocol_version":2,"supported_execution_semantics":["kiwi.execution.v3"],"protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("cert-only register = %d %s, want 200", resp.StatusCode, body)
 	}
@@ -365,7 +365,7 @@ func TestTLSSocketRunnerMTLSIdentity(t *testing.T) {
 		t.Fatalf("readiness without client cert = %d %s, want 200 (shared listener VerifyClientCertIfGiven)", resp.StatusCode, body)
 	}
 	resp, body = doSocketJSON(t, clientNone, http.MethodPost, base+"/api/v1/runners/register", "",
-		`{"name":"runner-x","protocol_version":2,"protocol_min":3,"protocol_max":3}`)
+		`{"name":"runner-x","protocol_version":2,"supported_execution_semantics":["kiwi.execution.v3"],"protocol_min":3,"protocol_max":3}`)
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("cert-less register with enforced runner mTLS = %d %s, want 401", resp.StatusCode, body)
 	}
@@ -515,7 +515,7 @@ func (r *trickleReader) Read(p []byte) (int, error) {
 func leaseArtifactJob(t *testing.T, client *http.Client, base, token string) (model.Runner, string, string, int64) {
 	t.Helper()
 	resp, body := doSocketJSON(t, client, http.MethodPost, base+"/api/v1/runners/register", token,
-		`{"name":"slow-runner","protocol_version":2,"protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
+		`{"name":"slow-runner","protocol_version":2,"supported_execution_semantics":["kiwi.execution.v3"],"protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("register = %d %s, want 200", resp.StatusCode, body)
 	}

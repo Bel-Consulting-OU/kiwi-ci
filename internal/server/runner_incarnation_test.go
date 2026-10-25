@@ -23,7 +23,7 @@ func TestRunnerIncarnationSupersedesOldSession(t *testing.T) {
 		t.Helper()
 		body, _ := json.Marshal(map[string]any{
 			"id": runnerID, "name": "r", "capacity": 1,
-			"protocol_version": 2, "protocol_min": 3, "protocol_max": 3,
+			"protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3,
 		})
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/runners/register", strings.NewReader(string(body)))
 		req.Header.Set("Authorization", "Bearer runner-tok")
@@ -94,7 +94,7 @@ func registerProtoAt(t *testing.T, s *Server, runnerID string, min, max int) str
 	t.Helper()
 	body, _ := json.Marshal(map[string]any{
 		"id": runnerID, "name": "r", "capacity": 1,
-		"protocol_version": 2, "protocol_min": min, "protocol_max": max,
+		"protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": min, "protocol_max": max,
 	})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/runners/register", strings.NewReader(string(body)))
 	req.Header.Set("Authorization", "Bearer runner-tok")
@@ -179,7 +179,7 @@ func TestCompletionRefusedForSupersededIncarnation(t *testing.T) {
 		t.Helper()
 		body, _ := json.Marshal(map[string]any{
 			"id": runnerID, "name": "r", "capacity": 1,
-			"protocol_version": 2, "protocol_min": 3, "protocol_max": 3,
+			"protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3,
 		})
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/runners/register", strings.NewReader(string(body)))
 		req.Header.Set("Authorization", "Bearer runner-tok")

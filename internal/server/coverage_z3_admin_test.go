@@ -146,7 +146,7 @@ func TestRunnerAdminFailureBranches(t *testing.T) {
 	t.Run("drain audit failure", func(t *testing.T) {
 		s, f, _, _ := cacheFixture(t)
 		f.mu.Lock()
-		f.runners["r-drain"] = model.Runner{ProtocolVersion: 2, ID: "r-drain", Name: "r-drain", Capacity: 1}
+		f.runners["r-drain"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "r-drain", Name: "r-drain", Capacity: 1}
 		f.mu.Unlock()
 		s.DB = &fcStore{dbFakeStore: f, appendAuditErr: errors.New("audit down")}
 		if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/r-drain/drain", "admin-tok", ""); w.Code != http.StatusServiceUnavailable {
@@ -156,7 +156,7 @@ func TestRunnerAdminFailureBranches(t *testing.T) {
 	t.Run("enable audit failure", func(t *testing.T) {
 		s, f, _, _ := cacheFixture(t)
 		f.mu.Lock()
-		f.runners["r-enable"] = model.Runner{ProtocolVersion: 2, ID: "r-enable", Name: "r-enable", Capacity: 1, Disabled: true}
+		f.runners["r-enable"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "r-enable", Name: "r-enable", Capacity: 1, Disabled: true}
 		f.mu.Unlock()
 		s.DB = &fcStore{dbFakeStore: f, appendAuditErr: errors.New("audit down")}
 		if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/r-enable/enable", "admin-tok", ""); w.Code != http.StatusServiceUnavailable {
@@ -166,7 +166,7 @@ func TestRunnerAdminFailureBranches(t *testing.T) {
 	t.Run("disable without the atomic store", func(t *testing.T) {
 		s, f, _, _ := cacheFixture(t)
 		f.mu.Lock()
-		f.runners["r-plain"] = model.Runner{ProtocolVersion: 2, ID: "r-plain", Name: "r-plain", Capacity: 1}
+		f.runners["r-plain"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "r-plain", Name: "r-plain", Capacity: 1}
 		f.mu.Unlock()
 		s.DB = fcPlainStore{f}
 		if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/r-plain/disable", "admin-tok", ""); w.Code != http.StatusServiceUnavailable {
@@ -176,7 +176,7 @@ func TestRunnerAdminFailureBranches(t *testing.T) {
 	t.Run("disable sees a vanished runner", func(t *testing.T) {
 		s, f, _, _ := cacheFixture(t)
 		f.mu.Lock()
-		f.runners["r-gone"] = model.Runner{ProtocolVersion: 2, ID: "r-gone", Name: "r-gone", Capacity: 1}
+		f.runners["r-gone"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "r-gone", Name: "r-gone", Capacity: 1}
 		f.mu.Unlock()
 		s.DB = disableNotFoundStore{dbFakeStore: f}
 		if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/r-gone/disable", "admin-tok", ""); w.Code != http.StatusNotFound {
@@ -189,7 +189,7 @@ func TestRunnerAdminFailureBranches(t *testing.T) {
 			t.Fatal(err)
 		}
 		s.mu.Lock()
-		s.runners["r-crl"] = model.Runner{ProtocolVersion: 2, ID: "r-crl", Name: "r-crl", Capacity: 1, CertSerial: "serial-1"}
+		s.runners["r-crl"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "r-crl", Name: "r-crl", Capacity: 1, CertSerial: "serial-1"}
 		s.crl = nil
 		s.mu.Unlock()
 		if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/r-crl/disable", "admin-tok", ""); w.Code != http.StatusOK {
@@ -212,8 +212,8 @@ func TestWriteRunnerProfileDBLegacyFallbackPreservesLeaseFields(t *testing.T) {
 	f := newDBFakeStore()
 	s := New("tok")
 	s.DB = fcPlainStore{f}
-	old := model.Runner{ProtocolVersion: 2, ID: "r1", Name: "r1", Capacity: 1, ActiveJobs: []string{"j1"}, CurrentJob: "j1", Completed: 2, Failed: 1}
-	profile := model.Runner{ProtocolVersion: 2, ID: "r1", Name: "r1", Capacity: 1, Draining: true}
+	old := model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "r1", Name: "r1", Capacity: 1, ActiveJobs: []string{"j1"}, CurrentJob: "j1", Completed: 2, Failed: 1}
+	profile := model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "r1", Name: "r1", Capacity: 1, Draining: true}
 	if err := s.writeRunnerProfileDB(context.Background(), profile, old, false); err != nil {
 		t.Fatalf("legacy profile write: %v", err)
 	}
@@ -274,7 +274,7 @@ func TestRollbackCompletionLockedRestoresAllMirrors(t *testing.T) {
 	s.runs["run1"] = model.Run{ID: "run1"}
 	s.completions["k1"] = model.CompletionReceipt{JobID: "j1"}
 	s.deployments["j1"] = model.Deployment{ID: "d1"}
-	s.runners["r1"] = model.Runner{ProtocolVersion: 2, ID: "r1"}
+	s.runners["r1"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "r1"}
 	s.mu.Unlock()
 	rb2 := completionRollback{
 		jobs:       map[string]model.Job{},

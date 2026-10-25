@@ -375,7 +375,7 @@ func TestReadinessHealsAcrossSwitchToDB(t *testing.T) {
 	}
 	s.persistFailForTest = errors.New("synthetic snapshot write failure")
 	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
-		`{"name":"r1","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`); w.Code != http.StatusOK {
+		`{"name":"r1","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`); w.Code != http.StatusOK {
 		t.Fatalf("register = %d: %s", w.Code, w.Body.String())
 	}
 	if w := doJSON(t, s, http.MethodGet, "/readiness", "", ""); w.Code != http.StatusServiceUnavailable {

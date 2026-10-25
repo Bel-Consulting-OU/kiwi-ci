@@ -100,7 +100,7 @@ func TestRegistrationOverlaysProfileResourceCapacity(t *testing.T) {
 	bindRunnerProfile(t, s, "revoke", "runner-a", "admin-tok")
 
 	ri := registerWithToken(t, s, map[string]any{
-		"id": "runner-a", "name": "ra", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3,
+		"id": "runner-a", "name": "ra", "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3,
 		"labels": []string{"spoofed"}, "capacity": 99,
 		"resource_capacity": map[string]any{"cpu": 999, "memory": int64(1) << 62, "disk": int64(1) << 62, "pids": 1000000},
 	}, "token-a")
@@ -137,7 +137,7 @@ func TestRegistrationZeroesClientResourceCapacity(t *testing.T) {
 	t.Run("require profiles unbound", func(t *testing.T) {
 		s := perRunnerTokenServer(t, map[string]string{"runner-a": "token-a"})
 		ri := registerWithToken(t, s, map[string]any{
-			"id": "runner-a", "name": "ra", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3,
+			"id": "runner-a", "name": "ra", "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3,
 			"labels": []string{"self"}, "capacity": 9, "resource_capacity": hostile,
 		}, "token-a")
 		assertNoPrivilegeInheritance(t, "unbound runner", ri)
@@ -158,7 +158,7 @@ func TestRegistrationZeroesClientResourceCapacity(t *testing.T) {
 		s := New("runner-tok")
 		s.AdminToken = "admin-tok"
 		ri := registerProfiled(t, s, map[string]any{
-			"id": "runner-a", "name": "ra", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3,
+			"id": "runner-a", "name": "ra", "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3,
 			"labels": []string{"self"}, "capacity": 3, "resource_capacity": hostile,
 		}, nil)
 		if len(ri.Labels) != 1 || ri.Labels[0] != "self" || ri.Capacity != 3 {
@@ -178,7 +178,7 @@ func TestRegistrationZeroesClientResourceCapacity(t *testing.T) {
 			t.Fatal(err)
 		}
 		ri := registerWithToken(t, s, map[string]any{
-			"id": "runner-a", "name": "ra", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3,
+			"id": "runner-a", "name": "ra", "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3,
 			"labels": []string{"self"}, "capacity": 9, "resource_capacity": hostile,
 		}, "shared-dev-tok")
 		assertNoPrivilegeInheritance(t, "db unbound runner", ri)
@@ -218,7 +218,7 @@ func TestUnlinkRevokesProfileSnapshotInFSMode(t *testing.T) {
 	bindRunnerProfile(t, s, "revoke", "runner-a", "admin-tok")
 
 	ri := registerWithToken(t, s, map[string]any{
-		"id": "runner-a", "name": "ra", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3,
+		"id": "runner-a", "name": "ra", "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3,
 		"labels": []string{"spoofed"}, "capacity": 99,
 		"capabilities":      []string{"native", "container"},
 		"resource_capacity": map[string]any{"memory": int64(1) << 62},
@@ -287,7 +287,7 @@ func TestUnlinkRevokesProfileSnapshotInFSMode(t *testing.T) {
 	// Re-bind and re-register restore the profile (the documented repair).
 	bindRunnerProfile(t, restarted, "revoke", "runner-a", "admin-tok")
 	re := registerWithToken(t, restarted, map[string]any{
-		"id": "runner-a", "name": "ra", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3,
+		"id": "runner-a", "name": "ra", "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3,
 		"capabilities": []string{"native", "container"},
 	}, "token-a")
 	if re.Capacity != 4 || re.ResourceCapacity != wantCapacity || re.ProfileID != "revoke" {
@@ -308,7 +308,7 @@ func TestFSDanglingRunnerIDBindingDeniesLease(t *testing.T) {
 	createProfile(t, s, unlinkRevokeProfile())
 	bindRunnerProfile(t, s, "revoke", "runner-a", "admin-tok")
 	s.mu.Lock()
-	s.runners["runner-a"] = model.Runner{ProtocolVersion: 2,
+	s.runners["runner-a"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion},
 		ID: "runner-a", Name: "ra", ProfileID: "revoke", Capacity: 4,
 		Labels: []string{"container"}, ResourceCapacity: model.ResourceCapacity{Memory: 8 << 30},
 	}
@@ -340,7 +340,7 @@ func TestUnlinkRevokesProfileSerializedWithLease(t *testing.T) {
 	createProfile(t, s, unlinkRevokeProfile())
 	bindRunnerProfile(t, s, "revoke", "runner-a", "admin-tok")
 	s.mu.Lock()
-	s.runners["runner-a"] = model.Runner{ProtocolVersion: 2,
+	s.runners["runner-a"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion},
 		ID: "runner-a", Name: "ra", ProfileID: "revoke", Capacity: 4,
 		Labels: []string{"container"}, ResourceCapacity: model.ResourceCapacity{Memory: 8 << 30},
 	}
@@ -382,7 +382,7 @@ func TestUnlinkRevokesProfileMaterializedByLease(t *testing.T) {
 	// the runner's real hardware claim so the later live profile can narrow
 	// it.
 	ri := registerWithToken(t, s, map[string]any{
-		"id": "runner-a", "name": "ra", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3,
+		"id": "runner-a", "name": "ra", "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3,
 		"capabilities": []string{"native", "container"},
 	}, "token-a")
 	if ri.Capacity != 0 || ri.ProfileID != "" {

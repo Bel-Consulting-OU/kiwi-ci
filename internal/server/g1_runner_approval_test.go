@@ -97,7 +97,7 @@ func TestDBDrainAndEnablePreserveConcurrentLease(t *testing.T) {
 		t.Run(action, func(t *testing.T) {
 			f := newDBFakeStore()
 			f.mu.Lock()
-			f.runners["r1"] = model.Runner{ProtocolVersion: 2,
+			f.runners["r1"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion},
 				ID: "r1", Name: "r1", Capacity: 1,
 				ActiveJobs: []string{"job-lease"}, CurrentJob: "job-lease", Busy: true,
 				Completed: 5, Failed: 1,

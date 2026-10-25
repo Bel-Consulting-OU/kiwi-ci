@@ -23,7 +23,7 @@ import (
 // HTTP surface and returns it.
 func registerLeaseRunner(t *testing.T, s *Server, token string) model.Runner {
 	t.Helper()
-	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", token, `{"name":"r1","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", token, `{"name":"r1","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d %s", w.Code, w.Body.String())
 	}
@@ -238,7 +238,7 @@ func TestMemoryLiveProfileRepoACLShrink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runner := model.Runner{ProtocolVersion: 2, ID: parityRunnerID, Name: "pr", Capacity: 1, Labels: []string{"container"}, CertSerial: "cert-1", AllowedRepositories: []string{"github.com/o/r"}, ReportedCapabilities: []string{"native", "container"}}
+	runner := model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: parityRunnerID, Name: "pr", Capacity: 1, Labels: []string{"container"}, CertSerial: "cert-1", AllowedRepositories: []string{"github.com/o/r"}, ReportedCapabilities: []string{"native", "container"}}
 	s.mu.Lock()
 	s.profiles["p1"] = model.RunnerProfile{ID: "p1", Capabilities: []string{"native", "container"}, MaxCapacity: 1, Labels: []string{"container"}, Repositories: []string{"github.com/o/other"}}
 	s.certProfiles["cert-1"] = "p1"
@@ -268,7 +268,7 @@ func TestDBFakeLiveProfileRepoACLShrink(t *testing.T) {
 	if err := s.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
-	runner := model.Runner{ProtocolVersion: 2, ID: parityRunnerID, Name: "pr", Capacity: 1, Labels: []string{"container"}, CertSerial: "cert-1", AllowedRepositories: []string{"github.com/o/r"}, ReportedCapabilities: []string{"native", "container"}}
+	runner := model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: parityRunnerID, Name: "pr", Capacity: 1, Labels: []string{"container"}, CertSerial: "cert-1", AllowedRepositories: []string{"github.com/o/r"}, ReportedCapabilities: []string{"native", "container"}}
 	paritySeedDB(f, runner, parityJob("pjob-1"))
 	if err := f.UpsertProfile(context.Background(), model.RunnerProfile{ID: "p1", Capabilities: []string{"native", "container"}, MaxCapacity: 1, Labels: []string{"container"}, Repositories: []string{"github.com/o/other"}}); err != nil {
 		t.Fatal(err)
@@ -305,7 +305,7 @@ func TestRunnerBearerAcceptableWithCAWhenCertsNotRequired(t *testing.T) {
 	s.LoadRunnerTokens(map[string]string{"runner-a": auth.TokenDigest("per-runner-token")})
 	h := s.Handler()
 	if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register",
-		map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "labels": []string{"container"}, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}, "per-runner-token", nil); w.Code != http.StatusOK {
+		map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "labels": []string{"container"}, "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3}, "per-runner-token", nil); w.Code != http.StatusOK {
 		t.Fatalf("bearer-only register with CA (Require=false): %d %s", w.Code, w.Body.String())
 	}
 	// Lease-bound call: submit (open RBAC mode) then poll with the bearer.
@@ -333,12 +333,12 @@ func TestRunnerCertRequiredEverywhereWhenEnforced(t *testing.T) {
 	h := s.Handler()
 	_, cert := pkiSignRunner(t, ca, "runner-a")
 	if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register",
-		map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "labels": []string{"container"}, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}, "per-runner-token", nil); w.Code == http.StatusOK {
+		map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "labels": []string{"container"}, "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3}, "per-runner-token", nil); w.Code == http.StatusOK {
 		t.Fatalf("register without cert accepted under RequireRunnerClientCerts: %d", w.Code)
 	}
 	// A valid certificate plus the bearer is accepted.
 	if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register",
-		map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "labels": []string{"container"}, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}, "per-runner-token", cert); w.Code != http.StatusOK {
+		map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "labels": []string{"container"}, "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3}, "per-runner-token", cert); w.Code != http.StatusOK {
 		t.Fatalf("register with cert: %d %s", w.Code, w.Body.String())
 	}
 	run := SubmitRun{RepoURL: "https://github.com/o/r.git", RepoFullName: "o/r", Ref: "refs/heads/main", SHA: "abc", Pipeline: testPipeline}
@@ -412,7 +412,7 @@ func paritySeedDB(f *dbFakeStore, runner model.Runner, jobs ...model.Job) {
 func TestLeaseDecisionParityMemoryVsDBFake(t *testing.T) {
 	containerRuntime := map[string]any{"job": map[string]any{"runtime": "container"}}
 	baseRunner := func() model.Runner {
-		return model.Runner{ProtocolVersion: 2, ID: parityRunnerID, Name: "pr", Capacity: 1, Labels: []string{"container"}}
+		return model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: parityRunnerID, Name: "pr", Capacity: 1, Labels: []string{"container"}}
 	}
 	cases := []struct {
 		name   string

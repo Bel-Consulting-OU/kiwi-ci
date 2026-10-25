@@ -411,8 +411,8 @@ func TestIDCovResolveRegistrationProfileBinding(t *testing.T) {
 		t.Fatalf("unowned legacy payload serial = %+v", got)
 	}
 	plain.mu.Lock()
-	plain.runners["runner-b"] = model.Runner{ProtocolVersion: 2, ID: "runner-b", CertSerial: "serial-owned"}
-	plain.runners["runner-a"] = model.Runner{ProtocolVersion: 2, ID: "runner-a", CertSerial: "serial-mine"}
+	plain.runners["runner-b"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "runner-b", CertSerial: "serial-owned"}
+	plain.runners["runner-a"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "runner-a", CertSerial: "serial-mine"}
 	plain.mu.Unlock()
 	if got := plain.resolveRegistrationProfileBinding(httptest.NewRequest(http.MethodPost, "/", nil), "runner-a", "serial-owned"); got.Serial != "" {
 		t.Fatalf("serial owned by another runner accepted: %+v", got)
@@ -430,7 +430,7 @@ func TestIDCovSerialClaimedByOther(t *testing.T) {
 		t.Fatalf("empty serial = %v %v", claimed, err)
 	}
 	s.mu.Lock()
-	s.runners["runner-b"] = model.Runner{ProtocolVersion: 2, ID: "runner-b", CertSerial: " serial-b "}
+	s.runners["runner-b"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "runner-b", CertSerial: " serial-b "}
 	s.mu.Unlock()
 	if claimed, err := s.serialClaimedByOther(context.Background(), "serial-b", "runner-a"); err != nil || !claimed {
 		t.Fatalf("other-owned serial = %v %v", claimed, err)
@@ -441,7 +441,7 @@ func TestIDCovSerialClaimedByOther(t *testing.T) {
 
 	// DB mode scans the store and fails closed on a store error.
 	f := newDBFakeStore()
-	f.runners["runner-b"] = model.Runner{ProtocolVersion: 2, ID: "runner-b", CertSerial: "serial-db"}
+	f.runners["runner-b"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "runner-b", CertSerial: "serial-db"}
 	s2 := New("t")
 	if err := s2.SwitchToDB(f); err != nil {
 		t.Fatal(err)
@@ -502,7 +502,7 @@ func TestIDCovRunnerIdentityThroughHandler(t *testing.T) {
 	s.LoadRunnerTokens(map[string]string{"runner-a": auth.TokenDigest("tok-a")})
 	h := s.Handler()
 
-	body := map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}
+	body := map[string]any{"id": "runner-a", "name": "ra", "capacity": 1, "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3}
 	if w := pkiRequest(t, h, http.MethodPost, "/api/v1/runners/register", body, "tok-a", nil); w.Code != http.StatusOK {
 		t.Fatalf("per-runner bearer register = %d: %s", w.Code, w.Body.String())
 	}

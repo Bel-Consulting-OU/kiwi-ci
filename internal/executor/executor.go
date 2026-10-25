@@ -688,7 +688,9 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	if !isSandbox {
 		for _, name := range e.Opt.PassEnv {
 			if v, ok := os.LookupEnv(name); ok {
-				baseEnv[name] = v
+				// Canonical key (case-folded on Windows) so a passed Path
+				// cannot coexist with an inherited PATH in the same map.
+				baseEnv[envKeyCanon(name)] = v
 			}
 		}
 	}
@@ -943,11 +945,12 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		// guesswork. When the host has no cgroup v2, Parent stays empty and
 		// the PID+start-stamp ledger remains a weaker fallback.
 		cgStatus, cgCleanup := jobCgroupSetup(ctx, jobCgroupRequest{
-			JobID:  cj.ID,
-			CPU:    cj.Job.Resources.CPU,
-			Memory: int64(cj.Job.Resources.Memory),
-			PIDs:   cj.Job.Resources.PIDs,
-			Force:  true,
+			JobID:      cj.ID,
+			CPU:        cj.Job.Resources.CPU,
+			Memory:     int64(cj.Job.Resources.Memory),
+			PIDs:       cj.Job.Resources.PIDs,
+			Force:      true,
+			NativeOnly: true,
 		})
 		if cgStatus.Enabled && cgCleanup != nil {
 			cgroupParent = cgStatus.Parent
@@ -971,10 +974,17 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		} else {
 			e.log(cj.ID, "service", "native job cgroup unavailable ("+cgStatus.Detail+"); PID+start-stamp ledger is the fallback")
 		}
-		net, nativeEnv, _, cleanupNS, nerr := startNativeServices(ctx, cj.ID, workRoot, serviceEnvFor(jobEnv, jobSecrets), cj.Job.Services, func(list []NativeServiceInfo) error {
+		net, nativeEnv, _, cleanupNS, nerr := startNativeServices(ctx, cj.ID, workRoot, serviceEnvFor(jobEnv, jobSecrets), cj.Job.Services, cgroupParent, func(list []NativeServiceInfo) error {
+			// Prefer clone-into-cgroup at spawn; the ledger still records the
+			// PID so recovery has secondary evidence when UseCgroupFD was
+			// unavailable (older kernels fall back to addPID after Start).
 			if cgroupParent != "" && len(list) > 0 {
 				if err := addPIDToJobCgroup(cgroupParent, list[len(list)-1].PID); err != nil {
-					return fmt.Errorf("add native service to job cgroup: %w", err)
+					// Ignore ENOENT/EINVAL when the process was already born
+					// inside the cgroup (UseCgroupFD): the write is redundant.
+					if !errors.Is(err, os.ErrNotExist) {
+						return fmt.Errorf("add native service to job cgroup: %w", err)
+					}
 				}
 			}
 			if e.Opt.OnNativeServices != nil {
@@ -1074,6 +1084,36 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		// No services to reach: fully disable networking. The container
 		// backend honors network "none"; the tart backend fails closed.
 		network = "none"
+	}
+	// Native jobs (with or without services): durable cgroup ownership for
+	// the whole process tree, created BEFORE the first step/service spawn.
+	if cgroupParent == "" && (cj.Job.Runtime == "" || cj.Job.Runtime == "native") {
+		cgNative, cgNativeCleanup := jobCgroupSetup(ctx, jobCgroupRequest{
+			JobID:      cj.ID,
+			CPU:        cj.Job.Resources.CPU,
+			Memory:     int64(cj.Job.Resources.Memory),
+			PIDs:       cj.Job.Resources.PIDs,
+			Force:      true,
+			NativeOnly: true,
+		})
+		if cgNative.Enabled && cgNativeCleanup != nil {
+			cgroupParent = cgNative.Parent
+			if e.Opt.OnCgroupCreated != nil {
+				if hookErr := e.Opt.OnCgroupCreated(cgNative.Parent); hookErr != nil {
+					_ = cgNativeCleanup()
+					res.Status = model.StatusFailure
+					res.Error = fmt.Sprintf("record job cgroup ownership: %v", hookErr)
+					return finish(res)
+				}
+			}
+			defer func() {
+				if cerr := cgNativeCleanup(); cerr != nil {
+					e.log(cj.ID, "service", "native job cgroup cleanup warning: "+cerr.Error())
+					e.reportCleanupDebt(CleanupCgroup, cgroupParent, cerr)
+				}
+			}()
+			e.log(cj.ID, "runtime", "native job cgroup: "+cgNative.Detail)
+		}
 	}
 	backend, err := backendForNetwork(cj.Job.Runtime, cj.Job.Image, cj.Job.VM, network)
 	if err != nil {
@@ -1327,7 +1367,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			}
 			res.Attempts++
 			e.log(cj.ID, name, fmt.Sprintf("running on %s (attempt %d/%d)", backend.Name(), attempt, attempts))
-			runErr = backend.Run(stepCtx, Command{Shell: shell, Script: st.Run, Dir: dir, Env: stepEnv, TimeoutSeconds: int64(timeout.Seconds()), Background: st.Background}, func(line string) { e.log(cj.ID, name, line) })
+			runErr = backend.Run(stepCtx, Command{Shell: shell, Script: st.Run, Dir: dir, Env: stepEnv, TimeoutSeconds: int64(timeout.Seconds()), Background: st.Background, CgroupParent: cgroupParent}, func(line string) { e.log(cj.ID, name, line) })
 			if runErr == nil {
 				break
 			}

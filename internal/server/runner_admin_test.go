@@ -8,7 +8,7 @@ import (
 
 func registerRunner(t *testing.T, c *testClient, name string, extra map[string]any) string {
 	t.Helper()
-	body := map[string]any{"name": name, "capacity": 1, "labels": []string{"native", "container"}, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3}
+	body := map[string]any{"name": name, "capacity": 1, "labels": []string{"native", "container"}, "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3}
 	for k, v := range extra {
 		body[k] = v
 	}

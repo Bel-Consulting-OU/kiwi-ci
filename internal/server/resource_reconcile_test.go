@@ -44,7 +44,7 @@ func TestServerResourceReconcileGateBlocksLeasesUntilReconciled(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.mu.Lock()
-	f.runners["gate-runner"] = model.Runner{ProtocolVersion: 2, ID: "gate-runner", Name: "gate", Capacity: 1}
+	f.runners["gate-runner"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "gate-runner", Name: "gate", Capacity: 1}
 	f.runs["gate-run"] = model.Run{ID: "gate-run", Status: model.StatusQueued}
 	f.jobs["gate-job"] = model.Job{ID: "gate-job", RunID: "gate-run", Key: "build", Status: model.StatusQueued, CreatedAt: time.Now().UTC()}
 	f.mu.Unlock()
@@ -98,7 +98,7 @@ func TestServerResourceReconcileStandbyPollQuiet(t *testing.T) {
 	}
 	f.setLeader(false)
 	f.mu.Lock()
-	f.runners["gate-runner"] = model.Runner{ProtocolVersion: 2, ID: "gate-runner", Name: "gate", Capacity: 1}
+	f.runners["gate-runner"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "gate-runner", Name: "gate", Capacity: 1}
 	f.mu.Unlock()
 
 	logs.Reset()
@@ -155,7 +155,7 @@ func TestServerResourceReconcileStaleLeaderRaceIsQuiet(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.mu.Lock()
-	f.runners["race-runner"] = model.Runner{ProtocolVersion: 2, ID: "race-runner", Name: "race", Capacity: 1}
+	f.runners["race-runner"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "race-runner", Name: "race", Capacity: 1}
 	f.mu.Unlock()
 
 	logs.Reset()

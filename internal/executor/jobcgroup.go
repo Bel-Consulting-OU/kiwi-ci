@@ -57,6 +57,11 @@ type jobCgroupRequest struct {
 	// Native services use this so ownership is kernel-durable (cgroup)
 	// BEFORE any child is spawned, not only a PID ledger entry.
 	Force bool
+	// NativeOnly marks a cgroup created solely for host-process ownership
+	// (no docker --cgroup-parent). The Docker cgroup-driver probe is
+	// skipped: a Linux native runner without Docker — or with the systemd
+	// driver — must still get a durable job cgroup.
+	NativeOnly bool
 }
 
 // declared reports whether the job declared at least one enforceable axis.

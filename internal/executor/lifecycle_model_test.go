@@ -30,7 +30,7 @@ func TestLifecycleNativeMidStartFailReleasesAll(t *testing.T) {
 		_, _, _, cleanup, err := startNativeServices(
 			context.Background(), "model", t.TempDir(),
 			map[string]string{"PATH": "/usr/bin:/bin"},
-			[]pipeline.Service{good, bad}, nil, nil,
+			[]pipeline.Service{good, bad}, "", nil, nil,
 		)
 		if cleanup != nil {
 			_ = cleanup()
@@ -61,8 +61,7 @@ func TestLifecycleNativeOnStartFailReleases(t *testing.T) {
 	_, _, _, cleanup, err := startNativeServices(
 		context.Background(), "model2", t.TempDir(),
 		map[string]string{"PATH": "/usr/bin:/bin"},
-		[]pipeline.Service{svc},
-		func([]NativeServiceInfo) error { return fmt.Errorf("ledger down") },
+		[]pipeline.Service{svc}, "", func([]NativeServiceInfo) error { return fmt.Errorf("ledger down") },
 		nil,
 	)
 	if cleanup != nil {

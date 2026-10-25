@@ -101,7 +101,7 @@ func TestBearerRunnerResolvesOwnBoundProfile(t *testing.T) {
 		}
 
 		ri := registerWithToken(t, s, map[string]any{
-			"id": "runner-a", "name": "ra", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3,
+			"id": "runner-a", "name": "ra", "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3,
 			"cert_serial": "0priv", "capabilities": []string{"native", "tart"},
 		}, "token-a")
 		if len(ri.Labels) != 1 || ri.Labels[0] != "container" || ri.Region != "own" {
@@ -139,7 +139,7 @@ func TestBearerRunnerResolvesOwnBoundProfile(t *testing.T) {
 			t.Fatalf("unlinked profile still resolves ok=%v err=%v", ok, err)
 		}
 		ri = registerWithToken(t, s, map[string]any{
-			"id": "runner-a", "name": "ra", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3,
+			"id": "runner-a", "name": "ra", "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3,
 			"cert_serial": "0priv", "capacity": 8,
 		}, "token-a")
 		assertNoPrivilegeInheritance(t, "unlinked runner", ri)
@@ -151,7 +151,7 @@ func TestBearerRunnerResolvesOwnBoundProfile(t *testing.T) {
 		delete(s.profiles, "p")
 		s.mu.Unlock()
 		ri = registerWithToken(t, s, map[string]any{
-			"id": "runner-a", "name": "ra", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3,
+			"id": "runner-a", "name": "ra", "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3,
 			"capacity": 8,
 		}, "token-a")
 		assertNoPrivilegeInheritance(t, "dangling-binding runner", ri)
@@ -175,7 +175,7 @@ func TestBearerRunnerResolvesOwnBoundProfile(t *testing.T) {
 			t.Fatalf("durable binding = (%+v, %v, %v)", p, ok, err)
 		}
 		ri := registerWithToken(t, s, map[string]any{
-			"id": "runner-a", "name": "ra", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3,
+			"id": "runner-a", "name": "ra", "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3,
 			"cert_serial": "0stolen", "capabilities": []string{"container"},
 		}, "token-a")
 		if len(ri.Labels) != 1 || ri.Labels[0] != "container" || ri.Capacity != 4 || ri.CertSerial != "" {
@@ -241,7 +241,7 @@ func TestMtlsProfileResolutionUsesVerifiedPeerSerial(t *testing.T) {
 	// profile: the verified serial wins.
 	w := pkiRequest(t, s.Handler(), http.MethodPost, "/api/v1/runners/register",
 		map[string]any{
-			"id": "runner-a", "name": "ra", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3,
+			"id": "runner-a", "name": "ra", "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3,
 			"cert_serial": foreign.SerialNumber.Text(16), "capabilities": []string{"container"},
 		}, "token-a", certA)
 	if w.Code != http.StatusOK {
@@ -263,7 +263,7 @@ func TestMtlsProfileResolutionUsesVerifiedPeerSerial(t *testing.T) {
 	// fallback while the runner CA is configured.
 	w = pkiRequest(t, s.Handler(), http.MethodPost, "/api/v1/runners/register",
 		map[string]any{
-			"id": "runner-a", "name": "ra", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3,
+			"id": "runner-a", "name": "ra", "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3,
 			"cert_serial": foreign.SerialNumber.Text(16), "capacity": 50,
 		}, "token-a", foreign)
 	if w.Code != http.StatusOK {
@@ -290,7 +290,7 @@ func TestRegistrationProfileResolutionLegacySerialPathStillWorks(t *testing.T) {
 	bindSerial(t, s, "legacy", "0legacy")
 
 	ri := registerProfiled(t, s, map[string]any{
-		"id": "runner-legacy", "name": "rl", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3,
+		"id": "runner-legacy", "name": "rl", "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3,
 		"cert_serial": "0legacy",
 	}, nil)
 	if len(ri.Labels) != 1 || ri.Capacity != 2 || ri.CertSerial != "0legacy" {
@@ -313,7 +313,7 @@ func TestStolenSerialLeavesNoBindingRows(t *testing.T) {
 
 	for _, id := range []string{"runner-a", "runner-b"} {
 		w := pkiRequest(t, s.Handler(), http.MethodPost, "/api/v1/runners/register",
-			map[string]any{"id": id, "name": id, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3, "cert_serial": "0stolen"},
+			map[string]any{"id": id, "name": id, "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3, "cert_serial": "0stolen"},
 			"token-"+id[len(id)-1:], nil)
 		if w.Code != http.StatusOK {
 			t.Fatalf("register %s: %d %s", id, w.Code, w.Body.String())

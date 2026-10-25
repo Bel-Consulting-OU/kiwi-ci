@@ -20,7 +20,7 @@ func seedCacheJob(t *testing.T, s *Server, jobID, runnerID, repoURL, repoFullNam
 	s.runs["run-c"] = model.Run{ID: "run-c", Repo: repoURL, RepoFullName: repoFullName, Status: model.StatusRunning}
 	s.jobs[jobID] = model.Job{ID: jobID, RunID: "run-c", Key: "build", RepoURL: repoURL, RepoFullName: repoFullName,
 		Status: model.StatusRunning, Trusted: trusted, LeaseRunnerID: runnerID, LeaseTokenHash: hashLeaseToken(s.leaseKey, raw), LeaseGeneration: 5, LeaseExpiresAt: &exp}
-	s.runners[runnerID] = model.Runner{ProtocolVersion: 2, ID: runnerID, Name: runnerID, Capacity: 1}
+	s.runners[runnerID] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: runnerID, Name: runnerID, Capacity: 1}
 	s.mu.Unlock()
 	return map[string]string{"X-Kiwi-Runner-ID": runnerID, "X-Kiwi-Lease-Token": raw, "X-Kiwi-Lease-Generation": "5"}
 }
@@ -131,7 +131,7 @@ func TestCacheManifestCarriesServerDerivedNamespace(t *testing.T) {
 	f.runs["run-c"] = model.Run{ID: "run-c", Repo: "https://github.com/o/repo-a.git", RepoFullName: "o/repo-a", Status: model.StatusRunning}
 	f.jobs["job-a"] = model.Job{ID: "job-a", RunID: "run-c", Key: "build", RepoURL: "https://github.com/o/repo-a.git", RepoFullName: "o/repo-a",
 		Status: model.StatusRunning, Trusted: true, LeaseRunnerID: "runner-a", LeaseTokenHash: hashLeaseToken(s.leaseKey, "cache-lease-token"), LeaseGeneration: 5, LeaseExpiresAt: &exp}
-	f.runners["runner-a"] = model.Runner{ProtocolVersion: 2, ID: "runner-a", Name: "runner-a", Capacity: 1}
+	f.runners["runner-a"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "runner-a", Name: "runner-a", Capacity: 1}
 	f.mu.Unlock()
 	key := strings.Repeat("f", 64)
 	w := doJSONHeaders(t, s, http.MethodPut, "/api/v1/jobs/job-a/cache/"+key, "runner-tok", "payload", hdrs)

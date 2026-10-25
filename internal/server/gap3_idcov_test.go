@@ -87,7 +87,7 @@ func TestIDCovMetricsHandlerAndDBRendering(t *testing.T) {
 	f.runs["run-open"] = model.Run{ID: "run-open", Status: model.StatusRunning}
 	f.runs["run-done"] = model.Run{ID: "run-done", Status: model.StatusSuccess}
 	f.jobs["job-1"] = model.Job{ID: "job-1", RunID: "run-open", Status: model.StatusRunning}
-	f.runners["r1"] = model.Runner{ProtocolVersion: 2, ID: "r1", Capacity: 0, ActiveJobs: []string{"job-1"}}
+	f.runners["r1"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "r1", Capacity: 0, ActiveJobs: []string{"job-1"}}
 	f.mu.Unlock()
 	sd := New("admin")
 	if err := sd.SwitchToDB(f); err != nil {

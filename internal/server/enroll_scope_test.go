@@ -407,7 +407,7 @@ func TestEnrollGrantExtraLabelsRejected(t *testing.T) {
 	// The enrolled identity registers with the PROFILE's labels: the extra
 	// enrollment label never becomes a scheduling attribute.
 	ri := registerProfiled(t, s, map[string]any{
-		"id": "runner-extra", "name": "re", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3,
+		"id": "runner-extra", "name": "re", "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3,
 	}, cert)
 	if len(ri.Labels) != 1 || ri.Labels[0] != "os:linux" {
 		t.Fatalf("enrollment labels leaked into scheduling: %+v", ri.Labels)

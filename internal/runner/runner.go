@@ -945,11 +945,14 @@ func (r *Runner) register(ctx context.Context) error {
 		// negotiates it (min with its own current version) and refuses the
 		// registration when it is below server.min_runner_protocol.
 		ProtocolVersion: model.RunnerProtocolVersion,
-		Version:         RunnerVersion,
-		Region:          os.Getenv(envRunnerRegion),
-		Capabilities:    discovered,
-		CertSerial:      r.clientCertSerial(),
-		Draining:        r.Cfg.Drain,
+		// Execution-engine versions this binary implements. The server
+		// refuses to lease a stamped job whose semantics are not listed.
+		SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion},
+		Version:                     RunnerVersion,
+		Region:                      os.Getenv(envRunnerRegion),
+		Capabilities:                discovered,
+		CertSerial:                  r.clientCertSerial(),
+		Draining:                    r.Cfg.Drain,
 	}
 	var out registerResponse
 	if err := r.post(ctx, "/api/v1/runners/register", in, &out); err != nil {
@@ -1488,6 +1491,13 @@ func (r *Runner) execute(parent context.Context, t server.Task) {
 			r.complete(parent, t, model.StatusFailure, fmt.Errorf("compiled job %q not found", t.Job.Key), nil, nil)
 			return
 		}
+	}
+	// Execution-semantics gate (defense in depth past lease matching): this
+	// binary implements ONE engine version; a stamped job from another
+	// interpreter must not be materialized or attested here.
+	if sem := t.Job.ExecutionSemantics; sem != "" && sem != model.ExecutionSemanticsVersion {
+		r.complete(parent, t, model.StatusFailure, fmt.Errorf("job requires execution semantics %q but this runner implements %q", sem, model.ExecutionSemanticsVersion), nil, nil)
+		return
 	}
 	eff, merr := execution.MaterializeEffectiveExecution(cj, t.Job.CompiledJobPayload, t.Job, caps)
 	if merr != nil {
@@ -2913,7 +2923,11 @@ func (r *Runner) complete(ctx context.Context, t server.Task, st model.Status, e
 	if err != nil {
 		msg = err.Error()
 	}
-	body := server.Complete{RunnerID: r.ID, LeaseToken: t.LeaseToken, LeaseGeneration: t.LeaseGeneration, Status: st, Error: msg, Outputs: outputs, ObservedRuntime: observed}
+	body := server.Complete{
+		RunnerID: r.ID, LeaseToken: t.LeaseToken, LeaseGeneration: t.LeaseGeneration,
+		Status: st, Error: msg, Outputs: outputs, ObservedRuntime: observed,
+		ExecutionSemantics: model.ExecutionSemanticsVersion,
+	}
 	_ = retryDelivery(completeCtx, func() error {
 		return r.post(completeCtx, "/api/v1/jobs/"+t.Job.ID+"/complete", body, nil)
 	})

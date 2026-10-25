@@ -2755,8 +2755,15 @@ func (m *memStore) CompleteJob(ctx context.Context, jobID string, generation int
 	j.AttemptRunnerID = runnerID
 	// Completion evidence mirrors the SQL payload write: the observed runtime
 	// is part of the completion's critical section, so a rejected completion
-	// stores nothing.
+	// stores nothing. The receipt carries the validated observed interpreter
+	// stamp (or empty for legacy); fall back to the job's requested stamp so
+	// a stamped completion always records requested == observed.
 	j.ObservedRuntime = observed
+	if sem := receipt.ObservedExecutionSemantics; sem != "" {
+		j.ObservedExecutionSemantics = sem
+	} else if j.ExecutionSemantics != "" {
+		j.ObservedExecutionSemantics = j.ExecutionSemantics
+	}
 	m.jobs[jobID] = j
 	// The written receipt records the identity semantic it was computed
 	// with: a version-less incoming receipt is recorded under the

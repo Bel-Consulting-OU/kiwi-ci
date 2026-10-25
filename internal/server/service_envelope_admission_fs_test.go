@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/execution"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executor"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
@@ -180,7 +181,7 @@ func TestMemoryServiceEnvelopeReasonParityWithDBMode(t *testing.T) {
 	f.mu.Lock()
 	f.profiles["env-par-prof"] = model.RunnerProfile{ID: "env-par-prof", Capabilities: []string{"native"}, MaxCapacity: 8, MaxMemory: 8 << 30}
 	f.certProfiles["env-par-serial"] = "env-par-prof"
-	f.runners["env-par-runner"] = model.Runner{ProtocolVersion: 2, ID: "env-par-runner", Name: "env-par-runner", Capacity: 8, CertSerial: "env-par-serial", ReportedCapabilities: []string{"native"}}
+	f.runners["env-par-runner"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "env-par-runner", Name: "env-par-runner", Capacity: 8, CertSerial: "env-par-serial", ReportedCapabilities: []string{"native"}}
 	f.runs["env-par-run"] = model.Run{ID: "env-par-run", Status: model.StatusQueued}
 	f.jobs["env-par-wait"] = model.Job{ID: "env-par-wait", RunID: "env-par-run", Key: "wait", Status: model.StatusQueued,
 		MemoryRequest: 5 << 30, ServiceEnvelopeRequest: model.ResourceCapacity{Memory: 2 << 30}, CreatedAt: time.Now().UTC()}
@@ -199,9 +200,11 @@ func TestMemoryServiceEnvelopeReasonParityWithDBMode(t *testing.T) {
 // TestServiceEnvelopeStampedForTrustedAndUntrustedJobs: the envelope stamp is
 // derived from the EFFECTIVE compiled job — for untrusted jobs after the
 // server-side ceilings were filled, which is exactly what the runner executes
-// (the signed CompiledJobPayload.EffectiveJob) — and for trusted jobs from the
-// declared resources unchanged. The stamp itself is trust-agnostic: both
-// classes get the aggregate.
+// (ApplyPersistedResourceRequests over the signed CompiledJobPayload.EffectiveJob)
+// — and for trusted jobs from the declared resources unchanged. The stamp itself
+// is trust-agnostic: both classes get the aggregate from the SAME planner.
+// Fair split of one service: min(job cpu, serviceDefaultCPUs=2),
+// min(job memory, 2GiB), min(job pids, serviceDefaultPIDs=1024).
 func TestServiceEnvelopeStampedForTrustedAndUntrustedJobs(t *testing.T) {
 	s := New("tok")
 	mk := func(resources pipeline.Resources) pipeline.CompiledJob {
@@ -211,23 +214,24 @@ func TestServiceEnvelopeStampedForTrustedAndUntrustedJobs(t *testing.T) {
 		cj.Job.Services = []pipeline.Service{{Name: "db", Image: "postgres:16"}}
 		return cj
 	}
-	// Fair split of one service: min(job cpu, 2), min(job memory, 2GiB),
-	// min(job pids, 256).
+	// Trusted: declared resources stand. PIDs 300 stays 300 (fair split
+	// min(300, serviceDefaultPIDs=1024)); 256 is the untrusted CEILING, not
+	// the fair-split default.
 	trustedJob, err := s.applyUntrustedResourceCeilings(mk(pipeline.Resources{CPU: 3, Memory: 6 << 30, PIDs: 300}), true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var tj model.Job
 	applyCompiledJobFields(&tj, trustedJob, nil, time.Now())
-	if tj.ServiceEnvelopeRequest != (model.ResourceCapacity{CPU: 2, Memory: 2 << 30, PIDs: 256}) {
-		t.Fatalf("trusted envelope = %+v, want the declared-resource fair split {cpu:2 memory:2GiB pids:256}", tj.ServiceEnvelopeRequest)
+	if tj.ServiceEnvelopeRequest != (model.ResourceCapacity{CPU: 2, Memory: 2 << 30, PIDs: 300}) {
+		t.Fatalf("trusted envelope = %+v, want the declared-resource fair split {cpu:2 memory:2GiB pids:300}", tj.ServiceEnvelopeRequest)
 	}
 	if tj.CPURequest != 3 || tj.MemoryRequest != 6<<30 || tj.PIDsRequest != 300 {
 		t.Fatalf("trusted own request = %v/%d/%d, want the declared resources", tj.CPURequest, tj.MemoryRequest, tj.PIDsRequest)
 	}
 
 	// Untrusted: the ceilings fill cpu=2, pids=256 and the disk bound, so the
-	// envelope derives from the FILLED envelope (cpu 2, memory 3GiB, pids
+	// envelope derives from the FILLED resources (cpu 2, memory 3GiB, pids
 	// 256), not from the declared CPU/PIDs of zero.
 	untrustedJob, err := s.applyUntrustedResourceCeilings(mk(pipeline.Resources{Memory: 3 << 30}), false)
 	if err != nil {
@@ -256,9 +260,12 @@ func TestMemoryServiceEnvelopeStampedAtEnqueue(t *testing.T) {
 	if svc.ServiceEnvelopeRequest.Memory != 2<<30 || svc.ServiceEnvelopeRequest.CPU != 2 || svc.ServiceEnvelopeRequest.PIDs != 256 {
 		t.Fatalf("stamped envelope = %+v, want the executor's fair split {cpu:2 memory:2GiB pids:256}", svc.ServiceEnvelopeRequest)
 	}
-	// The stamped envelope IS the executor's own computation: re-planning the
-	// signed effective job through executor.ServiceEnvelopeRequest must
-	// reproduce it exactly (one planner behind admission and execution).
+	// The stamped envelope IS the executor's own computation after the
+	// runner overlays the persisted relational request fields (ceiling fill
+	// lives there, NOT in the signed EffectiveJob — see
+	// execution.ApplyPersistedResourceRequests): re-planning the effective
+	// job with those fields applied must reproduce the stamp exactly (one
+	// planner behind admission and execution).
 	raw, err := json.Marshal(svc.CompiledJobPayload.EffectiveJob)
 	if err != nil {
 		t.Fatal(err)
@@ -267,6 +274,7 @@ func TestMemoryServiceEnvelopeStampedAtEnqueue(t *testing.T) {
 	if err := json.Unmarshal(raw, &cj); err != nil {
 		t.Fatal(err)
 	}
+	execution.ApplyPersistedResourceRequests(&cj, svc)
 	req, err := executor.ServiceEnvelopeRequest(cj.Job.Resources, cj.Job.Services)
 	if err != nil {
 		t.Fatalf("executor planner on the effective job: %v", err)
@@ -311,7 +319,7 @@ func nativeServiceEnvelopeServer(t *testing.T) (*Server, string) {
 	})
 	bindSerial(t, s, "native-env-prof", serial)
 	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "runner-tok",
-		`{"name":"native-env-runner","cert_serial":"`+serial+`","capabilities":["native","container"],"protocol_version": 2, "protocol_min":3,"protocol_max":3}`)
+		`{"name":"native-env-runner","cert_serial":"`+serial+`","capabilities":["native","container"],"protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d %s", w.Code, w.Body.String())
 	}

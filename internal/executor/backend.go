@@ -17,6 +17,10 @@ type Command struct {
 	// detach). The process is torn down with the job workspace/container.
 	// No step outputs are collected from a background step.
 	Background bool
+	// CgroupParent is the job-scoped cgroup ("/path") for native steps.
+	// After Start the child PID is migrated into it so a hard crash can
+	// reclaim the process tree from the durable cgroup record.
+	CgroupParent string
 }
 
 type Backend interface {

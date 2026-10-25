@@ -63,7 +63,7 @@ func composeRotationMatrix(t *testing.T) []composeMatrixCase {
 		{"snapshot listing invisible", http.MethodGet, "/api/v1/runs/run-b/snapshots", "", http.StatusForbidden},
 		{"snapshot download visible", http.MethodGet, "/api/v1/runs/run-a/snapshots/snap-a", "", http.StatusForbidden},
 		{"snapshot download invisible", http.MethodGet, "/api/v1/runs/run-b/snapshots/snap-b", "", http.StatusForbidden},
-		{"runner registration", http.MethodPost, "/api/v1/runners/register", `{"name":"r","protocol_version": 2, "protocol_min":3,"protocol_max":3}`, http.StatusUnauthorized},
+		{"runner registration", http.MethodPost, "/api/v1/runners/register", `{"name":"r","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3}`, http.StatusUnauthorized},
 		{"test-intelligence visible", http.MethodGet, "/api/v1/test-intelligence?repo=o/repo-a", "", http.StatusOK},
 		{"test-intelligence invisible", http.MethodGet, "/api/v1/test-intelligence?repo=o/repo-b", "", http.StatusForbidden},
 	}
@@ -83,7 +83,7 @@ func composeAdminRotationMatrix() []composeMatrixCase {
 		{"snapshot listing invisible", http.MethodGet, "/api/v1/runs/run-b/snapshots", "", http.StatusOK},
 		{"snapshot download visible", http.MethodGet, "/api/v1/runs/run-a/snapshots/snap-a", "", http.StatusOK},
 		{"snapshot download invisible", http.MethodGet, "/api/v1/runs/run-b/snapshots/snap-b", "", http.StatusOK},
-		{"runner registration", http.MethodPost, "/api/v1/runners/register", `{"name":"r","protocol_version": 2, "protocol_min":3,"protocol_max":3}`, http.StatusUnauthorized},
+		{"runner registration", http.MethodPost, "/api/v1/runners/register", `{"name":"r","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3}`, http.StatusUnauthorized},
 		{"test-intelligence visible", http.MethodGet, "/api/v1/test-intelligence?repo=o/repo-a", "", http.StatusOK},
 		{"test-intelligence invisible", http.MethodGet, "/api/v1/test-intelligence?repo=o/repo-b", "", http.StatusOK},
 	}
@@ -172,7 +172,7 @@ func TestComposeRotationIdenticalAuthorizationMatrixMemory(t *testing.T) {
 
 	// Control: the runner token clears the runner-tier registration entry the
 	// store principals are refused, so the matrix is not trivially denying.
-	control := composeCapture(t, s, http.MethodPost, "/api/v1/runners/register", "runner-tok", `{"name":"r","protocol_version": 2, "protocol_min":3,"protocol_max":3}`)
+	control := composeCapture(t, s, http.MethodPost, "/api/v1/runners/register", "runner-tok", `{"name":"r","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3}`)
 	if control.Status != http.StatusOK {
 		t.Fatalf("runner-token registration = %d, want 200: %s", control.Status, control.Body)
 	}

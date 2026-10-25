@@ -3379,6 +3379,24 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		declared = model.RunnerProtocolVersion
 	}
 	in.ProtocolVersion = declared
+	// Execution-semantics advertisement is fail-closed: only the known
+	// engine versions this control plane understands are accepted. An empty
+	// list is the legacy contract (v2-only) and is left empty. Unknown
+	// values would otherwise sit in the lease predicate as silent denials
+	// with no operator-visible reason.
+	if len(in.SupportedExecutionSemantics) > 0 {
+		cleaned := make([]string, 0, len(in.SupportedExecutionSemantics))
+		for _, s := range in.SupportedExecutionSemantics {
+			switch s {
+			case model.ExecutionSemanticsVersion, model.LegacyExecutionSemanticsVersion:
+				cleaned = append(cleaned, s)
+			default:
+				http.Error(w, fmt.Sprintf("unsupported execution semantics %q; this server implements %q", s, model.ExecutionSemanticsVersion), http.StatusBadRequest)
+				return
+			}
+		}
+		in.SupportedExecutionSemantics = cleaned
+	}
 	// Identity binding: mTLS peer certificate and/or the per-runner bearer
 	// token must agree with the claimed ID (an empty ID adopts them).
 	if err := s.bindRunnerIdentity(r, in.ID); err != nil {
@@ -5076,6 +5094,25 @@ func (s *Server) logDBWrite(ctx context.Context, j model.Job, runnerID string, i
 	return ls.AppendLogForLease(ctx, j.ID, runnerID, in.LeaseGeneration, e)
 }
 
+// checkCompletionSemantics validates (and may fill) the observed interpreter
+// stamp on a completion. Returns the semantics to persist and whether to
+// continue.
+func checkCompletionSemantics(j model.Job, in Complete) (string, bool) {
+	if j.ExecutionSemantics == "" {
+		return in.ExecutionSemantics, true
+	}
+	if in.ExecutionSemantics == "" {
+		// Lease already proved the runner advertises this stamp; fill for
+		// the evidence record. A runner that never advertised support could
+		// not have been leased.
+		return j.ExecutionSemantics, true
+	}
+	if in.ExecutionSemantics != j.ExecutionSemantics {
+		return "", false
+	}
+	return in.ExecutionSemantics, true
+}
+
 func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 	_, span := s.startSpan(r.Context(), "server.complete")
 	defer span.End()
@@ -5113,8 +5150,10 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	j, authErr := s.authorizeRunnerLease(r, in.RunnerID, in.LeaseToken, in.LeaseGeneration)
-	if authErr != nil {
+	// The pre-lock job from authorize is intentionally discarded: the live
+	// row is re-read under s.mu below (a concurrent completion may have
+	// raced this authorization).
+	if _, authErr := s.authorizeRunnerLease(r, in.RunnerID, in.LeaseToken, in.LeaseGeneration); authErr != nil {
 		if errors.Is(authErr, errStaleLease) {
 			// Completion is idempotent for the active generation. A previous
 			// completion may already have made the job terminal and cleared
@@ -5126,7 +5165,18 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 			// the snapshot BEFORE any effect can run, and an unwritable
 			// snapshot answers 503 so effects never dispatch off state the
 			// disk does not contain.
+			//
+			// Execution-semantics equality is checked on the replay path too:
+			// a matching result hash must never let a wrong interpreter stamp
+			// through just because the first delivery was correct.
 			s.mu.Lock()
+			if live, ok := s.jobs[jobID]; ok {
+				if _, semOK := checkCompletionSemantics(live, in); !semOK {
+					s.mu.Unlock()
+					http.Error(w, "completion execution semantics does not match job stamp", http.StatusConflict)
+					return
+				}
+			}
 			matched, perr := s.completionReplayReadyLocked(jobID, in.LeaseGeneration, in.RunnerID, in, hash)
 			s.mu.Unlock()
 			if matched {
@@ -5164,6 +5214,14 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.validActiveLease(cur, in.RunnerID, in.LeaseToken, in.LeaseGeneration, now) {
+		// Same fail-closed rule as the stale-lease replay above: a matching
+		// receipt must not accept a completion whose observed interpreter
+		// stamp contradicts the job.
+		if _, semOK := checkCompletionSemantics(cur, in); !semOK {
+			s.mu.Unlock()
+			http.Error(w, "completion execution semantics does not match job stamp", http.StatusConflict)
+			return
+		}
 		matched, perr := s.completionReplayReadyLocked(jobID, in.LeaseGeneration, in.RunnerID, in, hash)
 		s.mu.Unlock()
 		if matched {
@@ -5185,7 +5243,13 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "stale or invalid lease", http.StatusConflict)
 		return
 	}
-	j = cur
+	j := cur
+	observedSem, ok := checkCompletionSemantics(j, in)
+	if !ok {
+		s.mu.Unlock()
+		http.Error(w, "completion execution semantics does not match job stamp", http.StatusConflict)
+		return
+	}
 	completionFrom := j.Status
 	if !j.Status.Terminal() {
 		st := in.Status
@@ -5218,6 +5282,7 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request) {
 			j.Error = "runner returned invalid or oversized job outputs"
 		}
 		j.FinishedAt = &now
+		j.ObservedExecutionSemantics = observedSem
 		// Runtime evidence rides the completion: a deep copy of the validated
 		// wire value with Components replaced by the resolved component
 		// digests of the persisted job (server-owned, never client-trusted).
@@ -5402,6 +5467,19 @@ func (s *Server) completeDB(w http.ResponseWriter, r *http.Request, jobID string
 			return
 		}
 		if matched {
+			// Replay still refuses a contradictory interpreter stamp: a
+			// matching result hash is not authority to rewrite evidence.
+			jg, jerr := s.DB.GetJob(ctx, jobID)
+			if jerr != nil && !errors.Is(jerr, storage.ErrNotFound) {
+				s.internalError(w, r, jerr, "")
+				return
+			}
+			if jerr == nil {
+				if _, semOK := checkCompletionSemantics(jg, in); !semOK {
+					http.Error(w, "completion execution semantics does not match job stamp", http.StatusConflict)
+					return
+				}
+			}
 			if derr := s.reconcileCompletionEffects(ctx, jobID); derr != nil {
 				s.internalError(w, r, derr, "")
 				return
@@ -5422,6 +5500,17 @@ func (s *Server) completeDB(w http.ResponseWriter, r *http.Request, jobID string
 					return
 				}
 				if matched {
+					jg, jerr := s.DB.GetJob(ctx, jobID)
+					if jerr != nil && !errors.Is(jerr, storage.ErrNotFound) {
+						s.internalError(w, r, jerr, "")
+						return
+					}
+					if jerr == nil {
+						if _, semOK := checkCompletionSemantics(jg, in); !semOK {
+							http.Error(w, "completion execution semantics does not match job stamp", http.StatusConflict)
+							return
+						}
+					}
 					if derr := s.reconcileCompletionEffects(ctx, jobID); derr != nil {
 						s.internalError(w, r, derr, "")
 						return
@@ -5432,6 +5521,11 @@ func (s *Server) completeDB(w http.ResponseWriter, r *http.Request, jobID string
 			}
 		}
 		s.writeLeaseAuthError(w, r, authErr)
+		return
+	}
+	observedSemDB, okSem := checkCompletionSemantics(j, in)
+	if !okSem {
+		http.Error(w, "completion execution semantics does not match job stamp", http.StatusConflict)
 		return
 	}
 	st := in.Status
@@ -5450,7 +5544,7 @@ func (s *Server) completeDB(w http.ResponseWriter, r *http.Request, jobID string
 	// resolved components come from the locked/authorized persisted job (the
 	// wire's Components are never trusted).
 	observed := observedRuntimeWithComponents(in.ObservedRuntime, j)
-	if err := s.Sched.Complete(ctx, jobID, in.LeaseGeneration, in.RunnerID, st, errMsg, outputs, hash, observed); err != nil {
+	if err := s.Sched.CompleteWithSemantics(ctx, jobID, in.LeaseGeneration, in.RunnerID, st, errMsg, outputs, hash, observedSemDB, observed); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			http.NotFound(w, r)
 			return

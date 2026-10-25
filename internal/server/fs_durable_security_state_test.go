@@ -96,7 +96,7 @@ func TestCRLPersistFailuresBlockDisableAcknowledgment(t *testing.T) {
 				t.Fatal(err)
 			}
 			s.mu.Lock()
-			s.runners["runner-a"] = model.Runner{ProtocolVersion: 2, ID: "runner-a", Name: "ra", Capacity: 1, CertSerial: serial}
+			s.runners["runner-a"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "runner-a", Name: "ra", Capacity: 1, CertSerial: serial}
 			perr := s.persistCheckedErrLocked("test.seed")
 			s.mu.Unlock()
 			if perr != nil {

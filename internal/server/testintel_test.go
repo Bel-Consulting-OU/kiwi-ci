@@ -217,7 +217,7 @@ jobs:
 
 func registerMemoryRunner(t *testing.T, s *Server) string {
 	t.Helper()
-	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token", `{"name":"r1","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container","native"],"capacity":2}`)
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token", `{"name":"r1","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"labels":["container","native"],"capacity":2}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d %s", w.Code, w.Body.String())
 	}

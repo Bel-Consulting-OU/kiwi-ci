@@ -126,7 +126,7 @@ func TestTLSConfigVerifiesRunnerClientCerts(t *testing.T) {
 	clientCert := issueRunnerClientCert(t, ca, "runner-1")
 	client := ts.Client()
 	client.Transport = &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{clientCert}, InsecureSkipVerify: true}}
-	regReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/runners/register", stringsReader(`{"name":"runner-1","protocol_version": 2, "protocol_min":3,"protocol_max":3}`))
+	regReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/runners/register", stringsReader(`{"name":"runner-1","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3}`))
 	regReq.Header.Set("Authorization", "Bearer runner-tok")
 	regReq.Header.Set("Content-Type", "application/json")
 	regResp, err := client.Do(regReq)

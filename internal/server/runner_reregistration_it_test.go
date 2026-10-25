@@ -73,7 +73,7 @@ func TestIntegrationRegisterRevokesPredecessorIncarnation(t *testing.T) {
 	runnerID := pgITServerRandomHex(t, 32)
 	register := func() registerResponse {
 		t.Helper()
-		body := `{"id":"` + runnerID + `","name":"r","capacity":1,"labels":["container"],"protocol_version": 2, "protocol_min":3,"protocol_max":3}`
+		body := `{"id":"` + runnerID + `","name":"r","capacity":1,"labels":["container"],"protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3}`
 		w := pgITDo(t, s, http.MethodPost, "/api/v1/runners/register", "token", body, nil)
 		if w.Code != http.StatusOK {
 			t.Fatalf("register: %d %s", w.Code, w.Body.String())

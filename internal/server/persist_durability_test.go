@@ -28,7 +28,7 @@ func usageMetricsSnapshot(s *Server) (cost, energy float64) {
 func registerUsageRunner(t *testing.T, s *Server) (string, Task) {
 	t.Helper()
 	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
-		`{"name":"r1","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2,"cost_per_hour":7200,"power_watts":500}`)
+		`{"name":"r1","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2,"cost_per_hour":7200,"power_watts":500}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d %s", w.Code, w.Body.String())
 	}
@@ -68,7 +68,7 @@ func TestReadinessDegradedOnPersistFailureAndHeals(t *testing.T) {
 		// not propagate the persist error; readiness is the fail-closed
 		// signal.
 		w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
-			`{"name":"r1","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
+			`{"name":"r1","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
 		if w.Code != http.StatusOK {
 			t.Fatalf("register = %d, want 200: %s", w.Code, w.Body.String())
 		}
@@ -94,7 +94,7 @@ func TestReadinessDegradedOnPersistFailureAndHeals(t *testing.T) {
 	t.Run("successful persist heals readiness", func(t *testing.T) {
 		s.persistFailForTest = nil
 		w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
-			`{"name":"r2","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
+			`{"name":"r2","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
 		if w.Code != http.StatusOK {
 			t.Fatalf("healing register = %d, want 200: %s", w.Code, w.Body.String())
 		}
@@ -170,7 +170,7 @@ func TestLeaseRefusedWhileDegradedAndHeals(t *testing.T) {
 	// Register the runner while the store is healthy; the refusal below can
 	// then only come from the degraded gate, not from a missing runner.
 	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
-		`{"name":"r1","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
+		`{"name":"r1","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d %s", w.Code, w.Body.String())
 	}
@@ -183,7 +183,7 @@ func TestLeaseRefusedWhileDegradedAndHeals(t *testing.T) {
 	// Arm the degraded state with another persisting mutation; registration
 	// answers 200 and /readiness is the fail-closed signal.
 	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
-		`{"name":"r2","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`); w.Code != http.StatusOK {
+		`{"name":"r2","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`); w.Code != http.StatusOK {
 		t.Fatalf("degrading register: %d %s", w.Code, w.Body.String())
 	}
 	if !s.stateDegraded.Load() {
@@ -209,7 +209,7 @@ func TestLeaseRefusedWhileDegradedAndHeals(t *testing.T) {
 	// then leases normally and hands the runner a token.
 	s.persistFailForTest = nil
 	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
-		`{"name":"r3","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`); w.Code != http.StatusOK {
+		`{"name":"r3","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`); w.Code != http.StatusOK {
 		t.Fatalf("healing register: %d %s", w.Code, w.Body.String())
 	}
 	if s.stateDegraded.Load() {
@@ -249,7 +249,7 @@ func TestLeasePersistFailureWithholdsTokenAndRecovers(t *testing.T) {
 		t.Fatal(err)
 	}
 	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
-		`{"name":"r1","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
+		`{"name":"r1","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register: %d %s", w.Code, w.Body.String())
 	}
@@ -298,7 +298,7 @@ func TestLeasePersistFailureWithholdsTokenAndRecovers(t *testing.T) {
 	// first (the gate refuses new leases until then, by design).
 	s.persistFailForTest = nil
 	if w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
-		`{"name":"r1-heal","protocol_version": 2, "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`); w.Code != http.StatusOK {
+		`{"name":"r1-heal","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":1}`); w.Code != http.StatusOK {
 		t.Fatalf("healing register: %d %s", w.Code, w.Body.String())
 	}
 	if s.stateDegraded.Load() {

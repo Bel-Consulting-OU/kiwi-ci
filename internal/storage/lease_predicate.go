@@ -98,6 +98,12 @@ func (p LeasePredicate) Allows() bool {
 	if j.RepoIdentityQuarantined {
 		return false
 	}
+	// Execution-semantics gate: never lease a stamped job to a runner whose
+	// binary claims a different interpreter (or, for a legacy runner that
+	// never advertised the field, only to kiwi.execution.v2).
+	if !model.SupportsExecutionSemantics(r.SupportedExecutionSemantics, j.ExecutionSemantics) {
+		return false
+	}
 	if r.Disabled || r.Draining {
 		return false
 	}
@@ -193,6 +199,9 @@ func ClaimAllowsRunner(r model.Runner, c LeaseClaim) bool {
 		// repo_identity_quarantined payload flag denies every claim even when
 		// the runner's repository allowlist is empty or grants the whole
 		// forge.
+		return false
+	}
+	if !model.SupportsExecutionSemantics(r.SupportedExecutionSemantics, c.ExecutionSemantics) {
 		return false
 	}
 	if r.Disabled || r.Draining {

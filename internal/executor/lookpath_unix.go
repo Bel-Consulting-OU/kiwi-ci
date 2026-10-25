@@ -12,7 +12,7 @@ import (
 func lookPathWithExt(name, pathEnv, pathExt string) (string, error) {
 	_ = pathExt
 	if name == "" {
-		return "", fmt.Errorf("empty executable name")
+		return "", errEmptyExecutable
 	}
 	if strings.ContainsRune(name, os.PathSeparator) || (len(name) > 1 && name[1] == ':') {
 		if st, err := os.Stat(name); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
@@ -34,5 +34,5 @@ func lookPathWithExt(name, pathEnv, pathExt string) (string, error) {
 			return cand, nil
 		}
 	}
-	return "", fmt.Errorf("%s not found on execution PATH %q", name, pathEnv)
+	return "", errNotFoundOnPath(name, pathEnv, "")
 }

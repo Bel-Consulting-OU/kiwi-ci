@@ -3,9 +3,30 @@
 package executor
 
 import (
+	"os"
 	"os/exec"
 	"syscall"
 )
+
+// processAlive reports whether pid is a live process (signal 0 probe).
+// Used to reclaim stale host-port claim locks left by a dead runner.
+func processAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	err = proc.Signal(syscall.Signal(0))
+	if err == nil {
+		return true
+	}
+	if err == syscall.ESRCH {
+		return false
+	}
+	return err == syscall.EPERM
+}
 
 // superviseChild is the non-Windows counterpart of the Job Object helper: on
 // Unix the process group configured by configureProcess already gives

@@ -50,8 +50,8 @@ func scopedStoreServer(t *testing.T) *Server {
 	s.artifacts["art-b"] = model.ArtifactRecord{ID: "art-b", RunID: "run-b", JobID: "job-b", Name: "bin", SHA256: "a", CreatedAt: now}
 	s.snapshots["snap-a"] = model.SnapshotRecord{ID: "snap-a", RunID: "run-a", CreatedAt: now}
 	s.snapshots["snap-b"] = model.SnapshotRecord{ID: "snap-b", RunID: "run-b", CreatedAt: now}
-	s.runners["r-a"] = model.Runner{ProtocolVersion: 2, ID: "r-a", Name: "r-a", Capacity: 1, ActiveJobs: []string{"job-a"}}
-	s.runners["r-b"] = model.Runner{ProtocolVersion: 2, ID: "r-b", Name: "r-b", Capacity: 1, ActiveJobs: []string{"job-b"}}
+	s.runners["r-a"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "r-a", Name: "r-a", Capacity: 1, ActiveJobs: []string{"job-a"}}
+	s.runners["r-b"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "r-b", Name: "r-b", Capacity: 1, ActiveJobs: []string{"job-b"}}
 	s.mu.Unlock()
 	return s
 }

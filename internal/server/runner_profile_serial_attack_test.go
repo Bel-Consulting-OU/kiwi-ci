@@ -84,7 +84,7 @@ func TestStolenCertSerialCannotInheritPrivilegedProfile(t *testing.T) {
 
 	w := pkiRequest(t, s.Handler(), http.MethodPost, "/api/v1/runners/register",
 		map[string]any{
-			"id": "runner-low", "name": "low", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3,
+			"id": "runner-low", "name": "low", "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3,
 			"cert_serial": "0priv", "labels": []string{"self"}, "capacity": 1,
 			"capabilities": []string{"container"},
 		}, "token-low", nil)
@@ -128,7 +128,7 @@ func TestStolenCertSerialCannotInheritPrivilegedProfileDB(t *testing.T) {
 
 	w := pkiRequest(t, s.Handler(), http.MethodPost, "/api/v1/runners/register",
 		map[string]any{
-			"id": "runner-low", "name": "low", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3,
+			"id": "runner-low", "name": "low", "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3,
 			"cert_serial": "0priv-db", "labels": []string{"self"}, "capacity": 1,
 		}, "token-low", nil)
 	if w.Code != http.StatusOK {
@@ -166,7 +166,7 @@ func TestUnverifiedPeerCertSerialCannotSelectProfile(t *testing.T) {
 
 	w := pkiRequest(t, s.Handler(), http.MethodPost, "/api/v1/runners/register",
 		map[string]any{
-			"id": "runner-a", "name": "ra", "protocol_version": 2, "protocol_min": 3, "protocol_max": 3,
+			"id": "runner-a", "name": "ra", "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3,
 			"cert_serial": foreign.SerialNumber.Text(16), "capacity": 8,
 		}, "token-a", foreign)
 	if w.Code != http.StatusOK {
@@ -208,7 +208,7 @@ func TestConcurrentBearerSerialDoubleClaimNoInheritance(t *testing.T) {
 			defer wg.Done()
 			id := fmt.Sprintf("runner-%02d", i)
 			body, err := json.Marshal(map[string]any{
-				"id": id, "name": id, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3,
+				"id": id, "name": id, "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3,
 				"cert_serial": "0race", "capabilities": []string{"container"},
 			})
 			if err != nil {

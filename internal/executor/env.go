@@ -50,25 +50,41 @@ func containerSafeEnv(in map[string]string) map[string]string {
 
 // osEnvironMap captures the host environment as a map. It is used only for the
 // explicit InheritEnv opt-in (local trusted jobs) and PassEnv allowlisting.
+// On Windows, keys are stored uppercased so PATH/Path collide to one entry
+// (Go's case-insensitive env contract). On Unix keys keep their case.
 func osEnvironMap() map[string]string {
 	m := map[string]string{}
 	for _, e := range os.Environ() {
 		if i := strings.IndexByte(e, '='); i > 0 {
-			m[e[:i]] = e[i+1:]
+			m[envKeyCanon(e[:i])] = e[i+1:]
 		}
 	}
 	return m
 }
 
-// mergeEnvMap merges maps left to right; later maps win per key.
+// envKeyCanon is the canonical map key for an environment variable name.
+// Windows environment names are case-insensitive; Go itself implements
+// case-insensitive duplicate elimination. One canonical form prevents
+// Path= and PATH= from both surviving into the child environment where
+// the last-sorting entry would silently win.
+func envKeyCanon(key string) string {
+	if runtime.GOOS == "windows" {
+		return strings.ToUpper(key)
+	}
+	return key
+}
+
+// mergeEnvMap merges maps left to right; later maps win per key. Keys are
+// canonicalized first (case-folded on Windows) so a later PATH cannot
+// coexist with an earlier Path.
 func mergeEnvMap(base map[string]string, maps ...map[string]string) map[string]string {
 	out := make(map[string]string, len(base))
 	for k, v := range base {
-		out[k] = v
+		out[envKeyCanon(k)] = v
 	}
 	for _, x := range maps {
 		for k, v := range x {
-			out[k] = v
+			out[envKeyCanon(k)] = v
 		}
 	}
 	return out
@@ -93,7 +109,8 @@ func serviceEnvFor(jobEnv, jobSecrets map[string]string) map[string]string {
 }
 
 // envSlice converts an env map to a sorted KEY=VALUE slice suitable for
-// exec.Cmd.Env.
+// exec.Cmd.Env. Keys are already canonical (envKeyCanon), so on Windows a
+// single PATH entry survives — never both Path= and PATH=.
 func envSlice(m map[string]string) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {

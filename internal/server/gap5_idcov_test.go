@@ -53,7 +53,7 @@ func TestIDCovNextDBLeaseRunnerLookup(t *testing.T) {
 			f := newDBFakeStore()
 			f.setLeader(true)
 			f.mu.Lock()
-			f.runners["r1"] = model.Runner{ProtocolVersion: 2, ID: "r1", Name: "r1", Capacity: 1}
+			f.runners["r1"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "r1", Name: "r1", Capacity: 1}
 			f.mu.Unlock()
 			store := &idcovRunnerScriptStore{dbFakeStore: f}
 			store.fn = func(n int) (model.Runner, error) {

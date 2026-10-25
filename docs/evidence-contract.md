@@ -83,7 +83,7 @@ lowercase hex SHA-256 unless stated otherwise.
 | Trust | artifact `externalParameters.trusted` | the persisted trust state of the job |
 | Execution-assurance level | attestation `executionAssurance` (`level`, `name`); artifact `executionAssurance` | see §4; the name is validated to match the level |
 | External-effects class | attestation `externalEffects`; artifact `externalEffects` | `pure`, `kiwi_mediated` or `opaque_external`; see §4 |
-| Execution semantics | `executionSemantics` (artifact + attestation) | `model.ExecutionSemanticsVersion` read from durable stamps; empty for records predating stamping |
+| Execution semantics | `executionSemantics` (artifact + attestation) | `model.ExecutionSemanticsVersion` read from durable stamps (`Job.ObservedExecutionSemantics` preferred after completion, else `Job.ExecutionSemantics`, else the run's stamp); empty for records predating stamping |
 | Runner transport protocol | not part of the signed evidence (it is a lease-admission gate) | `model.RunnerProtocolVersion`; see §3 |
 | Dependency resolution | job `needs`/`needsOutputs` and the dependency-status records | `model.Job.Needs`, `NeedsOutputs`; involved in the graph fingerprint |
 | Replay lineage | snapshots `id`, `phase`, `sha256`, `generation`; `leaseGeneration`, `attempts` | `pre_job` snapshot = materialized input state, `post_job` = outcome material; `model.SnapshotRecord` |
@@ -109,7 +109,7 @@ same durable state differently, and vice versa.
 | Dimension | Current value | Carrier | Bump rule |
 |---|---|---|---|
 | Runner transport protocol | `model.RunnerProtocolVersion = 2` | runner registration and `/next` negotiation; a runner below `JobRequiresProtocol` is refused with 409 `RUNNER_PROTOCOL_UNSUPPORTED` | any wire-shape change the negotiation must gate |
-| Execution semantics | `"kiwi.execution.v3"` (`model.ExecutionSemanticsVersion`) | `Run.ExecutionSemantics`, `Job.ExecutionSemantics`, snapshot `execution_semantics`, artifact + attestation `executionSemantics` | any change to how the scheduler/runner/executor INTERPRET durable state, not additive fields the old semantics safely ignore |
+| Execution semantics | `"kiwi.execution.v3"` (`model.ExecutionSemanticsVersion`) | `Run.ExecutionSemantics`, `Job.ExecutionSemantics`, `Job.ObservedExecutionSemantics` (completion: requested == observed or 409), runner registration `supported_execution_semantics` (lease-time match; empty advertisement = v2-only), snapshot `execution_semantics`, artifact + attestation `executionSemantics` | any change to how the scheduler/runner/executor INTERPRET durable state, not additive fields the old semantics safely ignore |
 | Event schema | `model.ExecutionEvent.SchemaVersion` (1) | PostgreSQL `execution_events` rows and the fs event journal | any change to event payload semantics |
 | Snapshot schema | `snapshot.ManifestVersion = 1` | `model.SnapshotRecord.Version` | any change to the workspace manifest encoding |
 | Graph / pipeline schema | pipeline `Spec.Version` (1) and `model.CompiledJobPayload.SchemaVersion` (1) | persisted pipelines, compiled payloads, fragment wire bodies | any change to pipeline or compiled-job semantics |

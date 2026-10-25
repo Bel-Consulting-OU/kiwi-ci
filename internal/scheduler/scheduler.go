@@ -964,7 +964,8 @@ func (w *leaseCandidateWalk) consider(candidate model.Job) leaseWalkResult {
 		// A quarantined candidate carries the durable identity flag, so
 		// the SQL claim denies it independently of every allowlist just
 		// as the in-memory predicate does (R1-6).
-		Quarantined: candidate.RepoIdentityQuarantined,
+		Quarantined:        candidate.RepoIdentityQuarantined,
+		ExecutionSemantics: candidate.ExecutionSemantics,
 	}
 	// Capacity-atomic lease: the job claim, every predicate above, the
 	// resource reservation and the runner's active-jobs append happen in
@@ -1425,8 +1426,23 @@ func (s *DBScheduler) Heartbeat(ctx context.Context, jobID, runnerID string, tok
 
 // Complete applies a runner completion through the store's transactional
 // CompleteJob, passing the canonical completion receipt for idempotent replay.
+// observedSem is the runner's interpreter stamp (server already refused a
+// mismatch against the job); it is stored on the receipt so the completion
+// transaction can persist Job.ObservedExecutionSemantics atomically.
 func (s *DBScheduler) Complete(ctx context.Context, jobID string, generation int64, runnerID string, status model.Status, errMsg string, outputs map[string]string, resultHash string, observed ...*model.ObservedRuntime) error {
-	receipt := model.CompletionReceipt{JobID: jobID, Generation: generation, RunnerID: runnerID, ResultHash: resultHash}
+	return s.CompleteWithSemantics(ctx, jobID, generation, runnerID, status, errMsg, outputs, resultHash, "", observed...)
+}
+
+// CompleteWithSemantics is Complete plus the observed execution-semantics
+// stamp for the durable evidence record.
+func (s *DBScheduler) CompleteWithSemantics(ctx context.Context, jobID string, generation int64, runnerID string, status model.Status, errMsg string, outputs map[string]string, resultHash, observedSem string, observed ...*model.ObservedRuntime) error {
+	receipt := model.CompletionReceipt{
+		JobID:                      jobID,
+		Generation:                 generation,
+		RunnerID:                   runnerID,
+		ResultHash:                 resultHash,
+		ObservedExecutionSemantics: observedSem,
+	}
 	var runtime *model.ObservedRuntime
 	if len(observed) > 0 {
 		runtime = observed[0]

@@ -1194,9 +1194,16 @@ func (s *Server) exportRunJobPipeline(w http.ResponseWriter, r *http.Request) {
 
 // jobExecutionSemantics resolves the stamped execution semantics of a job,
 // falling back to the owning run's value for a job record persisted without
-// its own copy. It returns the empty string for records that predate
-// semantics stamping; callers decide how to treat that legacy case.
+// its own copy. When the completion recorded an observed interpreter stamp,
+// that is preferred: it is what the runner actually used (the server
+// already refused a mismatch, so requested == observed for any stamped
+// completion; the observed field is the durable proof of that equality).
+// It returns the empty string for records that predate semantics stamping;
+// callers decide how to treat that legacy case.
 func jobExecutionSemantics(j model.Job, run model.Run) string {
+	if j.ObservedExecutionSemantics != "" {
+		return j.ObservedExecutionSemantics
+	}
 	if j.ExecutionSemantics != "" {
 		return j.ExecutionSemantics
 	}

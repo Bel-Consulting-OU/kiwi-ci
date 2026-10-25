@@ -100,7 +100,7 @@ func TestIntegrationComposeRevocationAndGrantStateSurviveReplicaRestartDB(t *tes
 	// replica: the identity gate rejects the certificate the database says is
 	// revoked, before any leadership or scheduling decision.
 	if w := pkiRequest(t, sB.Handler(), http.MethodPost, "/api/v1/runners/register",
-		map[string]any{"id": runnerID, "name": runnerID, "capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3},
+		map[string]any{"id": runnerID, "name": runnerID, "capacity": 1, "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3},
 		runnerBearer, cert); w.Code != http.StatusForbidden {
 		t.Fatalf("revoked-cert re-registration on the restarted replica = %d: %s", w.Code, w.Body.String())
 	}
@@ -111,7 +111,7 @@ func TestIntegrationComposeRevocationAndGrantStateSurviveReplicaRestartDB(t *tes
 	// Re-registration without the revoked certificate succeeds (the runner
 	// may come back with a new credential) but must NOT clear the disable.
 	if w := pkiRequest(t, sB.Handler(), http.MethodPost, "/api/v1/runners/register",
-		map[string]any{"id": runnerID, "name": runnerID, "capacity": 1, "protocol_version": 2, "protocol_min": 3, "protocol_max": 3},
+		map[string]any{"id": runnerID, "name": runnerID, "capacity": 1, "protocol_version": 2, "supported_execution_semantics": []any{"kiwi.execution.v3"}, "protocol_min": 3, "protocol_max": 3},
 		runnerBearer, nil); w.Code != http.StatusOK {
 		t.Fatalf("bearer re-registration on the restarted replica = %d: %s", w.Code, w.Body.String())
 	}

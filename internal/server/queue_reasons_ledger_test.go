@@ -28,7 +28,7 @@ func TestMemoryReservationLedgerWorkScalesWithRunningJobs(t *testing.T) {
 		id := fmt.Sprintf("hist-%04d", i)
 		jobs[id] = model.Job{ID: id, RunID: "run-hist", Key: id, Status: model.StatusSuccess, CreatedAt: now}
 	}
-	runner := model.Runner{ProtocolVersion: 2, ID: "ledger-runner", Name: "ledger", Labels: []string{"container"}, Capacity: 8}
+	runner := model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "ledger-runner", Name: "ledger", Labels: []string{"container"}, Capacity: 8}
 	active := make([]string, 0, running)
 	expires := now.Add(time.Hour)
 	for i := 0; i < running; i++ {

@@ -28,7 +28,7 @@ func g1SeedLeasedJob(t *testing.T, s *Server, jobID, runID, runnerID, repoURL, r
 	s.jobs[jobID] = model.Job{ID: jobID, RunID: runID, Key: "build", RepoURL: repoURL, RepoFullName: repoFullName,
 		Status: model.StatusRunning, Trusted: true, LeaseRunnerID: runnerID,
 		LeaseTokenHash: hashLeaseToken(s.leaseKey, raw), LeaseGeneration: gen, LeaseExpiresAt: &exp}
-	s.runners[runnerID] = model.Runner{ProtocolVersion: 2, ID: runnerID, Name: runnerID, Capacity: 1}
+	s.runners[runnerID] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: runnerID, Name: runnerID, Capacity: 1}
 	s.mu.Unlock()
 	return map[string]string{"X-Kiwi-Runner-ID": runnerID, "X-Kiwi-Lease-Token": raw, "X-Kiwi-Lease-Generation": strconv.FormatInt(gen, 10)}
 }
@@ -95,7 +95,7 @@ func TestDBReportDeliveryScopedByJob(t *testing.T) {
 	f.jobs["job-b"] = model.Job{ID: "job-b", RunID: "run-b", Key: "build", RepoURL: "https://github.com/o/repo-a.git", RepoFullName: "o/repo-a",
 		Status: model.StatusRunning, Trusted: true, LeaseRunnerID: "runner-b",
 		LeaseTokenHash: hashLeaseToken(s.leaseKey, "cache-lease-token"), LeaseGeneration: 5, LeaseExpiresAt: &exp}
-	f.runners["runner-b"] = model.Runner{ProtocolVersion: 2, ID: "runner-b", Name: "runner-b", Capacity: 1}
+	f.runners["runner-b"] = model.Runner{ProtocolVersion: 2, SupportedExecutionSemantics: []string{model.ExecutionSemanticsVersion}, ID: "runner-b", Name: "runner-b", Capacity: 1}
 	f.mu.Unlock()
 	hdrsB := map[string]string{"X-Kiwi-Runner-ID": "runner-b", "X-Kiwi-Lease-Token": "cache-lease-token", "X-Kiwi-Lease-Generation": "5"}
 

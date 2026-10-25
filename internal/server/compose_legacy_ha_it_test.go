@@ -201,7 +201,7 @@ func TestIntegrationComposeLegacyWorldCertSerialRunnerLeasePG(t *testing.T) {
 		t.Fatalf("bind cert profile = %d %s", w.Code, w.Body.String())
 	}
 	w := pgITDo(t, s, http.MethodPost, "/api/v1/runners/register", "token",
-		`{"name":"legacy-cert-runner","cert_serial":"`+serial+`","protocol_version": 2, "protocol_min":3,"protocol_max":3,"capabilities":["container"],"capacity":8,"protocol_version": 2, "protocol_min":3,"protocol_max":3}`, nil)
+		`{"name":"legacy-cert-runner","cert_serial":"`+serial+`","protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3,"capabilities":["container"],"capacity":8,"protocol_version": 2, "supported_execution_semantics": ["kiwi.execution.v3"], "protocol_min":3,"protocol_max":3}`, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("register = %d %s", w.Code, w.Body.String())
 	}
