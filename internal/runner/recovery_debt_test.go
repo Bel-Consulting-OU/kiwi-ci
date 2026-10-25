@@ -90,6 +90,7 @@ func TestRecoveryDebtStopsNewLeases(t *testing.T) {
 // TestCurrentIncarnationDebtReconcilesBeforeResume: a bounded in-process
 // reconciliation that CLEARS the debt lets the runner resume polling.
 func TestCurrentIncarnationDebtReconcilesBeforeResume(t *testing.T) {
+	installFakeDockerForRunner(t, filepath.Join(t.TempDir(), "docker.log"))
 	var nextCalls atomic.Int32
 	ts := nextCountingServer(t, &nextCalls)
 	defer ts.Close()
@@ -118,6 +119,7 @@ func TestCurrentIncarnationDebtReconcilesBeforeResume(t *testing.T) {
 // first task creates quota cleanup debt, a second task is queued, and the
 // same runner must never lease it.
 func TestQuotaCleanupPendingStopsNewLeases(t *testing.T) {
+	installFakeDockerForRunner(t, filepath.Join(t.TempDir(), "docker.log"))
 	var served, nextCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -486,6 +488,7 @@ func TestWorkspaceRemoveFailureStopsNewLeases(t *testing.T) {
 // cancellation past the drain grace means Kiwi can no longer prove the old
 // execution authority is gone; the Runner instance must be poisoned.
 func TestRunBackgroundDrainTimeoutPoisonsRunner(t *testing.T) {
+	installFakeDockerForRunner(t, filepath.Join(t.TempDir(), "docker.log"))
 	var nextCalls, registerCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {

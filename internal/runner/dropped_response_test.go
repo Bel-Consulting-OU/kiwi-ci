@@ -653,6 +653,7 @@ func TestDroppedArtifactUploadResponseIsRetriedAndDeduped(t *testing.T) {
 // (checkout) happen exactly once because the completion retry never
 // re-executes the job.
 func TestDroppedCompletionResponseIsRetriedAndDeduped(t *testing.T) {
+	installFakeDockerForRunner(t, filepath.Join(t.TempDir(), "docker.log"))
 	buildStep := nativeScript(
 		"mkdir -p out && echo hello > out/app.txt",
 		"New-Item -ItemType Directory -Force -Path out | Out-Null; 'hello' | Out-File -Encoding utf8 out/app.txt",

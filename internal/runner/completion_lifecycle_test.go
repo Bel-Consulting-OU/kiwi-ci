@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -89,6 +90,7 @@ func TestCompletionAbortsOnRunnerShutdown(t *testing.T) {
 // derived from the passed runner context Run returns in milliseconds; with
 // the previous context.WithoutCancel(parent) it would wait the whole grace.
 func TestRunnerShutdownDoesNotWaitCompletionGrace(t *testing.T) {
+	installFakeDockerForRunner(t, filepath.Join(t.TempDir(), "docker.log"))
 	origGrace := completionGrace
 	completionGrace = 6 * time.Second
 	t.Cleanup(func() { completionGrace = origGrace })

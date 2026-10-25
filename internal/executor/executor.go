@@ -976,15 +976,12 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		}
 		net, nativeEnv, _, cleanupNS, nerr := startNativeServices(ctx, cj.ID, workRoot, serviceEnvFor(jobEnv, jobSecrets), cj.Job.Services, cgroupParent, func(list []NativeServiceInfo) error {
 			// Prefer clone-into-cgroup at spawn; the ledger still records the
-			// PID so recovery has secondary evidence when UseCgroupFD was
-			// unavailable (older kernels fall back to addPID after Start).
+			// PID so recovery has secondary evidence. writePIDToJobCgroup
+			// treats a dead PID (ESRCH) as success — a fast-exit service that
+			// was born inside the cgroup must not fail the start.
 			if cgroupParent != "" && len(list) > 0 {
 				if err := addPIDToJobCgroup(cgroupParent, list[len(list)-1].PID); err != nil {
-					// Ignore ENOENT/EINVAL when the process was already born
-					// inside the cgroup (UseCgroupFD): the write is redundant.
-					if !errors.Is(err, os.ErrNotExist) {
-						return fmt.Errorf("add native service to job cgroup: %w", err)
-					}
+					return fmt.Errorf("add native service to job cgroup: %w", err)
 				}
 			}
 			if e.Opt.OnNativeServices != nil {

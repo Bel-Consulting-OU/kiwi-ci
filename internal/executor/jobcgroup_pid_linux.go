@@ -3,6 +3,7 @@
 package executor
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -56,13 +57,25 @@ func cgroupAbsDir(parent string) string {
 }
 
 // writePIDToJobCgroup is the post-Start fallback when UseCgroupFD was not
-// available (older kernels return EINVAL for the attr).
+// available. A dead PID (ESRCH) is success: the process already exited and
+// cannot escape the cgroup it was born into (or is simply gone) — failing
+// here would tear down a service that UseCgroupFD already owned only to
+// lose a race with a fast exit.
 func writePIDToJobCgroup(parent string, pid int) error {
 	dir := cgroupAbsDir(parent)
 	if dir == "" {
 		return fmt.Errorf("refusing to add pid to malformed cgroup %q", parent)
 	}
-	return os.WriteFile(filepath.Join(dir, "cgroup.procs"), []byte(strconv.Itoa(pid)+"\n"), 0o644)
+	err := os.WriteFile(filepath.Join(dir, "cgroup.procs"), []byte(strconv.Itoa(pid)+"\n"), 0o644)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, syscall.ESRCH) {
+		return nil
+	}
+	// ENOENT on cgroup.procs means the durable cgroup itself is missing —
+	// that is a real ownership failure, never "already a member".
+	return err
 }
 
 // ensure syscall is referenced for build-tag completeness on some toolchains.

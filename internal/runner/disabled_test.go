@@ -60,6 +60,9 @@ func TestDisabledRunnerExitsNonzero(t *testing.T) {
 
 func assertRunnerExitsDisabled(t *testing.T, serverURL string) {
 	t.Helper()
+	// Hermetic: crash reconciliation always shells out to docker; without a
+	// double the test fails whenever the host daemon is down.
+	installFakeDockerForRunner(t, filepath.Join(t.TempDir(), "docker.log"))
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	r := &Runner{Cfg: Config{Server: serverURL, Token: "runner-tok", Poll: 10 * time.Millisecond}, ID: "runner-1"}
@@ -87,6 +90,7 @@ func assertRunnerExitsDisabled(t *testing.T, serverURL string) {
 // (and key) survive, so a later re-enrollment continues the same identity
 // instead of burning a fresh one.
 func TestDisabledClearsPersistedCertificate(t *testing.T) {
+	installFakeDockerForRunner(t, filepath.Join(t.TempDir(), "docker.log"))
 	dir := t.TempDir()
 	ca, err := runnerpki.NewCA("test ca", time.Hour)
 	if err != nil {

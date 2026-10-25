@@ -20,6 +20,22 @@ type upRunnerDTO struct {
 	Labels []string `json:"labels"`
 }
 
+// installFakeDocker puts a minimal docker CLI double first on PATH so the
+// embedded runner's crash reconciliation never depends on a live daemon.
+// ReconcileRuntime fail-closes on `docker ps` errors; without this the
+// single-machine stack dies whenever the host docker daemon is down even
+// though this runner's state dir is brand new.
+func installFakeDocker(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	script := filepath.Join(dir, "docker")
+	body := "#!/bin/sh\ncase \"$1\" in\n  ps) exit 0;;\n  network) exit 0;;\n  info) echo cgroupfs;;\n  rm) exit 0;;\nesac\nexit 0\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
 // TestUpRunsSingleMachineStack drives `kiwi up` end to end: one process
 // serving the control plane and a local runner registered against it, with
 // the state directory holding the persisted token. It then cancels the stack
@@ -28,6 +44,10 @@ func TestUpRunsSingleMachineStack(t *testing.T) {
 	if testing.Short() {
 		t.Skip("single-machine stack startup is an integration-shaped test")
 	}
+	// Hermetic: the embedded runner always runs ReconcileRuntime, which
+	// fail-closes if `docker ps` errors (daemon down is not proof of
+	// absence). A fresh stack never needs a real daemon.
+	installFakeDocker(t)
 	dir := t.TempDir()
 	addr := freeTCPAddr(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -124,6 +144,9 @@ func waitRunnerLabel(t *testing.T, base, token, label string) {
 	t.Helper()
 	deadline := time.Now().Add(upStartupTimeout)
 	client := &http.Client{Timeout: 2 * time.Second}
+	lastStatus := 0
+	lastBody := ""
+	lastErr := ""
 	for time.Now().Before(deadline) {
 		req, err := http.NewRequest(http.MethodGet, base+"/api/v1/runners", nil)
 		if err != nil {
@@ -131,12 +154,19 @@ func waitRunnerLabel(t *testing.T, base, token, label string) {
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
 		resp, err := client.Do(req)
-		if err == nil {
+		if err != nil {
+			lastErr = err.Error()
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		body := make([]byte, 4096)
+		n, _ := resp.Body.Read(body)
+		lastStatus = resp.StatusCode
+		lastBody = string(body[:n])
+		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
 			var runners []upRunnerDTO
-			dec := json.NewDecoder(resp.Body)
-			derr := dec.Decode(&runners)
-			_ = resp.Body.Close()
-			if resp.StatusCode == http.StatusOK && derr == nil {
+			if derr := json.Unmarshal(body[:n], &runners); derr == nil {
 				for _, r := range runners {
 					for _, l := range r.Labels {
 						if l == label {
@@ -144,11 +174,14 @@ func waitRunnerLabel(t *testing.T, base, token, label string) {
 						}
 					}
 				}
+			} else {
+				lastErr = "decode: " + derr.Error()
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	t.Fatalf("no runner with label %q registered within %s", label, upStartupTimeout)
+	t.Fatalf("no runner with label %q registered within %s (last status=%d body=%q err=%q)",
+		label, upStartupTimeout, lastStatus, lastBody, lastErr)
 }
 
 // TestUpStateDirAndTokenHelpers pins the state-directory and token

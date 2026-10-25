@@ -209,6 +209,7 @@ func TestRunnerArtifactCapturesRespectAggregateBudget(t *testing.T) {
 // the cleanup context detached from the runner lifecycle this test would
 // block for the full drain grace; with the lifecycle tie it returns at once.
 func TestRunnerShutdownDoesNotWaitCleanupTimeout(t *testing.T) {
+	installFakeDockerForRunner(t, filepath.Join(t.TempDir(), "docker.log"))
 	dir := t.TempDir()
 	mainMarker := filepath.Join(dir, "main-started")
 	cleanupMarker := filepath.Join(dir, "cleanup-ran")

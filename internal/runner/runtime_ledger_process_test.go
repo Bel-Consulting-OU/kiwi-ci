@@ -116,6 +116,7 @@ func waitFor(t *testing.T, what string, timeout time.Duration, cond func() bool)
 }
 
 func TestRunnerProcessBoundaryLedgerIsolation(t *testing.T) {
+	installFakeDockerForRunner(t, filepath.Join(t.TempDir(), "docker.log"))
 	if testing.Short() {
 		t.Skip("process-boundary test builds and runs real binaries")
 	}

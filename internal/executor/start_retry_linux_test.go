@@ -8,19 +8,20 @@ import (
 	"testing"
 )
 
-// TestStartRetryAfterUseCgroupFDFailure is the oracle for a bug we actually
-// shipped: Go's exec.Cmd.Start is SINGLE-SHOT (startCalled is set even when
-// the first call fails), so a UseCgroupFD failure must rebuild a FRESH
-// command. Re-calling Start on the same Cmd yields "exec: already started"
-// and every cgroup-attached native step would die on kernels that reject
-// clone-into-cgroup.
+// TestStartRetryAfterUseCgroupFDFailure pins the stdlib constraint that
+// forced the production design: Go's exec.Cmd.Start is SINGLE-SHOT
+// (startCalled is set even when the first call fails). A second Start on
+// the same Cmd always returns "exec: already started". Production therefore
+// FAILS CLOSED when clone-into-cgroup is rejected (see
+// TestNativeRunUseCgroupFDFailureFailsClosed) rather than "retrying"
+// outside the durable cgroup.
 func TestStartRetryAfterUseCgroupFDFailure(t *testing.T) {
 	bad := exec.Command("/bin/true")
 	bad.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, UseCgroupFD: true, CgroupFD: 99999}
 	err := bad.Start()
 	if err == nil {
 		_ = bad.Wait()
-		t.Skip("kernel accepted bogus CgroupFD; cannot exercise the fallback")
+		t.Skip("kernel accepted bogus CgroupFD; cannot exercise the constraint")
 	}
 	// Same Cmd, second Start: ALWAYS already-started, never a real retry.
 	if err2 := bad.Start(); err2 == nil {
@@ -30,17 +31,12 @@ func TestStartRetryAfterUseCgroupFDFailure(t *testing.T) {
 		t.Fatalf("second Start err = %v, want exec: already started", err2)
 	}
 
-	// The production fallback: a FRESH command with Setpgid only must start.
+	// A FRESH command with Setpgid only is how a caller would start if it
+	// were not fail-closed — documents that only a new Cmd can Start.
 	fresh := exec.Command("/bin/true")
 	configureProcess(fresh)
 	if startErr := fresh.Start(); startErr != nil {
-		fallback := exec.Command("/bin/true")
-		configureProcess(fallback)
-		if err2 := fallback.Start(); err2 != nil {
-			t.Fatalf("fresh Setpgid-only start: %v (after %v)", err2, startErr)
-		}
-		_ = fallback.Wait()
-		return
+		t.Fatalf("fresh Setpgid-only start: %v", startErr)
 	}
 	_ = fresh.Wait()
 }

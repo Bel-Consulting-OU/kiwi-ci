@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 // runner registers with Draining=true, takes no work, and exits cleanly
 // instead of polling forever.
 func TestDrainRunnerExitsIdle(t *testing.T) {
+	installFakeDockerForRunner(t, filepath.Join(t.TempDir(), "docker.log"))
 	srv := server.New("runner-tok")
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -63,6 +65,7 @@ func TestDrainRunnerExitsIdle(t *testing.T) {
 // rebind the same port. A detached metrics server (the pre-fix shape) keeps
 // the port bound and this test fails.
 func TestDrainRunnerReleasesMetricsPort(t *testing.T) {
+	installFakeDockerForRunner(t, filepath.Join(t.TempDir(), "docker.log"))
 	// Reserve a concrete address, then free it for the runner to bind.
 	probe, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
