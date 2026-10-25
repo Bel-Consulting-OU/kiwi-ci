@@ -491,6 +491,11 @@ func assertBinaryVersion(t *testing.T, bin string) string {
 // A released N-1 artifact (KIWI_N_MINUS_ONE_BIN, optionally hash-pinned by
 // KIWI_N_MINUS_ONE_SHA256) is preferred over building a git worktree.
 func TestSysDFUpgrade002NMinusOne(t *testing.T) {
+	// Hermetic: both phases run runners against fresh state directories and
+	// never create a container. The HEAD runner's crash reconciliation
+	// fail-closes on any `docker ps` error, so on a CLI-present/daemon-down
+	// host the HEAD phase's runner would die and its job would never lease.
+	installFakeDockerForSystem(t)
 	srcDir := moduleRoot(t)
 	goBin := goTool(t)
 
@@ -767,6 +772,9 @@ func pickNMinusOneSHA(t *testing.T, srcDir string) string {
 // Both generations are asserted through `version` on the produced bytes.
 // Source identity is the single module root used for every build.
 func TestSysDFSelf002G1ToG2(t *testing.T) {
+	// G0/G1/G2 self-build lanes are trusted-native: never a container, so
+	// hermeticize crash reconciliation (CLI-present/daemon-down hosts).
+	installFakeDockerForSystem(t)
 	srcDir := moduleRoot(t)
 	outDir := t.TempDir()
 	g0 := filepath.Join(outDir, "g0")
@@ -844,6 +852,9 @@ func TestSysDFSelf002G1ToG2(t *testing.T) {
 // accepts real work and emits verifiable evidence. The hash of the binary
 // that ran is the hash recorded before install.
 func TestSysDFRelease001PackagedArtifact(t *testing.T) {
+	// Packaged-artifact proof runs a trusted-native runner: never a
+	// container (see TestSysDFSelf002G1ToG2).
+	installFakeDockerForSystem(t)
 	srcDir := moduleRoot(t)
 	stage := t.TempDir()
 

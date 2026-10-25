@@ -126,12 +126,12 @@ const (
 //     moved mid-read). Freeze must retry and then fail; RunLocal must
 //     NEVER fall back to live Git after Freeze.
 type FrozenGit struct {
-	Captured bool     `json:"captured"`
-	Unstable bool     `json:"unstable,omitempty"`
-	Repo     bool     `json:"repo,omitempty"`
-	SHA      string   `json:"sha,omitempty"`
-	Ref      string   `json:"ref,omitempty"`
-	Branch   string   `json:"branch,omitempty"`
+	Captured bool   `json:"captured"`
+	Unstable bool   `json:"unstable,omitempty"`
+	Repo     bool   `json:"repo,omitempty"`
+	SHA      string `json:"sha,omitempty"`
+	Ref      string `json:"ref,omitempty"`
+	Branch   string `json:"branch,omitempty"`
 	// RepoURL/RepoFullName are the repository identity derived from the
 	// source's remote AT FREEZE TIME. A linked worktree's .git pointer is
 	// stripped from the run-base, so a post-Freeze detectGitRepo would
@@ -140,9 +140,9 @@ type FrozenGit struct {
 	RepoFullName string `json:"repo_full_name,omitempty"`
 	// Explicit carries the resolved --base/--head/--merge-base changed-file
 	// set, computed from the SOURCE inside the frozen transaction.
-	Explicit      *FrozenRefs `json:"explicit_refs,omitempty"`
-	ChangedFiles  []string    `json:"changed_files,omitempty"`
-	ChangedKnown  bool        `json:"changed_known"`
+	Explicit     *FrozenRefs `json:"explicit_refs,omitempty"`
+	ChangedFiles []string    `json:"changed_files,omitempty"`
+	ChangedKnown bool        `json:"changed_known"`
 }
 
 // FrozenRefs is one explicit ref-range resolution captured at Freeze.
@@ -399,7 +399,7 @@ type trackedIndex interface {
 // freeze transaction itself always uses a captured index.
 type liveTrackedIndex struct{ src string }
 
-func (l liveTrackedIndex) dirTracked(rel string) bool { return hasTrackedFiles(l.src, rel) }
+func (l liveTrackedIndex) dirTracked(rel string) bool  { return hasTrackedFiles(l.src, rel) }
 func (l liveTrackedIndex) fileTracked(rel string) bool { return isGitTracked(l.src, rel) }
 
 // capturedTrackedIndex is the immutable index snapshot taken once per

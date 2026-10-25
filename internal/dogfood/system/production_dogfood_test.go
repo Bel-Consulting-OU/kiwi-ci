@@ -73,6 +73,10 @@ func (r resourceSnapshot) String() string {
 // (churn) and more jobs complete, and process resources return near the
 // pre-workload baseline. Resource facts are recorded in the test log.
 func TestSysDFScale002Soak(t *testing.T) {
+	// Hermetic: the soak never creates a container; the fake docker keeps
+	// the runner's fail-closed crash reconciliation from dying on a
+	// CLI-present/daemon-down host before the soak starts.
+	installFakeDockerForSystem(t)
 	sys := start(t)
 	if err := sys.StartRunner("soak-runner-a", nil); err != nil {
 		t.Fatalf("start runner: %v", err)
@@ -214,6 +218,7 @@ func dockerInstalled() bool {
 //
 // FAIL is preferred only when docker IS rootless and the success path fails.
 func TestSysUntrustedContainerEvidenceLane(t *testing.T) {
+	// Capability decisions first — they must see the REAL host docker.
 	switch {
 	case dockerInstalled() && rootlessDockerAvailable():
 		t.Log("untrusted-container evidence lane: rootless docker available — running the digest-pinned untrusted container success arm")
@@ -221,6 +226,11 @@ func TestSysUntrustedContainerEvidenceLane(t *testing.T) {
 	case dockerInstalled():
 		t.Log("untrusted-container evidence lane: docker is present but NOT rootless")
 		t.Log("high-assurance untrusted-container success lane requires rootless docker; asserting the rootless fail-closed floor and running the trusted-native evidence substitute")
+		// The substitute lanes run a runner but never create a container;
+		// on a CLI-present/daemon-down host the runner's crash
+		// reconciliation would otherwise kill it before the lane begins.
+		// Probes above already made the real-host decision.
+		installFakeDockerForSystem(t)
 		assertUntrustedRootlessFloorFailsClosed(t)
 		runTrustedNativeEvidence(t)
 	default:

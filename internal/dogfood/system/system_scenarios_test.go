@@ -153,6 +153,13 @@ func TestSysDFBoot001(t *testing.T) {
 		// observed on darwin/linux-without-prjquota.
 		t.Setenv("KIWI_ALLOW_UNQUOTAED_UNTRUSTED_DISK", "1")
 	}
+	// Trusted-native arm only: the container arm runs against a REAL
+	// rootless daemon and must keep it; the native arm never creates a
+	// container, so the fail-closed crash reconciliation is hermeticized
+	// (CLI-present/daemon-down hosts would otherwise kill the runner).
+	if trusted {
+		installFakeDockerForSystem(t)
+	}
 	dataDir := t.TempDir()
 	sys, err := system.Launch(system.SystemConfig{
 		RunnerToken: "sys-boot-runner",
@@ -288,6 +295,12 @@ func TestSysDFEvid001(t *testing.T) {
 	if !trusted {
 		t.Setenv("KIWI_ALLOW_UNQUOTAED_UNTRUSTED_DISK", "1")
 	}
+	// Trusted-native arm only (see TestSysDFBoot001): never a container,
+	// so hermeticize the fail-closed crash reconciliation after the real
+	// host probe.
+	if trusted {
+		installFakeDockerForSystem(t)
+	}
 	sys := start(t)
 	var labels []string
 	if !trusted {
@@ -363,6 +376,10 @@ func TestSysDFEvid001(t *testing.T) {
 // success with evidence. Direct API submissions cannot do this — server
 // submit force-clears Trusted — and nothing here mutates the store.
 func TestSysTrustedIngress(t *testing.T) {
+	// Trusted-native webhook lane: never creates a container; hermetic
+	// docker keeps fail-closed crash reconciliation from killing the
+	// runner on a CLI-present/daemon-down host.
+	installFakeDockerForSystem(t)
 	sys := start(t)
 	if !sys.TrustedWebhookEnabled() {
 		t.Fatal("trusted webhook ingress not enabled")
@@ -419,6 +436,9 @@ func TestSysTrustedIngress(t *testing.T) {
 // PUT /api/v1/schedules + POST .../trigger produces a Trusted native run.
 // fireSchedule copies the STORED Trusted flag; the store is never mutated.
 func TestSysTrustedScheduleIngress(t *testing.T) {
+	// Trusted-native schedule lane: never creates a container (see
+	// TestSysTrustedIngress).
+	installFakeDockerForSystem(t)
 	sys := start(t)
 	if err := sys.StartRunner("trusted-sched-runner", nil); err != nil {
 		t.Fatalf("start runner: %v", err)
@@ -529,6 +549,11 @@ func TestSysDFLease001(t *testing.T) {
 // The positive arm (hard quota available → admitted) requires Linux XFS
 // prjquota and is not exercised here; this test never fakes a hard bound.
 func TestSysQuotaGate(t *testing.T) {
+	// The fail-closed gate runs before any container backend is invoked
+	// (docker not required) — but the runner's crash reconciliation still
+	// calls `docker ps` whenever the CLI exists, so the native-only fail
+	// closed arm is hermeticized against a daemon-down host.
+	installFakeDockerForSystem(t)
 	sys := start(t)
 	// Claim the "container" scheduling label so the untrusted container job
 	// is leaseable on this host. The gate runs before any container backend

@@ -310,6 +310,11 @@ type JobView struct {
 	LeaseRunnerID   string       `json:"lease_runner_id,omitempty"`
 	AttemptRunnerID string       `json:"attempt_runner_id,omitempty"`
 	Trusted         bool         `json:"trusted"`
+	// QueueReason is the control plane's own explanation for why a
+	// non-terminal job has not been leased (mirrors the public DTO's
+	// queue_reason) — the forensics line when a wait times out on a job
+	// stuck in queued/waiting.
+	QueueReason string `json:"queue_reason,omitempty"`
 	// CompiledJobPayload is the enqueue-time compiled identity the runner
 	// executes. The determinism-authority dogfood asserts locked image
 	// identities appear HERE — the public job DTO redacts the pipeline
@@ -448,18 +453,32 @@ func (s *System) WaitJobTerminal(ctx context.Context, runID, jobKey string) (mod
 	defer tick.Stop()
 	var last model.Status
 	var lastErr string
+	var lastReason string
 	for {
 		j, err := s.JobByKey(ctx, runID, jobKey)
 		if err == nil {
 			last = j.Status
 			lastErr = j.Error
+			lastReason = j.QueueReason
 			if j.Status.Terminal() {
 				return j.Status, nil
 			}
 		}
 		select {
 		case <-ctx.Done():
-			return last, fmt.Errorf("wait job %q in run %s: last status %q error %q: %w", jobKey, runID, last, lastErr, ctx.Err())
+			// Surface the control plane's own queue reason AND the runner
+			// goroutine's exit (if any): a non-terminal timeout is almost
+			// always a denied lease or a runner that died after
+			// registration, and without either the failure is an
+			// unexplained "queued" with no forensics.
+			s.runnerMu.Lock()
+			rerr := s.runnerErr
+			s.runnerMu.Unlock()
+			runnerBit := ""
+			if rerr != nil {
+				runnerBit = fmt.Sprintf(" runner_err %q", rerr.Error())
+			}
+			return last, fmt.Errorf("wait job %q in run %s: last status %q error %q queue_reason %q%s: %w", jobKey, runID, last, lastErr, lastReason, runnerBit, ctx.Err())
 		case <-tick.C:
 		}
 	}
@@ -689,25 +708,44 @@ func (s *System) StopRunner() {
 // returns its id. Used by lease-fencing scenarios that drive complete
 // directly instead of through a live runner.Run.
 func (s *System) RegisterRunner(ctx context.Context, name string, labels []string) (string, error) {
-	body := map[string]any{
-		"name":             name,
-		"labels":           labels,
-		"capacity":         1,
-		"protocol_version": model.RunnerProtocolVersion,
-		"protocol_min":     3,
-		"protocol_max":     3,
+	// Same advertisement as production runner.Run (runner.go): a pre-field
+	// registration is the LEGACY v2 contract, and HEAD's lease predicate
+	// refuses v3-stamped jobs to legacy runners — correctly, but it left
+	// this harness's own upgrade drill unable to lease anything.
+	//
+	// Pre-field N-1 servers reject unknown JSON fields outright (strict
+	// decoder). For those the retry WITHOUT the field is the honest
+	// contract: they have no lease-time semantics gate to honor. Any other
+	// 400 is never retried.
+	register := func(withSemantics bool) (string, error) {
+		body := map[string]any{
+			"name":             name,
+			"labels":           labels,
+			"capacity":         1,
+			"protocol_version": model.RunnerProtocolVersion,
+			"protocol_min":     3,
+			"protocol_max":     3,
+		}
+		if withSemantics {
+			body["supported_execution_semantics"] = []string{model.ExecutionSemanticsVersion}
+		}
+		raw, _ := json.Marshal(body)
+		var out struct {
+			ID string `json:"id"`
+		}
+		if err := s.doJSON(ctx, s.RunnerToken, http.MethodPost, "/api/v1/runners/register", raw, &out); err != nil {
+			return "", err
+		}
+		if out.ID == "" {
+			return "", fmt.Errorf("register: empty runner id")
+		}
+		return out.ID, nil
 	}
-	raw, _ := json.Marshal(body)
-	var out struct {
-		ID string `json:"id"`
+	id, err := register(true)
+	if err != nil && strings.Contains(err.Error(), `unknown field "supported_execution_semantics"`) {
+		return register(false)
 	}
-	if err := s.doJSON(ctx, s.RunnerToken, http.MethodPost, "/api/v1/runners/register", raw, &out); err != nil {
-		return "", err
-	}
-	if out.ID == "" {
-		return "", fmt.Errorf("register: empty runner id")
-	}
-	return out.ID, nil
+	return id, err
 }
 
 // LeaseTask is the runner-tier next-poll answer this harness uses.
@@ -752,11 +790,35 @@ func (s *System) Next(ctx context.Context, runnerID string) (LeaseTask, bool, er
 // status is returned so a stale-generation rejection (409) is observable
 // without string-matching error bodies.
 func (s *System) Complete(ctx context.Context, t LeaseTask, status model.Status, errMsg string) (int, error) {
+	// Production runners report the interpreter stamp on every completion;
+	// HEAD REQUIRES it explicitly on stamped jobs (no inference — a
+	// pre-gate lease could be a v2 interpreter omitting the field).
+	// Pre-field N-1 servers reject the unknown JSON field outright; that
+	// 400 happens at decode, BEFORE any mutation, so retrying without the
+	// field is side-effect-free and is the honest legacy contract.
+	code, bodyText, err := s.completeOnce(ctx, t, status, errMsg, true)
+	if err != nil {
+		return 0, err
+	}
+	if code == http.StatusBadRequest && strings.Contains(bodyText, `unknown field "execution_semantics"`) {
+		retryCode, _, rerr := s.completeOnce(ctx, t, status, errMsg, false)
+		if rerr != nil {
+			return 0, rerr
+		}
+		return retryCode, nil
+	}
+	return code, nil
+}
+
+func (s *System) completeOnce(ctx context.Context, t LeaseTask, status model.Status, errMsg string, withSemantics bool) (int, string, error) {
 	body := map[string]any{
 		"runner_id":        t.RunnerID,
 		"lease_token":      t.LeaseToken,
 		"lease_generation": t.LeaseGeneration,
 		"status":           status,
+	}
+	if withSemantics {
+		body["execution_semantics"] = model.ExecutionSemanticsVersion
 	}
 	if errMsg != "" {
 		body["error"] = errMsg
@@ -764,17 +826,17 @@ func (s *System) Complete(ctx context.Context, t LeaseTask, status model.Status,
 	raw, _ := json.Marshal(body)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.BaseURL+"/api/v1/jobs/"+t.JobID+"/complete", bytes.NewReader(raw))
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	req.Header.Set("Authorization", "Bearer "+s.RunnerToken)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-	return resp.StatusCode, nil
+	payload, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	return resp.StatusCode, string(payload), nil
 }
 
 // getJSON performs an authenticated GET and decodes the JSON body into out.

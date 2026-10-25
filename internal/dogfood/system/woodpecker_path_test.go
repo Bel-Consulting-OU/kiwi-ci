@@ -47,6 +47,9 @@ jobs:
 // fails: that is exactly what "as good as Woodpecker as a practical CI/CD
 // system" means.
 func TestSysWoodpeckerPathE2E(t *testing.T) {
+	// Hermetic: native runner lane, never a container (see
+	// fake_docker_system_test.go).
+	installFakeDockerForSystem(t)
 	// A static secret store so the CI_TOKEN declaration actually resolves:
 	// the ordinary CI secret path must work end-to-end.
 	sys := startWithSecrets(t, map[string]string{"CI_TOKEN": "woodpecker-path-token"})

@@ -45,6 +45,15 @@ func TestSysDFDr001FSMode(t *testing.T) {
 	if !trusted {
 		t.Setenv("KIWI_ALLOW_UNQUOTAED_UNTRUSTED_DISK", "1")
 	}
+	// AFTER the rootless capability probe (which must see the real host):
+	// the runner's crash reconciliation fail-closes on any `docker ps`
+	// error, so a CLI-present/daemon-down host would kill the runner
+	// before the DR drill begins. Only the trusted-native arm gets the
+	// shim — the container arm runs on hosts with a REAL rootless daemon
+	// and must keep it.
+	if trusted {
+		installFakeDockerForSystem(t)
+	}
 
 	// --- Phase 1: live system on DataDir1, complete trusted work. ---
 	root := t.TempDir()

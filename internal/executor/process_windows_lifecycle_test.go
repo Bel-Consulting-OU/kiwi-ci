@@ -164,7 +164,7 @@ func processHandleOpen(pid int) bool {
 		return false
 	}
 	defer syscall.CloseHandle(h)
-	waitZero, err := windows.WaitForSingleObject(h, 0)
+	waitZero, err := windows.WaitForSingleObject(windows.Handle(h), 0)
 	if err != nil {
 		return false
 	}

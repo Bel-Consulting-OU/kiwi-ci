@@ -205,6 +205,11 @@ func postForgeCanary(ctx context.Context, baseURL, secret, deliveryID string, bo
 // canary even when no live provider credentials are configured. The live
 // provider (real github.com) canary remains a separate, planned proof.
 func TestSysDFForgeCanary001(t *testing.T) {
+	// Hermetic: the webhook-ingress canary runs a native runner against a
+	// fresh stack that never creates a container; without the shim a
+	// CLI-present/daemon-down host fail-closes crash reconciliation and
+	// kills the runner after registration.
+	installFakeDockerForSystem(t)
 	dataDir := t.TempDir()
 	sys, err := system.Launch(system.SystemConfig{
 		RunnerToken: "forge-canary-runner",
