@@ -12,11 +12,12 @@ import (
 	"time"
 )
 
-// TestReclaimNativeProcessGroupDeadLeaderLiveDescendant pins the audit
-// oracle: a dead group LEADER with a still-live descendant in the recorded
-// PGID is recovery debt, not a skip. The leader PID alone is never proof
-// the tree is gone.
-func TestReclaimNativeProcessGroupDeadLeaderLiveDescendant(t *testing.T) {
+// TestReclaimNativeDeadLeaderRetainsDebt: when the recorded leader PID is
+// gone but the numerical PGID is still populated, recovery must NOT
+// kill(-PGID). The number can name an unrelated group (unrelated leader
+// occupied PID=N, created PGID=N, spawned descendants, exited). Retain
+// recovery debt instead — cgroup.kill or an operator is the authority.
+func TestReclaimNativeDeadLeaderRetainsDebt(t *testing.T) {
 	dir := t.TempDir()
 	grandPidFile := dir + "/grand.pid"
 	script := "sleep 30 & echo $! > " + grandPidFile + " ; exit 0"
@@ -27,7 +28,6 @@ func TestReclaimNativeProcessGroupDeadLeaderLiveDescendant(t *testing.T) {
 	}
 	pgid := cmd.Process.Pid
 	_ = cmd.Wait()
-	// Leader is gone; grandchild remains in the process group.
 	deadline := time.Now().Add(2 * time.Second)
 	for processAliveUnix(pgid) && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
@@ -35,7 +35,6 @@ func TestReclaimNativeProcessGroupDeadLeaderLiveDescendant(t *testing.T) {
 	if processAliveUnix(pgid) {
 		t.Skip("leader pid still live (recycled or wait incomplete)")
 	}
-	// Wait for the grandchild pid file.
 	var b []byte
 	var err error
 	for i := 0; i < 40; i++ {
@@ -56,19 +55,35 @@ func TestReclaimNativeProcessGroupDeadLeaderLiveDescendant(t *testing.T) {
 		t.Skip("grandchild already reaped; oracle needs a live descendant")
 	}
 
-	// Recovery: dead leader (stamp mismatch is irrelevant once leader is
-	// gone) + recorded PGID must still kill the group.
-	if err := reclaimNativeServices([]NativeServiceLedger{
+	// Dead leader + populated PGID → debt, never kill.
+	reclaimErr := reclaimNativeServices([]NativeServiceLedger{
 		{Name: "svc", PID: pgid, PGID: pgid, Start: "stale"},
-	}); err != nil {
-		t.Fatalf("reclaim with dead leader must prove group gone: %v", err)
+	})
+	if reclaimErr == nil {
+		t.Fatal("dead leader with populated pgid must report debt, not silent success")
 	}
-	deadline = time.Now().Add(2 * time.Second)
-	for processAliveUnix(grand) && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
+	if !strings.Contains(reclaimErr.Error(), "recovery debt") &&
+		!strings.Contains(reclaimErr.Error(), "not ownership proof") {
+		t.Fatalf("error = %v, want ownership-proof refusal / debt", reclaimErr)
 	}
-	if processAliveUnix(grand) {
-		_ = syscall.Kill(grand, syscall.SIGKILL)
-		t.Fatal("descendant survived reclaim: process-group proof is missing")
+	// The descendant must survive: numerical PGID was not killed.
+	if !processAliveUnix(grand) {
+		t.Fatal("unverified PGID was killed: ABA host-safety violation")
+	}
+	if err := syscall.Kill(-pgid, 0); err != nil {
+		t.Fatalf("group was killed: %v", err)
+	}
+	// Cleanup so the test does not leak.
+	_ = syscall.Kill(grand, syscall.SIGKILL)
+	_ = syscall.Kill(-pgid, syscall.SIGKILL)
+}
+
+// TestReclaimNativeMissingPIDAndEmptyGroupIsSuccess: a fully-gone identity
+// (PID absent AND group empty) is success, not debt.
+func TestReclaimNativeMissingPIDAndEmptyGroupIsSuccess(t *testing.T) {
+	if err := reclaimNativeServices([]NativeServiceLedger{{
+		Name: "ghost", Port: 1, PID: 1 << 22, PGID: 1 << 22, Start: "x",
+	}}); err != nil {
+		t.Fatalf("missing pid + empty group = %v, want nil", err)
 	}
 }

@@ -1025,6 +1025,10 @@ func (w *leaseCandidateWalk) consider(candidate model.Job) leaseWalkResult {
 	// atomic path.
 	j.CostRate = w.eff.CostPerHour
 	j.PowerWatts = w.eff.PowerWatts
+	// Same bridge identity as every other lease path: without it a
+	// completion that omits execution_semantics could not be told apart
+	// from a pre-field legacy runner on a v2 job.
+	j.LeaseInterpreter = model.LeaseInterpreterFor(w.eff.SupportedExecutionSemantics, j.ExecutionSemantics)
 	if j.StartedAt == nil {
 		j.StartedAt = &w.now
 	}

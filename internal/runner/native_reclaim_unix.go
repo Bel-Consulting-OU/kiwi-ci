@@ -17,15 +17,13 @@ import (
 //     the start stamp proves the PID (and therefore the group it leads) is
 //     still our tree.
 //   - Live leader + missing/mismatched start stamp → the PID was recycled.
-//     The numerical PGID may now name an UNRELATED group (ABA: our tree
-//     exited, the number was reused). Never kill(-PGID) in this state;
-//     report recovery debt instead.
-//   - Dead leader (PID gone) + recorded PGID → a process group with PGID=N
-//     cannot be a newly created group unless some process occupies PID=N as
-//     its leader (setpgid(p,p)). With PID=N gone, a non-empty group can only
-//     be our orphaned descendants. Re-check PID absence immediately before
-//     the kill to narrow the recycle race, then kill the group.
-//   - Dead leader + empty group → nothing to do.
+//     Never kill(-PGID); report recovery debt if the group is still
+//     populated.
+//   - Dead leader (PID gone) → the numerical PGID is NOT sufficient proof:
+//     an unrelated process can occupy PID=N, create PGID=N, spawn
+//     descendants, and exit — leaving a populated group that is NOT ours.
+//     Never kill. If the group is already empty, nothing remains (success);
+//     if it is still populated, retain recovery debt.
 //
 // When a durable job cgroup exists, reconcileRuntimeLedger reclaims THAT
 // first and skips numeric PID/PGID reclamation entirely; cgroup.kill is the
@@ -84,29 +82,19 @@ func reclaimNativeServices(svcs []NativeServiceLedger) error {
 			}
 			continue
 		}
-		// Leader PID is gone (or was never live). Only then is the numeric
-		// PGID still attributable to our orphaned tree.
+		// Leader PID is gone (or was never live). The numerical PGID alone
+		// is NOT ownership proof: an unrelated leader may have used PID=N to
+		// create PGID=N, spawned descendants, and exited. Never kill(-PGID).
+		// An empty group means nothing remains (success); a populated group
+		// is unrecoverable-without-identity → debt.
 		if ns.PGID <= 1 {
 			continue
 		}
 		if processGroupGoneUnix(ns.PGID) {
 			continue
 		}
-		// Re-check immediately before the kill: if the leader PID reappeared
-		// (recycled into a new group), do not kill an unverified group.
-		if ns.PID > 0 && processAliveUnix(ns.PID) {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("native service %s pgid %d: leader pid %d reappeared before kill; refusing to kill an unverified process group", ns.Name, ns.PGID, ns.PID)
-			}
-			continue
-		}
-		if err := syscall.Kill(-ns.PGID, syscall.SIGKILL); err != nil && err != syscall.ESRCH && firstErr == nil {
-			firstErr = fmt.Errorf("kill orphan group pgid %d (%s): %w", ns.PGID, ns.Name, err)
-		}
-		if err := waitForProcessGroupGone(ns.PGID, 2*time.Second); err != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("native service %s pgid %d still populated after SIGKILL: %w", ns.Name, ns.PGID, err)
-			}
+		if firstErr == nil {
+			firstErr = fmt.Errorf("native service %s: leader pid %d is gone but pgid %d is still populated; numerical PGID is not ownership proof — retaining recovery debt (cgroup or operator cleanup required)", ns.Name, ns.PID, ns.PGID)
 		}
 	}
 	return firstErr

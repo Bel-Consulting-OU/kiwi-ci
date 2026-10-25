@@ -4502,6 +4502,10 @@ func (s *Server) next(w http.ResponseWriter, r *http.Request) {
 	j.LeaseTokenHash = hashLeaseToken(s.leaseKey, rawToken)
 	j.LeaseGeneration++
 	j.LeaseExpiresAt = &exp
+	// Bind the interpreter this lease was issued to (see Job.LeaseInterpreter):
+	// the v2 completion-drain bridge reads it when a pre-field runner omits
+	// execution_semantics on a stamped job.
+	j.LeaseInterpreter = model.LeaseInterpreterFor(ri.SupportedExecutionSemantics, j.ExecutionSemantics)
 	// The runner's registered rates are frozen into the job at lease time;
 	// completion derives cost/energy from them and the wall-clock duration.
 	j.CostRate = ri.CostPerHour
@@ -5097,12 +5101,16 @@ func (s *Server) logDBWrite(ctx context.Context, j model.Job, runnerID string, i
 // checkCompletionSemantics validates the observed interpreter stamp on a
 // completion. Returns the semantics to persist and whether to continue.
 //
-// A STAMPED job requires the completion to carry an explicit, equal stamp.
-// Inferring the value from the job would erase the upgrade distinction: a
-// lease issued by a pre-gate build (8a6d34f) can complete a v3-stamped job
-// with a v2 interpreter while omitting the field, and substituting "v3"
-// would falsely certify that attempt. Current runners always send the
-// value, so requiring it costs nothing on the supported path.
+// A STAMPED job requires the completion to carry an explicit, equal stamp —
+// never inferred (a pre-gate lease could be a v2 interpreter omitting the
+// field, and filling v3 would falsely certify that attempt).
+//
+// The ONLY omission bridge is the pre-field v2 drain: a job stamped
+// kiwi.execution.v2 may omit the field when the lease's persisted
+// LeaseInterpreter is also v2 (or empty, meaning the lease predates the
+// field and could only have been granted under the legacy contract). Current
+// runners advertise only v3 and therefore never lease a v2 job, so a v2
+// job + omission can only be a legacy interpreter.
 //
 // An UNSTAMPED (pre-stamp legacy) job accepts whatever the runner reports,
 // including nothing — there is no requested stamp to contradict.
@@ -5110,13 +5118,18 @@ func checkCompletionSemantics(j model.Job, in Complete) (string, bool) {
 	if j.ExecutionSemantics == "" {
 		return in.ExecutionSemantics, true
 	}
-	if in.ExecutionSemantics == "" {
-		return "", false
+	if in.ExecutionSemantics != "" {
+		if in.ExecutionSemantics != j.ExecutionSemantics {
+			return "", false
+		}
+		return in.ExecutionSemantics, true
 	}
-	if in.ExecutionSemantics != j.ExecutionSemantics {
-		return "", false
+	// Omitted on a stamped job.
+	if j.ExecutionSemantics == model.LegacyExecutionSemanticsVersion &&
+		(j.LeaseInterpreter == "" || j.LeaseInterpreter == model.LegacyExecutionSemanticsVersion) {
+		return model.LegacyExecutionSemanticsVersion, true
 	}
-	return in.ExecutionSemantics, true
+	return "", false
 }
 
 func (s *Server) complete(w http.ResponseWriter, r *http.Request) {

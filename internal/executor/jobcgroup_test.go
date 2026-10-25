@@ -421,3 +421,69 @@ func TestRunJobCgroupOwnershipFailureRollsBackBeforeContainers(t *testing.T) {
 		t.Fatalf("containers ran without an owned cgroup: %v", runs)
 	}
 }
+
+// TestNativeRequireJobCgroupFailsClosedBeforeAnyLaunch: a native job whose
+// runner profile promised the job-scoped cgroup must fail with an infra
+// error BEFORE any native service or step starts when the host cannot
+// provide one — never fall back to PID ownership after the scheduler
+// reserved only the job's own request under that promise.
+func TestNativeRequireJobCgroupFailsClosedBeforeAnyLaunch(t *testing.T) {
+	installFakeBins(t)
+	ws := t.TempDir()
+	t.Setenv("FAKE_WS", ws)
+	setFakeWS(t, ws)
+	calls, cleanups := stubJobCgroup(t, JobCgroupStatus{Detail: "no delegated cgroup here"})
+	sink := &covSink{}
+	spec := &pipeline.Spec{Version: 1, Jobs: map[string]pipeline.Job{
+		"build": {Runtime: "native", Steps: []pipeline.Step{{Run: "echo hi"}}},
+	}}
+	j := pipeline.CompiledJob{ID: "build", BaseID: "build", Job: pipeline.Job{
+		Runtime:   "native",
+		Resources: pipeline.Resources{CPU: 2, Memory: 4 << 30, PIDs: 512},
+		Steps:     []pipeline.Step{{Run: "echo hi"}},
+	}}
+	ex := &Executor{Opt: Options{Workspace: ws, RunID: "r", Logs: sink, RequireJobCgroup: true}, Masker: &secrets.Masker{}}
+	res := ex.runJob(context.Background(), spec, j, "success", nil)
+	if res.Status != "failure" {
+		t.Fatalf("runJob = %q / %q, want a fail-closed failure", res.Status, res.Error)
+	}
+	if !strings.Contains(res.Error, "job-scoped cgroup required") {
+		t.Fatalf("runJob error = %q, want job-scoped cgroup required", res.Error)
+	}
+	if *calls != 1 || *cleanups != 0 {
+		t.Fatalf("job cgroup setup/cleanup = (%d, %d), want (1, 0)", *calls, *cleanups)
+	}
+}
+
+// TestNativeJobCgroupAcquiredExactlyOnceWithNativeServices: the ownership
+// cgroup is attempted once even when native services are present. A second
+// attempt (the old pre-services + pre-backend double setup) could succeed
+// after the first failed, leaving already-started services outside the
+// cgroup the ledger later records.
+func TestNativeJobCgroupAcquiredExactlyOnceWithNativeServices(t *testing.T) {
+	installFakeBins(t)
+	ws := t.TempDir()
+	t.Setenv("FAKE_WS", ws)
+	setFakeWS(t, ws)
+	calls, cleanups := stubJobCgroup(t, JobCgroupStatus{
+		Enabled: false, // first attempt fails → fallback, must NOT retry
+		Detail:  "cgroup v2 unavailable for this probe",
+	})
+	sink := &covSink{}
+	svc := pipeline.Service{Name: "db", Native: true, Ready: "tcp:1", Command: []string{"true"}}
+	spec := &pipeline.Spec{Version: 1, Jobs: map[string]pipeline.Job{
+		"build": {Runtime: "native", Services: []pipeline.Service{svc}, Steps: []pipeline.Step{{Run: "echo hi"}}},
+	}}
+	j := pipeline.CompiledJob{ID: "build", BaseID: "build", Job: pipeline.Job{
+		Runtime:  "native",
+		Services: []pipeline.Service{svc},
+		Steps:    []pipeline.Step{{Run: "echo hi"}},
+	}}
+	ex := &Executor{Opt: Options{Workspace: ws, RunID: "r", Logs: sink}, Masker: &secrets.Masker{}}
+	// Whatever the job outcome, setup must have been attempted exactly once.
+	_ = ex.runJob(context.Background(), spec, j, "success", nil)
+	if *calls != 1 {
+		t.Fatalf("job cgroup setup calls = %d, want exactly 1 (single ownership acquisition)", *calls)
+	}
+	_ = cleanups
+}

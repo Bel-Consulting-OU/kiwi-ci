@@ -39,7 +39,7 @@ func TestFreezeFailsClosedOnUnstableGitCapture(t *testing.T) {
 	// Make it look like a repo so a real capture would not short-circuit;
 	// the seam forces Unstable regardless.
 	orig := captureFrozenGit
-	captureFrozenGit = func(string) FrozenGit { return FrozenGit{Unstable: true} }
+	captureFrozenGit = func(string, RefQuery) FrozenGit { return FrozenGit{Unstable: true} }
 	t.Cleanup(func() { captureFrozenGit = orig })
 
 	m, err := NewManager(src)

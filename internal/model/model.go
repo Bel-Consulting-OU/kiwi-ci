@@ -123,6 +123,26 @@ func SupportsExecutionSemantics(supported []string, jobSemantics string) bool {
 	return false
 }
 
+// LeaseInterpreterFor derives the lease-time interpreter identity persisted
+// on Job.LeaseInterpreter. A stamped job records its own stamp (the runner
+// was gated on advertising it at lease time). An unstamped job records the
+// legacy pre-field contract when the runner never advertised, or the
+// runner's advertised current engine otherwise.
+func LeaseInterpreterFor(advertised []string, jobStamp string) string {
+	if jobStamp != "" {
+		return jobStamp
+	}
+	if len(advertised) == 0 {
+		return LegacyExecutionSemanticsVersion
+	}
+	for _, s := range advertised {
+		if s == ExecutionSemanticsVersion {
+			return s
+		}
+	}
+	return advertised[0]
+}
+
 type Run struct {
 	ID string `json:"id"`
 	// RepoID is the immutable canonical repository identity, derived ONCE at
@@ -290,7 +310,17 @@ type Job struct {
 	LeaseTokenHash  []byte     `json:"lease_token_hash,omitempty"`
 	LeaseGeneration int64      `json:"lease_generation,omitempty"`
 	LeaseExpiresAt  *time.Time `json:"lease_expires_at,omitempty"`
-	ApprovedBy      string     `json:"approved_by,omitempty"`
+	// LeaseInterpreter is the execution-engine identity bound when this
+	// attempt was leased: the job's stamped semantics when the runner
+	// advertised support, or the legacy pre-field contract
+	// (kiwi.execution.v2) when the runner never advertised
+	// supported_execution_semantics. It is NOT cleared with the lease —
+	// completion and replay must still see which interpreter the lease was
+	// issued to (the v2 drain bridge for omitted completion stamps). A new
+	// lease overwrites it. Additive: empty on leases granted before the
+	// field existed.
+	LeaseInterpreter string `json:"lease_interpreter,omitempty"`
+	ApprovedBy       string `json:"approved_by,omitempty"`
 	// ForgeKind/ForgeHost carry the run's forge identity (copied at job
 	// creation) so job-level publication and audit can never guess a forge.
 	ForgeKind string `json:"forge_kind,omitempty"`

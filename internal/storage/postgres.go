@@ -2168,13 +2168,17 @@ func (s *PostgresStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim
 		return model.Job{}, err
 	}
 	// The job row is held by this transaction: freeze the live usage rates
-	// into the payload, and mirror them on the returned job.
-	if _, err := tx.Exec(ctx, `UPDATE jobs SET payload = jsonb_set(jsonb_set(payload, '{cost_rate}', to_jsonb($2::double precision), true), '{power_watts}', to_jsonb($3::double precision), true) WHERE id=$1`,
-		claim.JobID, costRate, powerWatts); err != nil {
+	// into the payload, and mirror them on the returned job. The lease-time
+	// interpreter identity rides the same payload write (v2 completion
+	// drain bridge — see model.Job.LeaseInterpreter).
+	interp := model.LeaseInterpreterFor(effective.SupportedExecutionSemantics, j.ExecutionSemantics)
+	if _, err := tx.Exec(ctx, `UPDATE jobs SET payload = jsonb_set(jsonb_set(jsonb_set(payload, '{cost_rate}', to_jsonb($2::double precision), true), '{power_watts}', to_jsonb($3::double precision), true), '{lease_interpreter}', to_jsonb($4::text), true) WHERE id=$1`,
+		claim.JobID, costRate, powerWatts, interp); err != nil {
 		return model.Job{}, err
 	}
 	j.CostRate = costRate
 	j.PowerWatts = powerWatts
+	j.LeaseInterpreter = interp
 
 	// Step 6: check-and-reserve the job's requested resources against the
 	// runner's remaining capacity. The runner row is locked above, so the

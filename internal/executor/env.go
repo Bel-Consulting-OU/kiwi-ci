@@ -66,43 +66,62 @@ func osEnvironMap() map[string]string {
 // Windows environment names are case-insensitive; Go itself implements
 // case-insensitive duplicate elimination. One canonical form prevents
 // Path= and PATH= from both surviving into the child environment where
-// the last-sorting entry would silently win.
+// the last-sorting entry would silently win (and a secret declared "Path"
+// would clobber the inherited PATH).
 func envKeyCanon(key string) string {
-	if runtime.GOOS == "windows" {
+	if envKeyFold {
 		return strings.ToUpper(key)
 	}
 	return key
 }
 
+// envKeyFold case-folds env keys (the Windows contract). Package-level var
+// so tests can exercise the Windows collision semantics on any GOOS.
+var envKeyFold = runtime.GOOS == "windows"
+
 // mergeEnvMap merges maps left to right; later maps win per key. Keys are
 // canonicalized first (case-folded on Windows) so a later PATH cannot
-// coexist with an earlier Path.
+// coexist with an earlier Path. Within ONE map, canon-colliding keys
+// (e.g. {Path: a, PATH: b} declared together) resolve DETERMINISTICLY:
+// keys are visited in sorted order, so the lexicographically-greatest
+// spelling always wins — never Go's randomized map iteration.
 func mergeEnvMap(base map[string]string, maps ...map[string]string) map[string]string {
 	out := make(map[string]string, len(base))
-	for k, v := range base {
-		out[envKeyCanon(k)] = v
+	for _, k := range sortedKeys(base) {
+		out[envKeyCanon(k)] = base[k]
 	}
 	for _, x := range maps {
-		for k, v := range x {
-			out[envKeyCanon(k)] = v
+		for _, k := range sortedKeys(x) {
+			out[envKeyCanon(k)] = x[k]
 		}
 	}
 	return out
+}
+
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // serviceEnvFor builds the environment native sidecar processes receive:
 // the job env minus every resolved secret key (both KIWI_SECRET_* and the
 // bare declared name). Repository-controlled services must not inherit
 // job secrets just because they share the job's environment map.
+// Lookups are canonicalized so a Windows-folded key cannot survive the
+// delete by its raw spelling.
 func serviceEnvFor(jobEnv, jobSecrets map[string]string) map[string]string {
 	out := make(map[string]string, len(jobEnv))
 	for k, v := range jobEnv {
-		out[k] = v
+		out[envKeyCanon(k)] = v
 	}
 	for k := range jobSecrets {
-		delete(out, k)
+		delete(out, envKeyCanon(k))
 		if secret := secretEnvName(k); secret != k {
-			delete(out, secret)
+			delete(out, envKeyCanon(secret))
 		}
 	}
 	return out

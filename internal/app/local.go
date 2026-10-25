@@ -64,6 +64,10 @@ func RunLocal(ctx context.Context, args []string) error {
 		return err
 	}
 	defer wm.Close()
+	// Explicit ref inputs ride INTO the freeze transaction: their
+	// resolutions are captured from the source before the run-base seals
+	// Git away (a stripped linked-worktree base cannot re-answer them).
+	wm.CaptureRefs(workspace.RefQuery{Base: *base, Head: *head, MergeBase: *mergeBase})
 	if err := wm.Freeze(ctx); err != nil {
 		if ctx.Err() != nil {
 			return fmt.Errorf("run cancelled: %w", ctx.Err())
@@ -104,22 +108,16 @@ func RunLocal(ctx context.Context, args []string) error {
 		}
 	}
 	// Git identity is whatever Freeze captured from the SOURCE — never a
-	// re-read of copied .git (linked worktrees can move HEAD after freeze).
+	// re-read of live Git or of the copied .git (linked worktrees can move
+	// HEAD after freeze, and their stripped run-base has no remote left to
+	// consult). NotRepo and RepoNoHead keep their frozen shape forever:
+	// a repository (or a first commit) created after Freeze is invisible
+	// to this run.
 	fg := wm.FrozenGitInfo()
 	if fg.CaptureFailed() {
 		// Freeze should have refused an unstable capture; never fall back
 		// to live Git after a source snapshot exists.
 		return fmt.Errorf("run: Git identity capture failed atomically; re-run when the repository is quiet")
-	}
-	gitDir := wd
-	if baseDir != "" && fg.Captured {
-		gitDir = baseDir
-	}
-	if !fg.Captured && baseDir != "" {
-		// Freeze succeeded and captured "not a repository": keep wd-based
-		// detection only when there is still no repo identity to protect
-		// (NotRepo is the only !Captured state Freeze allows through).
-		gitDir = wd
 	}
 	spec, err := pipeline.Load(fileToLoad)
 	if err != nil {
@@ -202,32 +200,46 @@ func RunLocal(ctx context.Context, args []string) error {
 	masker := &secrets.Masker{}
 	logs := &logging.Console{Writer: os.Stdout, Masker: masker}
 	provider := secrets.Chain{secrets.EnvProvider{Prefix: "KIWI_SECRET_"}, secrets.MacKeychainProvider{Service: "kiwi-ci"}}
-	repoURL, repoFullName := detectGitRepo(gitDir)
+	// Repository identity and changed files come from the frozen capture —
+	// zero post-Freeze Git reads. detectGitRepo on the (possibly stripped)
+	// run-base used to lose remote coordinates for linked worktrees, and
+	// live wd reads used to resurrect a HEAD created after Freeze.
+	repoURL, repoFullName := fg.RepoURL, fg.RepoFullName
 	explicitChanged := *changedFile
 	if explicitChanged == "" {
 		explicitChanged = *changedFiles
 	}
-	changedList := fg.ChangedFiles
-	changedKnown := fg.ChangedKnown
-	if len(explicitChanged) > 0 {
-		changedList, changedKnown = detectChangedFilesOpts(gitDir, *base, *head, *mergeBase, explicitChanged)
-	} else if !fg.Captured {
-		changedList, changedKnown = detectChangedFilesOpts(gitDir, *base, *head, *mergeBase, "")
-	} else if *base != "" || *mergeBase != "" || *head != "HEAD" {
-		// Explicit base/head/merge-base still recomputed against frozen git.
-		// (`--head` alone used to be ignored and silently fell back to the
-		// captured HEAD~1 range.)
-		changedList, changedKnown = detectChangedFilesOpts(gitDir, *base, *head, *mergeBase, "")
+	var changedList []string
+	var changedKnown bool
+	switch {
+	case len(explicitChanged) > 0:
+		// Explicit --changed-file(s): pure input parsing, no Git.
+		for _, s := range strings.Split(explicitChanged, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				changedList = append(changedList, s)
+			}
+		}
+		changedKnown = true
+	case fg.Explicit != nil:
+		// Explicit --base/--head/--merge-base resolved during the freeze
+		// transaction; unresolved stays unknown (never re-derived live).
+		changedList, changedKnown = fg.Explicit.Files, fg.Explicit.Known
+	case fg.Captured:
+		changedList, changedKnown = fg.ChangedFiles, fg.ChangedKnown
+	default:
+		// NotRepo / RepoNoHead: there is no trustworthy diff, and a
+		// repository appearing after Freeze is not this run's authority.
+		changedList, changedKnown = nil, false
 	}
 	opts := executor.Options{Workspace: wd, WorkspaceFor: func(jobID string) (string, func(), error) { return wm.Prepare(ctx, jobID) }, RunID: runID, MaxParallel: *parallel, OnlyJob: *job, ChangedFiles: changedList, ChangedFilesKnown: changedKnown, SecretProvider: provider, Logs: logs, RepoURL: repoURL, RepoFullName: repoFullName,
 		// Local parity: job conditions evaluate against the same branch and
 		// event context `kiwi explain --why` uses (the git-detected branch,
 		// push event), so a branch/event condition cannot silently diverge
 		// between explain, local runs and the control plane.
-		Branch: frozenBranch(fg, gitDir),
+		Branch: frozenBranch(fg),
 		Event:  "push",
-		GitSHA: frozenSHA(fg, gitDir),
-		GitRef: frozenRef(fg, gitDir),
+		GitSHA: frozenSHA(fg),
+		GitRef: frozenRef(fg),
 		// Declared dependency downloads are restored from this run's local
 		// artifact store (the distributed runner restores them through the
 		// control plane).
@@ -526,23 +538,22 @@ func fileExists(path string) bool {
 	return err == nil && !st.IsDir()
 }
 
-func frozenBranch(fg workspace.FrozenGit, gitDir string) string {
-	if fg.Captured && fg.Branch != "" {
-		return fg.Branch
-	}
-	return detectCurrentBranch(gitDir)
+// frozenBranch/SHA/Ref answer from the frozen capture ONLY. There is no
+// gitDir fallback: after Freeze, live Git (or a stripped run-base) is
+// never an authority — RepoNoHead keeps an empty SHA for the whole run
+// even if the first commit lands later, and NotRepo never grows an
+// identity because a repository appeared after the snapshot.
+func frozenBranch(fg workspace.FrozenGit) string {
+	return fg.Branch
 }
 
-func frozenSHA(fg workspace.FrozenGit, gitDir string) string {
+func frozenSHA(fg workspace.FrozenGit) string {
 	if fg.Captured {
 		return fg.SHA
 	}
-	return detectGitSHA(gitDir)
+	return ""
 }
 
-func frozenRef(fg workspace.FrozenGit, gitDir string) string {
-	if fg.Captured && fg.Ref != "" {
-		return fg.Ref
-	}
-	return detectGitRef(gitDir)
+func frozenRef(fg workspace.FrozenGit) string {
+	return fg.Ref
 }

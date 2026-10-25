@@ -47,7 +47,7 @@ func TestCaptureFrozenGitOnlyHeadMovementIsUnstable(t *testing.T) {
 	if err := exec.Command("git", "init", "-q", src).Run(); err != nil {
 		t.Skipf("git init: %v", err)
 	}
-	g := captureFrozenGitSource(src)
+	g := captureFrozenGitSource(src, RefQuery{})
 	if g.Captured || g.Unstable {
 		t.Fatalf("empty repo capture = %+v, want zero state", g)
 	}
@@ -68,7 +68,7 @@ func TestCaptureFrozenGitOnlyHeadMovementIsUnstable(t *testing.T) {
 	}
 	run("add", "a.txt")
 	run("commit", "-qm", "init")
-	g2 := captureFrozenGitSource(src)
+	g2 := captureFrozenGitSource(src, RefQuery{})
 	if !g2.Captured || g2.Unstable {
 		t.Fatalf("committed repo capture = %+v, want Captured", g2)
 	}
@@ -107,7 +107,7 @@ func TestCaptureFrozenGitCorruptHEADNotCaptured(t *testing.T) {
 	if err := os.WriteFile(headPath, []byte("not-a-ref-or-sha\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	g := captureFrozenGitSource(src)
+	g := captureFrozenGitSource(src, RefQuery{})
 	if g.Captured {
 		t.Fatalf("corrupt HEAD must not be Captured: %+v", g)
 	}

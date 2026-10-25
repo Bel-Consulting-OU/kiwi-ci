@@ -711,7 +711,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		return finish(res)
 	}
 	for k, v := range jobSecrets {
-		jobEnv[k] = v
+		jobEnv[envKeyCanon(k)] = v
 	}
 	jobEnv["KIWI"] = "true"
 	jobEnv["KIWI_RUN_ID"] = e.Opt.RunID
@@ -925,25 +925,16 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		res.Error = err.Error()
 		return finish(res)
 	}
-	// The job-scoped parent cgroup (when the host supports one) is shared by
-	// the service containers started here and by the main container started
-	// below.
+	// Native job ownership is acquired EXACTLY ONCE, before any service or
+	// step can start. The same cgroupParent (or the same documented
+	// fallback) applies to every process of this job for the rest of its
+	// lifetime — never switch ownership model mid-job.
+	// When the runner profile promised a job-scoped cgroup (RequireJobCgroup)
+	// and the host cannot provide one, fail closed BEFORE launching anything:
+	// the scheduler reserved only the job's own request under that promise.
 	cgroupParent := ""
-	if len(cj.Job.Services) > 0 && !RuntimeRunsServices(cj.Job.Runtime) && !RuntimeMayRunNativeServices(cj.Job.Runtime, cj.Job.Services) {
-		// Fail closed: a declared-but-unprovisioned service is a silent
-		// absence today (no containers, no warning, names unresolvable).
-		// Every DB-backed gate then fails on a missing daemon.
-		res.Status = model.StatusFailure
-		res.Error = fmt.Sprintf("job %q declares %d service(s) but runtime %q cannot provision them (container services require runtime: container; host services require runtime: native and native: true)", cj.ID, len(cj.Job.Services), cj.Job.Runtime)
-		return finish(res)
-	}
-	if RuntimeMayRunNativeServices(cj.Job.Runtime, cj.Job.Services) && len(cj.Job.Services) > 0 {
-		// Durable ownership BEFORE any child is spawned: create the job
-		// cgroup (even with no declared limits) and record it in the crash
-		// ledger. Children are migrated into the cgroup immediately after
-		// Start; a hard crash then reclaims via cgroup emptiness, not PID
-		// guesswork. When the host has no cgroup v2, Parent stays empty and
-		// the PID+start-stamp ledger remains a weaker fallback.
+	isNativeJob := cj.Job.Runtime == "" || cj.Job.Runtime == "native"
+	if isNativeJob {
 		cgStatus, cgCleanup := jobCgroupSetup(ctx, jobCgroupRequest{
 			JobID:      cj.ID,
 			CPU:        cj.Job.Resources.CPU,
@@ -957,7 +948,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			if e.Opt.OnCgroupCreated != nil {
 				if hookErr := e.Opt.OnCgroupCreated(cgStatus.Parent); hookErr != nil {
 					if cerr := cgCleanup(); cerr != nil {
-						e.log(cj.ID, "service", "job cgroup rollback after ownership failure: "+cerr.Error())
+						e.log(cj.ID, "runtime", "job cgroup rollback after ownership failure: "+cerr.Error())
 					}
 					res.Status = model.StatusFailure
 					res.Error = fmt.Sprintf("record job cgroup ownership: %v", hookErr)
@@ -966,14 +957,34 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			}
 			defer func() {
 				if cerr := cgCleanup(); cerr != nil {
-					e.log(cj.ID, "service", "job cgroup cleanup warning: "+cerr.Error())
+					e.log(cj.ID, "runtime", "native job cgroup cleanup warning: "+cerr.Error())
 					e.reportCleanupDebt(CleanupCgroup, cgroupParent, cerr)
 				}
 			}()
-			e.log(cj.ID, "service", "native job cgroup: "+cgStatus.Detail)
+			e.log(cj.ID, "runtime", "native job cgroup: "+cgStatus.Detail)
+		} else if e.Opt.RequireJobCgroup {
+			infra := &RunError{Kind: ErrorInfra, Err: fmt.Errorf("job-scoped cgroup required by the runner profile but unavailable for native job: %s", cgStatus.Detail)}
+			e.log(cj.ID, "runtime", infra.Error())
+			res.Status = model.StatusFailure
+			res.Error = infra.Error()
+			return finish(res)
 		} else {
-			e.log(cj.ID, "service", "native job cgroup unavailable ("+cgStatus.Detail+"); PID+start-stamp ledger is the fallback")
+			e.log(cj.ID, "runtime", "native job cgroup unavailable ("+cgStatus.Detail+"); PID+start-stamp ledger is the fallback for the whole job (services and steps share this outcome)")
 		}
+	}
+	if len(cj.Job.Services) > 0 && !RuntimeRunsServices(cj.Job.Runtime) && !RuntimeMayRunNativeServices(cj.Job.Runtime, cj.Job.Services) {
+		// Fail closed: a declared-but-unprovisioned service is a silent
+		// absence today (no containers, no warning, names unresolvable).
+		// Every DB-backed gate then fails on a missing daemon.
+		res.Status = model.StatusFailure
+		res.Error = fmt.Sprintf("job %q declares %d service(s) but runtime %q cannot provision them (container services require runtime: container; host services require runtime: native and native: true)", cj.ID, len(cj.Job.Services), cj.Job.Runtime)
+		return finish(res)
+	}
+	if RuntimeMayRunNativeServices(cj.Job.Runtime, cj.Job.Services) && len(cj.Job.Services) > 0 {
+		// Ownership (cgroupParent) was already acquired above — ONCE —
+		// before this call. Native services either all live inside that
+		// cgroup or all use the same documented PID fallback; the ledger
+		// outcome matches every other process of this job.
 		net, nativeEnv, _, cleanupNS, nerr := startNativeServices(ctx, cj.ID, workRoot, serviceEnvFor(jobEnv, jobSecrets), cj.Job.Services, cgroupParent, func(list []NativeServiceInfo) error {
 			// Prefer clone-into-cgroup at spawn; the ledger still records the
 			// PID so recovery has secondary evidence. writePIDToJobCgroup
@@ -997,7 +1008,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		network = net
 		cleanupServices = cleanupNS
 		for k, v := range nativeEnv {
-			jobEnv[k] = v
+			jobEnv[envKeyCanon(k)] = v
 		}
 		defer func() {
 			if cerr := cleanupServices(); cerr != nil {
@@ -1082,36 +1093,10 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		// backend honors network "none"; the tart backend fails closed.
 		network = "none"
 	}
-	// Native jobs (with or without services): durable cgroup ownership for
-	// the whole process tree, created BEFORE the first step/service spawn.
-	if cgroupParent == "" && (cj.Job.Runtime == "" || cj.Job.Runtime == "native") {
-		cgNative, cgNativeCleanup := jobCgroupSetup(ctx, jobCgroupRequest{
-			JobID:      cj.ID,
-			CPU:        cj.Job.Resources.CPU,
-			Memory:     int64(cj.Job.Resources.Memory),
-			PIDs:       cj.Job.Resources.PIDs,
-			Force:      true,
-			NativeOnly: true,
-		})
-		if cgNative.Enabled && cgNativeCleanup != nil {
-			cgroupParent = cgNative.Parent
-			if e.Opt.OnCgroupCreated != nil {
-				if hookErr := e.Opt.OnCgroupCreated(cgNative.Parent); hookErr != nil {
-					_ = cgNativeCleanup()
-					res.Status = model.StatusFailure
-					res.Error = fmt.Sprintf("record job cgroup ownership: %v", hookErr)
-					return finish(res)
-				}
-			}
-			defer func() {
-				if cerr := cgNativeCleanup(); cerr != nil {
-					e.log(cj.ID, "service", "native job cgroup cleanup warning: "+cerr.Error())
-					e.reportCleanupDebt(CleanupCgroup, cgroupParent, cerr)
-				}
-			}()
-			e.log(cj.ID, "runtime", "native job cgroup: "+cgNative.Detail)
-		}
-	}
+	// Native job ownership was already acquired ONCE above (before any
+	// service or step). Do not re-attempt cgroup setup here: a second
+	// attempt could succeed after the first failed, leaving already-started
+	// services outside the cgroup that the ledger would later record.
 	backend, err := backendForNetwork(cj.Job.Runtime, cj.Job.Image, cj.Job.VM, network)
 	if err != nil {
 		res.Status = model.StatusFailure
@@ -1347,7 +1332,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			continue
 		}
 		for k, v := range stepSecrets {
-			stepEnvMap[k] = v
+			stepEnvMap[envKeyCanon(k)] = v
 		}
 		outputFile := filepath.Join(dir, fmt.Sprintf(".kiwi-output-%d", i+1))
 		if _, isNative := backend.(*NativeBackend); isNative {
@@ -2246,11 +2231,11 @@ func (e *Executor) resolveSecrets(ctx context.Context, names []string, cache map
 			}
 			cache[name] = v
 		}
-		out[secretEnvName(name)] = v
+		out[envKeyCanon(secretEnvName(name))] = v
 		// Also deliver under the declared name itself: Woodpecker and
 		// imported scripts expect GITHUB_TOKEN, not KIWI_SECRET_GITHUB_TOKEN.
 		if name != secretEnvName(name) {
-			out[name] = v
+			out[envKeyCanon(name)] = v
 		}
 	}
 	return out, nil
@@ -2296,11 +2281,11 @@ func (e *Executor) resolveSecretsOptional(ctx context.Context, names []string, c
 			}
 			cache[name] = v
 		}
-		out[secretEnvName(name)] = v
+		out[envKeyCanon(secretEnvName(name))] = v
 		// Also deliver under the declared name itself: Woodpecker and
 		// imported scripts expect GITHUB_TOKEN, not KIWI_SECRET_GITHUB_TOKEN.
 		if name != secretEnvName(name) {
-			out[name] = v
+			out[envKeyCanon(name)] = v
 		}
 	}
 	return out, nil

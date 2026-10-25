@@ -16,6 +16,7 @@ import (
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/forge"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/model"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/server"
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/workspace"
 )
 
 // kvFlags collects repeatable --input k=v flags.
@@ -230,23 +231,9 @@ func forgeAdapterFor(repoURL, fullName, kind string) (forge.Forge, error) {
 
 // repoCoords derives the clone URL and canonical full name from a --repo
 // value: a URL is used as-is (full name from the last two path segments);
-// an owner/name pair defaults to GitHub.
+// an owner/name pair defaults to GitHub. The derivation lives in
+// workspace.RemoteRepoCoords so freeze-time remote capture and --repo
+// flag handling share one implementation.
 func repoCoords(repo string) (repoURL, fullName string) {
-	repo = strings.TrimSpace(repo)
-	if strings.Contains(repo, "://") {
-		repoURL = repo
-		fullName = repo
-		if i := strings.Index(fullName, "://"); i >= 0 {
-			fullName = fullName[i+3:]
-		}
-		fullName = strings.TrimSuffix(fullName, "/")
-		if i := strings.Index(fullName, "/"); i >= 0 {
-			fullName = fullName[i+1:]
-		}
-		fullName = strings.TrimSuffix(fullName, ".git")
-		return repoURL, fullName
-	}
-	fullName = repo
-	repoURL = "https://github.com/" + fullName + ".git"
-	return repoURL, fullName
+	return workspace.RemoteRepoCoords(repo)
 }

@@ -24,3 +24,26 @@ func TestSupportsExecutionSemantics(t *testing.T) {
 		t.Fatal("empty job stamp must lease")
 	}
 }
+
+func TestLeaseInterpreterFor(t *testing.T) {
+	// Stamped job always records the stamp (the lease gate required the
+	// runner to advertise it).
+	if got := LeaseInterpreterFor([]string{ExecutionSemanticsVersion}, ExecutionSemanticsVersion); got != ExecutionSemanticsVersion {
+		t.Fatalf("stamped v3 = %q", got)
+	}
+	if got := LeaseInterpreterFor(nil, LegacyExecutionSemanticsVersion); got != LegacyExecutionSemanticsVersion {
+		t.Fatalf("stamped v2 with no advertisement = %q", got)
+	}
+	// Unstamped + empty advertisement → legacy pre-field contract.
+	if got := LeaseInterpreterFor(nil, ""); got != LegacyExecutionSemanticsVersion {
+		t.Fatalf("unstamped no-ad = %q, want legacy", got)
+	}
+	// Unstamped + advertising runner → current engine.
+	if got := LeaseInterpreterFor([]string{ExecutionSemanticsVersion}, ""); got != ExecutionSemanticsVersion {
+		t.Fatalf("unstamped advertising = %q", got)
+	}
+	// Unstamped + only legacy advertised → legacy.
+	if got := LeaseInterpreterFor([]string{LegacyExecutionSemanticsVersion}, ""); got != LegacyExecutionSemanticsVersion {
+		t.Fatalf("unstamped legacy-ad = %q", got)
+	}
+}

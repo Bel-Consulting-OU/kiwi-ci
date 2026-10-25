@@ -59,24 +59,113 @@ type Manager struct {
 	// RunLocal never trusts a copied .git (linked worktrees point at live
 	// admin dirs and can change HEAD after freeze).
 	git FrozenGit
+	// refs carries explicit --base/--head/--merge-base inputs captured
+	// before Freeze so their ref resolutions are part of the frozen
+	// transaction instead of a post-Freeze live-Git read.
+	refs RefQuery
+	// tracked is the immutable index membership captured once at Freeze:
+	// the freeze manifest and the run-base copy are computed from this
+	// SAME set, and Prepare never re-queries Git on the frozen tree.
+	tracked trackedIndex
 }
+
+// RefQuery is the explicit ref context the caller wants frozen with the
+// tree (--base / --head / --merge-base from kiwi run). Set it before
+// Freeze; an empty query means "use the captured default range".
+type RefQuery struct {
+	Base      string
+	Head      string
+	MergeBase string
+}
+
+// explicit reports whether the caller asked for a non-default ref range.
+func (q RefQuery) explicit() bool {
+	return q.Base != "" || q.MergeBase != "" || (q.Head != "" && q.Head != "HEAD")
+}
+
+// CaptureRefs records the explicit ref query used by the frozen Git
+// capture. It must be called BEFORE Freeze; after a run-base exists the
+// call is ignored (the transaction is already closed).
+func (m *Manager) CaptureRefs(q RefQuery) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.base != "" {
+		return
+	}
+	m.refs = q
+}
+
+// FrozenGitState is the post-Freeze repository state. Every state is
+// captured at Freeze time; RunLocal must switch on it instead of
+// re-reading live Git.
+type FrozenGitState string
+
+const (
+	// FrozenGitNotRepo: the source was not a Git repository at Freeze.
+	FrozenGitNotRepo FrozenGitState = "not-repo"
+	// FrozenGitRepoNoHead: a repository with an unborn HEAD (no commits).
+	// SHA stays empty for the whole run, even if a commit lands later.
+	FrozenGitRepoNoHead FrozenGitState = "repo-no-head"
+	// FrozenGitStateCaptured: HEAD was sampled atomically.
+	FrozenGitStateCaptured FrozenGitState = "captured"
+	// FrozenGitUnstableState: the repository exists but identity capture
+	// failed (HEAD moved mid-read). Freeze refuses after one retry.
+	FrozenGitUnstableState FrozenGitState = "unstable"
+)
 
 // FrozenGit is the identity captured at freeze time from the source tree.
 //
-// Three states:
-//   - !Captured && !Unstable: not a repository (legacy empty).
-//   - Captured && !Unstable: atomic capture succeeded.
-//   - !Captured && Unstable: a repository exists but the atomic capture
-//     failed (HEAD moved mid-read). Freeze must retry and then fail;
-//     RunLocal must NEVER fall back to live Git after Freeze.
+// States (see State()):
+//   - not-repo: no repository; SHA/ref/branch/repo identity stay empty
+//     forever for this run — a repository created AFTER Freeze is never
+//     consulted.
+//   - repo-no-head: repository with unborn HEAD; SHA stays empty forever,
+//     but branch/ref/repo identity are captured.
+//   - captured: atomic capture succeeded.
+//   - unstable: a repository exists but the atomic capture failed (HEAD
+//     moved mid-read). Freeze must retry and then fail; RunLocal must
+//     NEVER fall back to live Git after Freeze.
 type FrozenGit struct {
-	Captured     bool     `json:"captured"`
-	Unstable     bool     `json:"unstable,omitempty"`
-	SHA          string   `json:"sha,omitempty"`
-	Ref          string   `json:"ref,omitempty"`
-	Branch       string   `json:"branch,omitempty"`
-	ChangedFiles []string `json:"changed_files,omitempty"`
-	ChangedKnown bool     `json:"changed_known"`
+	Captured bool     `json:"captured"`
+	Unstable bool     `json:"unstable,omitempty"`
+	Repo     bool     `json:"repo,omitempty"`
+	SHA      string   `json:"sha,omitempty"`
+	Ref      string   `json:"ref,omitempty"`
+	Branch   string   `json:"branch,omitempty"`
+	// RepoURL/RepoFullName are the repository identity derived from the
+	// source's remote AT FREEZE TIME. A linked worktree's .git pointer is
+	// stripped from the run-base, so a post-Freeze detectGitRepo would
+	// lose them — they must travel inside FrozenGit.
+	RepoURL      string `json:"repo_url,omitempty"`
+	RepoFullName string `json:"repo_full_name,omitempty"`
+	// Explicit carries the resolved --base/--head/--merge-base changed-file
+	// set, computed from the SOURCE inside the frozen transaction.
+	Explicit      *FrozenRefs `json:"explicit_refs,omitempty"`
+	ChangedFiles  []string    `json:"changed_files,omitempty"`
+	ChangedKnown  bool        `json:"changed_known"`
+}
+
+// FrozenRefs is one explicit ref-range resolution captured at Freeze.
+type FrozenRefs struct {
+	Base      string   `json:"base,omitempty"`
+	Head      string   `json:"head,omitempty"`
+	MergeBase string   `json:"merge_base,omitempty"`
+	Files     []string `json:"files,omitempty"`
+	Known     bool     `json:"known"`
+}
+
+// State classifies the frozen repository context.
+func (g FrozenGit) State() FrozenGitState {
+	switch {
+	case g.Unstable:
+		return FrozenGitUnstableState
+	case g.Captured:
+		return FrozenGitStateCaptured
+	case g.Repo:
+		return FrozenGitRepoNoHead
+	default:
+		return FrozenGitNotRepo
+	}
 }
 
 // Unstable reports a Git repository whose identity could not be captured
@@ -177,13 +266,23 @@ func (m *Manager) freezeLocked(ctx context.Context) error {
 	// creating run-base under Root mutates the source mid-freeze. Skip the
 	// manager's own Root in every manifest so that is not a false change.
 	skip := m.Root
-	before, err := freezeManifest(m.Source, skip)
+	// ONE immutable index membership per attempt: the manifest below, the
+	// copy after it, and the re-verification all read this same captured
+	// set — no live `git ls-files` decisions during the walk (an index
+	// change mid-freeze can no longer alter the snapshot while the
+	// before/after manifests stay identical).
+	idx, err := captureTrackedIndex(ctx, m.Source)
+	if err != nil {
+		return fmt.Errorf("run base: capture tracked paths: %w", err)
+	}
+	m.tracked = idx
+	before, err := freezeManifestIndex(m.Source, skip, idx)
 	if err != nil {
 		return fmt.Errorf("run base: source manifest: %w", err)
 	}
 	// Capture Git identity from the SOURCE before copying. Never use the
 	// copied .git later: a linked worktree's gitdir stays on the live repo.
-	m.git = captureFrozenGit(m.Source)
+	m.git = captureFrozenGit(m.Source, m.refs)
 	// Unstable capture (HEAD moved mid-read) forces the same one-retry
 	// transaction as a mutating source tree; after that we fail rather than
 	// let RunLocal fall back to live Git.
@@ -193,12 +292,12 @@ func (m *Manager) freezeLocked(ctx context.Context) error {
 	// worktree strategy): run-base must match the developer's source
 	// listing including ignored/untracked files, and a worktree of HEAD
 	// would silently drop them before any job runs.
-	strategy, err := m.snapshotFrom(ctx, m.Source, base, true)
+	strategy, err := m.snapshotFrom(ctx, m.Source, base, true, idx)
 	if err != nil {
 		_ = os.RemoveAll(base)
 		return fmt.Errorf("run base snapshot: %w", err)
 	}
-	after, err := freezeManifest(m.Source, skip)
+	after, err := freezeManifestIndex(m.Source, skip, idx)
 	if err != nil {
 		_ = os.RemoveAll(base)
 		return fmt.Errorf("run base: source re-manifest: %w", err)
@@ -210,19 +309,27 @@ func (m *Manager) freezeLocked(ctx context.Context) error {
 		// existed.
 		_ = os.RemoveAll(base)
 		base = filepath.Join(m.Root, "run-base")
-		before2, err := freezeManifest(m.Source, skip)
+		// The retry is a NEW transaction over a mutated source: recapture
+		// the index membership and Git identity together so manifest, copy
+		// and identity all describe the tree that actually won the retry.
+		idx, err = captureTrackedIndex(ctx, m.Source)
+		if err != nil {
+			return fmt.Errorf("run base: capture tracked paths: %w", err)
+		}
+		m.tracked = idx
+		before2, err := freezeManifestIndex(m.Source, skip, idx)
 		if err != nil {
 			return fmt.Errorf("run base: source manifest: %w", err)
 		}
 		// Recapture Git AFTER mutation so FrozenGit matches the tree that
 		// actually won the retry (not the pre-retry sampling).
-		m.git = captureFrozenGit(m.Source)
-		strategy, err = m.snapshotFrom(ctx, m.Source, base, true)
+		m.git = captureFrozenGit(m.Source, m.refs)
+		strategy, err = m.snapshotFrom(ctx, m.Source, base, true, idx)
 		if err != nil {
 			_ = os.RemoveAll(base)
 			return fmt.Errorf("run base snapshot: %w", err)
 		}
-		after2, err := freezeManifest(m.Source, skip)
+		after2, err := freezeManifestIndex(m.Source, skip, idx)
 		if err != nil {
 			_ = os.RemoveAll(base)
 			return fmt.Errorf("run base: source re-manifest: %w", err)
@@ -232,14 +339,14 @@ func (m *Manager) freezeLocked(ctx context.Context) error {
 			return fmt.Errorf("run base: source tree changed during freeze (retry also unstable); re-run when the working tree is quiet")
 		}
 	}
-	// Git capture must be definitive: NotRepo or Captured — never Unstable.
-	// An unstable identity would force RunLocal back to live Git after the
-	// source snapshot, recreating the source/Git split.
+	// Git capture must be definitive: NotRepo/RepoNoHead or Captured —
+	// never Unstable. An unstable identity would force RunLocal back to
+	// live Git after the source snapshot, recreating the source/Git split.
 	if m.git.CaptureFailed() {
 		_ = os.RemoveAll(base)
 		return fmt.Errorf("run base: Git identity capture failed atomically (HEAD moved during freeze); re-run when the repository is quiet")
 	}
-	if err := verifyStagedTree(m.Source, entries, base, strategy); err != nil {
+	if err := verifyStagedTreeIndex(m.Source, entries, base, strategy, idx); err != nil {
 		_ = os.RemoveAll(base)
 		return fmt.Errorf("run base verify: %w", err)
 	}
@@ -275,14 +382,105 @@ func stripLiveGitPointer(base string) error {
 	return os.Remove(p)
 }
 
+// trackedIndex answers skip-directory membership questions for one freeze
+// transaction. The captured form is immutable: the freeze manifest and the
+// run-base copy both consult the SAME index, so Git-index churn during the
+// copy can never change what enters the snapshot while the before/after
+// manifests stay identical.
+type trackedIndex interface {
+	// dirTracked reports whether any tracked path lives under rel.
+	dirTracked(rel string) bool
+	// fileTracked reports whether exactly rel is tracked.
+	fileTracked(rel string) bool
+}
+
+// liveTrackedIndex queries the live Git index per path. It backs the
+// legacy direct copyTree entry points and the keep-on-error helpers; the
+// freeze transaction itself always uses a captured index.
+type liveTrackedIndex struct{ src string }
+
+func (l liveTrackedIndex) dirTracked(rel string) bool { return hasTrackedFiles(l.src, rel) }
+func (l liveTrackedIndex) fileTracked(rel string) bool { return isGitTracked(l.src, rel) }
+
+// capturedTrackedIndex is the immutable index snapshot taken once per
+// freeze attempt (git ls-files -z in a single invocation).
+type capturedTrackedIndex struct {
+	files map[string]bool // slash-normalized tracked file paths
+	dirs  map[string]bool // slash-normalized dirs containing tracked files
+}
+
+func (c *capturedTrackedIndex) dirTracked(rel string) bool {
+	return c.dirs[filepath.ToSlash(rel)]
+}
+func (c *capturedTrackedIndex) fileTracked(rel string) bool {
+	return c.files[filepath.ToSlash(rel)]
+}
+
+// allTrackedIndex treats everything as tracked: used to copy the ALREADY
+// canonical run-base verbatim, where build-output filtering and index
+// membership were resolved once at Freeze and must never be re-derived.
+type allTrackedIndex struct{}
+
+func (allTrackedIndex) dirTracked(string) bool  { return true }
+func (allTrackedIndex) fileTracked(string) bool { return true }
+
+// captureTrackedIndex snapshots Git index membership for src ONCE.
+//
+//   - Not a Git repository: empty index (skip-name directories are build
+//     output by name — there is no index that could say otherwise), and
+//     the manifest and copy agree on that.
+//   - A repository whose index cannot be read: FAIL CLOSED. A lock or
+//     index race during freeze must never become a silent SkipDir or a
+//     silent extra file (K15), and a partial freeze must never certify a
+//     tree the index did not describe.
+func captureTrackedIndex(ctx context.Context, src string) (trackedIndex, error) {
+	idx := &capturedTrackedIndex{files: map[string]bool{}, dirs: map[string]bool{}}
+	if !gitRepo(ctx, src) {
+		return idx, nil
+	}
+	cmd := exec.CommandContext(ctx, "git", "-C", src, "ls-files", "-z")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("git ls-files: %w", err)
+	}
+	for _, p := range strings.Split(string(out), "\x00") {
+		p = strings.TrimSuffix(strings.TrimSpace(p), "/")
+		if p == "" {
+			continue
+		}
+		idx.files[p] = true
+		// Ancestor directories of a tracked file are "containing tracked
+		// files" for the skip-dir walk.
+		for d := filepath.ToSlash(filepath.Dir(filepath.FromSlash(p))); d != "." && d != "/" && d != ""; d = filepath.ToSlash(filepath.Dir(filepath.FromSlash(d))) {
+			idx.dirs[d] = true
+		}
+	}
+	return idx, nil
+}
+
 // freezeManifest is a deterministic digest of path/type/size/mtime for
 // every entry under root (symlinks record their target). skip, when
 // non-empty and under root, is omitted (the manager's own Root under a
 // HOME-as-source layout). Used to detect concurrent mutation while the
 // run-base is being copied.
+//
+// The two-argument form binds the LIVE index (tests and legacy callers);
+// the freeze transaction uses freezeManifestIndex with the captured set so
+// manifest membership and copy membership are byte-for-byte the same rule.
 func freezeManifest(root, skip string) (string, error) {
+	return freezeManifestIndex(root, skip, liveTrackedIndex{src: root})
+}
+
+// freezeManifestIndex digests exactly the entries the copy with the SAME
+// index would include: a skip-name directory enters iff the index says it
+// carries tracked paths, and inside it only indexed files are digested —
+// so an untracked temp file churning under dist/ can never destabilize the
+// freeze, and index changes are decided by one captured set instead of
+// repeated live queries.
+func freezeManifestIndex(root, skip string, idx trackedIndex) (string, error) {
 	skip = filepath.Clean(skip)
 	h := sha256.New()
+	var preserve []string
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -315,26 +513,42 @@ func freezeManifest(root, skip string) (string, error) {
 		kind := "f"
 		if info.IsDir() {
 			// Same inclusion rule as copyTree: a skip-name directory is
-			// omitted unless git tracks paths under it (tracked dist/ etc.
-			// must stay visible to the stability oracle).
-			if copyTreeSkipDirs[info.Name()] && !hasTrackedFiles(root, rel) {
+			// omitted unless the captured index tracks paths under it
+			// (tracked dist/ etc. must stay visible to the stability oracle).
+			if copyTreeSkipDirs[info.Name()] {
+				if idx.dirTracked(rel) {
+					preserve = append(preserve, rel)
+				} else {
+					return filepath.SkipDir
+				}
+			}
+			// Inside a preserved skip directory, directories without
+			// tracked descendants never enter the copy — exclude them here
+			// too so both walks describe one input set.
+			if inPreservedSkip(preserve, rel) && !isSkipRoot(preserve, rel) && !idx.dirTracked(rel) {
 				return filepath.SkipDir
 			}
 			kind = "d"
-		} else if info.Mode()&os.ModeSymlink != 0 {
-			kind = "l"
-			target, lerr := os.Readlink(path)
-			if lerr != nil {
-				return lerr
+		} else {
+			if inPreservedSkip(preserve, rel) && !idx.fileTracked(rel) {
+				return nil
 			}
-			fmt.Fprintf(h, "%s\x00%s\x00%s\n", rel, kind, target)
-			return nil
+			if info.Mode()&os.ModeSymlink != 0 {
+				kind = "l"
+				target, lerr := os.Readlink(path)
+				if lerr != nil {
+					return lerr
+				}
+				fmt.Fprintf(h, "%s\x00%s\x00%s\n", rel, kind, target)
+				return nil
+			}
 		}
 		fmt.Fprintf(h, "%s\x00%s\x00%d\x00%d\x00%016x", rel, kind, info.Size(), info.Mode().Perm(), info.ModTime().UnixNano())
 		// Content digest: size+mtime can miss a same-size rewrite (P2
 		// determinism). Regular files are streamed (not capped at 1 MiB) up
-		// to freezeContentHashMax; larger blobs get a head+tail sample plus
-		// size so multi-gigabyte artifacts cannot pin the freeze walk.
+		// to freezeContentHashMax; larger blobs get a head/middle/tail
+		// sample plus size so multi-gigabyte artifacts cannot pin the
+		// freeze walk.
 		if kind == "f" && info.Size() > 0 {
 			if d, ok := freezeContentDigest(path, info.Size()); ok {
 				fmt.Fprintf(h, "\x00%s", d)
@@ -372,9 +586,19 @@ func freezeContentDigest(path string, size int64) (string, bool) {
 		}
 		return hex.EncodeToString(h.Sum(nil)[:8]), true
 	}
-	// Head + tail sample for oversized files.
+	// Head + MIDDLE + tail sample for oversized files. The middle band
+	// exists because a same-size, same-mtime rewrite of an artifact's core
+	// (a repacked archive, an overwritten blob segment) escaped the
+	// head/tail sample: only the untouched ends stayed identical and the
+	// freeze certified a tree that had actually changed under it.
 	h := sha256.New()
 	if _, err := io.CopyN(h, f, 32<<10); err != nil {
+		return "", false
+	}
+	if _, err := f.Seek(size/2-(16<<10), io.SeekStart); err != nil {
+		return "", false
+	}
+	if _, err := io.CopyN(h, f, 32<<10); err != nil && err != io.EOF {
 		return "", false
 	}
 	if _, err := f.Seek(size-(32<<10), io.SeekStart); err != nil {
@@ -384,6 +608,39 @@ func freezeContentDigest(path string, size int64) (string, bool) {
 		return "", false
 	}
 	return hex.EncodeToString(h.Sum(nil)[:8]), true
+}
+
+// adoptStat is the adopted-file stability seam: tests substitute a changing
+// size/mtime sequence to prove AdoptFile refuses a file that mutated while
+// it was being read (a hybrid of two writes must never become run
+// authority).
+var adoptStat = os.Stat
+
+// adoptStableRead reads path under a before/after stability bracket. If
+// size or mtime moved between the two samples (or the read length does not
+// match the sampled size), a concurrent writer was mid-update — retry once,
+// then fail closed. Never adopt bytes no single point in time ever had.
+func adoptStableRead(path string) ([]byte, error) {
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		before, err := adoptStat(path)
+		if err != nil {
+			return nil, err
+		}
+		data, rerr := os.ReadFile(path)
+		after, aerr := adoptStat(path)
+		if rerr != nil {
+			return nil, rerr
+		}
+		if aerr != nil {
+			return nil, aerr
+		}
+		if before.Size() == after.Size() && before.ModTime().Equal(after.ModTime()) && int64(len(data)) == before.Size() {
+			return data, nil
+		}
+		lastErr = fmt.Errorf("adopt: %s changed while it was being read (size/mtime moved mid-copy); refusing a hybrid as run authority", path)
+	}
+	return nil, lastErr
 }
 
 // BasePath returns the immutable run-base directory, or "" if Freeze has
@@ -423,42 +680,97 @@ func (m *Manager) Prepare(ctx context.Context, jobID string) (string, func(), er
 	if _, err := os.Lstat(target); err == nil {
 		return "", nil, fmt.Errorf("job workspace %q already exists", target)
 	}
-	// Verify against the listing captured at freeze time (immutable base).
-	srcEntries := m.baseEntries
-	srcPath := m.base
-	if srcEntries == nil {
-		var err error
-		srcEntries, err = os.ReadDir(m.Source)
-		if err != nil {
-			return "", nil, fmt.Errorf("prepare workspace for %q: read source: %w", jobID, err)
-		}
-		srcPath = m.Source
-	}
-	strategy, err := m.snapshotFrom(ctx, srcPath, target, false)
+	// Frozen run-base is the CANONICAL tree: a job workspace is an exact
+	// copy of it. Git-dependent source selection (skip-name filtering,
+	// index membership) was resolved ONCE at Freeze against the live
+	// source; re-running it here would re-derive a DIFFERENT set on a
+	// run-base whose live Git was stripped (linked worktrees) or whose
+	// index moved — silently dropping tracked dist/ content the freeze
+	// already certified as source. allTrackedIndex copies every byte the
+	// freeze chose to keep.
+	strategy, err := m.snapshotFrom(ctx, m.base, target, false, allTrackedIndex{})
 	if err != nil {
-		_ = os.RemoveAll(target)
-		return "", nil, fmt.Errorf("prepare workspace for %q: %w", jobID, err)
-	}
-	if err := verifyStagedTree(srcPath, srcEntries, target, strategy); err != nil {
 		_ = os.RemoveAll(target)
 		return "", nil, fmt.Errorf("prepare workspace for %q: %w", jobID, err)
 	}
 	switch strategy {
 	case "worktree":
-		// Worktree was created from the snapshot source (run-base or the
-		// live source), not always m.Source — cleanup must match.
-		wtSrc := srcPath
-		return target, func() { removeWorktree(wtSrc, target) }, nil
+		// Worktree was created from the frozen base (opt-in strategy),
+		// which carries its own copy of the frozen .git — never from the
+		// live source. Verify against the immutable source listing with
+		// the captured index (same rules as the freeze copy).
+		if err := verifyStagedTreeIndex(m.Source, m.baseEntries, target, strategy, m.tracked); err != nil {
+			removeWorktree(m.base, target)
+			return "", nil, fmt.Errorf("prepare workspace for %q: %w", jobID, err)
+		}
+		return target, func() { removeWorktree(m.base, target) }, nil
 	default:
+		// Exact copy: verify against the run-base itself (the authority).
+		if err := verifyExactTree(m.base, target); err != nil {
+			_ = os.RemoveAll(target)
+			return "", nil, fmt.Errorf("prepare workspace for %q: %w", jobID, err)
+		}
 		return target, func() { _ = os.RemoveAll(target) }, nil
 	}
+}
+
+// verifyExactTree fails closed unless every top-level entry of the
+// canonical run-base made it into the job workspace, and the file counts
+// match. Used for frozen Prepare, where no filtering decision may be
+// re-derived: the base IS the expected content.
+func verifyExactTree(base, target string) error {
+	baseEntries, err := os.ReadDir(base)
+	if err != nil {
+		return fmt.Errorf("verify exact copy: read base: %w", err)
+	}
+	dstEntries, err := os.ReadDir(target)
+	if err != nil {
+		return fmt.Errorf("verify exact copy: read target: %w", err)
+	}
+	have := map[string]bool{}
+	for _, e := range dstEntries {
+		have[e.Name()] = true
+	}
+	var missing []string
+	for _, e := range baseEntries {
+		if !have[e.Name()] {
+			missing = append(missing, e.Name())
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("staged workspace is truncated: missing base entr(y/ies) %v", missing)
+	}
+	countFiles := func(root string) (n int) {
+		_ = filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
+			if err == nil && info != nil && !info.IsDir() {
+				n++
+			}
+			return nil
+		})
+		return n
+	}
+	bn, dn := countFiles(base), countFiles(target)
+	if bn > 0 && dn == 0 {
+		return fmt.Errorf("staged workspace is empty but the run-base has %d files", bn)
+	}
+	if dn < bn {
+		return fmt.Errorf("staged workspace has %d files, run-base has %d (truncated copy)", dn, bn)
+	}
+	return nil
 }
 
 // verifyStagedTree fails closed when a snapshot lost top-level directories
 // from the pre-copied source listing or produced an implausibly small tree.
 // srcEntries must be the listing taken BEFORE the copy so concurrent
 // source mutations cannot invent phantom missing directories.
+// The unqualified form binds the LIVE index (tests and the legacy
+// unfrozen branch); freeze/Prepare use verifyStagedTreeIndex with the
+// captured set.
 func verifyStagedTree(src string, srcEntries []os.DirEntry, target, strategy string) error {
+	return verifyStagedTreeIndex(src, srcEntries, target, strategy, liveTrackedIndex{src: src})
+}
+
+func verifyStagedTreeIndex(src string, srcEntries []os.DirEntry, target, strategy string, idx trackedIndex) error {
 	dstEntries, err := os.ReadDir(target)
 	if err != nil {
 		return fmt.Errorf("verify staged tree: read target: %w", err)
@@ -485,7 +797,7 @@ func verifyStagedTree(src string, srcEntries []os.DirEntry, target, strategy str
 		if !e.IsDir() {
 			continue
 		}
-		if copyTreeSkipDirs[name] && !hasTrackedFiles(src, name) {
+		if copyTreeSkipDirs[name] && !idx.dirTracked(name) {
 			continue
 		}
 		if name == ".kiwi" {
@@ -520,16 +832,19 @@ func verifyStagedTree(src string, srcEntries []os.DirEntry, target, strategy str
 
 // snapshot materializes the source tree at target and reports which
 // strategy produced it.
-// snapshotCopyTree is copyTree unless a fallback test substitutes a
-// failing copy to exercise the reflink/cancel paths.
-var snapshotCopyTree = copyTree
+// snapshotCopyTree is copyTree bound to an index (the snapshot caller's
+// index) unless a fallback test substitutes a failing copy to exercise the
+// reflink/cancel paths.
+var snapshotCopyTree = func(src, dst string, idx trackedIndex) error {
+	return copyTreeSkipIndex(src, dst, "", idx)
+}
 
 // workspaceStrategyEnv selects the snapshot strategy. Empty (default) is
 // always copyTree — the deterministic working-tree copy. "worktree" opts
 // into the clean-tree `git worktree add` snapshot (committed files only).
 const workspaceStrategyEnv = "KIWI_WORKSPACE_STRATEGY"
 
-func (m *Manager) snapshotFrom(ctx context.Context, src, target string, forceCopy bool) (string, error) {
+func (m *Manager) snapshotFrom(ctx context.Context, src, target string, forceCopy bool, idx trackedIndex) (string, error) {
 	// K15: staging must be deterministic. copyTree is the default; the
 	// worktree path is opt-in only and never used for freeze (forceCopy).
 	//
@@ -558,13 +873,13 @@ func (m *Manager) snapshotFrom(ctx context.Context, src, target string, forceCop
 	// ENTIRE tree — never use it when we must exclude Root (skip), because
 	// `cp -R` cannot honor skip and would nest sibling workspaces.
 	if forceCopy || skip != "" {
-		if err := copyTreeSkip(src, target, skip); err != nil {
+		if err := copyTreeSkipIndex(src, target, skip, idx); err != nil {
 			_ = os.RemoveAll(target)
 			return "", err
 		}
 		return "copy", nil
 	}
-	if err := snapshotCopyTree(src, target); err == nil {
+	if err := snapshotCopyTree(src, target, idx); err == nil {
 		return "copy", nil
 	}
 	_ = os.RemoveAll(target)
@@ -695,10 +1010,19 @@ func hasTrackedFiles(src, rel string) bool {
 // the repository): without it the walk descends into the half-copied
 // workspace and copies it into itself until the path length explodes.
 func copyTree(src, dst string) error {
-	return copyTreeSkip(src, dst, "")
+	return copyTreeSkipIndex(src, dst, "", liveTrackedIndex{src: src})
 }
 
 func copyTreeSkip(src, dst, skip string) error {
+	return copyTreeSkipIndex(src, dst, skip, liveTrackedIndex{src: src})
+}
+
+// copyTreeSkipIndex copies with an explicit index for skip-directory
+// membership. The freeze transaction passes its captured index (one
+// immutable membership for manifest AND copy); direct/live copies pass
+// liveTrackedIndex; frozen Prepare passes allTrackedIndex for an exact
+// copy of the canonical run-base.
+func copyTreeSkipIndex(src, dst, skip string, idx trackedIndex) error {
 	// Resolve symlinked roots/components so Walk can descend (macOS /tmp,
 	// /var/folders) AND so destination-exclusion compares the same
 	// resolved paths. Without this: (1) a symlinked source stages zero
@@ -760,22 +1084,24 @@ func copyTreeSkip(src, dst, skip string) error {
 			// A skip-name directory that carries TRACKED paths is source
 			// (tools/redteam/target, dist/ release assets). Keep only the
 			// tracked subtree; untracked build output inside it is omitted.
-			if hasTrackedFiles(src, rel) {
+			// Membership comes from the transaction's index — never a
+			// second live `git ls-files` decision mid-copy.
+			if idx.dirTracked(rel) {
 				preserveTrackedUnder = append(preserveTrackedUnder, rel)
 			} else {
 				return filepath.SkipDir
 			}
 		}
-		// Inside a kept skip-name directory, copy only git-tracked paths.
+		// Inside a kept skip-name directory, copy only indexed paths.
 		// The root itself always stays so the walk reaches its children.
 		// Directories stay if they hold tracked descendants (a bare dir is
 		// not in the index; its files are).
 		if inPreservedSkip(preserveTrackedUnder, rel) && !isSkipRoot(preserveTrackedUnder, rel) {
 			if info.IsDir() {
-				if !hasTrackedFiles(src, rel) {
+				if !idx.dirTracked(rel) {
 					return filepath.SkipDir
 				}
-			} else if !isGitTracked(src, rel) {
+			} else if !idx.fileTracked(rel) {
 				return nil
 			}
 		}
@@ -933,9 +1259,10 @@ func sanitizeJobIDBare(id string) string {
 	return out
 }
 
-// captureFrozenGit records HEAD SHA/ref/branch and the changed-file set
-// from dir (the SOURCE, before copy). known is false when git cannot
-// produce a trustworthy diff.
+// captureFrozenGit records repository identity (HEAD SHA/ref/branch, the
+// remote's repo coordinates, the changed-file set, and any explicit
+// --base/--head/--merge-base resolution) from dir (the SOURCE, before
+// copy). known is false when git cannot produce a trustworthy diff.
 //
 // Package-level var so tests can substitute an unstable capture and prove
 // Freeze refuses to fall back to live Git.
@@ -946,23 +1273,42 @@ var captureFrozenGit = captureFrozenGitSource
 // directory lives outside the freeze tree and can move mid-read; a
 // mismatched sample yields Unstable (not "not a repo"), which Freeze
 // treats as a hard failure after one retry.
-func captureFrozenGitSource(dir string) FrozenGit {
+//
+// After this returns, NO caller may re-read live Git: everything RunLocal
+// needs (including remote coordinates, which a stripped linked-worktree
+// run-base can no longer answer) is inside the returned struct.
+func captureFrozenGitSource(dir string, refs RefQuery) FrozenGit {
 	g := FrozenGit{}
 	if !gitRepo(context.Background(), dir) {
-		// Not a repository: leave Captured=false, Unstable=false.
+		// Not a repository: leave Captured=false, Unstable=false, Repo=false.
 		return g
 	}
+	g.Repo = true
+	g.RepoURL, g.RepoFullName = captureRepoIdentity(dir)
 	// Unstable means "HEAD was sampled once and then MOVED" — never
 	// "HEAD missing". An empty repository (git init, no commits) has no
-	// identity to freeze and must not fail Freeze; RunLocal's !Captured
-	// path is correct there because live Git also has no HEAD.
-	unstable := FrozenGit{Unstable: true}
+	// identity to freeze and must not fail Freeze; it is its own state
+	// (repo-no-head): SHA stays empty for the whole run even if a commit
+	// lands a millisecond later, because RunLocal never re-reads Git.
+	unstable := FrozenGit{Unstable: true, Repo: true, RepoURL: g.RepoURL, RepoFullName: g.RepoFullName}
 	headOut, err := exec.Command("git", "-C", dir, "rev-parse", "--verify", "--quiet", "HEAD").Output()
 	if err != nil || len(headOut) == 0 {
 		// Distinguish unborn HEAD (empty repo — symbolic-ref still works)
 		// from an unreadable/corrupt HEAD (unstable capture).
 		if refOut, refErr := exec.Command("git", "-C", dir, "symbolic-ref", "-q", "HEAD").Output(); refErr == nil && len(refOut) > 0 {
-			return g // unborn HEAD: no commits yet
+			// repo-no-head: capture everything that does NOT depend on a
+			// commit so the run keeps stable branch/ref/repo identity.
+			g.Ref = strings.TrimSpace(string(refOut))
+			if out, berr := exec.Command("git", "-C", dir, "symbolic-ref", "--short", "-q", "HEAD").Output(); berr == nil {
+				g.Branch = strings.TrimSpace(string(out))
+			}
+			if refs.explicit() {
+				// No HEAD to resolve against; record the request as
+				// unresolved so RunLocal reports unknown instead of
+				// re-running Git against the live tree after Freeze.
+				g.Explicit = &FrozenRefs{Base: refs.Base, Head: refs.Head, MergeBase: refs.MergeBase, Known: false}
+			}
+			return g
 		}
 		return unstable // HEAD claimed but unreadable / mid-operation
 	}
@@ -1003,15 +1349,109 @@ func captureFrozenGitSource(dir string) FrozenGit {
 		// identity is captured; only the change set is unknown.
 		g.ChangedKnown = false
 		g.ChangedFiles = nil
-		return g
-	}
-	g.ChangedKnown = true
-	for _, s := range strings.Split(string(out), "\n") {
-		if s = strings.TrimSpace(s); s != "" {
-			g.ChangedFiles = append(g.ChangedFiles, s)
+	} else {
+		g.ChangedKnown = true
+		for _, s := range strings.Split(string(out), "\n") {
+			if s = strings.TrimSpace(s); s != "" {
+				g.ChangedFiles = append(g.ChangedFiles, s)
+			}
 		}
 	}
+	// Explicit --base/--head/--merge-base: resolve inside the SAME
+	// transaction so a post-Freeze live read can never reinterpret the
+	// range against a tree (or a stripped run-base) that cannot answer it.
+	if refs.explicit() {
+		fr := &FrozenRefs{Base: refs.Base, Head: refs.Head, MergeBase: refs.MergeBase}
+		resolveBase := refs.Base
+		if refs.MergeBase != "" {
+			mb, mberr := exec.Command("git", "-C", dir, "merge-base", "HEAD", refs.MergeBase).Output()
+			if !sameHEAD() {
+				return unstable
+			}
+			if mberr != nil {
+				g.Explicit = fr // Known=false: unresolved, never guessed
+				return g
+			}
+			resolveBase = strings.TrimSpace(string(mb))
+		}
+		if resolveBase == "" {
+			resolveBase = "HEAD~1"
+		}
+		dh := refs.Head
+		if dh == "" {
+			dh = "HEAD"
+		}
+		dout, derr := exec.Command("git", "-C", dir, "diff", "--name-only", resolveBase, dh).Output()
+		if !sameHEAD() {
+			return unstable
+		}
+		if derr != nil {
+			g.Explicit = fr
+			return g
+		}
+		fr.Known = true
+		for _, s := range strings.Split(string(dout), "\n") {
+			if s = strings.TrimSpace(s); s != "" {
+				fr.Files = append(fr.Files, s)
+			}
+		}
+		g.Explicit = fr
+	}
 	return g
+}
+
+// captureRepoIdentity reads the source's remote (origin, then upstream,
+// then any remote) and derives repo coordinates — the same pure string
+// derivation detectGitRepo applies, but ONCE at freeze time so a stripped
+// linked-worktree run-base can never lose CI_REPO / GITHUB_REPOSITORY.
+func captureRepoIdentity(dir string) (repoURL, fullName string) {
+	for _, remote := range []string{"origin", "upstream"} {
+		out, err := exec.Command("git", "-C", dir, "remote", "get-url", remote).Output()
+		if err != nil {
+			continue
+		}
+		url := strings.TrimSpace(string(out))
+		if url == "" {
+			continue
+		}
+		return RemoteRepoCoords(url)
+	}
+	out, err := exec.Command("git", "-C", dir, "remote", "-v").Output()
+	if err != nil {
+		return "", ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] != "" {
+			return RemoteRepoCoords(fields[1])
+		}
+	}
+	return "", ""
+}
+
+// RemoteRepoCoords derives the clone URL and canonical full name from a
+// repository remote / --repo value: a URL is used as-is (full name from the
+// first host segment onward); an owner/name pair defaults to GitHub.
+// Pure string math — no Git — so frozen identity can be derived after the
+// run-base has sealed the repository away.
+func RemoteRepoCoords(remote string) (repoURL, fullName string) {
+	repo := strings.TrimSpace(remote)
+	if strings.Contains(repo, "://") {
+		repoURL = repo
+		fullName = repo
+		if i := strings.Index(fullName, "://"); i >= 0 {
+			fullName = fullName[i+3:]
+		}
+		fullName = strings.TrimSuffix(fullName, "/")
+		if i := strings.Index(fullName, "/"); i >= 0 {
+			fullName = fullName[i+1:]
+		}
+		fullName = strings.TrimSuffix(fullName, ".git")
+		return repoURL, fullName
+	}
+	fullName = repo
+	repoURL = "https://github.com/" + fullName + ".git"
+	return repoURL, fullName
 }
 
 // materializeSymlink writes a freeze-safe link (or file snapshot) instead of
@@ -1088,7 +1528,9 @@ func escapesFrozen(link string) bool {
 }
 
 // AdoptFile copies an external file (e.g. -f ../shared/pipeline.yaml) into
-// the frozen run-base so the run identity covers the pipeline bytes.
+// the frozen run-base so the run identity covers the pipeline bytes. The
+// source is read under a stability bracket: a file mutating mid-read is
+// retried once and then refused, never adopted as a hybrid of two writes.
 func (m *Manager) AdoptFile(srcPath string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1099,12 +1541,16 @@ func (m *Manager) AdoptFile(srcPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	st, err := os.Stat(abs)
+	st, err := adoptStat(abs)
 	if err != nil {
 		return "", err
 	}
 	if st.IsDir() {
 		return "", fmt.Errorf("AdoptFile: %s is a directory; adopt the specific file", abs)
+	}
+	data, err := adoptStableRead(abs)
+	if err != nil {
+		return "", err
 	}
 	name := filepath.Base(abs)
 	// Keep a stable subdirectory for adopted authority files.
@@ -1113,7 +1559,7 @@ func (m *Manager) AdoptFile(srcPath string) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return "", err
 	}
-	if err := copyFile(abs, dst, 0o644); err != nil {
+	if err := os.WriteFile(dst, data, 0o644); err != nil {
 		return "", err
 	}
 	return dst, nil
@@ -1123,7 +1569,8 @@ func (m *Manager) AdoptFile(srcPath string) (string, error) {
 // the run-base and returns the root directory to pass to applyLocalImageLock
 // (Join(root, ".kiwi/lock.json") must resolve to the adopted bytes). This
 // preserves the lockfilePath layout instead of flattening lock.json next to
-// the pipeline, and never leaves the live original path as authority.
+// the pipeline, and never leaves the live original path as authority. The
+// source read is stability-bracketed like AdoptFile.
 func (m *Manager) AdoptLock(srcLockFile string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1134,12 +1581,16 @@ func (m *Manager) AdoptLock(srcLockFile string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	st, err := os.Stat(abs)
+	st, err := adoptStat(abs)
 	if err != nil {
 		return "", err
 	}
 	if st.IsDir() {
 		return "", fmt.Errorf("AdoptLock: %s is a directory, not a lockfile", abs)
+	}
+	data, err := adoptStableRead(abs)
+	if err != nil {
+		return "", err
 	}
 	// Structured destination: <base>/.kiwi-frozen/lockroot/.kiwi/lock.json
 	root := filepath.Join(m.base, ".kiwi-frozen", "lockroot")
@@ -1147,7 +1598,7 @@ func (m *Manager) AdoptLock(srcLockFile string) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return "", err
 	}
-	if err := copyFile(abs, dst, 0o644); err != nil {
+	if err := os.WriteFile(dst, data, 0o644); err != nil {
 		return "", err
 	}
 	return root, nil

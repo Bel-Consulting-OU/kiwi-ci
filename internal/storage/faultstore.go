@@ -2661,6 +2661,10 @@ func (m *memStore) AcquireLease(ctx context.Context, jobID, runnerID string, tok
 	j.LeaseTokenHash = tokenHash
 	j.LeaseGeneration = generation
 	j.LeaseExpiresAt = &expiresAt
+	// Non-atomic claim has no runner snapshot: record the stamped job
+	// semantics (or the legacy contract when unstamped) so the completion
+	// bridge still has a lease-time identity.
+	j.LeaseInterpreter = model.LeaseInterpreterFor(nil, j.ExecutionSemantics)
 	m.jobs[jobID] = j
 	m.adjustQuotaLocked(RepoIDForJob(j), 1, -1)
 	m.appendExecutionEventLocked(ExecutionEventAttemptCreated(j, runnerID))
@@ -5960,6 +5964,8 @@ func (m *memStore) AcquireLeaseAtomic(ctx context.Context, claim LeaseClaim) (mo
 	j.LeaseTokenHash = claim.TokenHash
 	j.LeaseGeneration = claim.Generation
 	j.LeaseExpiresAt = &claim.ExpiresAt
+	// Lease-time interpreter identity (v2 completion drain bridge).
+	j.LeaseInterpreter = model.LeaseInterpreterFor(effective.SupportedExecutionSemantics, j.ExecutionSemantics)
 	m.jobs[claim.JobID] = j
 	r.ActiveJobs = append(r.ActiveJobs, claim.JobID)
 	r.Busy = effective.Capacity > 0 && len(r.ActiveJobs) >= effective.Capacity

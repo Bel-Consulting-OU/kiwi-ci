@@ -21,24 +21,34 @@ import (
 // KIWI_SERVICE_<NAME>_HOST / _PORT always appear when a port was allocated.
 const nativeServiceEnvPrefix = "KIWI_SERVICE_"
 
-// nativePortClaims is the process-wide host-port ownership table for
-// native services. Two concurrent jobs (matrix variants) must not both
-// believe they own tcp:5432 on the same runner host. The in-memory map is
-// the fast path; claimNativePort also takes a durable per-port lock file
-// under the system temp dir so TWO RUNNER PROCESSES on one host cannot
-// both claim the same port (the previous process-local gap). A lock whose
-// recorded owner PID is dead is reclaimed; a live foreign owner fails
-// closed. The pre-start dial still catches foreign listeners that never
-// took the lock.
+// nativePortClaim is one held host-port claim: owner identity plus the open
+// (locked) claim file. Both live under nativePortClaims' single mutex so
+// claim → release → reclaim is one atomic transition per port.
+type nativePortClaim struct {
+	owner  string
+	handle *os.File
+}
+
+// nativePortClaims is the process-wide host-port ownership table for native
+// services. Two concurrent jobs (matrix variants) must not both believe they
+// own tcp:5432 on the same runner host. The in-memory map is the handle
+// table (one mutex for {owner, handle}); claimNativePort also takes a
+// durable per-port flock so TWO RUNNER PROCESSES on one host cannot both
+// claim the same port. The kernel releases the flock when the holder exits,
+// so a dead runner's claim is reclaimed by simply acquiring the lock — no
+// read-delete-create ABA. The pre-start dial still catches foreign listeners
+// that never took the lock.
 var nativePortClaims = struct {
 	sync.Mutex
-	byPort map[int]string
-}{byPort: map[int]string{}}
+	byPort map[int]*nativePortClaim
+}{byPort: map[int]*nativePortClaim{}}
 
-// nativePortClaimDir is the host-wide lock directory for native port
-// ownership (one file per TCP port). Empty owner/pid means invalid.
+// nativePortClaimDir is the per-UID host-wide lock directory (mode 0700).
+// Not a shared attacker-creatable /tmp name: ensurePortClaimDir refuses a
+// foreign-owned or world-writable directory so a local user cannot plant
+// lock symlinks the runner would follow.
 var nativePortClaimDir = func() string {
-	return filepath.Join(os.TempDir(), "kiwi-native-port-claims")
+	return filepath.Join(os.TempDir(), fmt.Sprintf("kiwi-native-port-claims-%d", os.Getuid()))
 }
 
 func claimNativePort(port int, owner string) error {
@@ -46,64 +56,105 @@ func claimNativePort(port int, owner string) error {
 		return fmt.Errorf("invalid host port %d", port)
 	}
 	nativePortClaims.Lock()
-	if prev, ok := nativePortClaims.byPort[port]; ok {
-		nativePortClaims.Unlock()
-		return fmt.Errorf("host port %d already claimed by %s", port, prev)
+	defer nativePortClaims.Unlock()
+	if prev, ok := nativePortClaims.byPort[port]; ok && prev != nil {
+		return fmt.Errorf("host port %d already claimed by %s", port, prev.owner)
 	}
-	// Durable cross-process claim before accepting the in-memory one.
-	if err := claimNativePortFile(port, owner); err != nil {
-		nativePortClaims.Unlock()
+	// File lock + handle install under the SAME mutex: release can never
+	// interleave between them.
+	f, err := claimNativePortFile(port, owner)
+	if err != nil {
 		return err
 	}
-	nativePortClaims.byPort[port] = owner
-	nativePortClaims.Unlock()
+	nativePortClaims.byPort[port] = &nativePortClaim{owner: owner, handle: f}
 	return nil
 }
 
 func releaseNativePort(port int) {
 	nativePortClaims.Lock()
+	defer nativePortClaims.Unlock()
+	c := nativePortClaims.byPort[port]
+	if c == nil {
+		return
+	}
 	delete(nativePortClaims.byPort, port)
-	nativePortClaims.Unlock()
-	releaseNativePortFile(port)
+	if c.handle != nil {
+		_ = c.handle.Close()
+	}
 }
 
-// claimNativePortFile takes an exclusive cross-process lock on the port
-// claim file (flock on Unix, LockFileEx on Windows). The lock is released
-// when the holder exits, so a stale claim from a dead runner is reclaimed
-// simply by acquiring the lock — there is no read-delete-create window in
-// which two processes can both believe they own the port.
-//
-// The held file stays open until releaseNativePortFile closes it.
-func claimNativePortFile(port int, owner string) error {
-	dir := nativePortClaimDir()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("host port %d claim dir: %w", port, err)
+// ensurePortClaimDir creates or validates the claim directory: a real
+// directory, owned by this UID, mode 0700. A pre-existing world-writable or
+// foreign-owned directory is refused — another local user must not be able
+// to plant lock symlinks under a path the runner will open.
+func ensurePortClaimDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("port claim dir: %w", err)
 	}
-	path := filepath.Join(dir, fmt.Sprintf("%d.lock", port))
-	payload := []byte(fmt.Sprintf("pid=%d\nowner=%s\n", os.Getpid(), owner))
-	f, err := lockPortClaimFile(path, payload)
+	info, err := os.Lstat(dir)
 	if err != nil {
-		if portClaimLocked(err) {
-			lockOwner, lockPID := readPortClaimIdentity(path)
-			if lockPID > 0 && lockPID == os.Getpid() {
-				// Same process already holds it (in-memory map miss).
-				return fmt.Errorf("host port %d already claimed by %s (pid %d)", port, lockOwner, lockPID)
-			}
-			return fmt.Errorf("host port %d already claimed by %s (pid %d)", port, lockOwner, lockPID)
-		}
-		return fmt.Errorf("host port %d claim: %w", port, err)
+		return fmt.Errorf("port claim dir stat: %w", err)
 	}
-	// Hold the lock for the lifetime of the claim: stash the file handle.
-	setPortClaimHandle(port, f)
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("port claim dir %s is not a real directory", dir)
+	}
+	if !fileOwnedByCurrentUID(info) {
+		return fmt.Errorf("port claim dir %s is not owned by uid %d (refusing untrusted lock directory)", dir, os.Getuid())
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return fmt.Errorf("tighten port claim dir %s: %w", dir, err)
+		}
+	}
 	return nil
 }
 
+// claimNativePortFile takes an exclusive cross-process lock on a regular,
+// no-follow port-claim file inside the trusted directory. The returned file
+// is LOCKed and must stay open for the lifetime of the claim (closing it
+// releases the flock).
+func claimNativePortFile(port int, owner string) (*os.File, error) {
+	dir := nativePortClaimDir()
+	if err := ensurePortClaimDir(dir); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(dir, fmt.Sprintf("%d.lock", port))
+	// Refuse a pre-planted non-regular path (symlink) before opening.
+	if fi, err := os.Lstat(path); err == nil && !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("host port %d claim path %s is not a regular file", port, path)
+	}
+	payload := []byte(fmt.Sprintf("pid=%d\nowner=%s\n", os.Getpid(), owner))
+	f, err := openPortClaimFileNoFollow(path)
+	if err != nil {
+		return nil, fmt.Errorf("host port %d claim open: %w", port, err)
+	}
+	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, fmt.Errorf("host port %d claim: opened path is not a regular file", port)
+	} else if !claimFileTrusted(fi) {
+		_ = f.Close()
+		return nil, fmt.Errorf("host port %d claim: %s is not owned by this user (refusing untrusted lock file)", port, path)
+	}
+	if err := lockPortClaimFile(f, payload); err != nil {
+		_ = f.Close()
+		if portClaimLocked(err) {
+			lockOwner, lockPID := readPortClaimIdentity(path)
+			return nil, fmt.Errorf("host port %d already claimed by %s (pid %d)", port, lockOwner, lockPID)
+		}
+		return nil, fmt.Errorf("host port %d claim lock: %w", port, err)
+	}
+	return f, nil
+}
+
 func readPortClaimIdentity(path string) (owner string, pid int) {
-	b, err := os.ReadFile(path)
+	f, err := openPortClaimFileRead(path)
 	if err != nil {
 		return "", 0
 	}
-	for _, line := range strings.Split(string(b), "\n") {
+	defer f.Close()
+	b := make([]byte, 512)
+	n, _ := f.Read(b)
+	for _, line := range strings.Split(string(b[:n]), "\n") {
 		if strings.HasPrefix(line, "pid=") {
 			fmt.Sscanf(line, "pid=%d", &pid)
 		}
@@ -112,35 +163,6 @@ func readPortClaimIdentity(path string) (owner string, pid int) {
 		}
 	}
 	return owner, pid
-}
-
-// portClaimHandles keeps the open (locked) claim files so release can close
-// them. Keyed by port; guarded by nativePortClaims' mutex at call sites.
-var portClaimHandles = map[int]*os.File{}
-
-func setPortClaimHandle(port int, f *os.File) {
-	if old, ok := portClaimHandles[port]; ok && old != nil {
-		_ = old.Close()
-	}
-	portClaimHandles[port] = f
-}
-
-func releaseNativePortFile(port int) {
-	if f, ok := portClaimHandles[port]; ok && f != nil {
-		_ = f.Close()
-		delete(portClaimHandles, port)
-		return
-	}
-	// Fallback for tests that claim without a held handle.
-	path := filepath.Join(nativePortClaimDir(), fmt.Sprintf("%d.lock", port))
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return
-	}
-	if !strings.Contains(string(b), fmt.Sprintf("pid=%d\n", os.Getpid())) {
-		return
-	}
-	_ = os.Remove(path)
 }
 
 // childProc tracks one native service process so readiness can race

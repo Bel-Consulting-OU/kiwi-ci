@@ -134,7 +134,7 @@ func TestSnapshotCancelDuringReflink(t *testing.T) {
 	// Force the reflink fallback: production prefers copyTree (skips
 	// build-output dirs); this test cancels during `cp`.
 	origCopy := snapshotCopyTree
-	snapshotCopyTree = func(string, string) error { return errForceCopyTree }
+	snapshotCopyTree = func(string, string, trackedIndex) error { return errForceCopyTree }
 	t.Cleanup(func() { snapshotCopyTree = origCopy })
 
 	m, err := NewManager(src)
