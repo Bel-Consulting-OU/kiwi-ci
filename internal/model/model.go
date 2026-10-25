@@ -124,23 +124,33 @@ func SupportsExecutionSemantics(supported []string, jobSemantics string) bool {
 }
 
 // LeaseInterpreterFor derives the lease-time interpreter identity persisted
-// on Job.LeaseInterpreter. A stamped job records its own stamp (the runner
-// was gated on advertising it at lease time). An unstamped job records the
-// legacy pre-field contract when the runner never advertised, or the
-// runner's advertised current engine otherwise.
+// on Job.LeaseInterpreter: WHICH ENGINE the lease was issued to, not a
+// restatement of the job's stamp.
+//
+//   - No advertisement → the legacy pre-field contract
+//     (kiwi.execution.v2): only such a runner can have leased a v2-stamped
+//     job without knowing the completion field, so its omission of
+//     execution_semantics is the drain bridge's one accepted case.
+//   - Advertisement → a post-field engine; when the current engine version
+//     is among the advertised values the identity is that current version
+//     (a current engine leasing an older-stamped job still cannot omit the
+//     completion field — see checkCompletionSemantics).
+//
+// Returning the JOB's stamp here (the first implementation) collapsed the
+// distinction: a v2 job leased to a current engine would have read
+// "legacy-v2" and wrongly authorized an omitted completion.
 func LeaseInterpreterFor(advertised []string, jobStamp string) string {
-	if jobStamp != "" {
-		return jobStamp
-	}
 	if len(advertised) == 0 {
 		return LegacyExecutionSemanticsVersion
 	}
 	for _, s := range advertised {
 		if s == ExecutionSemanticsVersion {
-			return s
+			return ExecutionSemanticsVersion
 		}
 	}
-	return advertised[0]
+	// Post-field but pre-current (e.g. a runner that only ever advertised
+	// v2): its own advertised engine is the identity.
+	return advertised[len(advertised)-1]
 }
 
 type Run struct {

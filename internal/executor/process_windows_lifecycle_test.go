@@ -32,6 +32,14 @@ import (
 // Requires a real Windows host (this file is windows-only by build tag);
 // cross-compilation from another GOOS proves it stays in the build.
 func TestSuspendedLaunchLifecycleAssignResumeKill(t *testing.T) {
+	// The descendant-proof needs PowerShell to publish its PID; hosts
+	// without it (rare Server Core configurations) skip rather than fail.
+	if _, err := exec.LookPath("powershell.exe"); err != nil {
+		t.Skipf("powershell.exe not available: %v", err)
+	}
+	if _, err := exec.LookPath("ping.exe"); err != nil {
+		t.Skipf("ping.exe not available: %v", err)
+	}
 	dir := t.TempDir()
 	marker := filepath.Join(dir, "ran.txt")
 	grandPIDFile := filepath.Join(dir, "grand.pid")

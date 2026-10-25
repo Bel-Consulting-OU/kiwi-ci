@@ -706,7 +706,7 @@ func (m *Manager) Prepare(ctx context.Context, jobID string) (string, func(), er
 		return target, func() { removeWorktree(m.base, target) }, nil
 	default:
 		// Exact copy: verify against the run-base itself (the authority).
-		if err := verifyExactTree(m.base, target); err != nil {
+		if err := verifyExactTree(m.base, target, strategy); err != nil {
 			_ = os.RemoveAll(target)
 			return "", nil, fmt.Errorf("prepare workspace for %q: %w", jobID, err)
 		}
@@ -718,7 +718,12 @@ func (m *Manager) Prepare(ctx context.Context, jobID string) (string, func(), er
 // canonical run-base made it into the job workspace, and the file counts
 // match. Used for frozen Prepare, where no filtering decision may be
 // re-derived: the base IS the expected content.
-func verifyExactTree(base, target string) error {
+//
+// strategy "reflink" (the darwin cp -c fallback) deliberately strips .git
+// from the materialized tree — the same exemption verifyStagedTree applies
+// — so the .git subtree is excluded from both the presence check and the
+// file count instead of failing a legitimately complete copy.
+func verifyExactTree(base, target, strategy string) error {
 	baseEntries, err := os.ReadDir(base)
 	if err != nil {
 		return fmt.Errorf("verify exact copy: read base: %w", err)
@@ -733,28 +738,38 @@ func verifyExactTree(base, target string) error {
 	}
 	var missing []string
 	for _, e := range baseEntries {
+		if strategy == "reflink" && e.Name() == ".git" {
+			continue
+		}
 		if !have[e.Name()] {
 			missing = append(missing, e.Name())
 		}
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("staged workspace is truncated: missing base entr(y/ies) %v", missing)
+		return fmt.Errorf("staged workspace is truncated: missing base entr(y/ies) %v (strategy=%s)", missing, strategy)
 	}
-	countFiles := func(root string) (n int) {
-		_ = filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
+	countFiles := func(root string, excludeGit bool) (n int) {
+		_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 			if err == nil && info != nil && !info.IsDir() {
+				if excludeGit {
+					rel, rerr := filepath.Rel(root, path)
+					if rerr == nil && (rel == ".git" || strings.HasPrefix(rel, ".git"+string(filepath.Separator))) {
+						return nil
+					}
+				}
 				n++
 			}
 			return nil
 		})
 		return n
 	}
-	bn, dn := countFiles(base), countFiles(target)
+	excludeGit := strategy == "reflink"
+	bn, dn := countFiles(base, excludeGit), countFiles(target, false)
 	if bn > 0 && dn == 0 {
 		return fmt.Errorf("staged workspace is empty but the run-base has %d files", bn)
 	}
 	if dn < bn {
-		return fmt.Errorf("staged workspace has %d files, run-base has %d (truncated copy)", dn, bn)
+		return fmt.Errorf("staged workspace has %d files, run-base has %d (truncated copy, strategy=%s)", dn, bn, strategy)
 	}
 	return nil
 }

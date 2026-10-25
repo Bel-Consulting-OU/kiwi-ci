@@ -169,6 +169,19 @@ func (*NativeBackend) Run(ctx context.Context, c Command, emit func(string)) err
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(c.TimeoutSeconds)*time.Second)
 		defer cancel()
 	}
+	// Authoritative pre-spawn boundary: never start user code under a dead
+	// context. exec.Command (this backend supervises manually) does NOT
+	// refuse an already-canceled context the way CommandContext does, so
+	// without this check a cancelled() cleanup dispatched after runner
+	// shutdown would spawn the shell and its first command could run
+	// before the kill path gets scheduled.
+	if err := ctx.Err(); err != nil {
+		kind := ErrorCancelled
+		if err == context.DeadlineExceeded {
+			kind = ErrorTimeout
+		}
+		return &RunError{Kind: kind, Err: fmt.Errorf("command not started: %w", err)}
+	}
 	// Resolve the shell against the materialized execution PATH so the
 	// binary that runs is the one the job environment claims, not whatever
 	// the runner daemon's ambient PATH would pick.

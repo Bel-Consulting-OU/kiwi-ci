@@ -57,6 +57,53 @@ func TestRunLocalLinkedWorktreeRepoIdentity(t *testing.T) {
 	}
 }
 
+// TestRunLocalExplicitRefsResolvedFromFrozenSource is the item-6 e2e for
+// --base/--head: the ref range must be resolved FROM THE SOURCE inside the
+// freeze transaction and reach the job as KIWI_CHANGED_FILES — a linked
+// worktree's frozen run-base has no .git left to re-answer the query, and
+// a commit landing in the live source AFTER Freeze must not extend the
+// list.
+func TestRunLocalExplicitRefsResolvedFromFrozenSource(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	main := t.TempDir()
+	runGit(t, main, "init", "-b", "main")
+	runGit(t, main, "config", "user.email", "t@example.com")
+	runGit(t, main, "config", "user.name", "t")
+	writeFile(t, filepath.Join(main, "seed.txt"), "s")
+	runGit(t, main, "add", ".")
+	runGit(t, main, "commit", "-m", "seed")
+	writeFile(t, filepath.Join(main, "feat.txt"), "f")
+	runGit(t, main, "add", ".")
+	runGit(t, main, "commit", "-m", "feature")
+
+	wt := filepath.Join(t.TempDir(), "wt")
+	runGit(t, main, "worktree", "add", "--detach", wt, "HEAD")
+	runGit(t, wt, "config", "user.email", "t@example.com")
+	runGit(t, wt, "config", "user.name", "t")
+
+	out := filepath.Join(t.TempDir(), "changed.txt")
+	// Step 1 commits into the LIVE worktree (after Freeze); step 2 dumps
+	// the changed-file env the executor received.
+	live := filepath.Join(wt, "later.txt")
+	path := writePipeline(t, wt, "version: 1\njobs:\n  build:\n    steps:\n"+
+		"      - name: move-live-head\n        run: echo mid-run > "+live+" && git -C "+wt+" add later.txt && git -C "+wt+" commit -qm mid-run\n"+
+		"      - name: dump\n        run: printf '%s' \"$KIWI_CHANGED_FILES\" > "+out+"\n")
+	chdir(t, wt)
+	if err := RunLocal(context.Background(), []string{"-f", path, "--base", "HEAD~1", "--head", "HEAD", "--max-parallel", "1"}); err != nil {
+		t.Fatalf("RunLocal: %v", err)
+	}
+	b, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("changed-files dump missing: %v", err)
+	}
+	got := strings.TrimSpace(string(b))
+	if got != "feat.txt" {
+		t.Fatalf("KIWI_CHANGED_FILES = %q, want exactly feat.txt (frozen --base HEAD~1 resolution; no post-freeze commit, no stripped-base git failure)", got)
+	}
+}
+
 // TestFrozenHelpersNeverConsultLiveGit pins the item-6 helper contract:
 // frozenSHA/frozenBranch/frozenRef answer ONLY from the frozen struct.
 // There is no gitDir parameter anymore — a NotRepo or RepoNoHead capture

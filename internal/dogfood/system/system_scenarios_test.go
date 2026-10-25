@@ -98,7 +98,16 @@ func useTrustedNative(t *testing.T) bool {
 // must fail closed at the sandbox gate (never execute). The quota escape is
 // set only so the attempt reaches the rootless check on hosts without XFS;
 // the rootless requirement itself is never bypassed.
+//
+// The daemon's SECURITY-OPTIONS INPUT is supplied by the hermetic docker
+// shim (reporting a non-rootless "cgroupfs" configuration): the rootless
+// gate, the job's fail-closed failure, and every assertion below run
+// production code against exactly the input the floor keys on. This keeps
+// the required suite executable on hosts whose real daemon is unreachable
+// or rootless — without the shim the test could only skip there, reddening
+// the dogfood-system require contract for an environmental reason.
 func TestSysRootlessEnforced(t *testing.T) {
+	installFakeDockerForSystem(t)
 	requireDocker(t)
 	out, err := exec.Command("docker", "info", "--format", "{{.SecurityOptions}}").CombinedOutput()
 	if err != nil {

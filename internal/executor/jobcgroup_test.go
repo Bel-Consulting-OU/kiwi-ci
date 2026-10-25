@@ -434,15 +434,19 @@ func TestNativeRequireJobCgroupFailsClosedBeforeAnyLaunch(t *testing.T) {
 	setFakeWS(t, ws)
 	calls, cleanups := stubJobCgroup(t, JobCgroupStatus{Detail: "no delegated cgroup here"})
 	sink := &covSink{}
+	svc := pipeline.Service{Name: "db", Native: true, Ready: "tcp:1", Command: []string{"true"}}
 	spec := &pipeline.Spec{Version: 1, Jobs: map[string]pipeline.Job{
-		"build": {Runtime: "native", Steps: []pipeline.Step{{Run: "echo hi"}}},
+		"build": {Runtime: "native", Services: []pipeline.Service{svc}, Steps: []pipeline.Step{{Run: "echo hi"}}},
 	}}
 	j := pipeline.CompiledJob{ID: "build", BaseID: "build", Job: pipeline.Job{
 		Runtime:   "native",
 		Resources: pipeline.Resources{CPU: 2, Memory: 4 << 30, PIDs: 512},
+		Services:  []pipeline.Service{svc},
 		Steps:     []pipeline.Step{{Run: "echo hi"}},
 	}}
-	ex := &Executor{Opt: Options{Workspace: ws, RunID: "r", Logs: sink, RequireJobCgroup: true}, Masker: &secrets.Masker{}}
+	var serviceLaunches int
+	ex := &Executor{Opt: Options{Workspace: ws, RunID: "r", Logs: sink, RequireJobCgroup: true,
+		OnNativeServices: func(string, []NativeServiceInfo) error { serviceLaunches++; return nil }}, Masker: &secrets.Masker{}}
 	res := ex.runJob(context.Background(), spec, j, "success", nil)
 	if res.Status != "failure" {
 		t.Fatalf("runJob = %q / %q, want a fail-closed failure", res.Status, res.Error)
@@ -452,6 +456,11 @@ func TestNativeRequireJobCgroupFailsClosedBeforeAnyLaunch(t *testing.T) {
 	}
 	if *calls != 1 || *cleanups != 0 {
 		t.Fatalf("job cgroup setup/cleanup = (%d, %d), want (1, 0)", *calls, *cleanups)
+	}
+	// The failure must land BEFORE the service phase: no native sidecar may
+	// ever be spawned under a promise the host could not keep.
+	if serviceLaunches != 0 {
+		t.Fatalf("native services launched %d time(s) before the RequireJobCgroup fail-closed", serviceLaunches)
 	}
 }
 

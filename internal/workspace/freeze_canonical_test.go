@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -319,6 +320,130 @@ func TestFreezeManifestAndCopyShareOneInclusionSet(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dst, "dist", "temp.js")); err == nil {
 		t.Fatal("untracked dist file entered the indexed copy")
 	}
+}
+
+// TestRunBaseSkipDirMembershipEqualsCapturedIndex pins the inclusion-set
+// contract on the ARTIFACT: every file the frozen run-base carries inside
+// a skip-name directory is exactly the captured-index set for that
+// directory — nothing untracked slipped in (manifest-only membership), and
+// nothing tracked was dropped (copy-only membership). One index, one set,
+// materialized.
+func TestRunBaseSkipDirMembershipEqualsCapturedIndex(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	src := t.TempDir()
+	runGit(t, src, "init", "-b", "main")
+	runGit(t, src, "config", "user.email", "t@example.com")
+	runGit(t, src, "config", "user.name", "t")
+	writeFile(t, filepath.Join(src, "seed.txt"), "s")
+	runGit(t, src, "add", ".")
+	runGit(t, src, "commit", "-m", "init")
+	// Tracked content nested under two skip-name roots, plus untracked
+	// noise beside and beneath them.
+	writeFile(t, filepath.Join(src, "dist", "release.js"), "r")
+	writeFile(t, filepath.Join(src, "dist", "nested", "deep.txt"), "d")
+	writeFile(t, filepath.Join(src, "tools", "redteam", "target", "keep.txt"), "k")
+	runGit(t, src, "add", "-A")
+	runGit(t, src, "commit", "-m", "tracked skip content")
+	writeFile(t, filepath.Join(src, "dist", "temp.js"), "junk")
+	writeFile(t, filepath.Join(src, "dist", "nested", "scratch.tmp"), "junk")
+	writeFile(t, filepath.Join(src, "tools", "redteam", "target", "debug", "bin"), "cargo")
+	writeFile(t, filepath.Join(src, "node_modules", "pkg", "index.js"), "vendor")
+
+	idx, err := captureTrackedIndex(t.Context(), src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The captured set itself: exactly the three tracked files.
+	wantTracked := map[string]bool{
+		"dist/release.js":               true,
+		"dist/nested/deep.txt":          true,
+		"tools/redteam/target/keep.txt": true,
+	}
+	gotTracked := map[string]bool{}
+	for p := range idx.(*capturedTrackedIndex).files {
+		if isUnderSkipName(p) {
+			gotTracked[p] = true
+		}
+	}
+	for p := range wantTracked {
+		if !gotTracked[p] {
+			t.Fatalf("captured index missing tracked skip file %q (have %v)", p, keysOfSet(gotTracked))
+		}
+	}
+	if len(gotTracked) != len(wantTracked) {
+		t.Fatalf("captured skip membership = %v, want exactly %v", keysOfSet(gotTracked), keysOfSet(wantTracked))
+	}
+
+	m, err := NewManager(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.Freeze(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	base := m.BasePath()
+	// Materialized set under skip-name dirs == captured set.
+	materialized := map[string]bool{}
+	_ = filepath.Walk(base, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		rel, rerr := filepath.Rel(base, path)
+		if rerr != nil {
+			return rerr
+		}
+		slash := filepath.ToSlash(rel)
+		if isUnderSkipName(slash) {
+			materialized[slash] = true
+		}
+		return nil
+	})
+	if len(materialized) != len(wantTracked) {
+		t.Fatalf("run-base skip files = %v, want exactly the tracked set %v", keysOfSet(materialized), keysOfSet(wantTracked))
+	}
+	for p := range wantTracked {
+		if !materialized[p] {
+			t.Fatalf("tracked %q missing from the run-base", p)
+		}
+	}
+	// Untracked noise must be gone from the base...
+	for _, junk := range []string{"dist/temp.js", "dist/nested/scratch.tmp", "tools/redteam/target/debug/bin", "node_modules/pkg/index.js"} {
+		if _, err := os.Stat(filepath.Join(base, filepath.FromSlash(junk))); err == nil {
+			t.Fatalf("untracked %q entered the run-base", junk)
+		}
+	}
+	// ...and the job workspace is an exact copy of that set.
+	dir, cleanup, err := m.Prepare(context.Background(), "job")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	assertSameFileSet(t, base, dir)
+}
+
+// isUnderSkipName reports whether slash-path lives inside one of the
+// build-output directory names copyTreeSkipDirs excludes (at any depth —
+// tools/redteam/target/… counts as under target/).
+func isUnderSkipName(slashPath string) bool {
+	padded := "/" + slashPath
+	for part := range copyTreeSkipDirs {
+		if strings.Contains(padded, "/"+part+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func keysOfSet(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // assertSameFileSet fails when two trees differ in relative file content

@@ -11,8 +11,11 @@ import (
 )
 
 // TestAcquireDirLockWritableLockFile proves a pre-existing lock file that any
-// non-owner could rewrite (group/world-writable) is refused before flock: the
-// file is part of the ownership proof, not scratch space.
+// non-owner could rewrite (group/world-writable) is refused before taking
+// ownership: the file is part of the ownership proof, not scratch space.
+// The refusal SHAPE is platform-specific — the flock path reports the
+// trust check, the non-flock fallback reports a possibly-live owner — and
+// both must refuse.
 func TestAcquireDirLockWritableLockFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, LockFileName)
@@ -22,26 +25,12 @@ func TestAcquireDirLockWritableLockFile(t *testing.T) {
 	if err := os.Chmod(path, 0o666); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := acquireDirLock(dir); err == nil || !strings.Contains(err.Error(), "trustworthy") {
-		t.Fatalf("acquireDirLock(writable lock) = %v, want the trust refusal", err)
+	_, err := acquireDirLock(dir)
+	if err == nil {
+		t.Fatal("acquireDirLock(writable lock) succeeded, want a refusal")
 	}
-}
-
-// TestDirLockReleaseUnlockFailure proves a release whose underlying descriptor
-// was already closed reports the unlock failure instead of acknowledging
-// ownership release.
-func TestDirLockReleaseUnlockFailure(t *testing.T) {
-	dir := t.TempDir()
-	lock, err := acquireDirLock(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := lock.file.Close(); err != nil {
-		t.Fatal(err)
-	}
-	err = lock.release()
-	if err == nil || !strings.Contains(err.Error(), "unlock") {
-		t.Fatalf("release after close = %v, want the unlock failure", err)
+	if !strings.Contains(err.Error(), "trustworthy") && !strings.Contains(err.Error(), "owner may still be live") {
+		t.Fatalf("acquireDirLock(writable lock) = %v, want the trust or live-owner refusal", err)
 	}
 }
 

@@ -1345,26 +1345,45 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		stepEnv := envSlice(stepEnvMap)
 		stepStart := time.Now()
 		var runErr error
-		for attempt := 1; attempt <= attempts; attempt++ {
-			if _, isNative := backend.(*NativeBackend); isNative {
-				_ = os.Remove(outputFile)
+		// A step dispatched under a DEAD context must never execute user
+		// code. The cancelled() cleanup dispatched after a runner shutdown
+		// gets a cleanupCtx that was canceled at creation — without this
+		// gate the backend spawns the shell and its first command races the
+		// kill (single-P scheduling made that race lose reliably: the
+		// "cleanup step ran after runner shutdown" oracle).
+		if stepCtx != nil && stepCtx.Err() != nil {
+			kind := ErrorCancelled
+			if stepCtx.Err() == context.DeadlineExceeded {
+				kind = ErrorTimeout
 			}
-			res.Attempts++
-			e.log(cj.ID, name, fmt.Sprintf("running on %s (attempt %d/%d)", backend.Name(), attempt, attempts))
-			runErr = backend.Run(stepCtx, Command{Shell: shell, Script: st.Run, Dir: dir, Env: stepEnv, TimeoutSeconds: int64(timeout.Seconds()), Background: st.Background, CgroupParent: cgroupParent}, func(line string) { e.log(cj.ID, name, line) })
-			if runErr == nil {
-				break
-			}
-			if !retryAllows(retry, runErr) {
-				break
-			}
-			if attempt < attempts {
-				e.log(cj.ID, name, fmt.Sprintf("retrying after error: %v", runErr))
-				select {
-				case <-stepCtx.Done():
-					runErr = stepCtx.Err()
-					attempt = attempts
-				case <-time.After(backoffFor(attempt, backoff, maxRetryBackoff, seed)):
+			runErr = &RunError{Kind: kind, Err: fmt.Errorf("step not started: %w", stepCtx.Err())}
+		}
+		// The loop condition must stay `attempt <= attempts` ONLY: the
+		// backoff wait intentionally leaves runErr holding the previous
+		// attempt's error while the next attempt runs (a `runErr == nil`
+		// guard here silently skipped every retry).
+		if runErr == nil {
+			for attempt := 1; attempt <= attempts; attempt++ {
+				if _, isNative := backend.(*NativeBackend); isNative {
+					_ = os.Remove(outputFile)
+				}
+				res.Attempts++
+				e.log(cj.ID, name, fmt.Sprintf("running on %s (attempt %d/%d)", backend.Name(), attempt, attempts))
+				runErr = backend.Run(stepCtx, Command{Shell: shell, Script: st.Run, Dir: dir, Env: stepEnv, TimeoutSeconds: int64(timeout.Seconds()), Background: st.Background, CgroupParent: cgroupParent}, func(line string) { e.log(cj.ID, name, line) })
+				if runErr == nil {
+					break
+				}
+				if !retryAllows(retry, runErr) {
+					break
+				}
+				if attempt < attempts {
+					e.log(cj.ID, name, fmt.Sprintf("retrying after error: %v", runErr))
+					select {
+					case <-stepCtx.Done():
+						runErr = stepCtx.Err()
+						attempt = attempts
+					case <-time.After(backoffFor(attempt, backoff, maxRetryBackoff, seed)):
+					}
 				}
 			}
 		}
@@ -1386,6 +1405,13 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			case errors.Is(outErr, os.ErrNotExist):
 				// Step wrote no outputs; treat as empty.
 				stepOutputs[st.ID] = map[string]string{}
+			case outErr != nil && runErr != nil &&
+				(errors.Is(outErr, context.Canceled) || errors.Is(outErr, context.DeadlineExceeded)) &&
+				(errorKind(runErr) == ErrorCancelled || errorKind(runErr) == ErrorTimeout):
+				// The same dead context refused/killed the step AND the
+				// output read: keep the cancellation classification —
+				// reclassifying it as a step failure would turn a shutdown
+				// into a failed job.
 			case outErr != nil:
 				runErr = &RunError{Kind: ErrorFailure, Err: fmt.Errorf("step outputs: %w", outErr)}
 			default:

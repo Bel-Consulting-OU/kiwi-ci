@@ -3,6 +3,12 @@ package version
 import "testing"
 
 func TestString(t *testing.T) {
+	// Self-contained: package globals are shared across tests, and
+	// -shuffle can run TestFull (which stamps BuildDate) FIRST — without
+	// resetting BuildDate/Dirty here the "no suffix" cases would inherit
+	// the built-date stamp and fail out of order.
+	origV, origC, origB, origD := Version, Commit, BuildDate, Dirty
+	t.Cleanup(func() { Version, Commit, BuildDate, Dirty = origV, origC, origB, origD })
 	cases := []struct {
 		version, commit, want string
 	}{
@@ -11,7 +17,7 @@ func TestString(t *testing.T) {
 		{"1.2.3", "a1b2c3d", "1.2.3 (a1b2c3d)"},
 	}
 	for _, c := range cases {
-		Version, Commit = c.version, c.commit
+		Version, Commit, BuildDate, Dirty = c.version, c.commit, "", ""
 		if got := String(); got != c.want {
 			t.Errorf("String() with version=%q commit=%q = %q, want %q", c.version, c.commit, got, c.want)
 		}
@@ -19,6 +25,8 @@ func TestString(t *testing.T) {
 }
 
 func TestFull(t *testing.T) {
+	origV, origC, origB, origD := Version, Commit, BuildDate, Dirty
+	t.Cleanup(func() { Version, Commit, BuildDate, Dirty = origV, origC, origB, origD })
 	Version, Commit, BuildDate, Dirty = "2.0.0", "deadbeef", "2026-09-14T00:00:00Z", "true"
 	full := Full()
 	want := map[string]string{

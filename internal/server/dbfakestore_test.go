@@ -3541,6 +3541,11 @@ func (f *dbFakeStore) AcquireLeaseAtomic(ctx context.Context, claim storage.Leas
 	j.LeaseTokenHash = claim.TokenHash
 	j.LeaseGeneration = claim.Generation
 	j.LeaseExpiresAt = &claim.ExpiresAt
+	// Mirror the SQL claim's lease-time interpreter identity (production
+	// postgres jsonb-sets the same value): without it the DB-mode fake
+	// would present every lease as pre-field (empty) and the v2 completion
+	// drain bridge could never be exercised with its refusal arm here.
+	j.LeaseInterpreter = model.LeaseInterpreterFor(eff.SupportedExecutionSemantics, j.ExecutionSemantics)
 	f.jobs[claim.JobID] = j
 	r.ActiveJobs = append(r.ActiveJobs, claim.JobID)
 	r.Busy = eff.Capacity > 0 && len(r.ActiveJobs) >= eff.Capacity

@@ -51,7 +51,14 @@ func TestBoundedToolCommandSuccessKeepsOutput(t *testing.T) {
 // binary cannot flood the diagnostic.
 func TestBoundedToolCommandHangingTimesOutTypedBoundedOutput(t *testing.T) {
 	testutil.UnixShell(t)
-	noisyHang := "#!/bin/sh\nif [ -n \"$KIWI_TEST_WARM\" ]; then exit 0; fi\ni=0\nwhile [ \"$i\" -lt 100 ]; do printf 'abcdefghij'; i=$(expr $i + 1); done\nexec sleep 300\n"
+	// Emit the >512-char hostile payload in ONE printf before hanging: a
+	// loop of `expr` subprocesses made the capture amount load-dependent
+	// (under -shuffle the script could be killed before crossing the 512
+	// truncation threshold, so the [truncated] marker legitimately never
+	// appeared and the test failed for scheduling reasons, not contract
+	// reasons).
+	bulk := strings.Repeat("abcdefghij", 110) // 1100 chars > the 512 limit
+	noisyHang := "#!/bin/sh\nif [ -n \"$KIWI_TEST_WARM\" ]; then exit 0; fi\nprintf '" + bulk + "'\nexec sleep 300\n"
 	fake := writePrewarmedScript(t, "tool", noisyHang)
 
 	start := time.Now()

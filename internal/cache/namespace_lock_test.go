@@ -304,9 +304,12 @@ func TestAbandonedTempReclaimedAfterPriorProcessExits(t *testing.T) {
 	}
 }
 
-// TestNamespaceLockErrorBranches pins the lock's checked failure paths: an
-// unopenable lock path (a regular file where the directory should be), the
-// release-after-close unlock error, and idempotent release.
+// TestNamespaceLockErrorBranches pins the lock's checked failure paths on
+// every platform: an unopenable lock path (a regular file where the
+// directory should be) and idempotent nil release. The held-file close
+// branch is unix-specific (the non-flock fallback has no open handle) and
+// lives in namespace_lock_unix_test.go — sharing it here broke the Windows
+// test build (`l.file` does not exist on the !unix namespaceLock).
 func TestNamespaceLockErrorBranches(t *testing.T) {
 	filePath := filepath.Join(t.TempDir(), "not-a-dir")
 	if err := os.WriteFile(filePath, []byte("x"), 0o600); err != nil {
@@ -314,17 +317,6 @@ func TestNamespaceLockErrorBranches(t *testing.T) {
 	}
 	if _, err := acquireNamespaceLock(filePath); err == nil {
 		t.Fatal("locking a regular file path succeeded")
-	}
-	dir := t.TempDir()
-	l, err := acquireNamespaceLock(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := l.file.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := l.release(); err == nil {
-		t.Fatal("release after an externally closed file reported success")
 	}
 	var nilLock *namespaceLock
 	if err := nilLock.release(); err != nil {

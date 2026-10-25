@@ -144,3 +144,151 @@ func TestHTTPLegacyRunnerCannotLeaseV3Job(t *testing.T) {
 		t.Fatalf("legacy runner holds the v3 lease: %q", j.LeaseRunnerID)
 	}
 }
+
+// TestHTTPCurrentEngineLeasingV2JobCannotOmitStamp is the audit-exact
+// REFUSAL arm, reachable natively once LeaseInterpreterFor records the
+// ENGINE rather than the job stamp: a runner advertising BOTH engines can
+// lease a v2-stamped job (the predicate allows it), but it is a post-field
+// binary — it knew the completion contract. Its lease must persist the
+// current engine identity, and an omitted execution_semantics on completion
+// must be refused 409 (only a legacy-v2 or pre-field lease bridges).
+func TestHTTPCurrentEngineLeasingV2JobCannotOmitStamp(t *testing.T) {
+	s := New("token")
+	if _, err := s.enqueue(t.Context(), SubmitRun{
+		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
+		Ref: "refs/heads/main", SHA: "abc", Event: "push",
+		Pipeline: "version: 1\njobs:\n  j:\n    runtime: container\n    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n    steps:\n      - run: echo hi\n",
+		Trusted:  true,
+	}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	var jobID string
+	s.mu.Lock()
+	for id := range s.jobs {
+		jobID = id
+		j := s.jobs[id]
+		j.ExecutionSemantics = model.LegacyExecutionSemanticsVersion
+		s.jobs[id] = j
+	}
+	s.mu.Unlock()
+
+	// Dual-advertising (post-field) runner: allowed to lease the v2 job.
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
+		`{"name":"dual-r","protocol_version":2,"supported_execution_semantics":["kiwi.execution.v2","kiwi.execution.v3"],"protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("dual register: %d %s", w.Code, w.Body.String())
+	}
+	var ri model.Runner
+	if err := json.Unmarshal(w.Body.Bytes(), &ri); err != nil {
+		t.Fatal(err)
+	}
+	w = doJSON(t, s, http.MethodPost, "/api/v1/runners/"+ri.ID+"/next", "token", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("dual runner lease of v2 job: %d %s", w.Code, w.Body.String())
+	}
+	var task Task
+	if err := json.Unmarshal(w.Body.Bytes(), &task); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	leased := s.jobs[jobID]
+	s.mu.Unlock()
+	if leased.LeaseInterpreter != model.ExecutionSemanticsVersion {
+		t.Fatalf("LeaseInterpreter = %q, want the CURRENT engine identity (not a restatement of the v2 stamp)", leased.LeaseInterpreter)
+	}
+
+	// Omission from a post-field engine: refused (no bridge).
+	body, _ := json.Marshal(map[string]any{
+		"runner_id": ri.ID, "lease_token": task.LeaseToken,
+		"lease_generation": task.LeaseGeneration, "status": "success",
+		"execution_semantics": "",
+	})
+	w = doJSON(t, s, http.MethodPost, "/api/v1/jobs/"+jobID+"/complete", "token", string(body))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("omitted completion from a current engine = %d %s, want 409", w.Code, w.Body.String())
+	}
+	// The explicit equal stamp still completes the drained job.
+	body, _ = json.Marshal(map[string]any{
+		"runner_id": ri.ID, "lease_token": task.LeaseToken,
+		"lease_generation": task.LeaseGeneration, "status": "success",
+		"execution_semantics": model.LegacyExecutionSemanticsVersion,
+	})
+	w = doJSON(t, s, http.MethodPost, "/api/v1/jobs/"+jobID+"/complete", "token", string(body))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("explicit v2 completion from dual engine = %d %s, want 204", w.Code, w.Body.String())
+	}
+}
+
+// TestDBHTTPV2LegacyRunnerDrainBridge is the DB-mode twin of the fs-mode
+// drain bridge: the lease goes through the DB scheduler claim
+// (AcquireLeaseAtomic), which must persist the lease-time interpreter
+// identity into the durable payload — then a pre-field runner's omitted
+// completion is accepted ONLY through that persisted legacy identity.
+func TestDBHTTPV2LegacyRunnerDrainBridge(t *testing.T) {
+	f := newDBFakeStore()
+	s, err := NewPersistent("token", "token", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SwitchToDB(f); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.enqueue(t.Context(), SubmitRun{
+		RepoURL: "https://example.com/o/r.git", RepoFullName: "o/r",
+		Ref: "refs/heads/main", SHA: "abc", Event: "push",
+		Pipeline: "version: 1\njobs:\n  j:\n    runtime: container\n    image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n    steps:\n      - run: echo hi\n",
+		Trusted:  true,
+	}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	// Pre-upgrade record: v2-stamped job in the durable store.
+	var jobID string
+	f.mu.Lock()
+	for id, j := range f.jobs {
+		jobID = id
+		j.ExecutionSemantics = model.LegacyExecutionSemanticsVersion
+		f.jobs[id] = j
+	}
+	f.mu.Unlock()
+
+	w := doJSON(t, s, http.MethodPost, "/api/v1/runners/register", "token",
+		`{"name":"db-legacy","protocol_version":2,"protocol_min":3,"protocol_max":3,"labels":["container"],"capacity":2}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("legacy register: %d %s", w.Code, w.Body.String())
+	}
+	var ri model.Runner
+	if err := json.Unmarshal(w.Body.Bytes(), &ri); err != nil {
+		t.Fatal(err)
+	}
+	w = doJSON(t, s, http.MethodPost, "/api/v1/runners/"+ri.ID+"/next", "token", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("legacy lease in DB mode: %d %s", w.Code, w.Body.String())
+	}
+	var task Task
+	if err := json.Unmarshal(w.Body.Bytes(), &task); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	leased := f.jobs[jobID]
+	f.mu.Unlock()
+	if leased.LeaseInterpreter != model.LegacyExecutionSemanticsVersion {
+		t.Fatalf("DB-mode LeaseInterpreter = %q, want persisted legacy identity", leased.LeaseInterpreter)
+	}
+
+	// Pre-field completion: explicit empty == an omitted key after unmarshal.
+	body, _ := json.Marshal(map[string]any{
+		"runner_id": ri.ID, "lease_token": task.LeaseToken,
+		"lease_generation": task.LeaseGeneration, "status": "success",
+		"execution_semantics": "",
+	})
+	w = doJSON(t, s, http.MethodPost, "/api/v1/jobs/"+jobID+"/complete", "token", string(body))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("DB-mode v2 drain completion = %d %s, want 204", w.Code, w.Body.String())
+	}
+	f.mu.Lock()
+	done := f.jobs[jobID]
+	f.mu.Unlock()
+	if done.ObservedExecutionSemantics != model.LegacyExecutionSemanticsVersion {
+		t.Fatalf("ObservedExecutionSemantics = %q, want v2 drain stamp", done.ObservedExecutionSemantics)
+	}
+}

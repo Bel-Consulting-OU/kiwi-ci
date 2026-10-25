@@ -4,7 +4,6 @@ package cache
 
 import (
 	"archive/tar"
-	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -41,13 +40,20 @@ const (
 	cacheCrashRootEnv  = "KIWI_TEST_CACHE_CRASH_ROOT"
 	cacheCrashWSEnv    = "KIWI_TEST_CACHE_CRASH_WS"
 	cacheCrashKeyEnv   = "KIWI_TEST_CACHE_CRASH_KEY"
+	cacheCrashReadyEnv = "KIWI_TEST_CACHE_CRASH_READY"
 )
 
 // TestCacheCrashHelperProcess is not a test: it is the helper entry point
-// that runs a REAL restore in a child process and SIGKILLs itself in the
-// rename seam right after the Nth publish rename. The parent
-// (TestRestoreMidPublishCrash...) re-execs this test binary with the crash
-// environment set.
+// that runs a REAL restore in a child process and stops dead in the rename
+// seam right after the Nth publish rename — by publishing a readiness
+// marker and PARKING, never by self-SIGKILL. A self-directed SIGKILL is
+// delivered asynchronously: the helper demonstrably published one MORE
+// member after the intended crash point before the kernel stopped it
+// (observed under GOMAXPROCS=1: workspace [a b c] for crashAfter=2), so
+// "kill myself after N renames" does not pin a crash INSTANT. The parent
+// owns the kill: it waits for the marker and SIGKILLs the parked child,
+// which can no longer start another rename. The parent re-execs this test
+// binary with the crash environment set.
 func TestCacheCrashHelperProcess(t *testing.T) {
 	raw := os.Getenv(cacheCrashAfterEnv)
 	if raw == "" {
@@ -78,9 +84,33 @@ func TestCacheCrashHelperProcess(t *testing.T) {
 		}
 		if newpath == canonicalWS || strings.HasPrefix(newpath, prefix) {
 			publishes++
+			// Forensic trail: which members were actually published before
+			// the kill, plus the stage contents at the first publish (a
+			// residue assertion failure otherwise discarded all helper
+			// output; single-P runs made the residue nondeterministic with
+			// no way to see whether the missing member was ever extracted).
+			if publishes == 1 {
+				if names, lerr := os.ReadDir(filepath.Dir(oldpath)); lerr == nil {
+					var stage []string
+					for _, n := range names {
+						stage = append(stage, n.Name())
+					}
+					fmt.Fprintf(os.Stderr, "helper: stage at first publish = %v\n", stage)
+				}
+			}
+			fmt.Fprintf(os.Stderr, "helper: published rename %s -> %s (count=%d)\n", oldpath, newpath, publishes)
 			if publishes == crashAfter {
-				// SIGKILL: no deferred function, no rollback, no close.
-				_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+				// Publish the readiness marker and PARK. No further code
+				// in this goroutine (or any other) can start another
+				// rename: the parent SIGKILLs this process while it sits
+				// here, so the crash instant is exactly "after rename N".
+				// A long sleep (not select{}): an all-goroutines-asleep
+				// select{} trips the runtime deadlock detector and exits
+				// status 2 before the parent's SIGKILL can land.
+				if ready := os.Getenv(cacheCrashReadyEnv); ready != "" {
+					_ = os.WriteFile(ready, []byte("ready\n"), 0o600)
+				}
+				time.Sleep(24 * time.Hour) // parked until the parent's SIGKILL
 			}
 		}
 		return nil
@@ -129,36 +159,107 @@ func TestRestoreMidPublishCrashLeavesExactDocumentedState(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd := exec.Command(exe, "-test.run=^TestCacheCrashHelperProcess$", "-test.v=false")
+	readyPath := filepath.Join(t.TempDir(), "crash-ready")
 	cmd.Env = append(os.Environ(),
 		cacheCrashAfterEnv+"="+strconv.Itoa(crashAfter),
 		cacheCrashRootEnv+"="+cacheRoot,
 		cacheCrashWSEnv+"="+ws,
 		cacheCrashKeyEnv+"=crashkey",
+		cacheCrashReadyEnv+"="+readyPath,
 	)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	// Direct file descriptor with O_APPEND (child and the parent-side
+	// watcher share it): the forensic lines are the only way to see which
+	// members were published or staged at crash time.
+	logPath := filepath.Join(t.TempDir(), "helper.stderr")
+	lf, lerr := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	cmd.Stderr = lf
+	helperLog := func() string {
+		b, err := os.ReadFile(logPath)
+		if err != nil {
+			return "<helper log unreadable: " + err.Error() + ">"
+		}
+		return string(b)
+	}
 	if err := cmd.Start(); err != nil {
+		_ = lf.Close()
 		t.Fatal(err)
 	}
+	// Parent-side stage watcher: the parent survives the child's SIGKILL,
+	// so its samples cannot be cut off mid-flight by the crash itself. It
+	// records every change to the staging sibling so a member that vanishes
+	// WITHOUT a logged publish rename is attributable.
+	stopWatch := make(chan struct{})
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		var last string
+		for {
+			select {
+			case <-stopWatch:
+				return
+			default:
+			}
+			var snapshot []string
+			if dirs, derr := os.ReadDir(parent); derr == nil {
+				for _, d := range dirs {
+					if !strings.HasPrefix(d.Name(), cacheStagePrefix) {
+						continue
+					}
+					members, _ := os.ReadDir(filepath.Join(parent, d.Name()))
+					for _, m := range members {
+						snapshot = append(snapshot, d.Name()+"/"+m.Name())
+					}
+				}
+			}
+			cur := strings.Join(snapshot, ",")
+			if cur != last {
+				fmt.Fprintf(lf, "parent: stage-snapshot [%s]\n", cur)
+				last = cur
+			}
+			time.Sleep(200 * time.Microsecond)
+		}
+	}()
 	waited := make(chan error, 1)
-	go func() { waited <- cmd.Wait() }()
+	go func() {
+		waited <- cmd.Wait()
+		close(stopWatch)
+		<-watchDone
+		_ = lf.Close()
+	}()
 	var werr error
+	// Wait for the helper to PARK at the crash point (it publishes the
+	// marker after the Nth rename and blocks — it cannot rename again),
+	// then deliver the crash instant ourselves with SIGKILL.
+	readyDeadline := time.Now().Add(60 * time.Second)
+	for {
+		if _, rerr := os.Stat(readyPath); rerr == nil {
+			break
+		}
+		if time.Now().After(readyDeadline) {
+			_ = cmd.Process.Kill()
+			<-waited
+			t.Fatalf("helper never parked at the crash point within 60s (stderr: %s)", helperLog())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	_ = cmd.Process.Kill()
 	select {
 	case werr = <-waited:
 	case <-time.After(60 * time.Second):
-		// The child hung instead of crashing: kill it so the test fails with
-		// the real diagnostic instead of a SIGKILL look-alike.
 		_ = cmd.Process.Kill()
 		<-waited
-		t.Fatalf("helper did not reach the crash seam within 60s (stderr: %s)", stderr.String())
+		t.Fatalf("helper did not die after the crash-point kill (stderr: %s)", helperLog())
 	}
 	ee, ok := werr.(*exec.ExitError)
 	if !ok {
-		t.Fatalf("helper exit = %v, want death by SIGKILL (stderr: %s)", werr, stderr.String())
+		t.Fatalf("helper exit = %v, want death by SIGKILL (stderr: %s)", werr, helperLog())
 	}
 	st, ok := ee.Sys().(syscall.WaitStatus)
 	if !ok || !st.Signaled() || st.Signal() != syscall.SIGKILL {
-		t.Fatalf("helper termination = %v, want SIGKILL (stderr: %s)", ee.Sys(), stderr.String())
+		t.Fatalf("helper termination = %v, want SIGKILL (stderr: %s)", ee.Sys(), helperLog())
 	}
 
 	// 1. The staging sibling exists OUTSIDE the workspace and still holds
@@ -172,7 +273,7 @@ func TestRestoreMidPublishCrashLeavesExactDocumentedState(t *testing.T) {
 		t.Fatalf("staging tree %s is inside the workspace %s", stage, canonicalWS)
 	}
 	if got := crashDirNames(t, stage); len(got) != 2 || got[0] != "c.txt" || got[1] != "d.txt" {
-		t.Fatalf("staging residue = %v, want exactly [c.txt d.txt] (the never-published members)", got)
+		t.Fatalf("staging residue = %v, want exactly [c.txt d.txt] (the never-published members); helper stderr: %s", got, helperLog())
 	}
 
 	// 2. The workspace contains exactly the first N published members, with
