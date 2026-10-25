@@ -61,7 +61,7 @@ func leaseDeploymentJob(t *testing.T, s *Server, c *testClient) (runID, jobID, r
 func TestDeploymentLifecycle(t *testing.T) {
 	s := New("secret")
 	grantDeployments(s)
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	runID, jobID, runnerID, token, gen := leaseDeploymentJob(t, s, c)
 
 	// The lease created the deployment record automatically.
@@ -121,7 +121,7 @@ func TestDeploymentLifecycle(t *testing.T) {
 
 func TestDeploymentRecordRejectsNonEnvironmentJob(t *testing.T) {
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	_, jobID, _, _, _ := leaseNativeJob(t, c, testPipeline)
 	w := c.do(http.MethodPost, "/api/v1/jobs/"+jobID+"/deployments", nil, nil)
 	if w.Code != http.StatusConflict {
@@ -132,7 +132,7 @@ func TestDeploymentRecordRejectsNonEnvironmentJob(t *testing.T) {
 func TestDeploymentCreatedAtOrdered(t *testing.T) {
 	s := New("secret")
 	grantDeployments(s)
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	_, jobID, _, _, _ := leaseDeploymentJob(t, s, c)
 	s.mu.Lock()
 	s.deployments[jobID+"x"] = model.Deployment{ID: jobID + "x", RunID: s.deployments[jobID].RunID, CreatedAt: time.Now().UTC().Add(-time.Hour)}
@@ -172,7 +172,7 @@ jobs:
 func TestEnvironmentConcurrencyScopedToRepo(t *testing.T) {
 	s := New("secret")
 	grantDeployments(s)
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	for _, repo := range []string{"https://github.com/acme/one.git", "https://github.com/acme/two.git"} {
 		if _, err := s.enqueue(context.Background(), SubmitRun{RepoURL: repo, Ref: "main", Pipeline: sharedEnvPipeline, Trusted: true}); err != nil {
 			t.Fatalf("enqueue %s: %v", repo, err)
@@ -217,7 +217,7 @@ func TestEnvironmentConcurrencyScopedToRepo(t *testing.T) {
 func TestDeploymentRecordRequiresRunningJob(t *testing.T) {
 	s := New("secret")
 	grantDeployments(s)
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	s.mu.Lock()
 	s.DB = nil
 	s.mu.Unlock()

@@ -50,7 +50,7 @@ func TestSnapshotFsDurableRestartRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	runID, jobID, runnerID, token, gen := leaseNativeJob(t, c, testPipeline)
 	headers := map[string]string{
 		"X-Kiwi-Runner-ID":        runnerID,
@@ -76,7 +76,7 @@ func TestSnapshotFsDurableRestartRoundTrip(t *testing.T) {
 		t.Fatalf("restored record wrong: %+v", rec)
 	}
 
-	c2 := newTestClient(t, s2.Handler(), "secret")
+	c2 := newTestClientForServer(t, s2, "secret")
 	w := c2.do(http.MethodGet, "/api/v1/runs/"+runID+"/snapshots", nil, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("list after restart: %d %s", w.Code, w.Body.String())
@@ -108,7 +108,7 @@ func TestSnapshotFsMissingArchiveDroppedAtLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	_, jobID, runnerID, token, gen := leaseNativeJob(t, c, testPipeline)
 	recID, _ := uploadFsSnapshot(t, c, jobID, map[string]string{
 		"X-Kiwi-Runner-ID":        runnerID,
@@ -157,7 +157,7 @@ func TestSnapshotFsTamperedArchiveDroppedAtLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	_, jobID, runnerID, token, gen := leaseNativeJob(t, c, testPipeline)
 	recID, archive := uploadFsSnapshot(t, c, jobID, map[string]string{
 		"X-Kiwi-Runner-ID":        runnerID,
@@ -199,7 +199,7 @@ func TestSnapshotFsMissingManifestDroppedAtLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	_, jobID, runnerID, token, gen := leaseNativeJob(t, c, testPipeline)
 	recID, _ := uploadFsSnapshot(t, c, jobID, map[string]string{
 		"X-Kiwi-Runner-ID":        runnerID,

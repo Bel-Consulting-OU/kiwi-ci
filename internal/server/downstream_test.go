@@ -91,9 +91,20 @@ func downstreamServer(t *testing.T, pipelineText string) (*Server, model.Run) {
 
 func completeTask(t *testing.T, s *Server, task Task, runnerID, status string) *httptest.ResponseRecorder {
 	t.Helper()
-	body := fmt.Sprintf(`{"runner_id":%q,"lease_token":%q,"lease_generation":%d,"status":%q}`,
-		runnerID, task.LeaseToken, task.LeaseGeneration, status)
-	return doJSON(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/complete", "token", body)
+	body := map[string]any{
+		"runner_id": runnerID, "lease_token": task.LeaseToken,
+		"lease_generation": task.LeaseGeneration, "status": status,
+	}
+	// Stamped jobs require an explicit observed interpreter stamp; current
+	// runners always send it. Mirror that contract here.
+	if task.Job.ExecutionSemantics != "" {
+		body["execution_semantics"] = task.Job.ExecutionSemantics
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return doJSON(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/complete", "token", string(raw))
 }
 
 func childRunsOf(s *Server) []model.Run {

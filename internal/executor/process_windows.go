@@ -12,12 +12,18 @@ import (
 
 var (
 	modkernel32                  = syscall.NewLazyDLL("kernel32.dll")
+	modntdll                     = syscall.NewLazyDLL("ntdll.dll")
 	procCreateJobObjectW         = modkernel32.NewProc("CreateJobObjectW")
 	procSetInformationJobObject  = modkernel32.NewProc("SetInformationJobObject")
 	procAssignProcessToJobObject = modkernel32.NewProc("AssignProcessToJobObject")
-	procResumeThread             = modkernel32.NewProc("ResumeThread")
 	procCloseHandle              = modkernel32.NewProc("CloseHandle")
 	procGetExitCodeProcess       = modkernel32.NewProc("GetExitCodeProcess")
+	// NtResumeProcess resumes every thread of a process created with
+	// CREATE_SUSPENDED. os/exec's StartProcess closes the primary-thread
+	// handle (CloseHandle(pi.Thread)) before Start returns, and the primary
+	// thread TID is NOT the process PID — OpenThread(PID) is wrong. The
+	// process handle is the only identity we still own after Start.
+	procNtResumeProcess = modntdll.NewProc("NtResumeProcess")
 )
 
 // processQueryLimitedInformation is the OpenProcess access right needed for
@@ -69,10 +75,9 @@ type jobObjectExtendedLimitInformation struct {
 // synchronously assigns the child to it before returning.
 //
 // Ordering: the child is created SUSPENDED (CREATE_SUSPENDED via
-// SysProcAttr.CreationFlags), assigned to the Job Object, then resumed.
-// No userspace instruction of the child runs before it is inside the job,
-// so a fast native command cannot spawn an unowned grandchild during a
-// Start→assign window.
+// SysProcAttr.CreationFlags), assigned to the Job Object, then resumed
+// with NtResumeProcess on the process handle. No userspace instruction of
+// the child runs before it is inside the job.
 //
 // The returned cleanup closes the job handle; with kill-on-close set, that
 // terminates every process still assigned to the job. It must be invoked
@@ -113,8 +118,9 @@ func superviseChild(cmd *exec.Cmd) (func(), error) {
 		_ = syscall.CloseHandle(syscall.Handle(job))
 		return nil, err
 	}
-	// Primary thread handle: Go keeps it in ProcessState on some versions;
-	// open by PID with THREAD_SUSPEND_RESUME to resume the primary thread.
+	// Resume every thread of the CREATE_SUSPENDED process via the process
+	// handle. The primary-thread handle was closed inside os.StartProcess
+	// and the thread TID is not the PID, so OpenThread(PID) is not an option.
 	if err := resumeProcess(cmd.Process); err != nil {
 		_ = terminateProcess(cmd)
 		_ = killProcess(cmd)
@@ -126,48 +132,37 @@ func superviseChild(cmd *exec.Cmd) (func(), error) {
 	}, nil
 }
 
-// resumeProcess resumes the primary thread of a CREATE_SUSPENDED process.
-// On Windows the primary thread TID equals the process PID.
+// resumeProcess resumes a CREATE_SUSPENDED process by calling
+// NtResumeProcess on its process handle. NtResumeProcess takes the process,
+// not a thread id, and resumes every suspended thread of that process —
+// exactly the primary thread CreateProcessW left frozen.
 func resumeProcess(proc *os.Process) error {
-	const threadSuspendResume = 0x0002
-	h, err := syscall.OpenProcess(threadSuspendResume|processSetQuotaOrTerminate, false, uint32(proc.Pid))
+	if proc == nil {
+		return errors.New("resume: nil process")
+	}
+	// Open a process handle with the rights NtResumeProcess needs; the
+	// handle os.Process keeps may only carry SYNCHRONIZE/PROCESS_QUERY.
+	const processAllAccess = 0x1FFFFF
+	h, err := syscall.OpenProcess(processAllAccess, false, uint32(proc.Pid))
 	if err != nil {
-		// OpenProcess for the primary thread is wrong — OpenThread is.
-		// Fall through to OpenThread below.
-		_ = h
-	}
-	th, terr := openThread(threadSuspendResume, false, uint32(proc.Pid))
-	if terr != nil {
-		return terr
-	}
-	defer syscall.CloseHandle(th)
-	r, _, err := procResumeThread.Call(uintptr(th))
-	if r == ^uintptr(0) {
-		if err == nil || err == syscall.Errno(0) {
-			return errors.New("ResumeThread failed")
+		// Fall back to the handle embedded in os.Process via Signal probe
+		// is not available; retry with query-limited rights — NtResumeProcess
+		// only needs PROCESS_SUSPEND_RESUME (0x0800) on modern kernels.
+		h, err = syscall.OpenProcess(0x0800, false, uint32(proc.Pid))
+		if err != nil {
+			return err
 		}
-		return err
+	}
+	defer syscall.CloseHandle(h)
+	r, _, nerr := procNtResumeProcess.Call(uintptr(h))
+	// NTSTATUS 0 == STATUS_SUCCESS; any non-zero value is a failure.
+	if r != 0 {
+		if nerr != nil && nerr != syscall.Errno(0) {
+			return nerr
+		}
+		return errors.New("NtResumeProcess failed")
 	}
 	return nil
-}
-
-func openThread(access uint32, inherit bool, tid uint32) (syscall.Handle, error) {
-	procOpenThread := modkernel32.NewProc("OpenThread")
-	h, _, err := procOpenThread.Call(uintptr(access), uintptr(boolToInt(inherit)), uintptr(tid))
-	if h == 0 {
-		if err == nil || err == syscall.Errno(0) {
-			err = errors.New("OpenThread failed")
-		}
-		return 0, err
-	}
-	return syscall.Handle(h), nil
-}
-
-func boolToInt(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
 }
 
 // assignToJobObjectNow synchronously opens the child process with the
@@ -189,7 +184,7 @@ func assignToJobObjectNow(proc *os.Process, job syscall.Handle) error {
 }
 
 // configureProcess sets CREATE_SUSPENDED so the child is born frozen; the
-// Job Object assign + ResumeThread happen in superviseChild after Start.
+// Job Object assign + NtResumeProcess happen in superviseChild after Start.
 func configureProcess(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: createSuspendedFlag,

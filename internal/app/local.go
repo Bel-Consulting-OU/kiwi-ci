@@ -106,12 +106,19 @@ func RunLocal(ctx context.Context, args []string) error {
 	// Git identity is whatever Freeze captured from the SOURCE — never a
 	// re-read of copied .git (linked worktrees can move HEAD after freeze).
 	fg := wm.FrozenGitInfo()
+	if fg.CaptureFailed() {
+		// Freeze should have refused an unstable capture; never fall back
+		// to live Git after a source snapshot exists.
+		return fmt.Errorf("run: Git identity capture failed atomically; re-run when the repository is quiet")
+	}
 	gitDir := wd
 	if baseDir != "" && fg.Captured {
 		gitDir = baseDir
 	}
-	if !fg.Captured {
-		// No repo at freeze: keep wd-based detection (unknown/empty).
+	if !fg.Captured && baseDir != "" {
+		// Freeze succeeded and captured "not a repository": keep wd-based
+		// detection only when there is still no repo identity to protect
+		// (NotRepo is the only !Captured state Freeze allows through).
 		gitDir = wd
 	}
 	spec, err := pipeline.Load(fileToLoad)

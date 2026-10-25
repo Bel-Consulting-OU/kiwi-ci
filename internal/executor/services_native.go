@@ -2,7 +2,6 @@ package executor
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -68,9 +67,13 @@ func releaseNativePort(port int) {
 	releaseNativePortFile(port)
 }
 
-// claimNativePortFile takes O_CREATE|O_EXCL ownership of port in the
-// host-wide claim directory. A lock left by a dead PID is reclaimed; a
-// lock held by a live process fails closed.
+// claimNativePortFile takes an exclusive cross-process lock on the port
+// claim file (flock on Unix, LockFileEx on Windows). The lock is released
+// when the holder exits, so a stale claim from a dead runner is reclaimed
+// simply by acquiring the lock — there is no read-delete-create window in
+// which two processes can both believe they own the port.
+//
+// The held file stays open until releaseNativePortFile closes it.
 func claimNativePortFile(port int, owner string) error {
 	dir := nativePortClaimDir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -78,49 +81,58 @@ func claimNativePortFile(port int, owner string) error {
 	}
 	path := filepath.Join(dir, fmt.Sprintf("%d.lock", port))
 	payload := []byte(fmt.Sprintf("pid=%d\nowner=%s\n", os.Getpid(), owner))
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if err == nil {
-		_, werr := f.Write(payload)
-		cerr := f.Close()
-		return errors.Join(werr, cerr)
-	}
-	if !os.IsExist(err) {
+	f, err := lockPortClaimFile(path, payload)
+	if err != nil {
+		if portClaimLocked(err) {
+			lockOwner, lockPID := readPortClaimIdentity(path)
+			if lockPID > 0 && lockPID == os.Getpid() {
+				// Same process already holds it (in-memory map miss).
+				return fmt.Errorf("host port %d already claimed by %s (pid %d)", port, lockOwner, lockPID)
+			}
+			return fmt.Errorf("host port %d already claimed by %s (pid %d)", port, lockOwner, lockPID)
+		}
 		return fmt.Errorf("host port %d claim: %w", port, err)
 	}
-	// Existing lock: reclaim only when the recorded owner process is gone.
-	b, rerr := os.ReadFile(path)
-	if rerr != nil {
-		return fmt.Errorf("host port %d already claimed (unreadable lock): %w", port, rerr)
+	// Hold the lock for the lifetime of the claim: stash the file handle.
+	setPortClaimHandle(port, f)
+	return nil
+}
+
+func readPortClaimIdentity(path string) (owner string, pid int) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", 0
 	}
-	var lockPID int
-	var lockOwner string
 	for _, line := range strings.Split(string(b), "\n") {
 		if strings.HasPrefix(line, "pid=") {
-			fmt.Sscanf(line, "pid=%d", &lockPID)
+			fmt.Sscanf(line, "pid=%d", &pid)
 		}
 		if strings.HasPrefix(line, "owner=") {
-			lockOwner = strings.TrimPrefix(line, "owner=")
+			owner = strings.TrimPrefix(line, "owner=")
 		}
 	}
-	if lockPID > 0 && processAlive(lockPID) {
-		return fmt.Errorf("host port %d already claimed by %s (pid %d)", port, lockOwner, lockPID)
+	return owner, pid
+}
+
+// portClaimHandles keeps the open (locked) claim files so release can close
+// them. Keyed by port; guarded by nativePortClaims' mutex at call sites.
+var portClaimHandles = map[int]*os.File{}
+
+func setPortClaimHandle(port int, f *os.File) {
+	if old, ok := portClaimHandles[port]; ok && old != nil {
+		_ = old.Close()
 	}
-	// Stale lock (dead owner): take it over.
-	if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
-		return fmt.Errorf("host port %d stale lock remove: %w", port, rmErr)
-	}
-	f, err = os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if err != nil {
-		return fmt.Errorf("host port %d claim after stale release: %w", port, err)
-	}
-	_, werr := f.Write(payload)
-	cerr := f.Close()
-	return errors.Join(werr, cerr)
+	portClaimHandles[port] = f
 }
 
 func releaseNativePortFile(port int) {
+	if f, ok := portClaimHandles[port]; ok && f != nil {
+		_ = f.Close()
+		delete(portClaimHandles, port)
+		return
+	}
+	// Fallback for tests that claim without a held handle.
 	path := filepath.Join(nativePortClaimDir(), fmt.Sprintf("%d.lock", port))
-	// Only remove OUR lock: a foreign live owner must keep its file.
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return
@@ -291,22 +303,17 @@ func startNativeServices(ctx context.Context, jobID, workRoot string, baseEnv ma
 		envSlice := envMapToSlice(effectiveEnv)
 		envSlice = append(envSlice, fmt.Sprintf("PORT=%d", port))
 		closeCgroupFD := func() {}
-		// Start is single-shot: a UseCgroupFD failure must rebuild a fresh
-		// command (see native.go), not call Start twice on the same Cmd.
-		newCmd := func() *exec.Cmd {
-			cmd := exec.CommandContext(ctx, args[0], args[1:]...)
-			cmd.Dir = workDir
-			cmd.Env = envSlice
-			return cmd
-		}
-		cmd := newCmd()
+		cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+		cmd.Dir = workDir
+		cmd.Env = envSlice
 		if cgroupParent != "" {
 			cl, err := configureProcessCgroup(cmd, cgroupParent)
 			if err != nil {
-				configureProcess(cmd)
-			} else {
-				closeCgroupFD = cl
+				// Durable cgroup recorded: fail closed rather than start the
+				// service outside the ownership boundary.
+				return failInfo("job %s native service %s arm clone-into-cgroup %s: %w", jobID, svc.Name, cgroupParent, err)
 			}
+			closeCgroupFD = cl
 		} else {
 			configureProcess(cmd)
 		}
@@ -328,25 +335,19 @@ func startNativeServices(ctx context.Context, jobID, workRoot string, baseEnv ma
 
 		usedCgroupFD := cgroupFDActive(cmd)
 		serr := cmd.Start()
-		if serr != nil && usedCgroupFD {
-			closeCgroupFD()
-			closeCgroupFD = func() {}
-			cmd = newCmd()
-			configureProcess(cmd)
-			cmd.Stdout = stdoutW
-			cmd.Stderr = stderrW
-			usedCgroupFD = false
-			serr = cmd.Start()
-		}
+		closeCgroupFD()
 		if serr != nil {
-			closeCgroupFD()
 			_ = stdoutW.Close()
 			_ = stderrW.Close()
 			_ = stdoutR.Close()
 			_ = stderrR.Close()
+			if usedCgroupFD {
+				// Clone-into-cgroup armed but rejected: refuse to run the
+				// service outside the durable job cgroup.
+				return failInfo("job %s native service %s clone-into-cgroup start %s: %w (refusing to run outside the durable job cgroup)", jobID, svc.Name, bin, serr)
+			}
 			return failInfo("job %s native service %s start %s: %w", jobID, svc.Name, bin, serr)
 		}
-		closeCgroupFD()
 		_ = stdoutW.Close()
 		_ = stderrW.Close()
 		if emit != nil {

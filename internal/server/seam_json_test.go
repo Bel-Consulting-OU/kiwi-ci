@@ -65,7 +65,7 @@ func seamJSONFailAt(t *testing.T, failAt int) func() {
 
 func TestSeamJSONSubmitFailsClosed(t *testing.T) {
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	in := SubmitRun{RepoURL: "https://github.com/o/r.git", Ref: "main", Pipeline: testPipeline}
 
 	restore := seamJSON(t)
@@ -184,7 +184,7 @@ func TestSeamJSONStreamLogsSkipsUndeliverableEntries(t *testing.T) {
 func TestSeamJSONOIDCFailsClosed(t *testing.T) {
 	s := newOIDCTestServer(t, true)
 	_, jobID := seedOIDCJob(t, s, "lease-1")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	restore := seamJSON(t)
 	defer restore()
 

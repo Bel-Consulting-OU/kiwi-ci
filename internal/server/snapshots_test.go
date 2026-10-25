@@ -54,7 +54,7 @@ func TestSnapshotUploadAndList(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	runID, jobID, runnerID, token, gen := leaseNativeJob(t, c, testPipeline)
 
 	ws := t.TempDir()
@@ -135,7 +135,7 @@ func TestSnapshotUploadRequiresLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	_, jobID, runnerID, token, gen := leaseNativeJob(t, c, testPipeline)
 
 	// Wrong token.

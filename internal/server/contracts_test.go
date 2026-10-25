@@ -17,6 +17,7 @@ import (
 // headers) set.
 func doJSONHeaders(t *testing.T, s *Server, method, path, bearer, body string, headers map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
+	body = maybeInjectCompleteSemantics(s, path, body)
 	var r *http.Request
 	if body == "" {
 		r = httptest.NewRequest(method, path, nil)

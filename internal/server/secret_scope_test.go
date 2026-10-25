@@ -21,7 +21,7 @@ func TestSecretAADContextBinding(t *testing.T) {
 	const value = "aad-bound-value"
 	s := New("secret")
 	s.SecretBroker = secretbroker.StaticBroker{"tok": value}
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	jobID, runnerID, token, gen := seedJob(t, s, true, []string{"tok"})
 	priv, pubB64 := ephemeralKey(t)
 	w := issue(t, c, jobID, SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pubB64})
@@ -90,8 +90,8 @@ func TestIssueSecretClaimSingleUseAcrossReplicas(t *testing.T) {
 	f := newDBFakeStore()
 	s1 := dbSecretServer(t, f)
 	s2 := dbSecretServer(t, f)
-	c1 := newTestClient(t, s1.Handler(), "secret")
-	c2 := newTestClient(t, s2.Handler(), "secret")
+	c1 := newTestClientForServer(t, s1, "secret")
+	c2 := newTestClientForServer(t, s2, "secret")
 	jobID, runnerID, token, gen := seedDBSecretJob(t, f, s1, []string{"tok"})
 
 	_, pub1 := ephemeralKey(t)
@@ -129,7 +129,7 @@ func TestIssueSecretClaimSingleUseAcrossReplicas(t *testing.T) {
 	}
 	// A third replica sees the same durable claim.
 	s3 := dbSecretServer(t, f)
-	c3 := newTestClient(t, s3.Handler(), "secret")
+	c3 := newTestClientForServer(t, s3, "secret")
 	_, pub3 := ephemeralKey(t)
 	req3 := req1
 	req3.EphemeralPublic = pub3
@@ -169,7 +169,7 @@ func TestBrokerFailureReleasesClaimAndAllowsRetry(t *testing.T) {
 		s := New("secret")
 		broker := &flakyBroker{values: secretbroker.StaticBroker{"tok": "v"}}
 		s.SecretBroker = broker
-		c := newTestClient(t, s.Handler(), "secret")
+		c := newTestClientForServer(t, s, "secret")
 		jobID, runnerID, token, gen := seedJob(t, s, true, []string{"tok"})
 		_, pubB64 := ephemeralKey(t)
 		req := SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pubB64}
@@ -197,7 +197,7 @@ func TestBrokerFailureReleasesClaimAndAllowsRetry(t *testing.T) {
 		f := newDBFakeStore()
 		s := dbSecretServer(t, f)
 		s.SecretBroker = &flakyBroker{values: secretbroker.StaticBroker{"tok": "v"}}
-		c := newTestClient(t, s.Handler(), "secret")
+		c := newTestClientForServer(t, s, "secret")
 		jobID, runnerID, token, gen := seedDBSecretJob(t, f, s, []string{"tok"})
 		_, pubB64 := ephemeralKey(t)
 		req := SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pubB64}
@@ -236,7 +236,7 @@ func TestInvalidEphemeralKeyReleasesClaim(t *testing.T) {
 				s.SecretBroker = secretbroker.StaticBroker{"tok": "v"}
 				jobID, runnerID, token, gen = seedJob(t, s, true, []string{"tok"})
 			}
-			c := newTestClient(t, s.Handler(), "secret")
+			c := newTestClientForServer(t, s, "secret")
 			bad := []string{"", "!!!", base64.StdEncoding.EncodeToString([]byte("short")), base64.StdEncoding.EncodeToString(make([]byte, 33))}
 			for _, pub := range bad {
 				w := issue(t, c, jobID, SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pub})

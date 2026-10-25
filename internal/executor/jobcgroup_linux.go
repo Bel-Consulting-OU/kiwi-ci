@@ -80,7 +80,17 @@ func setupJobCgroup(ctx context.Context, req jobCgroupRequest) (JobCgroupStatus,
 	if err != nil {
 		return JobCgroupStatus{Detail: err.Error()}, nil
 	}
-	dir, cleanup, err := createJobCgroupUnder(base, jobCgroupDirName(req.JobID, jobCgroupSuffix()), jobCgroupControllers(req), jobCgroupLimits(req))
+	// Native-only: processes go INTO this cgroup (clone-into-cgroup /
+	// addPID). Do NOT enable domain controllers in its own subtree_control —
+	// cgroup-v2 forbids processes in a non-root cgroup with domain
+	// controllers enabled for children. Limits still apply to this leaf via
+	// the parent's delegation. Container jobs keep the controllers so docker
+	// child cgroups carry the control files.
+	subtreeControllers := jobCgroupControllers(req)
+	if req.NativeOnly {
+		subtreeControllers = nil
+	}
+	dir, cleanup, err := createJobCgroupUnder(base, jobCgroupDirName(req.JobID, jobCgroupSuffix()), subtreeControllers, jobCgroupLimits(req))
 	if err != nil {
 		return JobCgroupStatus{Detail: err.Error()}, nil
 	}
@@ -90,10 +100,14 @@ func setupJobCgroup(ctx context.Context, req jobCgroupRequest) (JobCgroupStatus,
 		return JobCgroupStatus{Detail: fmt.Sprintf("job cgroup %s is not inside the cgroup root %s", dir, root)}, nil
 	}
 	parent := "/" + filepath.ToSlash(rel)
+	detail := fmt.Sprintf("job-scoped cgroup %s (declared envelope %s) enforces the main container and every service together", parent, jobCgroupEnvelopeSummary(req))
+	if req.NativeOnly {
+		detail = fmt.Sprintf("native job cgroup %s (declared envelope %s) hosts the process tree as a leaf (no subtree controllers; limits apply in place)", parent, jobCgroupEnvelopeSummary(req))
+	}
 	return JobCgroupStatus{
 		Enabled: true,
 		Parent:  parent,
-		Detail:  fmt.Sprintf("job-scoped cgroup %s (declared envelope %s) enforces the main container and every service together", parent, jobCgroupEnvelopeSummary(req)),
+		Detail:  detail,
 	}, cleanup
 }
 

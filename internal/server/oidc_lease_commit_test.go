@@ -34,7 +34,7 @@ func issueOIDCForStatus(t *testing.T, s *Server, authHeader, audience string) *h
 	if authHeader != "" {
 		headers["Authorization"] = authHeader
 	}
-	return newTestClient(t, s.Handler(), "").do(http.MethodPost, "/api/v1/jobs/job-oidc/oidc", map[string]any{"audience": audience}, headers)
+	return newTestClientForServer(t, s, "").do(http.MethodPost, "/api/v1/jobs/job-oidc/oidc", map[string]any{"audience": audience}, headers)
 }
 
 // requireNoToken fails a test whenever a denied issuance leaked a credential.
@@ -314,7 +314,7 @@ func TestOIDCIssuanceNeverReturnsJWTWithoutDurableAudit(t *testing.T) {
 		}
 		prevRoot := s.store.Root
 		s.store.Root = blocker
-		w := newTestClient(t, s.Handler(), "lease1").do(http.MethodPost, "/api/v1/jobs/"+jobID+"/oidc", map[string]any{"audience": "https://aud.example.com"}, nil)
+		w := newTestClientForServer(t, s, "lease1").do(http.MethodPost, "/api/v1/jobs/"+jobID+"/oidc", map[string]any{"audience": "https://aud.example.com"}, nil)
 		if w.Code != http.StatusInternalServerError {
 			t.Fatalf("fs issuance with a failing audit sink = %d, want 500: %s", w.Code, w.Body.String())
 		}

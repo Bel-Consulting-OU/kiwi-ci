@@ -59,7 +59,7 @@ func TestIssueSecretDecryptableEnvelope(t *testing.T) {
 	const value = "the-ultra-secret-value"
 	s := New("secret")
 	s.SecretBroker = secretbroker.StaticBroker{"tok": value}
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	jobID, runnerID, token, gen := seedJob(t, s, true, []string{"tok"})
 	priv, pubB64 := ephemeralKey(t)
 
@@ -101,7 +101,7 @@ func TestIssueSecretDecryptableEnvelope(t *testing.T) {
 func TestIssueSecretNotDeclared(t *testing.T) {
 	s := New("secret")
 	s.SecretBroker = secretbroker.StaticBroker{"tok": "v"}
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	jobID, runnerID, token, gen := seedJob(t, s, true, []string{"other"})
 	_, pubB64 := ephemeralKey(t)
 
@@ -114,7 +114,7 @@ func TestIssueSecretNotDeclared(t *testing.T) {
 func TestIssueSecretUntrustedJob(t *testing.T) {
 	s := New("secret")
 	s.SecretBroker = secretbroker.StaticBroker{"tok": "v"}
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	jobID, runnerID, token, gen := seedJob(t, s, false, []string{"tok"})
 	_, pubB64 := ephemeralKey(t)
 
@@ -127,7 +127,7 @@ func TestIssueSecretUntrustedJob(t *testing.T) {
 func TestIssueSecretStaleLease(t *testing.T) {
 	s := New("secret")
 	s.SecretBroker = secretbroker.StaticBroker{"tok": "v"}
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	jobID, runnerID, token, gen := seedJob(t, s, true, []string{"tok"})
 	_, pubB64 := ephemeralKey(t)
 
@@ -153,7 +153,7 @@ func TestIssueSecretStaleLease(t *testing.T) {
 
 func TestIssueSecretBrokerNotConfigured(t *testing.T) {
 	s := New("x")
-	c := newTestClient(t, s.Handler(), "x")
+	c := newTestClientForServer(t, s, "x")
 	jobID, runnerID, token, gen := seedJob(t, s, true, []string{"tok"})
 	_, pubB64 := ephemeralKey(t)
 
@@ -166,7 +166,7 @@ func TestIssueSecretBrokerNotConfigured(t *testing.T) {
 func TestIssueSecretDuplicateDelivery(t *testing.T) {
 	s := New("secret")
 	s.SecretBroker = &secretbroker.OneTime{Inner: secretbroker.StaticBroker{"tok": "v"}}
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	jobID, runnerID, token, gen := seedJob(t, s, true, []string{"tok"})
 	_, pubB64 := ephemeralKey(t)
 
@@ -188,7 +188,7 @@ func TestIssueSecretDuplicateDelivery(t *testing.T) {
 func TestIssueSecretReceiptServerOwned(t *testing.T) {
 	s := New("secret")
 	s.SecretBroker = secretbroker.StaticBroker{"tok": "v"}
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	jobID, runnerID, token, gen := seedJob(t, s, true, []string{"tok", "other"})
 
 	_, pubB64 := ephemeralKey(t)
@@ -225,7 +225,7 @@ func TestIssueSecretReceiptSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	s1.SecretBroker = secretbroker.StaticBroker{"tok": "v"}
-	c := newTestClient(t, s1.Handler(), "secret")
+	c := newTestClientForServer(t, s1, "secret")
 	jobID, runnerID, token, gen := seedJob(t, s1, true, []string{"tok"})
 	// seedJob writes the run/job into the memory maps only; persist them so
 	// the restarted server sees the same job.
@@ -244,7 +244,7 @@ func TestIssueSecretReceiptSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	s2.SecretBroker = secretbroker.StaticBroker{"tok": "v"}
-	c2 := newTestClient(t, s2.Handler(), "secret")
+	c2 := newTestClientForServer(t, s2, "secret")
 	_, pubB64 = ephemeralKey(t)
 	req.EphemeralPublic = pubB64
 	if w := issue(t, c2, jobID, req); w.Code != http.StatusConflict {

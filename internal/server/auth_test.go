@@ -39,7 +39,7 @@ func TestSubmitAuthorizedViaStorePrincipal(t *testing.T) {
 	s := storeServer(t, "", map[string]auth.Principal{
 		"ci-token": {Subject: "ci-bot", Roles: []auth.Role{auth.RoleRun}},
 	})
-	c := newTestClient(t, s.Handler(), "ci-token")
+	c := newTestClientForServer(t, s, "ci-token")
 	w := c.do(http.MethodPost, "/api/v1/runs", SubmitRun{RepoURL: "https://github.com/kiwi/repo.git", Ref: "main", Pipeline: testPipeline}, nil)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("submit via store principal: want 202 got %d: %s", w.Code, w.Body.String())
@@ -65,7 +65,7 @@ func TestSubmitForbiddenWithoutRunRole(t *testing.T) {
 	s := storeServer(t, "", map[string]auth.Principal{
 		"read-token": {Subject: "reader", Roles: []auth.Role{auth.RoleRead}},
 	})
-	c := newTestClient(t, s.Handler(), "read-token")
+	c := newTestClientForServer(t, s, "read-token")
 	w := c.do(http.MethodPost, "/api/v1/runs", SubmitRun{RepoURL: "https://github.com/kiwi/repo.git", Ref: "main", Pipeline: testPipeline}, nil)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("submit without run role: want 403 got %d: %s", w.Code, w.Body.String())
@@ -124,7 +124,7 @@ func TestLegacyAdminTokenStillAuthorizesActions(t *testing.T) {
 	// Dev mode (empty store): the AdminToken bearer maps to the admin
 	// principal and passes every action.
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	w := c.do(http.MethodPost, "/api/v1/runs", SubmitRun{RepoURL: "https://github.com/kiwi/repo.git", Ref: "main", Pipeline: testPipeline}, nil)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("admin token submit: want 202 got %d: %s", w.Code, w.Body.String())
@@ -148,7 +148,7 @@ func TestApproveIgnoresActorHeader(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	c := newTestClient(t, s.Handler(), "admin-tok")
+	c := newTestClientForServer(t, s, "admin-tok")
 	w := c.do(http.MethodPost, "/api/v1/runs", SubmitRun{RepoURL: "https://github.com/kiwi/repo.git", Ref: "main", Pipeline: approvalPipeline}, nil)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("submit: want 202 got %d: %s", w.Code, w.Body.String())
@@ -171,7 +171,7 @@ func TestApproveIgnoresActorHeader(t *testing.T) {
 
 	// The approval comes from the store principal; the X-Kiwi-Actor header
 	// must be ignored entirely.
-	c2 := newTestClient(t, s.Handler(), "reviewer")
+	c2 := newTestClientForServer(t, s, "reviewer")
 	w = c2.do(http.MethodPost, "/api/v1/jobs/"+jobID+"/approve", nil, map[string]string{"X-Kiwi-Actor": "mallory"})
 	if w.Code != http.StatusOK {
 		t.Fatalf("approve: want 200 got %d: %s", w.Code, w.Body.String())
@@ -190,7 +190,7 @@ func TestApproveIgnoresActorHeader(t *testing.T) {
 	}
 
 	// The audit trail records the principal subject as actor.
-	c3 := newTestClient(t, s.Handler(), "ops")
+	c3 := newTestClientForServer(t, s, "ops")
 	w = c3.do(http.MethodGet, "/api/v1/audit?limit=100", nil, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("list audit: want 200 got %d: %s", w.Code, w.Body.String())
@@ -218,7 +218,7 @@ func TestCancelUsesPrincipalSubject(t *testing.T) {
 	s := storeServer(t, "", map[string]auth.Principal{
 		"bot-token": {Subject: "canceller", Roles: []auth.Role{auth.RoleRun, auth.RoleCancel}},
 	})
-	c := newTestClient(t, s.Handler(), "bot-token")
+	c := newTestClientForServer(t, s, "bot-token")
 	w := c.do(http.MethodPost, "/api/v1/runs", SubmitRun{RepoURL: "https://github.com/kiwi/repo.git", Ref: "main", Pipeline: testPipeline}, nil)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("submit: want 202 got %d", w.Code)
@@ -254,7 +254,7 @@ func TestCancelForbiddenWithoutCancelRole(t *testing.T) {
 		"read-token": {Subject: "reader", Repositories: map[string]auth.RepositoryPermission{"github.com/kiwi/repo": {Read: true}}},
 		"ops-token":  {Subject: "ops", Roles: []auth.Role{auth.RoleAdmin}},
 	})
-	c := newTestClient(t, s.Handler(), "run-token")
+	c := newTestClientForServer(t, s, "run-token")
 	w := c.do(http.MethodPost, "/api/v1/runs", SubmitRun{RepoURL: "https://github.com/kiwi/repo.git", Ref: "main", Pipeline: testPipeline}, nil)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("submit: want 202 got %d", w.Code)
@@ -269,12 +269,12 @@ func TestCancelForbiddenWithoutCancelRole(t *testing.T) {
 	}
 	// A principal that can READ the run but lacks the cancel action keeps the
 	// capability-style 403: visibility passed, the action was denied.
-	cReader := newTestClient(t, s.Handler(), "read-token")
+	cReader := newTestClientForServer(t, s, "read-token")
 	if w := cReader.do(http.MethodPost, "/api/v1/runs/"+run.ID+"/cancel", nil, nil); w.Code != http.StatusForbidden {
 		t.Fatalf("cancel without cancel action: want 403 got %d", w.Code)
 	}
 	// An admin principal can still cancel.
-	c2 := newTestClient(t, s.Handler(), "ops-token")
+	c2 := newTestClientForServer(t, s, "ops-token")
 	w = c2.do(http.MethodPost, "/api/v1/runs/"+run.ID+"/cancel", nil, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("admin cancel: want 200 got %d: %s", w.Code, w.Body.String())
@@ -287,7 +287,7 @@ func TestRerunRequiresRerunRole(t *testing.T) {
 		"read-token": {Subject: "reader", Repositories: map[string]auth.RepositoryPermission{"github.com/kiwi/repo": {Read: true}}},
 		"ops-token":  {Subject: "ops", Roles: []auth.Role{auth.RoleAdmin}},
 	})
-	c := newTestClient(t, s.Handler(), "run-token")
+	c := newTestClientForServer(t, s, "run-token")
 	w := c.do(http.MethodPost, "/api/v1/runs", SubmitRun{RepoURL: "https://github.com/kiwi/repo.git", Ref: "main", Pipeline: testPipeline}, nil)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("submit: want 202 got %d", w.Code)
@@ -302,11 +302,11 @@ func TestRerunRequiresRerunRole(t *testing.T) {
 	}
 	// A principal that can READ the run but lacks the rerun action keeps the
 	// 403: visibility passed, the action was denied.
-	cReader := newTestClient(t, s.Handler(), "read-token")
+	cReader := newTestClientForServer(t, s, "read-token")
 	if w := cReader.do(http.MethodPost, "/api/v1/runs/"+run.ID+"/rerun", nil, nil); w.Code != http.StatusForbidden {
 		t.Fatalf("rerun without rerun action: want 403 got %d", w.Code)
 	}
-	c2 := newTestClient(t, s.Handler(), "ops-token")
+	c2 := newTestClientForServer(t, s, "ops-token")
 	w = c2.do(http.MethodPost, "/api/v1/runs/"+run.ID+"/rerun", nil, nil)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("admin rerun: want 202 got %d: %s", w.Code, w.Body.String())

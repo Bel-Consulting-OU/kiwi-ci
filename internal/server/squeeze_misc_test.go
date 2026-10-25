@@ -69,7 +69,7 @@ jobs:
 // TestSqueezeStreamLogsReadError covers the no-store stream read refusal.
 func TestSqueezeStreamLogsReadError(t *testing.T) {
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	w := c.do(http.MethodGet, "/api/v1/runs/unknown-run/logs/stream", nil, nil)
 	if w.Code == http.StatusOK {
 		t.Fatalf("stream without storage = %d, want an error", w.Code)

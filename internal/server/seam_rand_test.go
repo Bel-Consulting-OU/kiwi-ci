@@ -178,7 +178,7 @@ func TestSeamRandAuditLockedDropsEvent(t *testing.T) {
 // TestSeamRandHTTPHandlers drives the handlers whose identifier mint fails.
 func TestSeamRandHTTPHandlers(t *testing.T) {
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	if w := c.do(http.MethodPost, "/api/v1/runs", SubmitRun{RepoURL: "https://github.com/o/r.git", Ref: "main", Pipeline: testPipeline}, nil); w.Code != http.StatusAccepted {
 		t.Fatalf("seed submit = %d: %s", w.Code, w.Body.String())
 	}
@@ -294,7 +294,7 @@ func TestSeamRandRunnerPayloadUploads(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		c := newTestClient(t, s.Handler(), "secret")
+		c := newTestClientForServer(t, s, "secret")
 		_, jobID, runnerID, token, gen := leaseNativeJob(t, c, testPipeline)
 		headers := map[string]string{
 			"X-Kiwi-Runner-ID":        runnerID,
@@ -321,7 +321,7 @@ func TestSeamRandRunnerPayloadUploads(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		c := newTestClient(t, s.Handler(), "secret")
+		c := newTestClientForServer(t, s, "secret")
 		_, jobID, runnerID, token, gen := leaseNativeJob(t, c, testPipeline)
 		restore := seamRand(t, seamErrReader{})
 		defer restore()
@@ -341,7 +341,7 @@ func TestSeamRandWebLoginFailsClosed(t *testing.T) {
 	// generating (and panicking on) the key, so the request reaches the
 	// session-token mint under test.
 	s.WebSessionSecret = make([]byte, 32)
-	c := newTestClient(t, s.Handler(), "")
+	c := newTestClientForServer(t, s, "")
 	restore := seamRand(t, seamErrReader{})
 	defer restore()
 	if w := c.do(http.MethodPost, "/api/v1/login", map[string]string{"token": "secret"}, nil); w.Code != http.StatusInternalServerError {
@@ -354,7 +354,7 @@ func TestSeamRandWebLoginFailsClosed(t *testing.T) {
 func TestSeamRandOIDCIssuance(t *testing.T) {
 	s := newOIDCTestServer(t, true)
 	_, jobID := seedOIDCJob(t, s, "lease-1")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	// Initialize the signer while entropy still works.
 	if got := issueOIDCToken(t, s, jobID, "lease-1", "https://audience.example"); got == "" {
 		t.Fatal("seed OIDC token empty")

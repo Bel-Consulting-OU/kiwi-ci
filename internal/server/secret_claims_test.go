@@ -53,7 +53,7 @@ func dbSecretServer(t *testing.T, f *dbFakeStore) *Server {
 func TestIssueSecretDBModeConcurrentSingleDelivery(t *testing.T) {
 	f := newDBFakeStore()
 	s := dbSecretServer(t, f)
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	jobID, runnerID, token, gen := seedDBSecretJob(t, f, s, []string{"tok"})
 	_, pubB64 := ephemeralKey(t)
 	req := SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pubB64}
@@ -114,7 +114,7 @@ func TestIssueSecretDBModeConcurrentSingleDelivery(t *testing.T) {
 func TestIssueSecretDBModeClaimErrorFailsClosed(t *testing.T) {
 	f := newDBFakeStore()
 	s := dbSecretServer(t, f)
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	jobID, runnerID, token, gen := seedDBSecretJob(t, f, s, []string{"tok"})
 	f.mu.Lock()
 	f.claimErr = errors.New("claim: injected failure")
@@ -135,7 +135,7 @@ func TestIssueSecretDBModeClaimErrorFailsClosed(t *testing.T) {
 func TestIssueSecretDBModeClaimSurvivesRestart(t *testing.T) {
 	f := newDBFakeStore()
 	s1 := dbSecretServer(t, f)
-	c1 := newTestClient(t, s1.Handler(), "secret")
+	c1 := newTestClientForServer(t, s1, "secret")
 	jobID, runnerID, token, gen := seedDBSecretJob(t, f, s1, []string{"tok"})
 	_, pubB64 := ephemeralKey(t)
 	req := SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pubB64}
@@ -145,7 +145,7 @@ func TestIssueSecretDBModeClaimSurvivesRestart(t *testing.T) {
 
 	// "Restart": a fresh server instance on the same store.
 	s2 := dbSecretServer(t, f)
-	c2 := newTestClient(t, s2.Handler(), "secret")
+	c2 := newTestClientForServer(t, s2, "secret")
 	_, pubB64 = ephemeralKey(t)
 	req.EphemeralPublic = pubB64
 	if w := issue(t, c2, jobID, req); w.Code != http.StatusConflict {
@@ -164,7 +164,7 @@ func TestIssueSecretMemoryReceiptPersistenceFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.SecretBroker = secretbroker.StaticBroker{"tok": "v"}
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	jobID, runnerID, token, gen := seedJob(t, s, true, []string{"tok"})
 	// Replace the receipts file path with a directory so the atomic write
 	// fails.

@@ -38,7 +38,7 @@ jobs:
 
 func TestRegionFiltering(t *testing.T) {
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	w := c.do(http.MethodPost, "/api/v1/runs", SubmitRun{RepoURL: "https://github.com/kiwi/repo.git", Ref: "main", Pipeline: regionPipeline}, nil)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("submit: %d %s", w.Code, w.Body.String())
@@ -80,7 +80,7 @@ func TestRegionFiltering(t *testing.T) {
 
 func TestRunnerDrainDisableEnable(t *testing.T) {
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	w := c.do(http.MethodPost, "/api/v1/runs", SubmitRun{RepoURL: "https://github.com/kiwi/repo.git", Ref: "main", Pipeline: testPipeline}, nil)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("submit: %d %s", w.Code, w.Body.String())
@@ -171,14 +171,14 @@ func TestRunnerDrainDisableEnable(t *testing.T) {
 func TestRunnerAdminAuth(t *testing.T) {
 	s := New("secret")
 	s.AdminToken = "admin"
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	// The runner token must not drain/disable runners.
 	w := c.do(http.MethodPost, "/api/v1/runners/whatever/drain", nil, nil)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("runner token passed admin gate: %d", w.Code)
 	}
 	// The admin token may.
-	cAdmin := newTestClient(t, s.Handler(), "admin")
+	cAdmin := newTestClientForServer(t, s, "admin")
 	w = cAdmin.do(http.MethodPost, "/api/v1/runners/whatever/drain", nil, nil)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("admin drain on unknown runner: %d %s", w.Code, w.Body.String())
@@ -187,7 +187,7 @@ func TestRunnerAdminAuth(t *testing.T) {
 
 func TestRunnerSelfDrainRegistration(t *testing.T) {
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	// A runner registering with draining=true stays draining across
 	// re-registration (kiwi runner --drain semantics).
 	id := registerRunner(t, c, "drainer", map[string]any{"draining": true})

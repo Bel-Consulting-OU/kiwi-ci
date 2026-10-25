@@ -562,7 +562,7 @@ func TestSecretReceiptDirSyncFailureRetainsReceipt(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.SecretBroker = secretbroker.StaticBroker{"tok": "v"}
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	jobID, runnerID, token, gen := seedJob(t, s, true, []string{"tok"})
 	_, pubB64 := ephemeralKey(t)
 

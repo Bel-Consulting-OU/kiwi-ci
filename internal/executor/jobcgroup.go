@@ -161,18 +161,27 @@ func jobCgroupEnvelopeSummary(req jobCgroupRequest) string {
 var materializeCgroupControls = func(string) error { return nil }
 
 // createJobCgroupUnder creates the job cgroup directory under base (which the
-// caller must have verified is a delegated cgroup directory), enables the
-// required controllers for the container child cgroups docker creates
-// underneath, writes the limit files, and returns the directory plus a
-// cleanup that removes it and any per-container child cgroups docker left
-// behind. The cleanup is idempotent and never panics; a failed write removes
-// the just-created directory before returning.
+// caller must have verified is a delegated cgroup directory), optionally
+// enables controllers for container child cgroups docker creates underneath,
+// writes the limit files, and returns the directory plus a cleanup.
 //
-// Enabling the controllers in the job cgroup's own cgroup.subtree_control is
-// what makes docker's per-container cgroups (created below the parent) carry
-// cpu/memory/pids control files; the cgroup-v2 rule only forbids enabling a
-// controller on a cgroup that has processes of its own, and the just-created
-// job cgroup is empty.
+// Two layouts share this helper:
+//
+//   - Container jobs pass non-empty controllers: enabling them in the job
+//     cgroup's OWN cgroup.subtree_control is what makes docker's per-container
+//     child cgroups carry cpu/memory/pids files. The job cgroup itself stays
+//     empty of processes (containers live in children), so the cgroup-v2
+//     no-internal-process rule is satisfied.
+//   - Native-only jobs (NativeOnly) pass nil controllers: processes are
+//     placed DIRECTLY in this cgroup (clone-into-cgroup / addPID). Enabling
+//     domain controllers in a cgroup that also contains processes violates
+//     the no-internal-process constraint, so subtree_control stays empty.
+//     Limits (cpu.max, memory.max, pids.max) still apply to this leaf — they
+//     are inherited from the parent's delegation, not from this cgroup's own
+//     subtree_control.
+//
+// The cleanup is idempotent and never panics; a failed write removes the
+// just-created directory before returning.
 func createJobCgroupUnder(base, name string, controllers []string, limits []cgroupLimit) (string, func() error, error) {
 	dir := filepath.Join(base, name)
 	if err := os.Mkdir(dir, 0o755); err != nil {

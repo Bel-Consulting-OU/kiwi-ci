@@ -328,7 +328,7 @@ func TestEventsFSBestEffortCanonicalFalse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := newTestClient(t, s.Handler(), "token")
+	c := newTestClientForServer(t, s, "token")
 	_, _, _, _, _ = leaseJob(t, c)
 
 	w := doJSON(t, s, http.MethodGet, "/api/v1/events?limit=1000", "token", "")

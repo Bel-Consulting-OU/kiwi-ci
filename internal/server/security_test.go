@@ -24,10 +24,21 @@ type testClient struct {
 	t     *testing.T
 	h     http.Handler
 	token string
+	// srv, when set, lets complete requests inject the job's execution
+	// semantics for fixtures that omit the field (see
+	// maybeInjectCompleteSemantics).
+	srv *Server
 }
 
 func newTestClient(t *testing.T, h http.Handler, token string) *testClient {
 	return &testClient{t: t, h: h, token: token}
+}
+
+// newTestClientForServer is like newTestClient and also wires the server so
+// /complete requests get the stamped job's execution_semantics injected when
+// the fixture omits it.
+func newTestClientForServer(t *testing.T, s *Server, token string) *testClient {
+	return &testClient{t: t, h: s.Handler(), token: token, srv: s}
 }
 
 func (c *testClient) do(method, path string, body any, headers map[string]string) *httptest.ResponseRecorder {
@@ -37,11 +48,17 @@ func (c *testClient) do(method, path string, body any, headers map[string]string
 	case nil:
 		rd = bytes.NewReader(nil)
 	case []byte:
+		if c.srv != nil {
+			b = []byte(maybeInjectCompleteSemantics(c.srv, path, string(b)))
+		}
 		rd = bytes.NewReader(b)
 	default:
 		raw, err := json.Marshal(b)
 		if err != nil {
 			c.t.Fatal(err)
+		}
+		if c.srv != nil {
+			raw = []byte(maybeInjectCompleteSemantics(c.srv, path, string(raw)))
 		}
 		rd = bytes.NewReader(raw)
 	}
@@ -99,7 +116,7 @@ func TestCancelledJobLeaseRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	runID, jobID, runnerID, token, gen := leaseJob(t, c)
 
 	// Sanity: a running lease authorizes log uploads.
@@ -143,7 +160,7 @@ func TestCancelledJobLeaseRejected(t *testing.T) {
 
 func TestCompletionReceiptIdempotency(t *testing.T) {
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	_, jobID, runnerID, token, gen := leaseJob(t, c)
 
 	payload := Complete{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Status: "success"}
@@ -176,7 +193,7 @@ func TestCompletionReceiptIdempotency(t *testing.T) {
 
 func TestStaleGenerationRejected(t *testing.T) {
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	_, jobID, runnerID, token, gen := leaseJob(t, c)
 
 	w := c.do(http.MethodPost, "/api/v1/jobs/"+jobID+"/heartbeat", Heartbeat{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen + 1}, nil)
@@ -196,7 +213,7 @@ func TestLeaseSurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := newTestClient(t, s1.Handler(), "secret")
+	c := newTestClientForServer(t, s1, "secret")
 	_, jobID, runnerID, token, gen := leaseJob(t, c)
 	// Sanity: the task response never carries the persisted hash.
 	s1.mu.Lock()
@@ -235,7 +252,7 @@ func TestLeaseSurvivesRestart(t *testing.T) {
 	}
 
 	// The reloaded server still authorizes the lease (key was persisted).
-	c2 := newTestClient(t, s2.Handler(), "secret")
+	c2 := newTestClientForServer(t, s2, "secret")
 	w := c2.do(http.MethodPost, "/api/v1/jobs/"+jobID+"/heartbeat", Heartbeat{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen}, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("heartbeat after restart: %d %s", w.Code, w.Body.String())
@@ -244,7 +261,7 @@ func TestLeaseSurvivesRestart(t *testing.T) {
 
 func TestExpiredLeaseRequeued(t *testing.T) {
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	_, jobID, _, _, _ := leaseJob(t, c)
 	s.mu.Lock()
 	j := s.jobs[jobID]
@@ -268,7 +285,7 @@ func TestExpiredLeaseRequeued(t *testing.T) {
 
 func TestDecodeRejectsTrailingData(t *testing.T) {
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	body := `{"repo_url":"https://github.com/kiwi/repo.git","ref":"main","pipeline":"` + testPipeline + `"}{"extra":true}`
 	w := c.do(http.MethodPost, "/api/v1/runs", []byte(body), nil)
 	if w.Code != http.StatusBadRequest {
@@ -278,7 +295,7 @@ func TestDecodeRejectsTrailingData(t *testing.T) {
 
 func TestLogBodyLimits(t *testing.T) {
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	_, jobID, runnerID, token, gen := leaseJob(t, c)
 	// Oversized line is rejected before any lease work.
 	huge := strings.Repeat("x", 1<<20+1)
@@ -295,7 +312,7 @@ func TestLogBodyLimits(t *testing.T) {
 
 func TestCompleteErrorLimit(t *testing.T) {
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	_, jobID, runnerID, token, gen := leaseJob(t, c)
 	w := c.do(http.MethodPost, "/api/v1/jobs/"+jobID+"/complete", Complete{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Status: "failure", Error: strings.Repeat("e", 64<<10+1)}, nil)
 	if w.Code != http.StatusBadRequest {
@@ -305,7 +322,7 @@ func TestCompleteErrorLimit(t *testing.T) {
 
 func TestRequestIDMiddleware(t *testing.T) {
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	w := c.do(http.MethodGet, "/api/v1/runs", nil, map[string]string{"X-Kiwi-Request-ID": "abc-123_XYZ.9"})
 	if got := w.Header().Get("X-Kiwi-Request-ID"); got != "abc-123_XYZ.9" {
 		t.Fatalf("valid request id not echoed: %q", got)

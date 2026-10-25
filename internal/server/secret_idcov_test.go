@@ -90,7 +90,7 @@ func TestIDCovLoadSecretReceiptsPaths(t *testing.T) {
 // TestIDCovIssueSecretBadJSON covers the decode guard.
 func TestIDCovIssueSecretBadJSON(t *testing.T) {
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	if w := c.do(http.MethodPost, "/api/v1/jobs/j1/secrets", nil, nil); w.Code != http.StatusBadRequest {
 		t.Fatalf("empty body = %d, want 400", w.Code)
 	}
@@ -109,7 +109,7 @@ func TestIDCovIssueSecretUnsupportedClaimStore(t *testing.T) {
 	s.DB = idcovStoreOnly{Store: f}
 	jobID, runnerID, token, gen := idcovSeedDBJob(t, s, f, "job-503", "run-503", true, []string{"tok"})
 	_, pubB64 := ephemeralKey(t)
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	w := issue(t, c, jobID, SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pubB64})
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("unsupported claim store = %d, want 503: %s", w.Code, w.Body.String())
@@ -300,7 +300,7 @@ func TestIDCovIssueSecretDBClaimConflict(t *testing.T) {
 	}
 	s.SecretBroker = secretbroker.StaticBroker{"tok": "v"}
 	jobID, runnerID, token, gen := idcovSeedDBJob(t, s, f, "job-db-1", "run-db-1", true, []string{"tok"})
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	_, pubB64 := ephemeralKey(t)
 	req := SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pubB64}
 	if w := issue(t, c, jobID, req); w.Code != http.StatusOK {

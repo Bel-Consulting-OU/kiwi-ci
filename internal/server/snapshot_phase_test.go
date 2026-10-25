@@ -41,7 +41,7 @@ func TestSnapshotUploadPhaseRoundTripMemory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	runID, jobID, runnerID, token, gen := leaseNativeJob(t, c, testPipeline)
 
 	if rec := uploadSnapshotPhaseMemory(t, s, c, jobID, runnerID, token, gen, ""); rec.Phase != model.SnapshotPhasePostJob {

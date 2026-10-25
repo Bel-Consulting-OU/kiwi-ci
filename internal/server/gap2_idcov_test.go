@@ -570,7 +570,7 @@ func TestIDCovGetRunAndListJobsDBBranches(t *testing.T) {
 	if err := scoped.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
-	c := newTestClient(t, scoped.Handler(), "read-token")
+	c := newTestClientForServer(t, scoped, "read-token")
 	if w := c.do(http.MethodGet, "/api/v1/runs/r1", nil, nil); w.Code != http.StatusNotFound {
 		t.Fatalf("scoped-out getRun = %d, want masked 404", w.Code)
 	}
@@ -730,14 +730,14 @@ func TestIDCovRunnerAdminForbiddenAndMemory(t *testing.T) {
 	restricted := storeServer(t, "", map[string]auth.Principal{
 		"read-token": {Subject: "reader", Roles: []auth.Role{auth.RoleRead}},
 	})
-	c := newTestClient(t, restricted.Handler(), "read-token")
+	c := newTestClientForServer(t, restricted, "read-token")
 	for _, path := range []string{"/api/v1/runners/r1/drain", "/api/v1/runners/r1/disable", "/api/v1/runners/r1/enable"} {
 		if w := c.do(http.MethodPost, path, map[string]any{}, nil); w.Code != http.StatusForbidden {
 			t.Fatalf("%s without runner_manage = %d, want 403", path, w.Code)
 		}
 	}
 	noRole := storeServer(t, "", map[string]auth.Principal{"none-token": {Subject: "none"}})
-	if w := newTestClient(t, noRole.Handler(), "none-token").do(http.MethodGet, "/api/v1/runners/serving", nil, nil); w.Code != http.StatusForbidden {
+	if w := newTestClientForServer(t, noRole, "none-token").do(http.MethodGet, "/api/v1/runners/serving", nil, nil); w.Code != http.StatusForbidden {
 		t.Fatalf("serving without any role = %d, want 403", w.Code)
 	}
 
@@ -865,7 +865,7 @@ func TestIDCovApproveForbidden(t *testing.T) {
 	restricted.jobs["job-a"] = model.Job{ID: "job-a", RunID: "run-a", Key: "deploy", Status: model.StatusWaitingApproval, ApprovalRequired: true}
 	restricted.runs["run-a"] = model.Run{ID: "run-a", Status: model.StatusRunning}
 	restricted.mu.Unlock()
-	c := newTestClient(t, restricted.Handler(), "read-token")
+	c := newTestClientForServer(t, restricted, "read-token")
 	if w := c.do(http.MethodPost, "/api/v1/jobs/job-a/approve", map[string]any{}, nil); w.Code != http.StatusForbidden {
 		t.Fatalf("approve without approve role = %d, want 403", w.Code)
 	}

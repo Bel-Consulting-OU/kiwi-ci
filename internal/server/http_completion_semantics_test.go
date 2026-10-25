@@ -31,9 +31,9 @@ func TestHTTPCompletionSemanticsMismatch409(t *testing.T) {
 		body := map[string]any{
 			"runner_id": runnerID, "lease_token": task.LeaseToken,
 			"lease_generation": task.LeaseGeneration, "status": "success",
-		}
-		if sem != "" {
-			body["execution_semantics"] = sem
+			// Always present: "" means explicit omission (409 on stamped jobs);
+			// doJSON's test injector must NOT fill an explicit empty value.
+			"execution_semantics": sem,
 		}
 		raw, _ := json.Marshal(body)
 		w := doJSON(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/complete", "token", string(raw))
@@ -53,6 +53,12 @@ func TestHTTPCompletionSemanticsMismatch409(t *testing.T) {
 	}
 	if j.ObservedExecutionSemantics != "" {
 		t.Fatalf("mismatch completion wrote observed stamp %q", j.ObservedExecutionSemantics)
+	}
+
+	// Omission on a STAMPED job → 409 (no inference from the job stamp;
+	// a pre-gate lease could be a v2 interpreter omitting the field).
+	if got := post(""); *got != http.StatusConflict {
+		t.Fatalf("omitted completion on stamped job = %d, want 409", *got)
 	}
 
 	// Matching stamp → 204 and durable observed evidence.
@@ -104,10 +110,23 @@ func TestHTTPCompletionReplaySemanticsMismatch409(t *testing.T) {
 		t.Fatalf("replay mismatch = %d, want 409 (%s)", w.Code, w.Body.String())
 	}
 
-	// Replay with the same stamp (or omission) is still an idempotent ack.
+	// Replay OMITTING the stamp on a stamped job is also refused (no fill).
+	// Explicit empty key so the test injector does not backfill it.
+	omitBody, _ := json.Marshal(map[string]any{
+		"runner_id": runnerID, "lease_token": task.LeaseToken,
+		"lease_generation": task.LeaseGeneration, "status": "success",
+		"execution_semantics": "",
+	})
+	w = doJSON(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/complete", "token", string(omitBody))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("replay omission on stamped job = %d, want 409 (%s)", w.Code, w.Body.String())
+	}
+
+	// Replay with the SAME stamp is still an idempotent ack.
 	goodReplay, _ := json.Marshal(map[string]any{
 		"runner_id": runnerID, "lease_token": task.LeaseToken,
 		"lease_generation": task.LeaseGeneration, "status": "success",
+		"execution_semantics": task.Job.ExecutionSemantics,
 	})
 	w = doJSON(t, s, http.MethodPost, "/api/v1/jobs/"+task.Job.ID+"/complete", "token", string(goodReplay))
 	if w.Code != http.StatusNoContent {

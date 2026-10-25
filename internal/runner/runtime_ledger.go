@@ -294,13 +294,11 @@ func (r *Runner) reconcileRuntimeLedger(runInstanceID string) (ledgerReconcileRe
 		if entry.Instance == runInstanceID {
 			continue
 		}
-		// Native sidecars first: orphaned host processes must die before
-		// we drop the record that knows their PID/start identity.
-		if err := reclaimNativeServices(entry.NativeServices); err != nil {
-			res.Pending++
-			res.Errors = append(res.Errors, fmt.Errorf("reclaim native services (%s): %w", f.Name(), err))
-			continue
-		}
+		// Durable cgroup FIRST: it is the kernel-owned identity for every
+		// process of the job (main + native services). cgroup.kill terminates
+		// the whole tree without any numerical PID/PGID guesswork. Numeric
+		// native reclaim runs ONLY when no cgroup was recorded, so a recycled
+		// PGID can never be killed under a durable-cgroup job.
 		if entry.Cgroup != "" {
 			// The containers were proven gone by runtime reconciliation, so
 			// the job-scoped parent cgroup should be empty; a failure keeps
@@ -308,6 +306,14 @@ func (r *Runner) reconcileRuntimeLedger(runInstanceID string) (ledgerReconcileRe
 			if err := reclaimJobCgroup(entry.Cgroup); err != nil {
 				res.Pending++
 				res.Errors = append(res.Errors, fmt.Errorf("reclaim cgroup %s (%s): %w", entry.Cgroup, f.Name(), err))
+				continue
+			}
+		} else if len(entry.NativeServices) > 0 {
+			// No durable cgroup: numeric fallback with ownership proofs only
+			// (see reclaimNativeServices).
+			if err := reclaimNativeServices(entry.NativeServices); err != nil {
+				res.Pending++
+				res.Errors = append(res.Errors, fmt.Errorf("reclaim native services (%s): %w", f.Name(), err))
 				continue
 			}
 		}

@@ -8,38 +8,41 @@ import (
 	"testing"
 )
 
-// TestClaimNativePortCrossProcessFile: the durable lock file rejects a
-// second claim of the same port even when the in-memory map is empty
-// (the separate-runner-process gap).
+// TestClaimNativePortCrossProcessFile: an exclusive lock held by a LIVE
+// foreign claimant refuses a second claim; a stale (unlocked) file is
+// reclaimed. The lock, not the file content, is the ownership primitive.
 func TestClaimNativePortCrossProcessFile(t *testing.T) {
-	// Isolate the claim directory for this test.
 	dir := t.TempDir()
 	orig := nativePortClaimDir
 	nativePortClaimDir = func() string { return dir }
 	t.Cleanup(func() {
 		nativePortClaimDir = orig
 		releaseNativePort(64999)
+		// Extra cleanup of any handle left by the foreign lock simulation.
+		if f, ok := portClaimHandles[64999]; ok {
+			_ = f.Close()
+			delete(portClaimHandles, 64999)
+		}
 	})
-	// Simulate a FOREIGN live process holding the lock.
 	path := filepath.Join(dir, "64999.lock")
-	// Use our own PID so processAlive is true (a live foreign owner).
-	if err := os.WriteFile(path, []byte(fmt.Sprintf("pid=%d\nowner=other-runner\n", os.Getpid())), 0o644); err != nil {
-		t.Fatal(err)
+
+	// Foreign live claimant HOLDS the exclusive lock (simulated in-process).
+	foreign, err := lockPortClaimFile(path, []byte(fmt.Sprintf("pid=%d\nowner=other-runner\n", os.Getpid())))
+	if err != nil {
+		t.Fatalf("foreign lock: %v", err)
 	}
-	// Clear any in-memory claim so only the file gate can refuse.
+	// Clear any in-memory claim so only the cross-process lock can refuse.
 	nativePortClaims.Lock()
 	delete(nativePortClaims.byPort, 64999)
 	nativePortClaims.Unlock()
-	err := claimNativePort(64999, "job/redis")
-	if err == nil {
-		t.Fatal("second process must not claim a live foreign lock")
+	if err := claimNativePort(64999, "job/redis"); err == nil {
+		_ = foreign.Close()
+		t.Fatal("second claim must not succeed while a live foreign lock is held")
 	}
-	// Dead-owner lock is reclaimed.
-	if err := os.WriteFile(path, []byte("pid=999999999\nowner=dead-runner\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	// Release the foreign lock: the same file becomes reclaimable.
+	_ = foreign.Close()
 	if err := claimNativePort(64999, "job/redis"); err != nil {
-		t.Fatalf("stale lock must be reclaimed: %v", err)
+		t.Fatalf("unlocked (stale) claim must succeed: %v", err)
 	}
 	releaseNativePort(64999)
 }

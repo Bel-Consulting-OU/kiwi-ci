@@ -230,7 +230,7 @@ func TestEventsFSLifecycleParity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := newTestClient(t, s.Handler(), "token")
+	c := newTestClientForServer(t, s, "token")
 
 	runID, jobID, runnerID, leaseToken, generation := leaseJob(t, c)
 	w := c.do(http.MethodPost, "/api/v1/jobs/"+jobID+"/complete", Complete{
@@ -312,7 +312,7 @@ func TestEventsFSLifecycleParity(t *testing.T) {
 	if len(restored) != len(events) {
 		t.Fatalf("after restart = %d events, want %d", len(restored), len(events))
 	}
-	c2 := newTestClient(t, s2.Handler(), "token")
+	c2 := newTestClientForServer(t, s2, "token")
 	if w := c2.do(http.MethodPost, "/api/v1/runs", SubmitRun{RepoURL: "https://github.com/kiwi/repo.git", Ref: "main", Pipeline: testPipeline}, nil); w.Code != http.StatusAccepted {
 		t.Fatalf("post-restart submit = %d: %s", w.Code, w.Body.String())
 	}
@@ -340,7 +340,7 @@ func TestEventsAppendFailureSemantics(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(dir, "execution-events.jsonl"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	c := newTestClient(t, s.Handler(), "token")
+	c := newTestClientForServer(t, s, "token")
 
 	// Best-effort lease: the durable snapshot/audit path is unaffected, so
 	// the lease still succeeds.

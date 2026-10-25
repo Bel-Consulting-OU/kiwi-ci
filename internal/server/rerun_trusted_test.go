@@ -32,7 +32,7 @@ func rerunServer(t *testing.T) (*Server, model.Run) {
 
 func rerunAs(t *testing.T, s *Server, token, runID string) model.Run {
 	t.Helper()
-	c := newTestClient(t, s.Handler(), token)
+	c := newTestClientForServer(t, s, token)
 	w := c.do(http.MethodPost, "/api/v1/runs/"+runID+"/rerun", nil, nil)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("rerun = %d: %s", w.Code, w.Body.String())

@@ -178,17 +178,16 @@ func (*NativeBackend) Run(ctx context.Context, c Command, emit func(string)) err
 	}
 	shell = resolved
 	// Prefer clone-into-cgroup (Linux): the step is born inside the durable
-	// job cgroup. On platforms without UseCgroupFD this is a no-op beyond
-	// Setpgid; the post-Start addPID remains the fallback.
+	// job cgroup. When a durable cgroup is recorded, arming or starting with
+	// UseCgroupFD must succeed — we fail closed rather than run outside the
+	// ownership boundary (see below).
 	//
 	// Go forbids a second cmd.Start() even after a failed first call
-	// (startCalled is set unconditionally). A UseCgroupFD failure (kernel
-	// < 5.7, bad FD) therefore must rebuild a FRESH command rather than
-	// retry the same *exec.Cmd — otherwise every cgroup-attached native
-	// step would die with "exec: already started".
+	// (startCalled is set unconditionally), so there is no "retry without
+	// the cgroup" path by design.
 	closeCgroupFD := func() {}
-	// Deferred close reads the VARIABLE at return time, so a fallback can
-	// reassign it to a no-op after the FD is already released.
+	// Deferred close reads the VARIABLE at return time so an explicit close
+	// below can reassign it to a no-op without double-closing.
 	defer func() { closeCgroupFD() }()
 	newCmd := func() *exec.Cmd {
 		cmd := exec.Command(shell, args...)
@@ -200,10 +199,12 @@ func (*NativeBackend) Run(ctx context.Context, c Command, emit func(string)) err
 	if c.CgroupParent != "" {
 		cl, err := configureProcessCgroup(cmd, c.CgroupParent)
 		if err != nil {
-			configureProcess(cmd)
-		} else {
-			closeCgroupFD = cl
+			// A durable job cgroup was established but clone-into-cgroup
+			// could not be armed: fail closed rather than run the step
+			// outside the ownership boundary the ledger already recorded.
+			return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("arm clone-into-cgroup for %s: %w", c.CgroupParent, err)}
 		}
+		closeCgroupFD = cl
 	} else {
 		configureProcess(cmd)
 	}
@@ -215,10 +216,12 @@ func (*NativeBackend) Run(ctx context.Context, c Command, emit func(string)) err
 	// copies right after Start so the drains see EOF when the child exits.
 	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
+		closeCgroupFD()
 		return &RunError{Kind: ErrorInfra, Err: err}
 	}
 	stderrR, stderrW, err := os.Pipe()
 	if err != nil {
+		closeCgroupFD()
 		stdoutR.Close()
 		stdoutW.Close()
 		return &RunError{Kind: ErrorInfra, Err: err}
@@ -227,18 +230,17 @@ func (*NativeBackend) Run(ctx context.Context, c Command, emit func(string)) err
 	cmd.Stderr = stderrW
 	usedCgroupFD := cgroupFDActive(cmd)
 	started := cmd.Start()
+	closeCgroupFD()
+	closeCgroupFD = func() {}
 	if started != nil && usedCgroupFD {
-		// Kernel rejected clone-into-cgroup: release the FD and start a
-		// FRESH command (Start is single-shot) with Setpgid only; the
-		// post-Start addPID below migrates the child.
-		closeCgroupFD()
-		closeCgroupFD = func() {}
-		cmd = newCmd()
-		configureProcess(cmd)
-		cmd.Stdout = stdoutW
-		cmd.Stderr = stderrW
-		usedCgroupFD = false
-		started = cmd.Start()
+		// Clone-into-cgroup was armed (durable cgroup exists) but the kernel
+		// rejected it: fail closed. Running outside the cgroup would break
+		// the ownership invariant the ledger recorded before any user code.
+		stdoutR.Close()
+		stdoutW.Close()
+		stderrR.Close()
+		stderrW.Close()
+		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("clone-into-cgroup start for %s: %w (refusing to run outside the durable job cgroup)", c.CgroupParent, started)}
 	}
 	if started != nil {
 		stdoutR.Close()
@@ -247,14 +249,13 @@ func (*NativeBackend) Run(ctx context.Context, c Command, emit func(string)) err
 		stderrW.Close()
 		return &RunError{Kind: ErrorInfra, Err: started}
 	}
-	// Durable ownership: when clone-into-cgroup was unavailable, migrate
-	// after Start. When it succeeded the process is already inside the
-	// recorded cgroup; addPID is a redundant confirm and a failure here
-	// (process already gone) must not tear down a correct spawn.
+	// Fallback addPID (no UseCgroupFD): migrate BEFORE any supervision or
+	// logging work so ownership is established before user code can run.
 	if c.CgroupParent != "" && cmd.Process != nil && !usedCgroupFD {
 		if err := addPIDToJobCgroup(c.CgroupParent, cmd.Process.Pid); err != nil {
 			_ = terminateProcess(cmd)
 			_ = killProcess(cmd)
+			_ = reapKilledCommand(cmd, killGrace)
 			stdoutR.Close()
 			stdoutW.Close()
 			stderrR.Close()

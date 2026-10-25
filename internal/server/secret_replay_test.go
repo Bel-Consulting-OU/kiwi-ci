@@ -39,7 +39,7 @@ func TestSecretRetrySameKeyReplaysMemory(t *testing.T) {
 	s := New("secret")
 	broker := &countingBroker{}
 	s.SecretBroker = broker
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	jobID, runnerID, token, gen := seedJob(t, s, true, []string{"tok"})
 	_, pubB64 := ephemeralKey(t)
 	req := SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pubB64}
@@ -73,7 +73,7 @@ func TestSecretRetryDifferentKeyConflictsMemory(t *testing.T) {
 	s := New("secret")
 	broker := &countingBroker{}
 	s.SecretBroker = broker
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	jobID, runnerID, token, gen := seedJob(t, s, true, []string{"tok"})
 	_, pubB64 := ephemeralKey(t)
 	req := SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pubB64}
@@ -106,7 +106,7 @@ func TestSecretRetrySameKeyReplaysAfterJournalRestart(t *testing.T) {
 	s := New("secret")
 	s.dataDir = dir
 	s.SecretBroker = secretbroker.StaticBroker{"tok": value}
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	jobID, runnerID, token, gen := seedJob(t, s, true, []string{"tok"})
 	_, pubB64 := ephemeralKey(t)
 	req := SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pubB64}
@@ -172,7 +172,7 @@ func TestSecretRetrySameKeyReplaysAfterJournalRestart(t *testing.T) {
 		t.Fatalf("reseeded job identity changed: %s/%d -> %s/%d", jobID, gen, jobID2, gen2)
 	}
 	s2.SecretBroker = failingBroker{err: errors.New("broker must not be re-resolved for a replay")}
-	c2 := newTestClient(t, s2.Handler(), "secret")
+	c2 := newTestClientForServer(t, s2, "secret")
 	replay := issue(t, c2, jobID, SecretRequest{RunnerID: runnerID2, LeaseToken: token2, LeaseGeneration: gen2, Name: "tok", EphemeralPublic: pubB64})
 	if replay.Code != http.StatusOK {
 		t.Fatalf("post-restart same-key retry = %d, want 200: %s", replay.Code, replay.Body.String())
@@ -197,7 +197,7 @@ func TestSecretDBFakeSameKeyRetryReplays(t *testing.T) {
 	s := dbSecretServer(t, f)
 	broker := &countingBroker{}
 	s.SecretBroker = broker
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	jobID, runnerID, token, gen := seedDBSecretJob(t, f, s, []string{"tok"})
 	_, pubB64 := ephemeralKey(t)
 	req := SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pubB64}

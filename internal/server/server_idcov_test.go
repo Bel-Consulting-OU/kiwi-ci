@@ -358,7 +358,7 @@ func TestIDCovGetLogsEndpoints(t *testing.T) {
 	restricted.mu.Lock()
 	restricted.runs["run-4"] = model.Run{ID: "run-4", RepoID: "github.com/kiwi/repo", Repo: "https://github.com/kiwi/repo.git", RepoFullName: "kiwi/repo", Status: model.StatusRunning}
 	restricted.mu.Unlock()
-	c := newTestClient(t, restricted.Handler(), "read-token")
+	c := newTestClientForServer(t, restricted, "read-token")
 	if w := c.do(http.MethodGet, "/api/v1/runs/run-4/logs", nil, nil); w.Code != http.StatusNotFound {
 		t.Fatalf("scoped-out logs = %d, want masked 404", w.Code)
 	}
@@ -422,7 +422,7 @@ func TestIDCovListRunsScopedAndDBError(t *testing.T) {
 	if err := s.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
-	c := newTestClient(t, s.Handler(), "read-token")
+	c := newTestClientForServer(t, s, "read-token")
 	w := c.do(http.MethodGet, "/api/v1/runs", nil, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("scoped list = %d: %s", w.Code, w.Body.String())

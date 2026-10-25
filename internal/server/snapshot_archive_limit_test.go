@@ -37,7 +37,7 @@ func TestSnapshotUploadBodyLimitIsTheSharedArchiveBudget(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		c := newTestClient(t, s.Handler(), "secret")
+		c := newTestClientForServer(t, s, "secret")
 		_, jobID, runnerID, token, gen := leaseNativeJob(t, c, testPipeline)
 		headers := map[string]string{
 			"X-Kiwi-Runner-ID":        runnerID,
@@ -73,7 +73,7 @@ func TestSnapshotUploadBodyLimitIsTheSharedArchiveBudget(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		c := newTestClient(t, s.Handler(), "secret")
+		c := newTestClientForServer(t, s, "secret")
 		_, jobID, runnerID, token, gen := leaseNativeJob(t, c, testPipeline)
 		headers := map[string]string{
 			"X-Kiwi-Runner-ID":        runnerID,

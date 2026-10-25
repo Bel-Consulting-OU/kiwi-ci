@@ -62,14 +62,26 @@ type Manager struct {
 }
 
 // FrozenGit is the identity captured at freeze time from the source tree.
+//
+// Three states:
+//   - !Captured && !Unstable: not a repository (legacy empty).
+//   - Captured && !Unstable: atomic capture succeeded.
+//   - !Captured && Unstable: a repository exists but the atomic capture
+//     failed (HEAD moved mid-read). Freeze must retry and then fail;
+//     RunLocal must NEVER fall back to live Git after Freeze.
 type FrozenGit struct {
 	Captured     bool     `json:"captured"`
+	Unstable     bool     `json:"unstable,omitempty"`
 	SHA          string   `json:"sha,omitempty"`
 	Ref          string   `json:"ref,omitempty"`
 	Branch       string   `json:"branch,omitempty"`
 	ChangedFiles []string `json:"changed_files,omitempty"`
 	ChangedKnown bool     `json:"changed_known"`
 }
+
+// Unstable reports a Git repository whose identity could not be captured
+// atomically — distinct from "not a repository".
+func (g FrozenGit) CaptureFailed() bool { return g.Unstable && !g.Captured }
 
 // FrozenGitInfo returns the Git context captured at Freeze (zero if none).
 func (m *Manager) FrozenGitInfo() FrozenGit {
@@ -172,6 +184,10 @@ func (m *Manager) freezeLocked(ctx context.Context) error {
 	// Capture Git identity from the SOURCE before copying. Never use the
 	// copied .git later: a linked worktree's gitdir stays on the live repo.
 	m.git = captureFrozenGit(m.Source)
+	// Unstable capture (HEAD moved mid-read) forces the same one-retry
+	// transaction as a mutating source tree; after that we fail rather than
+	// let RunLocal fall back to live Git.
+	forceRetry := m.git.CaptureFailed()
 	base := filepath.Join(m.Root, "run-base")
 	// Freeze ALWAYS uses a plain working-tree copy (never the opt-in
 	// worktree strategy): run-base must match the developer's source
@@ -187,9 +203,10 @@ func (m *Manager) freezeLocked(ctx context.Context) error {
 		_ = os.RemoveAll(base)
 		return fmt.Errorf("run base: source re-manifest: %w", err)
 	}
-	if before != after {
-		// One retry: a transient editor write during the copy. After that,
-		// refuse a hybrid snapshot rather than invent a tree that never
+	if before != after || forceRetry {
+		// One retry: a transient editor write during the copy, or an
+		// unstable Git capture. After that, refuse a hybrid snapshot or an
+		// uncertified Git identity rather than inventing state that never
 		// existed.
 		_ = os.RemoveAll(base)
 		base = filepath.Join(m.Root, "run-base")
@@ -214,6 +231,13 @@ func (m *Manager) freezeLocked(ctx context.Context) error {
 			_ = os.RemoveAll(base)
 			return fmt.Errorf("run base: source tree changed during freeze (retry also unstable); re-run when the working tree is quiet")
 		}
+	}
+	// Git capture must be definitive: NotRepo or Captured — never Unstable.
+	// An unstable identity would force RunLocal back to live Git after the
+	// source snapshot, recreating the source/Git split.
+	if m.git.CaptureFailed() {
+		_ = os.RemoveAll(base)
+		return fmt.Errorf("run base: Git identity capture failed atomically (HEAD moved during freeze); re-run when the repository is quiet")
 	}
 	if err := verifyStagedTree(m.Source, entries, base, strategy); err != nil {
 		_ = os.RemoveAll(base)
@@ -913,25 +937,31 @@ func sanitizeJobIDBare(id string) string {
 // from dir (the SOURCE, before copy). known is false when git cannot
 // produce a trustworthy diff.
 //
+// Package-level var so tests can substitute an unstable capture and prove
+// Freeze refuses to fall back to live Git.
+var captureFrozenGit = captureFrozenGitSource
+
 // Atomicity: HEAD is sampled once and every subsequent command must still
 // resolve to that same SHA. On a linked worktree the administration
 // directory lives outside the freeze tree and can move mid-read; a
-// mismatched sample is treated as "not captured" rather than a hybrid of
-// two Git states.
-func captureFrozenGit(dir string) FrozenGit {
+// mismatched sample yields Unstable (not "not a repo"), which Freeze
+// treats as a hard failure after one retry.
+func captureFrozenGitSource(dir string) FrozenGit {
 	g := FrozenGit{}
 	if !gitRepo(context.Background(), dir) {
+		// Not a repository: leave Captured=false, Unstable=false.
 		return g
 	}
+	// Repository exists: any failure below is UNSTABLE, not "not a repo".
+	// Callers must not fall back to live Git on Unstable.
+	unstable := FrozenGit{Unstable: true}
 	headOut, err := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
 	if err != nil {
-		// Repo exists but HEAD is unreadable (empty, mid-rebase): refuse
-		// a partial capture.
-		return g
+		return unstable
 	}
 	head := strings.TrimSpace(string(headOut))
 	if head == "" {
-		return g
+		return unstable
 	}
 	g.Captured = true
 	g.SHA = head
@@ -946,18 +976,24 @@ func captureFrozenGit(dir string) FrozenGit {
 		g.Ref = head
 	}
 	if !sameHEAD() {
-		// HEAD moved between samples: abandon rather than mix states.
-		return FrozenGit{}
+		// HEAD moved between samples: unstable, never a hybrid of two states
+		// and never "not a repo" (which would send RunLocal to live Git).
+		return unstable
 	}
 	if out, err := exec.Command("git", "-C", dir, "symbolic-ref", "--short", "-q", "HEAD").Output(); err == nil {
 		g.Branch = strings.TrimSpace(string(out))
 	}
 	if !sameHEAD() {
-		return FrozenGit{}
+		return unstable
 	}
 	// Changed files: HEAD~1..HEAD like the local default, from SOURCE.
 	out, err := exec.Command("git", "-C", dir, "diff", "--name-only", "HEAD~1", "HEAD").Output()
-	if err != nil || !sameHEAD() {
+	if !sameHEAD() {
+		return unstable
+	}
+	if err != nil {
+		// HEAD is stable but the diff failed (no parent commit, etc.):
+		// identity is captured; only the change set is unknown.
 		g.ChangedKnown = false
 		g.ChangedFiles = nil
 		return g

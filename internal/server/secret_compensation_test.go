@@ -78,7 +78,7 @@ func TestSecretClaimReleaseOutlivesRequestCancellation(t *testing.T) {
 
 	// A fresh request with a healthy broker delivers the secret.
 	s.SecretBroker = secretbroker.StaticBroker{"tok": "v"}
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	_, pubB64 = ephemeralKey(t)
 	req.EphemeralPublic = pubB64
 	if w := issue(t, c, jobID, req); w.Code != http.StatusOK {

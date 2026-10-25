@@ -42,7 +42,7 @@ func TestSnapshotUploadStampsAttemptIdentityMemory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	runID, jobID, runnerID, token, gen := leaseNativeJob(t, c, testPipeline)
 	s.mu.Lock()
 	j := s.jobs[jobID]
@@ -171,7 +171,7 @@ func TestExportRunJobPipelineRequiresAdminMemory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	runID, jobID, _, _, _ := leaseNativeJob(t, c, testPipeline)
 	s.mu.Lock()
 	j := s.jobs[jobID]

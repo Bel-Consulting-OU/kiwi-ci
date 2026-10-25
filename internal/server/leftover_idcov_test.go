@@ -41,7 +41,7 @@ import (
 // rejects.
 func TestLeftoverResolvePipelineUnknownInputReference(t *testing.T) {
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	pipeline := `version: 1
 inputs:
   target: {type: string, default: prod}
@@ -412,7 +412,7 @@ func TestLeftoverRerunTrustedLegacyMode(t *testing.T) {
 		Ref: "main", Event: "push", Trusted: true, Status: model.StatusSuccess, CreatedAt: time.Now().UTC()}
 	s.jobs["job-trusted"] = model.Job{ID: "job-trusted", RunID: "run-trusted", Pipeline: testPipeline, Status: model.StatusSuccess}
 	s.mu.Unlock()
-	c := newTestClient(t, s.Handler(), "")
+	c := newTestClientForServer(t, s, "")
 	w := c.do(http.MethodPost, "/api/v1/runs/run-trusted/rerun", nil, nil)
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("legacy trusted rerun = %d: %s; want 202", w.Code, w.Body.String())
@@ -479,7 +479,7 @@ func TestLeftoverRerunScopedRunnerDenied(t *testing.T) {
 		{"db", repoScopedRunnerServerDB(t)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			c := newTestClient(t, tc.s.Handler(), "runner-tok")
+			c := newTestClientForServer(t, tc.s, "runner-tok")
 			if w := c.do(http.MethodPost, "/api/v1/runs/run-a/rerun", nil, nil); w.Code != http.StatusForbidden {
 				t.Fatalf("scoped rerun = %d: %s; want 403", w.Code, w.Body.String())
 			}
@@ -498,7 +498,7 @@ func TestLeftoverCancelScopedRunnerDenied(t *testing.T) {
 		{"db", repoScopedRunnerServerDB(t)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			c := newTestClient(t, tc.s.Handler(), "runner-tok")
+			c := newTestClientForServer(t, tc.s, "runner-tok")
 			if w := c.do(http.MethodPost, "/api/v1/runs/run-a/cancel", nil, nil); w.Code != http.StatusForbidden {
 				t.Fatalf("scoped cancel = %d: %s; want 403", w.Code, w.Body.String())
 			}
@@ -581,7 +581,7 @@ func hbBody() map[string]any {
 // different lease is a conflict.
 func TestLeftoverHeartbeatStaleMirror(t *testing.T) {
 	s := dbMirrorServer(t, nil)
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	if w := c.do(http.MethodPost, "/api/v1/jobs/job-x/heartbeat", hbBody(), nil); w.Code != http.StatusNotFound {
 		t.Fatalf("heartbeat with no mirror = %d; want 404", w.Code)
 	}
@@ -589,7 +589,7 @@ func TestLeftoverHeartbeatStaleMirror(t *testing.T) {
 	s = dbMirrorServer(t, func(*dbFakeStore) model.Job {
 		return model.Job{ID: "job-x", RunID: "run-x", Status: model.StatusCancelled}
 	})
-	c = newTestClient(t, s.Handler(), "secret")
+	c = newTestClientForServer(t, s, "secret")
 	w := c.do(http.MethodPost, "/api/v1/jobs/job-x/heartbeat", hbBody(), nil)
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "true") {
 		t.Fatalf("cancelled mirror heartbeat = %d: %s; want cancel response", w.Code, w.Body.String())
@@ -600,7 +600,7 @@ func TestLeftoverHeartbeatStaleMirror(t *testing.T) {
 		return model.Job{ID: "job-x", RunID: "run-x", Status: model.StatusRunning, LeaseRunnerID: "r-1",
 			LeaseTokenHash: hashLeaseToken(s.leaseKey, "different"), LeaseGeneration: 5, LeaseExpiresAt: &other}
 	})
-	c = newTestClient(t, s.Handler(), "secret")
+	c = newTestClientForServer(t, s, "secret")
 	if w := c.do(http.MethodPost, "/api/v1/jobs/job-x/heartbeat", hbBody(), nil); w.Code != http.StatusConflict {
 		t.Fatalf("stale mirror heartbeat = %d; want 409", w.Code)
 	}
@@ -616,7 +616,7 @@ func TestLeftoverCompleteStaleMirror(t *testing.T) {
 	body := map[string]any{"runner_id": "r-1", "lease_token": "lease-tok", "lease_generation": 5, "status": "success"}
 
 	s := dbMirrorServer(t, nil)
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	if w := c.do(http.MethodPost, "/api/v1/jobs/job-x/complete", body, nil); w.Code != http.StatusNotFound {
 		t.Fatalf("complete with no mirror = %d; want 404", w.Code)
 	}
@@ -624,7 +624,7 @@ func TestLeftoverCompleteStaleMirror(t *testing.T) {
 	s = dbMirrorServer(t, func(*dbFakeStore) model.Job {
 		return model.Job{ID: "job-x", RunID: "run-x", Status: model.StatusRunning}
 	})
-	c = newTestClient(t, s.Handler(), "secret")
+	c = newTestClientForServer(t, s, "secret")
 	if w := c.do(http.MethodPost, "/api/v1/jobs/job-x/complete", body, nil); w.Code != http.StatusConflict {
 		t.Fatalf("stale mirror complete = %d; want 409", w.Code)
 	}
@@ -636,7 +636,7 @@ func TestLeftoverCompleteStaleMirror(t *testing.T) {
 	s.mu.Lock()
 	s.completions[completionReceiptKey("job-x", 5, "r-1")] = model.CompletionReceipt{JobID: "job-x", Generation: 5, RunnerID: "r-1", ResultHash: hash}
 	s.mu.Unlock()
-	c = newTestClient(t, s.Handler(), "secret")
+	c = newTestClientForServer(t, s, "secret")
 	if w := c.do(http.MethodPost, "/api/v1/jobs/job-x/complete", body, nil); w.Code != http.StatusNoContent {
 		t.Fatalf("receipt replay = %d: %s; want 204", w.Code, w.Body.String())
 	}
@@ -652,7 +652,7 @@ func TestLeftoverCompleteStaleMirror(t *testing.T) {
 	f.mu.Lock()
 	f.getRunErr = errors.New("run read down")
 	f.mu.Unlock()
-	c = newTestClient(t, s.Handler(), "secret")
+	c = newTestClientForServer(t, s, "secret")
 	if w := c.do(http.MethodPost, "/api/v1/jobs/job-x/complete", body, nil); w.Code != http.StatusInternalServerError {
 		t.Fatalf("receipt replay with failing reconciliation = %d: %s; want 500", w.Code, w.Body.String())
 	}
@@ -663,7 +663,7 @@ func TestLeftoverCompleteStaleMirror(t *testing.T) {
 // in the runner next handler.
 func TestLeftoverNextSecondTokenEntropyFailure(t *testing.T) {
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	if w := c.do(http.MethodPost, "/api/v1/runs", SubmitRun{RepoURL: "https://github.com/o/r.git", Ref: "main", Pipeline: testPipeline}, nil); w.Code != http.StatusAccepted {
 		t.Fatalf("seed submit = %d: %s", w.Code, w.Body.String())
 	}

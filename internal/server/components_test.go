@@ -39,7 +39,7 @@ func TestComponentResolutionAtEnqueue(t *testing.T) {
 	s := New("secret")
 	s.ComponentRegistry = components.NewLocalRegistry()
 	s.ComponentRegistry.(*components.LocalRegistry).Register(spec)
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 
 	pipelineText := strings.Replace(componentPipeline, "PLACEHOLDER", digest, 1)
 	w := c.do(http.MethodPost, "/api/v1/runs", SubmitRun{RepoURL: "https://github.com/kiwi/repo.git", Ref: "main", Pipeline: pipelineText}, nil)
@@ -95,7 +95,7 @@ func TestComponentResolutionErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 
 	// No registry configured: component references are rejected.
 	w := c.do(http.MethodPost, "/api/v1/runs", SubmitRun{RepoURL: "https://github.com/kiwi/repo.git", Ref: "main", Pipeline: strings.Replace(componentPipeline, "PLACEHOLDER", digest, 1)}, nil)
@@ -138,7 +138,7 @@ jobs:
 
 func TestInputsValidationAndInjection(t *testing.T) {
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	pipelineText := `version: 1
 inputs:
   environment:

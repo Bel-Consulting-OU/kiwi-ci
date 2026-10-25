@@ -256,7 +256,7 @@ func TestE5OIDCIssuanceAuthenticatesBeforeSignerWork(t *testing.T) {
 				s.jobs["job-oidc"] = j
 				s.mu.Unlock()
 			}
-			cl := newTestClient(t, s.Handler(), c.token)
+			cl := newTestClientForServer(t, s, c.token)
 			w := cl.do(http.MethodPost, "/api/v1/jobs/"+c.jobID+"/oidc", map[string]any{"audience": c.audience}, nil)
 			if w.Code != c.want {
 				t.Fatalf("issuance = %d, want %d: %s", w.Code, c.want, w.Body.String())

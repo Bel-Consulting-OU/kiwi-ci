@@ -5094,18 +5094,24 @@ func (s *Server) logDBWrite(ctx context.Context, j model.Job, runnerID string, i
 	return ls.AppendLogForLease(ctx, j.ID, runnerID, in.LeaseGeneration, e)
 }
 
-// checkCompletionSemantics validates (and may fill) the observed interpreter
-// stamp on a completion. Returns the semantics to persist and whether to
-// continue.
+// checkCompletionSemantics validates the observed interpreter stamp on a
+// completion. Returns the semantics to persist and whether to continue.
+//
+// A STAMPED job requires the completion to carry an explicit, equal stamp.
+// Inferring the value from the job would erase the upgrade distinction: a
+// lease issued by a pre-gate build (8a6d34f) can complete a v3-stamped job
+// with a v2 interpreter while omitting the field, and substituting "v3"
+// would falsely certify that attempt. Current runners always send the
+// value, so requiring it costs nothing on the supported path.
+//
+// An UNSTAMPED (pre-stamp legacy) job accepts whatever the runner reports,
+// including nothing — there is no requested stamp to contradict.
 func checkCompletionSemantics(j model.Job, in Complete) (string, bool) {
 	if j.ExecutionSemantics == "" {
 		return in.ExecutionSemantics, true
 	}
 	if in.ExecutionSemantics == "" {
-		// Lease already proved the runner advertises this stamp; fill for
-		// the evidence record. A runner that never advertised support could
-		// not have been leased.
-		return j.ExecutionSemantics, true
+		return "", false
 	}
 	if in.ExecutionSemantics != j.ExecutionSemantics {
 		return "", false

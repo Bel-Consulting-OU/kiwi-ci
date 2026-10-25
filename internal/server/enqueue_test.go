@@ -106,7 +106,7 @@ func TestEnqueueStampsExecutionSemanticsDBFake(t *testing.T) {
 // digest derive from the effective (input-interpolated) compiled result.
 func TestEnqueueInterpolatesInputsIntoStoredPipeline(t *testing.T) {
 	s := New("token")
-	c := newTestClient(t, s.Handler(), "token")
+	c := newTestClientForServer(t, s, "token")
 	pipelineText := `version: 1
 inputs:
   environment:
@@ -193,7 +193,7 @@ func TestEnqueueStrictResolutionOnOriginalBytes(t *testing.T) {
 	reg.Register(cspec)
 	s := New("token")
 	s.ComponentRegistry = reg
-	c := newTestClient(t, s.Handler(), "token")
+	c := newTestClientForServer(t, s, "token")
 	submit := func(doc string) *httptest.ResponseRecorder {
 		return c.do(http.MethodPost, "/api/v1/runs", SubmitRun{RepoURL: "https://github.com/kiwi/repo.git", Ref: "main", Pipeline: doc}, nil)
 	}

@@ -50,7 +50,7 @@ func seedOIDCJob(t *testing.T, s *Server, leaseToken string) (runID, jobID strin
 
 func issueOIDCToken(t *testing.T, s *Server, jobID, leaseToken, audience string) string {
 	t.Helper()
-	c := newTestClient(t, s.Handler(), leaseToken)
+	c := newTestClientForServer(t, s, leaseToken)
 	w := c.do(http.MethodPost, "/api/v1/jobs/"+jobID+"/oidc", map[string]any{"audience": audience}, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("issue oidc: want 200 got %d: %s", w.Code, w.Body.String())
@@ -104,7 +104,7 @@ type jwk struct {
 
 func fetchJWKS(t *testing.T, s *Server) []jwk {
 	t.Helper()
-	c := newTestClient(t, s.Handler(), "")
+	c := newTestClientForServer(t, s, "")
 	w := c.do(http.MethodGet, "/api/v1/oidc/jwks", nil, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("jwks: want 200 got %d: %s", w.Code, w.Body.String())
@@ -287,7 +287,7 @@ func TestOIDCRetiredPreviousKeyRemovedFromJWKS(t *testing.T) {
 
 func TestOIDCJWKSETagAndCacheControl(t *testing.T) {
 	s := newOIDCTestServer(t, false)
-	c := newTestClient(t, s.Handler(), "")
+	c := newTestClientForServer(t, s, "")
 	w := c.do(http.MethodGet, "/api/v1/oidc/jwks", nil, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("jwks: want 200 got %d: %s", w.Code, w.Body.String())
@@ -314,7 +314,7 @@ func TestOIDCJWKSETagAndCacheControl(t *testing.T) {
 
 func TestOIDCConfigurationCacheControl(t *testing.T) {
 	s := newOIDCTestServer(t, false)
-	c := newTestClient(t, s.Handler(), "")
+	c := newTestClientForServer(t, s, "")
 	w := c.do(http.MethodGet, "/.well-known/openid-configuration", nil, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("configuration: want 200 got %d: %s", w.Code, w.Body.String())
@@ -336,7 +336,7 @@ func TestOIDCIssuanceAudited(t *testing.T) {
 	_, jobID := seedOIDCJob(t, s, "lease1")
 	issueOIDCToken(t, s, jobID, "lease1", "https://aud.example.com")
 
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	w := c.do(http.MethodGet, "/api/v1/audit?limit=100", nil, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("list audit: want 200 got %d: %s", w.Code, w.Body.String())
@@ -496,7 +496,7 @@ func TestOIDCIssuanceDBModeReadsStore(t *testing.T) {
 	s.mu.Lock()
 	s.jobs["job-ghost"] = model.Job{ID: "job-ghost", RunID: "run-oidc", Key: "ghost", Status: model.StatusRunning, Trusted: true, OIDCAllowed: true, LeaseExpiresAt: &ghostExp, LeaseTokenHash: hashLeaseToken(s.leaseKey, "lease1"), LeaseRunnerID: "runner-1"}
 	s.mu.Unlock()
-	c := newTestClient(t, s.Handler(), "lease1")
+	c := newTestClientForServer(t, s, "lease1")
 	w := c.do(http.MethodPost, "/api/v1/jobs/job-ghost/oidc", map[string]any{"audience": "a"}, nil)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("memory-only job issuance = %d, want 404 (store is the source of truth)", w.Code)
@@ -516,7 +516,7 @@ func TestOIDCIssuanceFailsClosedOnAuditFailure(t *testing.T) {
 	f.mu.Lock()
 	f.auditErr = fmt.Errorf("audit: injected failure")
 	f.mu.Unlock()
-	c := newTestClient(t, s.Handler(), "lease1")
+	c := newTestClientForServer(t, s, "lease1")
 	w := c.do(http.MethodPost, "/api/v1/jobs/"+jobID+"/oidc", map[string]any{"audience": "https://aud.example.com"}, nil)
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("issuance with audit failure = %d, want 500: %s", w.Code, w.Body.String())
@@ -692,7 +692,7 @@ func TestOIDCPreliminaryGateUsesDatabaseClockLeaseAuthority(t *testing.T) {
 		oidcBeforeSignerHook = func() { signerWork = true }
 		t.Cleanup(func() { oidcBeforeSignerHook = prevHook })
 
-		c := newTestClient(t, s.Handler(), "lease2")
+		c := newTestClientForServer(t, s, "lease2")
 		w := c.do(http.MethodPost, "/api/v1/jobs/"+jobID+"/oidc", map[string]any{"audience": "https://aud.example.com"}, nil)
 		if w.Code != http.StatusConflict {
 			t.Fatalf("DB-expired lease issuance = %d, want 409: %s", w.Code, w.Body.String())

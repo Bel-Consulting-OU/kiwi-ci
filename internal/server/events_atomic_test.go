@@ -152,7 +152,7 @@ func TestExecutionSnapshotFSBootstrapNoGap(t *testing.T) {
 	}
 
 	// Inject a transition after the snapshot: lease the queued job.
-	c := newTestClient(t, s.Handler(), "token")
+	c := newTestClientForServer(t, s, "token")
 	_, jobID, _, _, _ := leaseJob(t, c)
 	if jobID == "" {
 		t.Fatal("lease returned no job")

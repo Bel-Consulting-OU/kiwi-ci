@@ -31,7 +31,7 @@ func TestCanonicalReposNeverShareAuthorization(t *testing.T) {
 			},
 		},
 	})
-	c := newTestClient(t, s.Handler(), "github-token")
+	c := newTestClientForServer(t, s, "github-token")
 	// The principal's own forge: authorized.
 	w := c.do(http.MethodPost, "/api/v1/runs", SubmitRun{RepoURL: "https://github.com/acme/service.git", RepoFullName: "acme/service", Ref: "main", Pipeline: simpleContainerPipeline}, nil)
 	if w.Code != http.StatusAccepted {
@@ -65,7 +65,7 @@ func TestExplicitBareAliasOnlyWhenConfigured(t *testing.T) {
 			},
 		},
 	})
-	c := newTestClient(t, s.Handler(), "alias-token")
+	c := newTestClientForServer(t, s, "alias-token")
 	for _, repoURL := range []string{
 		"https://gitlab.example/acme/service.git",
 		"https://github.com/acme/service.git",
@@ -109,7 +109,7 @@ func TestRunListVisibilityStrictlyCanonical(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed gitlab run: %v", err)
 	}
-	c := newTestClient(t, s.Handler(), "github-token")
+	c := newTestClientForServer(t, s, "github-token")
 	w := c.do(http.MethodGet, "/api/v1/runs", nil, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("list = %d: %s", w.Code, w.Body.String())

@@ -81,7 +81,7 @@ func TestOIDCIssuanceDenialMatrixMemoryAndDB(t *testing.T) {
 					if c.mutate != nil {
 						mutate(c.mutate)
 					}
-					cl := newTestClient(t, s.Handler(), c.token)
+					cl := newTestClientForServer(t, s, c.token)
 					w := cl.do(http.MethodPost, "/api/v1/jobs/job-oidc/oidc", map[string]any{"audience": c.audience}, nil)
 					if w.Code != c.wantCode {
 						t.Fatalf("%s/%s = %d, want %d: %s", mode, c.name, w.Code, c.wantCode, w.Body.String())
@@ -97,7 +97,7 @@ func TestOIDCIssuanceDenialMatrixMemoryAndDB(t *testing.T) {
 			}
 			// Unknown job: 404 (and never an issuance).
 			s, _ := oidcScopeServer(t, mode == "db")
-			w := newTestClient(t, s.Handler(), "lease1").do(http.MethodPost, "/api/v1/jobs/ghost/oidc", map[string]any{"audience": "a"}, nil)
+			w := newTestClientForServer(t, s, "lease1").do(http.MethodPost, "/api/v1/jobs/ghost/oidc", map[string]any{"audience": "a"}, nil)
 			if w.Code != http.StatusNotFound {
 				t.Fatalf("%s unknown job = %d, want 404", mode, w.Code)
 			}
@@ -155,7 +155,7 @@ func TestOIDCCoarseClockRotationEveryIssue(t *testing.T) {
 	// Rotating again must not evict an unretired key either, and the JWKS
 	// validator must change with the body so a cached 304 can never serve
 	// a stale key set.
-	cl := newTestClient(t, s.Handler(), "")
+	cl := newTestClientForServer(t, s, "")
 	before := cl.do(http.MethodGet, "/api/v1/oidc/jwks", nil, nil)
 	if before.Code != http.StatusOK {
 		t.Fatalf("jwks: %d", before.Code)

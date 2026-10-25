@@ -111,7 +111,7 @@ func TestRepoAuthorizationExplicitDenyBeatsGlobalRead(t *testing.T) {
 			},
 		},
 	})
-	c := newTestClient(t, s.Handler(), "reader")
+	c := newTestClientForServer(t, s, "reader")
 
 	ids := rauthzListRunIDs(t, c)
 	if rauthzHas(ids, "run-denied") {
@@ -152,7 +152,7 @@ func TestRepoAuthorizationRepoOnlyReaderReachesCollections(t *testing.T) {
 			},
 		},
 	})
-	c := newTestClient(t, s.Handler(), "reader")
+	c := newTestClientForServer(t, s, "reader")
 
 	ids := rauthzListRunIDs(t, c)
 	if !rauthzHas(ids, "run-allowed") || !rauthzHas(ids, "run-cloneurl") {
@@ -204,7 +204,7 @@ func TestRepoAuthorizationCanonicalAliasesAgreeAcrossEndpoints(t *testing.T) {
 			s := rauthzServer(t, map[string]auth.Principal{
 				"reader": {Subject: "alias-reader", Repositories: repos},
 			})
-			c := newTestClient(t, s.Handler(), "reader")
+			c := newTestClientForServer(t, s, "reader")
 
 			if w := c.do(http.MethodGet, "/api/v1/runs/run-allowed", nil, nil); w.Code != http.StatusOK {
 				t.Fatalf("alias per-run read (stored RepoID) = %d, want 200: %s", w.Code, w.Body.String())
@@ -266,7 +266,7 @@ func TestRepoAuthorizationConflictingGrantsFailClosed(t *testing.T) {
 		},
 	})
 
-	conflict := newTestClient(t, s.Handler(), "conflict")
+	conflict := newTestClientForServer(t, s, "conflict")
 	if w := conflict.do(http.MethodGet, "/api/v1/runs/run-allowed", nil, nil); w.Code != http.StatusNotFound {
 		t.Fatalf("conflicting grants per-run read = %d, want masked 404: %s", w.Code, w.Body.String())
 	}
@@ -281,7 +281,7 @@ func TestRepoAuthorizationConflictingGrantsFailClosed(t *testing.T) {
 		t.Fatalf("conflicting grants leaked serving runners: %s", raw)
 	}
 
-	same := newTestClient(t, s.Handler(), "same")
+	same := newTestClientForServer(t, s, "same")
 	if w := same.do(http.MethodGet, "/api/v1/runs/run-allowed", nil, nil); w.Code != http.StatusOK {
 		t.Fatalf("identical duplicate grants per-run read = %d, want 200: %s", w.Code, w.Body.String())
 	}
@@ -304,7 +304,7 @@ func TestRepoAuthorizationConflictingGrantsFailClosed(t *testing.T) {
 func TestRepoAuthorizationLegacyNoPrincipalUnchanged(t *testing.T) {
 	s := New("")
 	rauthzSeed(s)
-	c := newTestClient(t, s.Handler(), "")
+	c := newTestClientForServer(t, s, "")
 
 	ids := rauthzListRunIDs(t, c)
 	for _, want := range []string{"run-allowed", "run-cloneurl", "run-denied"} {

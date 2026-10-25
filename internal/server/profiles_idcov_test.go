@@ -159,7 +159,7 @@ func TestIDCovProfileHandlersHTTP(t *testing.T) {
 	restricted := storeServer(t, "", map[string]auth.Principal{
 		"read-token": {Subject: "reader", Roles: []auth.Role{auth.RoleRead}},
 	})
-	c := newTestClient(t, restricted.Handler(), "read-token")
+	c := newTestClientForServer(t, restricted, "read-token")
 	if w := c.do(http.MethodPost, "/api/v1/runner-profiles", map[string]any{"id": "p"}, nil); w.Code != http.StatusForbidden {
 		t.Fatalf("create without policy_manage = %d, want 403", w.Code)
 	}

@@ -132,7 +132,7 @@ func TestSecretRevokedDuringBrokerResolveReturns409(t *testing.T) {
 		s := New("secret")
 		jobID, runnerID, token, gen := seedJob(t, s, true, []string{"tok"})
 		s.SecretBroker = hookBroker{value: "v", beforeFn: mutateMemJob(s, jobID, func(j *model.Job) { j.Status = model.StatusCancelled })}
-		c := newTestClient(t, s.Handler(), "secret")
+		c := newTestClientForServer(t, s, "secret")
 		_, pubB64 := ephemeralKey(t)
 		w := issue(t, c, jobID, SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pubB64})
 		if w.Code != http.StatusConflict {
@@ -150,7 +150,7 @@ func TestSecretRevokedDuringBrokerResolveReturns409(t *testing.T) {
 		s := dbSecretServer(t, f)
 		jobID, runnerID, token, gen := seedDBSecretJob(t, f, s, []string{"tok"})
 		s.SecretBroker = hookBroker{value: "v", beforeFn: mutateFakeJob(f, jobID, func(j *model.Job) { j.Status = model.StatusCancelled })}
-		c := newTestClient(t, s.Handler(), "secret")
+		c := newTestClientForServer(t, s, "secret")
 		_, pubB64 := ephemeralKey(t)
 		w := issue(t, c, jobID, SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pubB64})
 		if w.Code != http.StatusConflict {
@@ -178,7 +178,7 @@ func TestSecretExpiredDuringBrokerResolveReturns409(t *testing.T) {
 			exp := time.Now().UTC().Add(-time.Second)
 			j.LeaseExpiresAt = &exp
 		})}
-		c := newTestClient(t, s.Handler(), "secret")
+		c := newTestClientForServer(t, s, "secret")
 		_, pubB64 := ephemeralKey(t)
 		w := issue(t, c, jobID, SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pubB64})
 		if w.Code != http.StatusConflict {
@@ -196,7 +196,7 @@ func TestSecretExpiredDuringBrokerResolveReturns409(t *testing.T) {
 			exp := time.Now().UTC().Add(-time.Second)
 			j.LeaseExpiresAt = &exp
 		})}
-		c := newTestClient(t, s.Handler(), "secret")
+		c := newTestClientForServer(t, s, "secret")
 		_, pubB64 := ephemeralKey(t)
 		w := issue(t, c, jobID, SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pubB64})
 		if w.Code != http.StatusConflict {
@@ -215,7 +215,7 @@ func TestSecretCompletedDuringBrokerResolveReturns409(t *testing.T) {
 		s := New("secret")
 		jobID, runnerID, token, gen := seedJob(t, s, true, []string{"tok"})
 		s.SecretBroker = hookBroker{value: "v", beforeFn: mutateMemJob(s, jobID, func(j *model.Job) { j.Status = model.StatusSuccess })}
-		c := newTestClient(t, s.Handler(), "secret")
+		c := newTestClientForServer(t, s, "secret")
 		_, pubB64 := ephemeralKey(t)
 		w := issue(t, c, jobID, SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pubB64})
 		if w.Code != http.StatusConflict {
@@ -230,7 +230,7 @@ func TestSecretCompletedDuringBrokerResolveReturns409(t *testing.T) {
 		s := dbSecretServer(t, f)
 		jobID, runnerID, token, gen := seedDBSecretJob(t, f, s, []string{"tok"})
 		s.SecretBroker = hookBroker{value: "v", beforeFn: mutateFakeJob(f, jobID, func(j *model.Job) { j.Status = model.StatusSuccess })}
-		c := newTestClient(t, s.Handler(), "secret")
+		c := newTestClientForServer(t, s, "secret")
 		_, pubB64 := ephemeralKey(t)
 		w := issue(t, c, jobID, SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pubB64})
 		if w.Code != http.StatusConflict {
@@ -253,7 +253,7 @@ func TestSecretGenerationChangedBeforeCommitReturns409(t *testing.T) {
 		s := New("secret")
 		jobID, runnerID, token, gen := seedJob(t, s, true, []string{"tok"})
 		s.SecretBroker = hookBroker{value: "v", beforeFn: mutateMemJob(s, jobID, func(j *model.Job) { j.LeaseGeneration++ })}
-		c := newTestClient(t, s.Handler(), "secret")
+		c := newTestClientForServer(t, s, "secret")
 		_, pubB64 := ephemeralKey(t)
 		w := issue(t, c, jobID, SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pubB64})
 		if w.Code != http.StatusConflict {
@@ -268,7 +268,7 @@ func TestSecretGenerationChangedBeforeCommitReturns409(t *testing.T) {
 		s := dbSecretServer(t, f)
 		jobID, runnerID, token, gen := seedDBSecretJob(t, f, s, []string{"tok"})
 		s.SecretBroker = hookBroker{value: "v", beforeFn: mutateFakeJob(f, jobID, func(j *model.Job) { j.LeaseGeneration++ })}
-		c := newTestClient(t, s.Handler(), "secret")
+		c := newTestClientForServer(t, s, "secret")
 		_, pubB64 := ephemeralKey(t)
 		w := issue(t, c, jobID, SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pubB64})
 		if w.Code != http.StatusConflict {
@@ -288,7 +288,7 @@ func TestSecretConcurrentRequestsOnlyOneReturnsEnvelope(t *testing.T) {
 		s := New("secret")
 		s.SecretBroker = secretbroker.StaticBroker{"tok": "v"}
 		jobID, runnerID, token, gen := seedJob(t, s, true, []string{"tok"})
-		c := newTestClient(t, s.Handler(), "secret")
+		c := newTestClientForServer(t, s, "secret")
 		_, pub1 := ephemeralKey(t)
 		_, pub2 := ephemeralKey(t)
 		reqs := []SecretRequest{
@@ -307,7 +307,7 @@ func TestSecretConcurrentRequestsOnlyOneReturnsEnvelope(t *testing.T) {
 		f := newDBFakeStore()
 		s := dbSecretServer(t, f)
 		jobID, runnerID, token, gen := seedDBSecretJob(t, f, s, []string{"tok"})
-		c := newTestClient(t, s.Handler(), "secret")
+		c := newTestClientForServer(t, s, "secret")
 		_, pub1 := ephemeralKey(t)
 		_, pub2 := ephemeralKey(t)
 		reqs := []SecretRequest{
@@ -378,7 +378,7 @@ func TestSecretNoEnvelopeWithoutDurableAudit(t *testing.T) {
 		f.mu.Lock()
 		f.auditErr = errors.New("audit: injected failure")
 		f.mu.Unlock()
-		c := newTestClient(t, s.Handler(), "secret")
+		c := newTestClientForServer(t, s, "secret")
 		_, pubB64 := ephemeralKey(t)
 		req := SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pubB64}
 		w := issue(t, c, jobID, req)
@@ -415,7 +415,7 @@ func TestSecretNoEnvelopeWithoutDurableAudit(t *testing.T) {
 		}
 		// A store root under a regular file makes the audit append fail.
 		s.store = &storage.Repository{Root: blocker}
-		c := newTestClient(t, s.Handler(), "secret")
+		c := newTestClientForServer(t, s, "secret")
 		_, pubB64 := ephemeralKey(t)
 		req := SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pubB64}
 		w := issue(t, c, jobID, req)
@@ -466,7 +466,7 @@ func TestSecretInvalidEphemeralKeyRejectedBeforeBrokerWork(t *testing.T) {
 			if tc.genKey {
 				_, tc.pub = ephemeralKey(t)
 			}
-			c := newTestClient(t, s.Handler(), "secret")
+			c := newTestClientForServer(t, s, "secret")
 			w := issue(t, c, jobID, SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: tc.reqName, EphemeralPublic: tc.pub})
 			if w.Code != http.StatusBadRequest {
 				t.Fatalf("invalid request = %d, want 400: %s", w.Code, w.Body.String())
@@ -488,7 +488,7 @@ func TestSecretInvalidEphemeralKeyRejectedBeforeBrokerWork(t *testing.T) {
 		f.claimErr = errors.New("claim store must not be touched")
 		f.mu.Unlock()
 		jobID, runnerID, token, gen := seedDBSecretJob(t, f, s, []string{"tok"})
-		c := newTestClient(t, s.Handler(), "secret")
+		c := newTestClientForServer(t, s, "secret")
 		w := issue(t, c, jobID, SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: "not-base64"})
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("invalid key = %d, want 400: %s", w.Code, w.Body.String())

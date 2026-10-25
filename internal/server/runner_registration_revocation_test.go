@@ -175,7 +175,7 @@ func TestSupersededIncarnationRefusedOnSensitiveEndpoints(t *testing.T) {
 		s := newOIDCTestServer(t, false)
 		_, jobID := seedOIDCJob(t, s, "lease1")
 		pinIncarnation(s)
-		c := newTestClient(t, s.Handler(), "lease1")
+		c := newTestClientForServer(t, s, "lease1")
 		body := map[string]any{"audience": "https://aud.example.com"}
 
 		w := c.do(http.MethodPost, "/api/v1/jobs/"+jobID+"/oidc", body, map[string]string{RunnerIncarnationHeader: incA})
@@ -196,7 +196,7 @@ func TestSupersededIncarnationRefusedOnSensitiveEndpoints(t *testing.T) {
 		s.SecretBroker = secretbroker.StaticBroker{"tok": "v"}
 		jobID, runnerID, token, gen := seedJob(t, s, true, []string{"tok"})
 		pinIncarnation(s)
-		c := newTestClient(t, s.Handler(), "secret")
+		c := newTestClientForServer(t, s, "secret")
 		_, pub := ephemeralKey(t)
 		in := SecretRequest{RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen, Name: "tok", EphemeralPublic: pub}
 

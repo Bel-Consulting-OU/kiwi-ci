@@ -348,7 +348,7 @@ func TestSqueezeContextTimeout(t *testing.T) {
 
 func TestSqueezeDrainServerDecodeError(t *testing.T) {
 	s := New("t")
-	c := newTestClient(t, s.Handler(), "t")
+	c := newTestClientForServer(t, s, "t")
 	w := c.do(http.MethodPost, "/api/v1/drain", []byte("{"), map[string]string{"Content-Type": "application/json"})
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("decode error = %d, want 400", w.Code)
@@ -359,7 +359,7 @@ func TestSqueezeDrainServerDecodeError(t *testing.T) {
 // deployment endpoints and finishDeploymentDB's no-op returns.
 func TestSqueezeDeploymentMemoryNotFound(t *testing.T) {
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	if w := c.do(http.MethodPost, "/api/v1/jobs/missing/deployments", nil, nil); w.Code != http.StatusNotFound {
 		t.Fatalf("record missing job = %d, want 404", w.Code)
 	}
@@ -423,7 +423,7 @@ func TestSqueezeRecordDeploymentDBPaths(t *testing.T) {
 	if err := s.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
-	c := newTestClient(t, s.Handler(), "token")
+	c := newTestClientForServer(t, s, "token")
 	if w := c.do(http.MethodPost, "/api/v1/jobs/missing/deployments", nil, nil); w.Code != http.StatusInternalServerError {
 		t.Fatalf("store error = %d, want 500", w.Code)
 	}
@@ -485,7 +485,7 @@ func TestSqueezeListDeploymentsDBPaths(t *testing.T) {
 	if err := s.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
-	c := newTestClient(t, s.Handler(), "token")
+	c := newTestClientForServer(t, s, "token")
 	f.getRunErr = errStaticKindMissing
 	if w := c.do(http.MethodGet, "/api/v1/runs/run-1/deployments", nil, nil); w.Code != http.StatusInternalServerError {
 		t.Fatalf("store error = %d, want 500", w.Code)

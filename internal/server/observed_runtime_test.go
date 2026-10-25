@@ -27,7 +27,7 @@ func observedRuntimeFixture() *model.ObservedRuntime {
 // Components map is never trusted.
 func TestCompletePersistsObservedRuntimeMemory(t *testing.T) {
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	_, jobID, runnerID, token, gen := leaseNativeJob(t, c, testPipeline)
 	obs := observedRuntimeFixture()
 	obs.Components = map[string]string{"spoofed": "sha256:deadbeef"}
@@ -57,7 +57,7 @@ func TestCompletePersistsObservedRuntimeMemory(t *testing.T) {
 // refused with 400 before any lease or completion state changes.
 func TestCompleteRejectsMalformedObservedRuntime(t *testing.T) {
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	_, jobID, runnerID, token, gen := leaseNativeJob(t, c, testPipeline)
 
 	tooLong := &model.ObservedRuntime{RuntimeVersion: strings.Repeat("v", 500)}
@@ -89,7 +89,7 @@ func TestCompleteRejectsMalformedObservedRuntime(t *testing.T) {
 func TestDeploymentLeaseGenerationStampedAndPreserved(t *testing.T) {
 	s := New("secret")
 	grantDeployments(s)
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	_, jobID, runnerID, token, gen := leaseDeploymentJob(t, s, c)
 
 	s.mu.Lock()
@@ -143,7 +143,7 @@ func TestLogEntryCarriesLeaseGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	runID, jobID, runnerID, token, gen := leaseNativeJob(t, c, testPipeline)
 	w := c.do(http.MethodPost, "/api/v1/jobs/"+jobID+"/log", LogLine{
 		RunnerID: runnerID, LeaseToken: token, LeaseGeneration: gen,

@@ -34,7 +34,7 @@ func leaseBodyFor(t *testing.T, runnerID, token string, gen int64, extra map[str
 // TestSqueezeHeartbeatBranches covers the memory-mode heartbeat edges.
 func TestSqueezeHeartbeatBranches(t *testing.T) {
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	if w := c.do(http.MethodPost, "/api/v1/jobs/missing/heartbeat", map[string]any{"runner_id": "r", "lease_token": "t", "lease_generation": 1}, nil); w.Code != http.StatusNotFound {
 		t.Fatalf("unknown job = %d, want 404", w.Code)
 	}
@@ -66,7 +66,7 @@ func TestSqueezeHeartbeatBranches(t *testing.T) {
 // TestSqueezeLogBranches covers the memory-mode log edges.
 func TestSqueezeLogBranches(t *testing.T) {
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	if w := c.do(http.MethodPost, "/api/v1/jobs/missing/log", map[string]any{"runner_id": "r", "lease_token": "t", "lease_generation": 1, "line": "x"}, nil); w.Code != http.StatusNotFound {
 		t.Fatalf("unknown job = %d, want 404", w.Code)
 	}
@@ -81,7 +81,7 @@ func TestSqueezeLogBranches(t *testing.T) {
 // error.
 func TestSqueezeCompleteReceiptReplay(t *testing.T) {
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	_, jobID, runnerID, token, gen := leaseNativeJob(t, c, testPipeline)
 	body := leaseBodyFor(t, runnerID, token, gen, map[string]any{"status": model.StatusSuccess})
 	if w := c.do(http.MethodPost, "/api/v1/jobs/"+jobID+"/complete", body, nil); w.Code != http.StatusNoContent {
@@ -147,7 +147,7 @@ func TestSqueezeEnvironmentCapacity(t *testing.T) {
 func TestSqueezeRerunMemoryEdges(t *testing.T) {
 	testutil.UnixChmod(t)
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	if w := c.do(http.MethodPost, "/api/v1/runs/missing/rerun", nil, nil); w.Code != http.StatusNotFound {
 		t.Fatalf("rerun unknown = %d, want 404", w.Code)
 	}
@@ -179,7 +179,7 @@ func TestSqueezeRerunDBEdges(t *testing.T) {
 	if err := s.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	if w := c.do(http.MethodPost, "/api/v1/runs/missing/rerun", nil, nil); w.Code != http.StatusNotFound {
 		t.Fatalf("unknown run = %d, want 404", w.Code)
 	}
@@ -211,7 +211,7 @@ func TestSqueezeRerunDBEdges(t *testing.T) {
 // not-found/store-error paths.
 func TestSqueezeCancelBranches(t *testing.T) {
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	if w := c.do(http.MethodPost, "/api/v1/runs/missing/cancel", nil, nil); w.Code != http.StatusNotFound {
 		t.Fatalf("cancel unknown = %d, want 404", w.Code)
 	}
@@ -240,7 +240,7 @@ func TestSqueezeCancelBranches(t *testing.T) {
 	if err := db.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
-	dc := newTestClient(t, db.Handler(), "secret")
+	dc := newTestClientForServer(t, db, "secret")
 	if w := dc.do(http.MethodPost, "/api/v1/runs/missing/cancel", nil, nil); w.Code != http.StatusNotFound {
 		t.Fatalf("db cancel unknown = %d, want 404", w.Code)
 	}
@@ -287,7 +287,7 @@ func TestSqueezeCancelUnauthenticated(t *testing.T) {
 // read error.
 func TestSqueezeListAuditBranches(t *testing.T) {
 	s := New("secret")
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	w := c.do(http.MethodGet, "/api/v1/audit", nil, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("audit without store = %d: %s", w.Code, w.Body.String())
@@ -308,7 +308,7 @@ func TestSqueezeListAuditBranches(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, "audit.jsonl"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	pc := newTestClient(t, ps.Handler(), "secret")
+	pc := newTestClientForServer(t, ps, "secret")
 	if w := pc.do(http.MethodGet, "/api/v1/audit", nil, nil); w.Code != http.StatusInternalServerError {
 		t.Fatalf("audit read error = %d, want 500", w.Code)
 	}

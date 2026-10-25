@@ -101,7 +101,7 @@ func TestIDCovApproveDBForbidden(t *testing.T) {
 	if err := s.SwitchToDB(f); err != nil {
 		t.Fatal(err)
 	}
-	c := newTestClient(t, s.Handler(), "read-token")
+	c := newTestClientForServer(t, s, "read-token")
 	if w := c.do(http.MethodPost, "/api/v1/jobs/job-a/approve", map[string]any{}, nil); w.Code != http.StatusForbidden {
 		t.Fatalf("db approve without the role = %d, want 403", w.Code)
 	}

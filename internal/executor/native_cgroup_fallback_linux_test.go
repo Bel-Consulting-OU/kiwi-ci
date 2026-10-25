@@ -10,44 +10,49 @@ import (
 	"testing"
 )
 
-// TestNativeRunUseCgroupFDFailureFallsBack: a real NativeBackend.Run whose
-// clone-into-cgroup is rejected (CgroupFD points at a plain directory, not
-// cgroupfs) must rebuild a FRESH command with Setpgid and still execute the
-// step. Before the rebuild fix this died with "exec: already started".
-func TestNativeRunUseCgroupFDFailureFallsBack(t *testing.T) {
+// TestNativeRunUseCgroupFDFailureFailsClosed: when a durable job cgroup is
+// recorded but the kernel rejects clone-into-cgroup (UseCgroupFD against a
+// non-cgroup directory), NativeBackend.Run must FAIL CLOSED rather than
+// rebuild the command and run outside the ownership boundary. The previous
+// rebuild path silently downgraded the invariant the ledger had recorded.
+func TestNativeRunUseCgroupFDFailureFailsClosed(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv(jobCgroupRootEnv, root)
-	parent := "/delegated/kiwi-job-fallback"
-	dir := filepath.Join(root, "delegated", "kiwi-job-fallback")
+	parent := "/delegated/kiwi-job-fails-closed"
+	dir := filepath.Join(root, "delegated", "kiwi-job-fails-closed")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	work := t.TempDir()
 	outFile := filepath.Join(work, "marker")
 	script := "echo ran > marker"
-	// Force UseCgroupFD: configureProcessCgroup opens the plain dir successfully.
-	// The kernel then rejects CLONE_INTO_CGROUP for a non-cgroup FD.
 	env := []string{"PATH=/usr/bin:/bin", "HOME=" + work}
 	b := &NativeBackend{}
-	var lines []string
 	err := b.Run(context.Background(), Command{
 		Shell:        "bash",
 		Script:       script,
 		Dir:          work,
 		Env:          env,
 		CgroupParent: parent,
-	}, func(s string) { lines = append(lines, s) })
-	if err != nil {
-		// Fallback may still fail addPID if the kernel accepted UseCgroupFD
-		// on this host (some environments treat open dirs leniently). Only
-		// the "already started" class of failure is the regression.
-		msg := err.Error()
-		if strings.Contains(msg, "already started") {
-			t.Fatalf("UseCgroupFD fallback did not rebuild the command: %v", err)
+	}, func(string) {})
+	if err == nil {
+		// Some kernels may accept a plain-dir CgroupFD; then the step runs
+		// inside that directory as a cgroup — still ownership. Only treat
+		// unexpected success with a missing marker as a failure.
+		if _, serr := os.Stat(outFile); serr != nil {
+			t.Fatalf("run reported success but marker missing: %v", serr)
 		}
-		t.Fatalf("native run with rejected UseCgroupFD: %v", err)
+		t.Skip("kernel accepted UseCgroupFD on a non-cgroup FD; fail-closed path not exercised")
 	}
-	if _, serr := os.Stat(outFile); serr != nil {
-		t.Fatalf("step did not execute after fallback (marker missing): %v\nlines=%v", serr, lines)
+	msg := err.Error()
+	if !strings.Contains(msg, "clone-into-cgroup") && !strings.Contains(msg, "cgroup") {
+		t.Fatalf("want clone-into-cgroup fail-closed error, got: %v", err)
+	}
+	if strings.Contains(msg, "already started") {
+		t.Fatalf("must not retry Start on the same Cmd: %v", err)
+	}
+	// Fail-closed: no user code ran outside the cgroup.
+	if _, serr := os.Stat(outFile); serr == nil {
+		t.Fatal("step executed despite rejected clone-into-cgroup (ownership invariant broken)")
 	}
 }

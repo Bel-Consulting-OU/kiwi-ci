@@ -39,7 +39,7 @@ func snapshotCASServer(t *testing.T, f *dbFakeStore, casDir string, opts ...Opti
 		t.Fatalf("enqueue: %v", err)
 	}
 	runnerID, task := leaseRunJob(t, s)
-	c := newTestClient(t, s.Handler(), "token")
+	c := newTestClientForServer(t, s, "token")
 	return s, runnerID, task.Job.ID, task, c
 }
 
@@ -160,7 +160,7 @@ func TestSnapshotUploadDBModeCASAndRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	s2.SetBlobStore(blob.NewFS(casDir))
-	c2 := newTestClient(t, s2.Handler(), "token")
+	c2 := newTestClientForServer(t, s2, "token")
 	w = c2.do(http.MethodGet, "/api/v1/runs/"+runID+"/snapshots/"+rec.ID, nil, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("download from fresh replica = %d: %s", w.Code, w.Body.String())

@@ -45,7 +45,7 @@ func TestSnapshotPerJobCapRejectsWithoutStaging(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := newTestClient(t, s.Handler(), "secret")
+	c := newTestClientForServer(t, s, "secret")
 	runID, jobID, runnerID, token, gen := leaseNativeJob(t, c, testPipeline)
 
 	if w := uploadTestSnapshot(t, c, jobID, runnerID, token, gen); w.Code != http.StatusCreated {
