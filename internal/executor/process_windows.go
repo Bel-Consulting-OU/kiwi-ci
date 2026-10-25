@@ -16,8 +16,6 @@ var (
 	procCreateJobObjectW         = modkernel32.NewProc("CreateJobObjectW")
 	procSetInformationJobObject  = modkernel32.NewProc("SetInformationJobObject")
 	procAssignProcessToJobObject = modkernel32.NewProc("AssignProcessToJobObject")
-	procCloseHandle              = modkernel32.NewProc("CloseHandle")
-	procGetExitCodeProcess       = modkernel32.NewProc("GetExitCodeProcess")
 	// NtResumeProcess resumes every thread of a process created with
 	// CREATE_SUSPENDED. os/exec's StartProcess closes the primary-thread
 	// handle (CloseHandle(pi.Thread)) before Start returns, and the primary
@@ -25,10 +23,6 @@ var (
 	// process handle is the only identity we still own after Start.
 	procNtResumeProcess = modntdll.NewProc("NtResumeProcess")
 )
-
-// processQueryLimitedInformation is the OpenProcess access right needed for
-// GetExitCodeProcess liveness probes (portable across modern Windows).
-const processQueryLimitedInformation = 0x1000
 
 // jobObjectExtendedLimitInformationClass is the JobObjectInformationClass
 // value for JOBOBJECT_EXTENDED_LIMIT_INFORMATION.
@@ -202,24 +196,4 @@ func killProcess(cmd *exec.Cmd) error {
 		return nil
 	}
 	return cmd.Process.Kill()
-}
-
-// processAlive reports whether pid is a live process. On Windows FindProcess
-// succeeds for any PID, so liveness is GetExitCodeProcess == STILL_ACTIVE.
-func processAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	h, err := syscall.OpenProcess(processQueryLimitedInformation, false, uint32(pid))
-	if err != nil {
-		return false
-	}
-	defer syscall.CloseHandle(h)
-	var code uint32
-	r, _, _ := procGetExitCodeProcess.Call(uintptr(h), uintptr(unsafe.Pointer(&code)))
-	if r == 0 {
-		return false
-	}
-	const stillActive = 259
-	return code == stillActive
 }

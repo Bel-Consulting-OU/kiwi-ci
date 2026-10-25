@@ -2,6 +2,7 @@ package executor
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
@@ -82,5 +83,22 @@ func TestNativeResourceAdvisory(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestNativeResourceLogLinesCgroupVsAdvisory: a durable native job cgroup
+// reports kernel enforcement; without one the historical advisory stands.
+func TestNativeResourceLogLinesCgroupVsAdvisory(t *testing.T) {
+	res := pipeline.Resources{CPU: 2, Memory: 1 << 30, PIDs: 128}
+	adv := nativeResourceLogLines("", res)
+	if len(adv) == 0 || !strings.Contains(adv[0], "advisory") {
+		t.Fatalf("no cgroup → advisory lines, got %v", adv)
+	}
+	enf := nativeResourceLogLines("/delegated/kiwi-job-x", res)
+	if len(enf) != 1 || !strings.Contains(enf[0], "enforced via native job cgroup") {
+		t.Fatalf("cgroup present → enforced line, got %v", enf)
+	}
+	if strings.Contains(enf[0], "advisory") {
+		t.Fatalf("enforced line must not say advisory: %v", enf)
 	}
 }

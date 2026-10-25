@@ -952,16 +952,23 @@ func captureFrozenGitSource(dir string) FrozenGit {
 		// Not a repository: leave Captured=false, Unstable=false.
 		return g
 	}
-	// Repository exists: any failure below is UNSTABLE, not "not a repo".
-	// Callers must not fall back to live Git on Unstable.
+	// Unstable means "HEAD was sampled once and then MOVED" — never
+	// "HEAD missing". An empty repository (git init, no commits) has no
+	// identity to freeze and must not fail Freeze; RunLocal's !Captured
+	// path is correct there because live Git also has no HEAD.
 	unstable := FrozenGit{Unstable: true}
-	headOut, err := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
-	if err != nil {
-		return unstable
+	headOut, err := exec.Command("git", "-C", dir, "rev-parse", "--verify", "--quiet", "HEAD").Output()
+	if err != nil || len(headOut) == 0 {
+		// Distinguish unborn HEAD (empty repo — symbolic-ref still works)
+		// from an unreadable/corrupt HEAD (unstable capture).
+		if refOut, refErr := exec.Command("git", "-C", dir, "symbolic-ref", "-q", "HEAD").Output(); refErr == nil && len(refOut) > 0 {
+			return g // unborn HEAD: no commits yet
+		}
+		return unstable // HEAD claimed but unreadable / mid-operation
 	}
 	head := strings.TrimSpace(string(headOut))
 	if head == "" {
-		return unstable
+		return g
 	}
 	g.Captured = true
 	g.SHA = head

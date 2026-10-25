@@ -1165,10 +1165,12 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 		}
 		b.Resources = cj.Job.Resources
 	case *NativeBackend:
-		// The native runtime has no container boundary to apply resource
-		// requests to: they are logged as advisory and never change job
-		// status.
-		for _, line := range nativeResourceAdvisory(cj.Job.Resources) {
+		// When a durable native job cgroup owns the process tree, the
+		// declared cpu/memory/pids limits are kernel-enforced on that leaf —
+		// not advisory. Only a host without a job cgroup keeps the
+		// historical advisory (the native runtime has no other container
+		// boundary to apply requests to; status never changes either way).
+		for _, line := range nativeResourceLogLines(cgroupParent, cj.Job.Resources) {
 			e.log(cj.ID, "resources", line)
 		}
 	}

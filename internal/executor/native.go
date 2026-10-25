@@ -126,6 +126,18 @@ func nativeResourceAdvisory(r pipeline.Resources) []string {
 	return lines
 }
 
+// nativeResourceLogLines is the operator-facing decision for one native job:
+// a durable job cgroup kernel-enforces the declared envelope on the leaf;
+// without a cgroup the historical advisory applies (status never changes).
+func nativeResourceLogLines(cgroupParent string, r pipeline.Resources) []string {
+	if cgroupParent != "" {
+		return []string{fmt.Sprintf(
+			"enforced via native job cgroup %s (declared cpu=%v memory=%d pids=%d)",
+			cgroupParent, r.CPU, int64(r.Memory), r.PIDs)}
+	}
+	return nativeResourceAdvisory(r)
+}
+
 // ReadFile reads a workspace file on the host without following symlinks in
 // the final path component, so an attacker-controlled workspace cannot
 // redirect step-output reads to arbitrary host files.
@@ -217,11 +229,13 @@ func (*NativeBackend) Run(ctx context.Context, c Command, emit func(string)) err
 	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
 		closeCgroupFD()
+		closeCgroupFD = func() {}
 		return &RunError{Kind: ErrorInfra, Err: err}
 	}
 	stderrR, stderrW, err := os.Pipe()
 	if err != nil {
 		closeCgroupFD()
+		closeCgroupFD = func() {}
 		stdoutR.Close()
 		stdoutW.Close()
 		return &RunError{Kind: ErrorInfra, Err: err}

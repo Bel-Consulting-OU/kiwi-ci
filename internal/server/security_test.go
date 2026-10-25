@@ -30,13 +30,9 @@ type testClient struct {
 	srv *Server
 }
 
-func newTestClient(t *testing.T, h http.Handler, token string) *testClient {
-	return &testClient{t: t, h: h, token: token}
-}
-
-// newTestClientForServer is like newTestClient and also wires the server so
-// /complete requests get the stamped job's execution_semantics injected when
-// the fixture omits it.
+// newTestClientForServer wires the HTTP handler and the server so /complete
+// requests get the stamped job's execution_semantics injected when the
+// fixture omits it.
 func newTestClientForServer(t *testing.T, s *Server, token string) *testClient {
 	return &testClient{t: t, h: s.Handler(), token: token, srv: s}
 }

@@ -47,6 +47,28 @@ func TestClaimNativePortCrossProcessFile(t *testing.T) {
 	releaseNativePort(64999)
 }
 
+// TestClaimNativePortReleasedThenReclaimable: closing the held handle
+// releases the flock, so a subsequent claim of the same port succeeds
+// (no permanent stale lock).
+func TestClaimNativePortReleasedThenReclaimable(t *testing.T) {
+	dir := t.TempDir()
+	orig := nativePortClaimDir
+	nativePortClaimDir = func() string { return dir }
+	t.Cleanup(func() { nativePortClaimDir = orig })
+	const port = 64997
+	if err := claimNativePort(port, "jobA/redis"); err != nil {
+		t.Fatal(err)
+	}
+	if err := claimNativePort(port, "jobB/redis"); err == nil {
+		t.Fatal("second claim while held must fail")
+	}
+	releaseNativePort(port)
+	if err := claimNativePort(port, "jobC/redis"); err != nil {
+		t.Fatalf("reclaim after release: %v", err)
+	}
+	releaseNativePort(port)
+}
+
 // TestClaimNativePortInProcessStillRefused: concurrent jobs in one process
 // still cannot double-claim (regression for the original oracle).
 func TestClaimNativePortInProcessStillRefused(t *testing.T) {
