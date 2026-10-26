@@ -149,6 +149,30 @@ Native execution runs on the host in its own process group so
 cancellation terminates children. It is available only to trusted
 pipelines and should be restricted to dedicated runner machines.
 
+#### Crash-ownership capability matrix
+
+Hard-crash ownership for native work depends on the host kernel
+facilities a runner has. Kiwi never guesses when durable ownership is
+missing: reclaim that cannot be proven becomes recovery debt, and the
+runner refuses to lease new work until the debt clears.
+
+| Host | Ownership primitive | Hard-crash guarantee |
+| --- | --- | --- |
+| Linux with delegated cgroup v2 | Job cgroup recorded in the runtime ledger; reclaim issues cgroup.kill | Strong. Every process of the job, including forked service descendants, dies with the cgroup. |
+| Windows | Job Object with kill-on-close around a suspended start | Strong. Kernel handle lifetime bounds the whole process tree. |
+| Other Unix, including macOS without cgroup v2 | PID and start-stamp ledger only | Degraded. Proven live leaders are reclaimed by signal. Unverified descendants are never killed by number; they stay as recovery debt until an operator or a later capability clears them. |
+
+Guidance for the degraded tier:
+
+- Prefer foreground native services on hosts without kernel ownership.
+  A service that forks or daemonizes past its leader cannot be reclaimed
+  safely once the leader is gone.
+- Treat a recovery-debt log line as a stop condition. The runner already
+  refuses leases while debt is open.
+- Move production native service workloads to a Linux runner with
+  delegated cgroup v2 or to a Windows runner when hard-crash cleanup is
+  a requirement.
+
 ## Untrusted resource admission
 
 Untrusted work is bounded before it is ever queued. Admission applies

@@ -266,87 +266,104 @@ func (m *Manager) freezeLocked(ctx context.Context) error {
 	// creating run-base under Root mutates the source mid-freeze. Skip the
 	// manager's own Root in every manifest so that is not a false change.
 	skip := m.Root
-	// ONE immutable index membership per attempt: the manifest below, the
-	// copy after it, and the re-verification all read this same captured
-	// set — no live `git ls-files` decisions during the walk (an index
-	// change mid-freeze can no longer alter the snapshot while the
-	// before/after manifests stay identical).
-	idx, err := captureTrackedIndex(ctx, m.Source)
-	if err != nil {
-		return fmt.Errorf("run base: capture tracked paths: %w", err)
+	// The freeze transaction runs as ONE attempt function with a single
+	// retry. Every instability — a source tree that moves, an unstable Git
+	// capture, a byte-proof failure, OR a manifest that cannot establish
+	// content identity (unreadable file, size race mid-read) — is a
+	// retryable instability on the first attempt. Only the SECOND attempt
+	// decides which specific authority failed. This keeps the fail-closed
+	// content-identity rule compatible with the transaction's transient-
+	// mutation tolerance: a busy tree gets one retry instead of an
+	// immediate abort, and a persistently unprovable tree still fails.
+	type attemptResult struct {
+		strategy  string
+		unstable  bool
+		integrity error
+		changed   bool
+		err       error
 	}
-	m.tracked = idx
-	before, err := freezeManifestIndex(m.Source, skip, idx)
-	if err != nil {
-		return fmt.Errorf("run base: source manifest: %w", err)
+	clean := func(r attemptResult) bool {
+		return r.err == nil && !r.unstable && r.integrity == nil && !r.changed
 	}
-	// Capture Git identity from the SOURCE before copying. Never use the
-	// copied .git later: a linked worktree's gitdir stays on the live repo.
-	m.git = captureFrozenGit(m.Source, m.refs)
-	// Unstable capture (HEAD moved mid-read) forces the same one-retry
-	// transaction as a mutating source tree; after that we fail rather than
-	// let RunLocal fall back to live Git.
-	forceRetry := m.git.CaptureFailed()
-	base := filepath.Join(m.Root, "run-base")
-	// Freeze ALWAYS uses a plain working-tree copy (never the opt-in
-	// worktree strategy): run-base must match the developer's source
-	// listing including ignored/untracked files, and a worktree of HEAD
-	// would silently drop them before any job runs.
-	strategy, err := m.snapshotFrom(ctx, m.Source, base, true, idx)
-	if err != nil {
-		_ = os.RemoveAll(base)
-		return fmt.Errorf("run base snapshot: %w", err)
-	}
-	after, err := freezeManifestIndex(m.Source, skip, idx)
-	if err != nil {
-		_ = os.RemoveAll(base)
-		return fmt.Errorf("run base: source re-manifest: %w", err)
-	}
-	if before != after || forceRetry {
-		// One retry: a transient editor write during the copy, or an
-		// unstable Git capture. After that, refuse a hybrid snapshot or an
-		// uncertified Git identity rather than inventing state that never
-		// existed.
-		_ = os.RemoveAll(base)
-		base = filepath.Join(m.Root, "run-base")
-		// The retry is a NEW transaction over a mutated source: recapture
-		// the index membership and Git identity together so manifest, copy
-		// and identity all describe the tree that actually won the retry.
-		idx, err = captureTrackedIndex(ctx, m.Source)
+	attempt := func() attemptResult {
+		var res attemptResult
+		// ONE immutable index membership per attempt: the manifests, the
+		// copy, and the byte proof all read this same captured set — no
+		// live `git ls-files` decisions during the walk.
+		idx, err := captureTrackedIndex(ctx, m.Source)
 		if err != nil {
-			return fmt.Errorf("run base: capture tracked paths: %w", err)
+			res.err = fmt.Errorf("run base: capture tracked paths: %w", err)
+			return res
 		}
 		m.tracked = idx
-		before2, err := freezeManifestIndex(m.Source, skip, idx)
-		if err != nil {
-			return fmt.Errorf("run base: source manifest: %w", err)
+		if freezeBeforeManifestHook != nil {
+			freezeBeforeManifestHook()
 		}
-		// Recapture Git AFTER mutation so FrozenGit matches the tree that
-		// actually won the retry (not the pre-retry sampling).
+		proofs := map[string]freezeFileProof{}
+		before, err := freezeManifestIndex(m.Source, skip, idx, proofs)
+		if err != nil {
+			res.err = fmt.Errorf("run base: source manifest: %w", err)
+			return res
+		}
+		// Capture Git identity from the SOURCE before copying. Never use
+		// the copied .git later: a linked worktree's gitdir stays on the
+		// live repo.
 		m.git = captureFrozenGit(m.Source, m.refs)
-		strategy, err = m.snapshotFrom(ctx, m.Source, base, true, idx)
+		res.unstable = m.git.CaptureFailed()
+		base := filepath.Join(m.Root, "run-base")
+		// Freeze ALWAYS uses a plain working-tree copy (never the opt-in
+		// worktree strategy): run-base must match the developer's source
+		// listing including ignored/untracked files, and a worktree of HEAD
+		// would silently drop them before any job runs.
+		strategy, err := m.snapshotFrom(ctx, m.Source, base, true, idx)
 		if err != nil {
 			_ = os.RemoveAll(base)
-			return fmt.Errorf("run base snapshot: %w", err)
+			res.err = fmt.Errorf("run base snapshot: %w", err)
+			return res
 		}
-		after2, err := freezeManifestIndex(m.Source, skip, idx)
+		// Byte proof: re-hash every copied regular file against its source
+		// and require the source's identity to be the one the pre-copy
+		// manifest observed. This catches what before/after manifests
+		// cannot: a source mutated DURING the copy and restored before the
+		// after-manifest, which leaves A==B while the run-base holds
+		// hybrid bytes.
+		if freezeAfterCopyHook != nil {
+			freezeAfterCopyHook()
+		}
+		res.integrity = verifyRunBaseByteProof(m.Source, base, proofs)
+		after, err := freezeManifestIndex(m.Source, skip, idx, nil)
 		if err != nil {
 			_ = os.RemoveAll(base)
-			return fmt.Errorf("run base: source re-manifest: %w", err)
+			res.err = fmt.Errorf("run base: source re-manifest: %w", err)
+			return res
 		}
-		if before2 != after2 {
-			_ = os.RemoveAll(base)
+		res.strategy = strategy
+		res.changed = before != after
+		return res
+	}
+	res := attempt()
+	if !clean(res) {
+		// One retry over a freshly recaptured index, Git state and copy —
+		// the same transaction boundary the mutating-source design always
+		// had, now also covering manifest/identity-proof failures.
+		_ = os.RemoveAll(filepath.Join(m.Root, "run-base"))
+		res = attempt()
+	}
+	if !clean(res) {
+		_ = os.RemoveAll(filepath.Join(m.Root, "run-base"))
+		switch {
+		case res.err != nil:
+			return res.err
+		case res.integrity != nil:
+			return fmt.Errorf("run base: %w", res.integrity)
+		case res.unstable:
+			return fmt.Errorf("run base: Git identity capture failed atomically (HEAD moved during freeze); re-run when the repository is quiet")
+		default:
 			return fmt.Errorf("run base: source tree changed during freeze (retry also unstable); re-run when the working tree is quiet")
 		}
 	}
-	// Git capture must be definitive: NotRepo/RepoNoHead or Captured —
-	// never Unstable. An unstable identity would force RunLocal back to
-	// live Git after the source snapshot, recreating the source/Git split.
-	if m.git.CaptureFailed() {
-		_ = os.RemoveAll(base)
-		return fmt.Errorf("run base: Git identity capture failed atomically (HEAD moved during freeze); re-run when the repository is quiet")
-	}
-	if err := verifyStagedTreeIndex(m.Source, entries, base, strategy, idx); err != nil {
+	base := filepath.Join(m.Root, "run-base")
+	if err := verifyStagedTreeIndex(m.Source, entries, base, res.strategy, m.tracked); err != nil {
 		_ = os.RemoveAll(base)
 		return fmt.Errorf("run base verify: %w", err)
 	}
@@ -468,7 +485,14 @@ func captureTrackedIndex(ctx context.Context, src string) (trackedIndex, error) 
 // the freeze transaction uses freezeManifestIndex with the captured set so
 // manifest membership and copy membership are byte-for-byte the same rule.
 func freezeManifest(root, skip string) (string, error) {
-	return freezeManifestIndex(root, skip, liveTrackedIndex{src: root})
+	return freezeManifestIndex(root, skip, liveTrackedIndex{src: root}, nil)
+}
+
+// freezeFileProof is the pre-copy identity of one source regular file: the
+// FileInfo the manifest observed, used after the copy to prove the source
+// inode/size/mode/mtime never moved while the run-base was built.
+type freezeFileProof struct {
+	info os.FileInfo
 }
 
 // freezeManifestIndex digests exactly the entries the copy with the SAME
@@ -477,7 +501,14 @@ func freezeManifest(root, skip string) (string, error) {
 // so an untracked temp file churning under dist/ can never destabilize the
 // freeze, and index changes are decided by one captured set instead of
 // repeated live queries.
-func freezeManifestIndex(root, skip string, idx trackedIndex) (string, error) {
+//
+// When proofs is non-nil it is populated with the pre-copy identity of
+// every included regular file (the freeze transaction's byte-proof input).
+// Content identity is FAIL-CLOSED: if a file's bytes cannot be fully
+// hashed (unreadable, or it changed size mid-read), the manifest fails
+// instead of silently degrading to size/mode/mtime — metadata is fast
+// invalidation, not proof that the byte stream did not change.
+func freezeManifestIndex(root, skip string, idx trackedIndex, proofs map[string]freezeFileProof) (string, error) {
 	skip = filepath.Clean(skip)
 	h := sha256.New()
 	var preserve []string
@@ -544,13 +575,21 @@ func freezeManifestIndex(root, skip string, idx trackedIndex) (string, error) {
 			}
 		}
 		fmt.Fprintf(h, "%s\x00%s\x00%d\x00%d\x00%016x", rel, kind, info.Size(), info.Mode().Perm(), info.ModTime().UnixNano())
-		// Content digest: size+mtime can miss a same-size rewrite (P2
-		// determinism). Regular files are streamed (not capped at 1 MiB) up
-		// to freezeContentHashMax; larger blobs get a head/middle/tail
-		// sample plus size so multi-gigabyte artifacts cannot pin the
-		// freeze walk.
-		if kind == "f" && info.Size() > 0 {
-			if d, ok := freezeContentDigest(path, info.Size()); ok {
+		// Content identity: EVERY regular file is fully hashed (no sampled
+		// shortcut — run-base is the canonical authority from which
+		// execution and evidence derive, so equality cannot be
+		// probabilistic for any size). A digest that cannot be obtained
+		// fails the freeze: metadata-only rows are invalidation hints, not
+		// byte proof.
+		if kind == "f" {
+			if proofs != nil {
+				proofs[rel] = freezeFileProof{info: info}
+			}
+			if info.Size() > 0 {
+				d, ok := freezeContentDigest(path, info.Size())
+				if !ok {
+					return fmt.Errorf("freeze: content identity for %q could not be established (refusing a metadata-only freeze proof)", rel)
+				}
 				fmt.Fprintf(h, "\x00%s", d)
 			}
 		}
@@ -563,51 +602,122 @@ func freezeManifestIndex(root, skip string, idx trackedIndex) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// freezeContentHashMax is the largest file freeze content-hashes in full by
-// streaming. Beyond this size only a head/tail sample is hashed so a multi-GB
-// cache blob cannot pin the freeze stability walk (the sample still catches
-// same-size same-mtime rewrites at either end, which is where editors and
-// build tools touch files).
-const freezeContentHashMax = 64 << 20 // 64 MiB
-
-// freezeContentDigest returns a short hex digest of path's content for the
-// freeze manifest. ok is false when the file cannot be read (size/mtime
-// rows still bind the entry).
+// freezeContentDigest returns the hex digest of the file's COMPLETE byte
+// stream. ok is false when the bytes cannot be fully read or the file's
+// size moved while it was being read (the caller then refuses the freeze
+// rather than accepting metadata as a substitute). Every size gets the
+// full hash: sampled equality was acceptable for fast invalidation, never
+// for the canonical run-base proof.
 func freezeContentDigest(path string, size int64) (string, bool) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", false
 	}
 	defer f.Close()
-	if size <= freezeContentHashMax {
-		h := sha256.New()
-		if _, err := io.Copy(h, f); err != nil {
-			return "", false
-		}
-		return hex.EncodeToString(h.Sum(nil)[:8]), true
-	}
-	// Head + MIDDLE + tail sample for oversized files. The middle band
-	// exists because a same-size, same-mtime rewrite of an artifact's core
-	// (a repacked archive, an overwritten blob segment) escaped the
-	// head/tail sample: only the untouched ends stayed identical and the
-	// freeze certified a tree that had actually changed under it.
 	h := sha256.New()
-	if _, err := io.CopyN(h, f, 32<<10); err != nil {
-		return "", false
-	}
-	if _, err := f.Seek(size/2-(16<<10), io.SeekStart); err != nil {
-		return "", false
-	}
-	if _, err := io.CopyN(h, f, 32<<10); err != nil && err != io.EOF {
-		return "", false
-	}
-	if _, err := f.Seek(size-(32<<10), io.SeekStart); err != nil {
-		return "", false
-	}
-	if _, err := io.CopyN(h, f, 32<<10); err != nil && err != io.EOF {
+	n, err := io.Copy(h, f)
+	if err != nil || n != size {
 		return "", false
 	}
 	return hex.EncodeToString(h.Sum(nil)[:8]), true
+}
+
+// freezeBeforeManifestHook is a test-only seam invoked at the start of
+// every freeze attempt, before the source manifest runs, so tests can
+// script per-attempt instability (for example, a file that is unreadable
+// for the first manifest and readable for the retry). Nil in production.
+var freezeBeforeManifestHook func()
+
+// freezeAfterCopyHook is a test-only seam invoked after the run-base copy
+// and before the byte proof, so tests can fabricate exactly the race the
+// proof exists for (source mutated after its bytes were copied). Nil in
+// production.
+var freezeAfterCopyHook func()
+
+// verifyRunBaseByteProof re-hashes every copied regular file against its
+// source and requires the source's identity to match the pre-copy manifest
+// proof. This is the equality proof before/after manifests cannot give: a
+// source mutated DURING the copy and restored before the after-manifest
+// leaves both manifests equal while the run-base holds bytes that were
+// never the source's certified state at any single observation.
+//
+// The manager-created namespaces (.kiwi-frozen adoptions and the frozen
+// link-target store) are excluded: their bytes do not come from the source
+// tree copy.
+func verifyRunBaseByteProof(srcRoot, baseRoot string, proofs map[string]freezeFileProof) error {
+	return filepath.Walk(baseRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, rerr := filepath.Rel(baseRoot, path)
+		if rerr != nil {
+			return rerr
+		}
+		if rel == "." {
+			return nil
+		}
+		relSlash := filepath.ToSlash(rel)
+		if rel == ".kiwi-frozen" || strings.HasPrefix(relSlash, ".kiwi-frozen/") ||
+			rel == ".kiwi-frozen-link-targets" || strings.HasPrefix(relSlash, ".kiwi-frozen-link-targets/") {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			// Symlink identity (the target string) is bound by the
+			// manifests; byte proof covers regular file content only.
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("run base: %q is not a regular file", rel)
+		}
+		p, ok := proofs[rel]
+		if !ok {
+			return fmt.Errorf("run base: %q has no source proof from the pre-copy manifest", rel)
+		}
+		srcPath := filepath.Join(srcRoot, rel)
+		stNow, serr := os.Stat(srcPath)
+		if serr != nil {
+			return fmt.Errorf("run base: source file %q vanished during freeze: %w", rel, serr)
+		}
+		if !os.SameFile(p.info, stNow) ||
+			p.info.Size() != stNow.Size() ||
+			p.info.Mode() != stNow.Mode() ||
+			!p.info.ModTime().Equal(stNow.ModTime()) {
+			return fmt.Errorf("source identity for %q moved during freeze (inode/size/mode/mtime)", rel)
+		}
+		baseDigest, berr := hashFileContent(path)
+		if berr != nil {
+			return fmt.Errorf("run base: content identity for %q could not be established: %w", rel, berr)
+		}
+		srcDigest, serr := hashFileContent(srcPath)
+		if serr != nil {
+			return fmt.Errorf("run base: content identity for source %q could not be established: %w", rel, serr)
+		}
+		if baseDigest != srcDigest {
+			return fmt.Errorf("copied bytes do not match source for %q (content integrity)", rel)
+		}
+		return nil
+	})
+}
+
+// hashFileContent returns the hex digest of a file's complete byte stream.
+// A read failure is an error: byte proof never degrades to metadata.
+func hashFileContent(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // adoptStat is the adopted-file stability seam: tests substitute a changing
@@ -615,33 +725,6 @@ func freezeContentDigest(path string, size int64) (string, bool) {
 // it was being read (a hybrid of two writes must never become run
 // authority).
 var adoptStat = os.Stat
-
-// adoptStableRead reads path under a before/after stability bracket. If
-// size or mtime moved between the two samples (or the read length does not
-// match the sampled size), a concurrent writer was mid-update — retry once,
-// then fail closed. Never adopt bytes no single point in time ever had.
-func adoptStableRead(path string) ([]byte, error) {
-	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
-		before, err := adoptStat(path)
-		if err != nil {
-			return nil, err
-		}
-		data, rerr := os.ReadFile(path)
-		after, aerr := adoptStat(path)
-		if rerr != nil {
-			return nil, rerr
-		}
-		if aerr != nil {
-			return nil, aerr
-		}
-		if before.Size() == after.Size() && before.ModTime().Equal(after.ModTime()) && int64(len(data)) == before.Size() {
-			return data, nil
-		}
-		lastErr = fmt.Errorf("adopt: %s changed while it was being read (size/mtime moved mid-copy); refusing a hybrid as run authority", path)
-	}
-	return nil, lastErr
-}
 
 // BasePath returns the immutable run-base directory, or "" if Freeze has
 // not run. Useful for local execution metadata and replay.
@@ -1546,75 +1629,155 @@ func escapesFrozen(link string) bool {
 // the frozen run-base so the run identity covers the pipeline bytes. The
 // source is read under a stability bracket: a file mutating mid-read is
 // retried once and then refused, never adopted as a hybrid of two writes.
-func (m *Manager) AdoptFile(srcPath string) (string, error) {
+// AdoptedInputs is the result of one joint adoption transaction.
+type AdoptedInputs struct {
+	// PipelineDst is where the pipeline bytes were placed ("" when no
+	// pipeline path was given).
+	PipelineDst string
+	// LockRoot is the structured lock root to pass to applyLocalImageLock
+	// ("" when no lock path was given).
+	LockRoot string
+}
+
+// AdoptInputs adopts the external pipeline and its image lock (either may
+// be empty) under ONE stabilization transaction: every input is stat-sampled,
+// read, and stat-sampled again inside a single window, so the returned set
+// was simultaneously stable. Individually-stable reads could otherwise
+// certify pipeline A with lock B even though that combination never
+// existed. The whole transaction retries once, then fails closed.
+func (m *Manager) AdoptInputs(pipelinePath, lockPath string) (AdoptedInputs, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	var out AdoptedInputs
 	if m.base == "" {
-		return "", fmt.Errorf("AdoptFile: freeze first")
+		return out, fmt.Errorf("AdoptInputs: freeze first")
 	}
-	abs, err := filepath.Abs(srcPath)
+	if pipelinePath == "" && lockPath == "" {
+		return out, fmt.Errorf("AdoptInputs: nothing to adopt")
+	}
+	type planned struct {
+		abs   string
+		dst   string
+		isPip bool
+	}
+	var plan []planned
+	if pipelinePath != "" {
+		abs, err := filepath.Abs(pipelinePath)
+		if err != nil {
+			return out, err
+		}
+		plan = append(plan, planned{
+			abs:   abs,
+			dst:   filepath.Join(m.base, ".kiwi-frozen", filepath.Base(filepath.Clean(pipelinePath))),
+			isPip: true,
+		})
+	}
+	if lockPath != "" {
+		abs, err := filepath.Abs(lockPath)
+		if err != nil {
+			return out, err
+		}
+		plan = append(plan, planned{
+			abs: abs,
+			dst: filepath.Join(m.base, ".kiwi-frozen", "lockroot", ".kiwi", "lock.json"),
+		})
+	}
+
+	type sample struct {
+		info os.FileInfo
+	}
+	// One window across the whole set: stat-all, read-all, stat-all again.
+	// Any movement between a file's samples — size, mode, mtime, OR inode
+	// identity (an unlink/recreate that spoofs the metadata) — fails the
+	// WHOLE set: the combination was never simultaneously stable.
+	attempt := func() ([][]byte, string, error) {
+		s1 := make([]sample, len(plan))
+		for i, p := range plan {
+			st, err := adoptStat(p.abs)
+			if err != nil {
+				return nil, "", err
+			}
+			if st.IsDir() {
+				return nil, "", fmt.Errorf("adopt: %s is a directory; adopt the specific file", p.abs)
+			}
+			s1[i] = sample{info: st}
+		}
+		datas := make([][]byte, len(plan))
+		for i, p := range plan {
+			b, err := os.ReadFile(p.abs)
+			if err != nil {
+				return nil, "", err
+			}
+			datas[i] = b
+		}
+		for i, p := range plan {
+			st2, err := adoptStat(p.abs)
+			if err != nil {
+				return nil, "", err
+			}
+			// Inode identity: an unlink/recreate that clones size/mode/mtime
+			// is a different FILE. Stats without a Sys payload (test seam
+			// fixtures) skip the inode leg; every real os.Stat carries one.
+			inodeMoved := s1[i].info.Sys() != nil && st2.Sys() != nil && !os.SameFile(s1[i].info, st2)
+			if inodeMoved ||
+				s1[i].info.Size() != st2.Size() ||
+				s1[i].info.Mode() != st2.Mode() ||
+				!s1[i].info.ModTime().Equal(st2.ModTime()) {
+				return nil, p.abs, nil
+			}
+		}
+		return datas, "", nil
+	}
+	datas, changed, err := attempt()
+	if err != nil {
+		return out, err
+	}
+	if changed != "" {
+		datas, changed, err = attempt()
+		if err != nil {
+			return out, err
+		}
+		if changed != "" {
+			return out, fmt.Errorf("adopt: %s changed while it was being read (the adoption set must stabilize as one transaction)", changed)
+		}
+	}
+	for i, p := range plan {
+		if err := os.MkdirAll(filepath.Dir(p.dst), 0o755); err != nil {
+			return out, err
+		}
+		if err := os.WriteFile(p.dst, datas[i], 0o644); err != nil {
+			return out, err
+		}
+		if p.isPip {
+			out.PipelineDst = p.dst
+		} else {
+			out.LockRoot = filepath.Join(m.base, ".kiwi-frozen", "lockroot")
+		}
+	}
+	return out, nil
+}
+
+// AdoptFile copies an external file (e.g. -f ../shared/pipeline.yaml) into
+// the frozen run-base so the run identity covers the pipeline bytes.
+// It is the single-input form of AdoptInputs.
+func (m *Manager) AdoptFile(srcPath string) (string, error) {
+	res, err := m.AdoptInputs(srcPath, "")
 	if err != nil {
 		return "", err
 	}
-	st, err := adoptStat(abs)
-	if err != nil {
-		return "", err
-	}
-	if st.IsDir() {
-		return "", fmt.Errorf("AdoptFile: %s is a directory; adopt the specific file", abs)
-	}
-	data, err := adoptStableRead(abs)
-	if err != nil {
-		return "", err
-	}
-	name := filepath.Base(abs)
-	// Keep a stable subdirectory for adopted authority files.
-	rel := filepath.Join(".kiwi-frozen", name)
-	dst := filepath.Join(m.base, rel)
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return "", err
-	}
-	if err := os.WriteFile(dst, data, 0o644); err != nil {
-		return "", err
-	}
-	return dst, nil
+	return res.PipelineDst, nil
 }
 
 // AdoptLock freezes an image lockfile into a self-contained lock root under
 // the run-base and returns the root directory to pass to applyLocalImageLock
 // (Join(root, ".kiwi/lock.json") must resolve to the adopted bytes). This
 // preserves the lockfilePath layout instead of flattening lock.json next to
-// the pipeline, and never leaves the live original path as authority. The
-// source read is stability-bracketed like AdoptFile.
+// the pipeline, and never leaves the live original path as authority.
+// It is the single-input form of AdoptInputs.
 func (m *Manager) AdoptLock(srcLockFile string) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.base == "" {
-		return "", fmt.Errorf("AdoptLock: freeze first")
-	}
-	abs, err := filepath.Abs(srcLockFile)
+	res, err := m.AdoptInputs("", srcLockFile)
 	if err != nil {
 		return "", err
 	}
-	st, err := adoptStat(abs)
-	if err != nil {
-		return "", err
-	}
-	if st.IsDir() {
-		return "", fmt.Errorf("AdoptLock: %s is a directory, not a lockfile", abs)
-	}
-	data, err := adoptStableRead(abs)
-	if err != nil {
-		return "", err
-	}
-	// Structured destination: <base>/.kiwi-frozen/lockroot/.kiwi/lock.json
-	root := filepath.Join(m.base, ".kiwi-frozen", "lockroot")
-	dst := filepath.Join(root, ".kiwi", "lock.json")
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return "", err
-	}
-	if err := os.WriteFile(dst, data, 0o644); err != nil {
-		return "", err
-	}
-	return root, nil
+	return res.LockRoot, nil
 }

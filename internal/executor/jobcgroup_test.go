@@ -494,5 +494,11 @@ func TestNativeJobCgroupAcquiredExactlyOnceWithNativeServices(t *testing.T) {
 	if *calls != 1 {
 		t.Fatalf("job cgroup setup calls = %d, want exactly 1 (single ownership acquisition)", *calls)
 	}
+	// The degraded fallback must SAY so: the capability boundary (strong
+	// crash ownership only under cgroup/Job Object) is part of the
+	// contract operators read in logs and docs/runner-security.md.
+	if !sink.has("hard-crash ownership degraded") {
+		t.Fatal("cgroup-unavailable fallback never stated the crash-ownership degradation")
+	}
 	_ = cleanups
 }

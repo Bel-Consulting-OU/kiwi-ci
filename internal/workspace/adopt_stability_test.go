@@ -28,7 +28,9 @@ func (s scriptedStat) Sys() any           { return nil }
 // bracket: if the source's size/mtime moves between the before-sample and
 // the after-sample of the read, the bytes are a hybrid of two writes —
 // AdoptFile must retry once and then REFUSE, never adopt them as run
-// authority (the audit's unbracketed adopt-copy race).
+// authority (the audit's unbracketed adopt-copy race). AdoptFile routes
+// through the joint AdoptInputs transaction, so each attempt samples
+// stat-before and stat-after (the dir check is the before-sample).
 func TestAdoptFileRefusesMidReadMutation(t *testing.T) {
 	src := t.TempDir()
 	m, err := NewManager(src)
@@ -44,11 +46,11 @@ func TestAdoptFileRefusesMidReadMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Script: AdoptFile's dir-check samples first; then EVERY before/after
-	// pair of both bracket attempts reports a grown file (mid-write
-	// growth), so neither attempt can certify a stable read.
+	// Script: every before/after pair of both bracket attempts reports a
+	// grown file (mid-write growth), so neither attempt can certify a
+	// stable read. Call order per attempt: stat-before, stat-after.
 	mut := time.Now()
-	sizes := []int64{11, 11, 12, 11, 12}
+	sizes := []int64{11, 12, 11, 12}
 	calls := 0
 	orig := adoptStat
 	adoptStat = func(string) (os.FileInfo, error) {
@@ -69,8 +71,8 @@ func TestAdoptFileRefusesMidReadMutation(t *testing.T) {
 	if !strings.Contains(err.Error(), "changed while it was being read") {
 		t.Fatalf("error = %v, want mid-read mutation refusal", err)
 	}
-	if calls < 5 {
-		t.Fatalf("stability bracket sampled %d times, want dir-check + full retry bracket (5)", calls)
+	if calls < 4 {
+		t.Fatalf("stability bracket sampled %d times, want the full retry bracket (4)", calls)
 	}
 	// Nothing may have been adopted into the run-base.
 	if _, err := os.Stat(filepath.Join(m.BasePath(), ".kiwi-frozen", "pipeline.yaml")); err == nil {
@@ -86,15 +88,89 @@ func TestAdoptFileRefusesMidReadMutation(t *testing.T) {
 	}
 }
 
-// TestFreezeContentDigestCatchesMiddleOnlyRewrite: files above the full-
-// hash cap (64 MiB) are sampled head/tail — a same-size, same-mtime
-// rewrite of the MIDDLE band (repacked archive core, overwritten blob
-// segment) escaped that sample entirely. The middle band closes it: the
-// audit's ">64MiB middle-only rewrite" oracle.
+// TestAdoptInputsRejectsUnstableSet is the cross-file atomicity oracle: a
+// pipeline and lock that are each read-able must still be refused as a SET
+// when any member's stat moves inside the joint window. Individually
+// stable reads could certify a combination that never existed (pipeline A
+// + lock B). Nothing may be written when the set fails.
+func TestAdoptInputsRejectsUnstableSet(t *testing.T) {
+	src := t.TempDir()
+	m, err := NewManager(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.Freeze(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	extDir := t.TempDir()
+	pip := filepath.Join(extDir, "pipeline.yaml")
+	lock := filepath.Join(extDir, "lock.json")
+	if err := os.WriteFile(pip, []byte("version: 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lock, []byte(`{"version":1}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Call order per attempt: S1(pipeline), S1(lock), S2(pipeline),
+	// S2(lock). The lock's after-sample always reports growth.
+	mut := time.Now()
+	sizes := []int64{10, 10, 10, 11, 10, 10, 10, 11}
+	calls := 0
+	orig := adoptStat
+	adoptStat = func(string) (os.FileInfo, error) {
+		i := calls
+		calls++
+		if i >= len(sizes) {
+			i = len(sizes) - 1
+		}
+		return scriptedStat{size: sizes[i], mtime: mut}, nil
+	}
+	t.Cleanup(func() { adoptStat = orig })
+
+	_, err = m.AdoptInputs(pip, lock)
+	adoptStat = orig
+	if err == nil {
+		t.Fatal("AdoptInputs accepted a set that was never simultaneously stable")
+	}
+	if !strings.Contains(err.Error(), "one transaction") {
+		t.Fatalf("error = %v, want joint-transaction refusal", err)
+	}
+	if !strings.Contains(err.Error(), "lock.json") {
+		t.Fatalf("error should name the moving member: %v", err)
+	}
+	if _, serr := os.Stat(filepath.Join(m.BasePath(), ".kiwi-frozen", "pipeline.yaml")); serr == nil {
+		t.Fatal("pipeline was adopted despite the unstable set")
+	}
+	if _, serr := os.Stat(filepath.Join(m.BasePath(), ".kiwi-frozen", "lockroot", ".kiwi", "lock.json")); serr == nil {
+		t.Fatal("lock was adopted despite the unstable set")
+	}
+
+	// Stable set: BOTH members land with their layouts, one window.
+	res, err := m.AdoptInputs(pip, lock)
+	if err != nil {
+		t.Fatalf("stable AdoptInputs: %v", err)
+	}
+	if res.PipelineDst == "" || res.LockRoot == "" {
+		t.Fatalf("stable adoption returned %+v, want both destinations", res)
+	}
+	if b, rerr := os.ReadFile(res.PipelineDst); rerr != nil || string(b) != "version: 1\n" {
+		t.Fatalf("adopted pipeline = %q %v", b, rerr)
+	}
+	if b, rerr := os.ReadFile(filepath.Join(res.LockRoot, ".kiwi", "lock.json")); rerr != nil || string(b) != `{"version":1}` {
+		t.Fatalf("adopted lock = %q %v", b, rerr)
+	}
+}
+
+// TestFreezeContentDigestCatchesMiddleOnlyRewrite: a same-size, same-mtime
+// rewrite deep inside a large file (well past any historic head/tail
+// sampling bands) must change the freeze content digest. The canonical
+// freeze hashes every byte of every regular file, so any offset flips it.
 func TestFreezeContentDigestCatchesMiddleOnlyRewrite(t *testing.T) {
 	src := t.TempDir()
 	path := filepath.Join(src, "huge.bin")
-	size := int64(freezeContentHashMax) + (1 << 20) // 65 MiB: over the full-hash cap
+	size := int64(65 << 20) // 65 MiB: well past any historic sampling cap
 	payload := bytes.Repeat([]byte{'A'}, int(size))
 	if err := os.WriteFile(path, payload, 0o644); err != nil {
 		t.Fatal(err)
@@ -137,5 +213,77 @@ func TestFreezeContentDigestCatchesMiddleOnlyRewrite(t *testing.T) {
 	}
 	if d1 == d2 {
 		t.Fatal("middle-only rewrite of an oversized file escaped the freeze digest (head/tail-only sampling)")
+	}
+}
+
+// TestAdoptInputsRejectsInodeSwapWithSameStat: size, mode and mtime all
+// matching is not proof the file is the same FILE. An unlink/recreate (or
+// a swap to another inode whose metadata was cloned) between the before
+// and after samples must fail the adoption set — the metadata-only bracket
+// accepted it, exactly the class of proof the freeze byte-proof refuses
+// everywhere else.
+func TestAdoptInputsRejectsInodeSwapWithSameStat(t *testing.T) {
+	src := t.TempDir()
+	m, err := NewManager(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.Freeze(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	pip := filepath.Join(t.TempDir(), "pipeline.yaml")
+	body := []byte("version: 1\n")
+	if err := os.WriteFile(pip, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stP, err := os.Stat(pip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A different inode with identical size, mode and mtime.
+	other := filepath.Join(t.TempDir(), "other.yaml")
+	if err := os.WriteFile(other, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(other, stP.ModTime(), stP.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	stQ, err := os.Stat(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(stP, stQ) {
+		t.Fatal("fixture: expected distinct inodes")
+	}
+	if stP.Size() != stQ.Size() || !stP.ModTime().Equal(stQ.ModTime()) || stP.Mode() != stQ.Mode() {
+		t.Fatal("fixture: expected identical size/mode/mtime")
+	}
+
+	// Script: S1 sees the original inode, S2 sees the spoofed twin — every
+	// attempt.
+	seq := []os.FileInfo{stP, stQ, stP, stQ}
+	calls := 0
+	orig := adoptStat
+	adoptStat = func(string) (os.FileInfo, error) {
+		i := calls
+		calls++
+		if i >= len(seq) {
+			i = len(seq) - 1
+		}
+		return seq[i], nil
+	}
+	t.Cleanup(func() { adoptStat = orig })
+
+	_, err = m.AdoptInputs(pip, "")
+	adoptStat = orig
+	if err == nil {
+		t.Fatal("adoption accepted an inode swap with cloned metadata")
+	}
+	if !strings.Contains(err.Error(), "one transaction") {
+		t.Fatalf("error = %v, want joint-transaction refusal", err)
+	}
+	if _, serr := os.Stat(filepath.Join(m.BasePath(), ".kiwi-frozen", "pipeline.yaml")); serr == nil {
+		t.Fatal("bytes were adopted despite the inode swap")
 	}
 }

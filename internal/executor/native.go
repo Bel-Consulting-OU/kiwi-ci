@@ -197,9 +197,14 @@ func (*NativeBackend) Run(ctx context.Context, c Command, emit func(string)) err
 			pathExt = os.Getenv("PATHEXT")
 		}
 	}
-	resolved, rerr := lookPathWithEnv(shell, pathVal, pathExt)
+	// One semantic resolver for every native argv0: a path-qualified shell
+	// ("./tools/custom-bash") binds to this step's workDir and can never
+	// fall back to PATH or to a same-named shell beside the runner daemon —
+	// the shell interprets the entire job command, so the wrong shell
+	// contaminates every observed byte downstream.
+	resolved, rerr := resolveExecutableIn(shell, c.Dir, pathVal, pathExt)
 	if rerr != nil {
-		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("resolve shell %q against execution PATH: %w", shell, rerr)}
+		return &RunError{Kind: ErrorInfra, Err: fmt.Errorf("resolve shell %q: %w", shell, rerr)}
 	}
 	shell = resolved
 	// Prefer clone-into-cgroup (Linux): the step is born inside the durable

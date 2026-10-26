@@ -1,6 +1,8 @@
 package executor
 
 import (
+	"fmt"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -17,44 +19,77 @@ func lookPathWithEnv(name, pathEnv, pathExt string) (string, error) {
 
 // resolveExecutable resolves argv0 the way the child process will see it:
 // against workDir (Cmd.Dir, the execution directory) and the FULLY merged
-// effective environment (base + service/step overlays). A relative path
-// with a separator ("./bin/tool") is evaluated relative to workDir, matching
-// Go's os/exec contract for a command with Dir set. Bare names search PATH
-// (case-insensitively on Windows).
+// effective environment (base + service/step overlays).
+//
+// Authority rule (single semantic resolver, also used for the native step
+// shell): a PATH-QUALIFIED name ("./bin/tool", "sub/tool", "C:\x\y.exe")
+// has already expressed its resolution domain, so it resolves ONLY against
+// workDir and NEVER falls back to a PATH search or — worse — to a bare
+// stat of the name relative to the RUNNER PROCESS'S current directory. The
+// old fall-through let a job ask for "./tools/compiler", miss it in the
+// workspace, and silently execute a same-named file living beside the
+// runner daemon. Bare names search PATH (case-insensitively on Windows).
 func resolveExecutable(name, workDir string, env map[string]string) (string, error) {
-	if name == "" {
-		return "", errEmptyExecutable
-	}
-	pathVal := ""
-	pathExt := ""
+	pathVal, pathExt := "", ""
 	if runtime.GOOS == "windows" {
 		pathVal = envValueFold(env, "PATH")
 		pathExt = envValueFold(env, "PATHEXT")
 	} else {
 		pathVal = env["PATH"]
 	}
-	// Relative (or absolute) path containing a separator: resolve against
-	// the execution directory the child will use, not the runner CWD.
-	if strings.ContainsAny(name, `/\`) || (len(name) > 1 && name[1] == ':') {
+	return resolveExecutableIn(name, workDir, pathVal, pathExt)
+}
+
+// PathQualified reports whether name already expressed a filesystem domain
+// (contains a path separator or a drive prefix). Such names bind to the
+// job's workDir and never fall back to PATH or the process CWD.
+func PathQualified(name string) bool {
+	return strings.ContainsAny(name, `/\`) || (len(name) > 1 && name[1] == ':')
+}
+
+// resolveExecutableIn is the shared resolver core: path-qualified names
+// bind to workDir, bare names search the supplied PATH/PATHEXT. Callers
+// extract the PATH authorities themselves (service env maps, step env
+// slices) so every native argv0 — service commands, the step shell, and
+// other helpers — goes through identical semantics.
+func resolveExecutableIn(name, workDir, pathVal, pathExt string) (string, error) {
+	if name == "" {
+		return "", errEmptyExecutable
+	}
+	// Relative (or absolute) path containing a separator or a drive prefix.
+	if PathQualified(name) {
 		cand := name
+		base := workDir
+		if base == "" {
+			base = "."
+		}
 		if !filepath.IsAbs(name) {
-			base := workDir
-			if base == "" {
-				base = "."
-			}
 			cand = filepath.Join(base, name)
 		}
 		if resolved, err := lookPathWithEnv(cand, pathVal, pathExt); err == nil {
 			return resolved, nil
 		}
-		// Fall through: PATH search is still valid for names that contain a
-		// separator only as a drive-relative quirk; re-try bare below when
-		// the join missed.
-		if filepath.IsAbs(name) {
-			return "", errNotFoundOnPath(name, pathVal, pathExt)
-		}
+		// No fallback of any kind: the resolution domain was expressed.
+		return "", fmt.Errorf("executable %q not found relative to workdir %q (path-qualified names never fall back to PATH or the runner's current directory)", name, base)
 	}
 	return lookPathWithEnv(name, pathVal, pathExt)
+}
+
+// ResolveDeclaredTool resolves a tools:/toolchains: declaration name.
+// Path-qualified entries ("./tools/go") bind to the job workspace root —
+// the verification probe may never execute a same-named binary beside the
+// runner daemon. Bare names keep the documented host-tool contract (the
+// ambient PATH): these gates verify runner-provided tooling, while the
+// step shell independently resolves job-visible executables against the
+// effective environment.
+func ResolveDeclaredTool(name, workDir string) (string, error) {
+	if PathQualified(name) {
+		// Path-qualified candidates ignore PATH/PATHEXT-as-search (unix
+		// stats the joined path directly; windows applies PATHEXT suffixes
+		// to the joined path), so an empty env map is correct here.
+		return resolveExecutableIn(name, workDir, "", "")
+	}
+	return exec.LookPath(name)
 }
 
 // envValueFold is the Windows case-insensitive env lookup (PATH/PATHEXT).

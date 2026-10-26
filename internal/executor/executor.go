@@ -969,7 +969,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 			res.Error = infra.Error()
 			return finish(res)
 		} else {
-			e.log(cj.ID, "runtime", "native job cgroup unavailable ("+cgStatus.Detail+"); PID+start-stamp ledger is the fallback for the whole job (services and steps share this outcome)")
+			e.log(cj.ID, "runtime", "native job cgroup unavailable ("+cgStatus.Detail+"); PID+start-stamp ledger is the fallback for the whole job (services and steps share this outcome); hard-crash ownership degraded: unprovable descendants become recovery debt, never PID guesses (see docs/runner-security.md crash-ownership matrix)")
 		}
 	}
 	if len(cj.Job.Services) > 0 && !RuntimeRunsServices(cj.Job.Runtime) && !RuntimeMayRunNativeServices(cj.Job.Runtime, cj.Job.Services) {
@@ -1213,7 +1213,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	// Declared toolchains: entries are verified before step 1 (hermetic
 	// native jobs). Observed versions are recorded so the execution
 	// attestation can carry them.
-	if err := e.checkBoundToolchains(ctx, cj.ID, cj.Job.BoundToolchains); err != nil {
+	if err := e.checkBoundToolchains(ctx, cj.ID, cj.Job.BoundToolchains, workRoot); err != nil {
 		res.Status = model.StatusFailure
 		res.Error = err.Error()
 		return finish(res)
@@ -1222,7 +1222,7 @@ func (e *Executor) runJob(ctx context.Context, s *pipeline.Spec, cj pipeline.Com
 	// missing or wrong-version tool. Observed versions are recorded so the
 	// execution attestation can carry them.
 	if len(cj.Job.Tools) > 0 {
-		if err := e.checkToolFingerprint(cj.ID, cj.Job.Tools); err != nil {
+		if err := e.checkToolFingerprint(cj.ID, cj.Job.Tools, workRoot); err != nil {
 			res.Status = model.StatusFailure
 			res.Error = err.Error()
 			return finish(res)
@@ -1638,15 +1638,20 @@ func (e *Executor) captureSnapshot(jobID, workspace string) {
 // checkToolFingerprint asserts each tools: entry ("docker=29.5") before any
 // step runs. The tool must exist and its --version output must contain the
 // declared version prefix. Observed versions are logged for the attestation.
-func (e *Executor) checkToolFingerprint(jobID string, tools []string) error {
+// Path-qualified entries resolve against the job workspace root only — the
+// probe must never execute a same-named binary from the runner's CWD.
+func (e *Executor) checkToolFingerprint(jobID string, tools []string, workRoot string) error {
 	for _, entry := range tools {
 		name, want, ok := strings.Cut(entry, "=")
 		name = strings.TrimSpace(name)
 		if !ok || name == "" {
 			return fmt.Errorf("tools entry %q must be name=version-prefix", entry)
 		}
-		path, err := exec.LookPath(name)
+		path, err := ResolveDeclaredTool(name, workRoot)
 		if err != nil {
+			if PathQualified(name) {
+				return fmt.Errorf("tools: %s: %w", name, err)
+			}
 			return fmt.Errorf("tools: %s is required (declared %q) but not on PATH", name, entry)
 		}
 		if want == "" {
@@ -1680,7 +1685,7 @@ func truncateVersion(s string) string {
 // binary or version mismatch stops the job before any step runs. The
 // version probe runs under the job context so a hung `--version` cannot
 // outlive the job deadline.
-func (e *Executor) checkBoundToolchains(ctx context.Context, jobID string, toolchains []pipeline.Toolchain) error {
+func (e *Executor) checkBoundToolchains(ctx context.Context, jobID string, toolchains []pipeline.Toolchain, workRoot string) error {
 	for _, tc := range toolchains {
 		name := tc.Path
 		if name == "" {
@@ -1692,8 +1697,11 @@ func (e *Executor) checkBoundToolchains(ctx context.Context, jobID string, toolc
 		if name == "" {
 			return fmt.Errorf("toolchain has neither path nor command")
 		}
-		path, err := exec.LookPath(name)
+		path, err := ResolveDeclaredTool(name, workRoot)
 		if err != nil {
+			if PathQualified(name) {
+				return fmt.Errorf("toolchain %s: %w", name, err)
+			}
 			return fmt.Errorf("toolchain %s is required but not on PATH (pin install: or bootstrap with kiwi doctor --install-toolchains)", name)
 		}
 		args := tc.Command

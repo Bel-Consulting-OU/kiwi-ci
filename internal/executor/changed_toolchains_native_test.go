@@ -66,7 +66,7 @@ jobs:
 
 func TestCheckBoundToolchainsMissing(t *testing.T) {
 	e := &Executor{Opt: Options{Logs: logging.Func(func(string, string, string) {})}}
-	err := e.checkBoundToolchains(context.Background(), "j", []pipeline.Toolchain{{Path: "kiwi-definitely-missing-binary-xyz", Version: "1"}})
+	err := e.checkBoundToolchains(context.Background(), "j", []pipeline.Toolchain{{Path: "kiwi-definitely-missing-binary-xyz", Version: "1"}}, t.TempDir())
 	if err == nil || !strings.Contains(err.Error(), "not on PATH") {
 		t.Fatalf("checkBoundToolchains(missing) = %v", err)
 	}

@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Bel-Consulting-OU/kiwi-ci/internal/executor"
 	"github.com/Bel-Consulting-OU/kiwi-ci/internal/pipeline"
 )
 
@@ -325,6 +326,12 @@ func doctorPipelineToolchains(file string, install bool) error {
 	}
 	fmt.Println("== toolchains ==")
 	failed := false
+	// Path-qualified declarations bind to the PIPELINE's project root —
+	// the same domain family the executor binds them to (the job workspace
+	// built from that tree). The old exec.LookPath resolved them against
+	// the doctor process's CWD, so doctor could certify (and execute) a
+	// same-named binary that no job would ever run.
+	root := lockRootFor(file)
 	// Stable order: sorted names.
 	names := make([]string, 0, len(s.Toolchains))
 	for n := range s.Toolchains {
@@ -355,9 +362,13 @@ func doctorPipelineToolchains(file string, install bool) error {
 				continue
 			}
 		}
-		path, err := exec.LookPath(bin)
+		path, err := executor.ResolveDeclaredTool(bin, root)
 		if err != nil {
-			fmt.Printf("%-14s FAIL (not on PATH; declare install: or put %s on PATH)\n", name, bin)
+			if executor.PathQualified(bin) {
+				fmt.Printf("%-14s FAIL (%v)\n", name, err)
+			} else {
+				fmt.Printf("%-14s FAIL (not on PATH; declare install: or put %s on PATH)\n", name, bin)
+			}
 			failed = true
 			continue
 		}

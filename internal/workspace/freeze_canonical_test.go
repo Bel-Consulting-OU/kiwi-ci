@@ -287,13 +287,13 @@ func TestFreezeManifestAndCopyShareOneInclusionSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m1, err := freezeManifestIndex(src, "", idx)
+	m1, err := freezeManifestIndex(src, "", idx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Churn the untracked file (bytes and mtime): manifest must hold.
 	writeFile(t, filepath.Join(src, "dist", "temp.js"), "untracked-v2-changed")
-	m2, err := freezeManifestIndex(src, "", idx)
+	m2, err := freezeManifestIndex(src, "", idx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,7 +302,7 @@ func TestFreezeManifestAndCopyShareOneInclusionSet(t *testing.T) {
 	}
 	// Tracked content still must flip it (not over-stable).
 	writeFile(t, filepath.Join(src, "dist", "asset.txt"), "tracked-changed")
-	m3, err := freezeManifestIndex(src, "", idx)
+	m3, err := freezeManifestIndex(src, "", idx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -223,7 +223,14 @@ func TestRunXFSQuotaCommandHangingTimesOutBounded(t *testing.T) {
 	xfsQuotaTimeout = 500 * time.Millisecond
 	t.Cleanup(func() { xfsQuotaTimeout = orig })
 
-	noisyHang := "#!/bin/sh\nif [ -n \"$KIWI_TEST_WARM\" ]; then exit 0; fi\ni=0\nwhile [ \"$i\" -lt 100 ]; do printf 'abcdefghij'; i=$(expr $i + 1); done\nexec sleep 300\n"
+	// Emit the >512-char hostile payload in ONE printf before hanging (same
+	// load-independence fix as TestBoundedToolCommandHangingTimesOutTyped-
+	// BoundedOutput): a loop of `expr` subprocesses made the captured byte
+	// count scheduling-dependent, so under -race/-checkptr the kill could
+	// land before the 512-char truncation threshold and the [truncated]
+	// marker legitimately never appeared.
+	bulk := strings.Repeat("abcdefghij", 110) // 1100 chars > the 512 limit
+	noisyHang := "#!/bin/sh\nif [ -n \"$KIWI_TEST_WARM\" ]; then exit 0; fi\nprintf '" + bulk + "'\nexec sleep 300\n"
 	fake := writePrewarmedScript(t, "xfs_quota", noisyHang)
 	start := time.Now()
 	err := runXFSQuotaCommand(fake, "/mnt/xfs", "limit -p bhard=1 42")

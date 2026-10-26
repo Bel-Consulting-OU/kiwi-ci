@@ -79,8 +79,10 @@ func RunLocal(ctx context.Context, args []string) error {
 	// lives under the working tree.
 	fileToLoad := *file
 	adoptedPipeline := false
+	adoptedLockRoot := ""
 	if baseDir != "" {
 		if abs, aerr := filepath.Abs(*file); aerr == nil {
+			needAdopt := false
 			if rel, rerr := filepath.Rel(wd, abs); rerr == nil && !strings.HasPrefix(rel, "..") {
 				frozen := filepath.Join(baseDir, rel)
 				if fileExists(frozen) {
@@ -89,21 +91,34 @@ func RunLocal(ctx context.Context, args []string) error {
 					// Under the working tree but omitted from Freeze (e.g.
 					// untracked under target/). Live bytes would still change
 					// the run identity: adopt them into the frozen base.
-					adopted, aerr2 := wm.AdoptFile(abs)
-					if aerr2 != nil {
-						return fmt.Errorf("freeze in-tree pipeline: %w", aerr2)
-					}
-					fileToLoad = adopted
-					adoptedPipeline = true
+					needAdopt = true
 				}
 			} else {
 				// External pipeline: adopt bytes into the frozen run-base.
-				adopted, aerr2 := wm.AdoptFile(abs)
-				if aerr2 != nil {
-					return fmt.Errorf("freeze external pipeline: %w", aerr2)
+				needAdopt = true
+			}
+			if needAdopt {
+				// The pipeline AND its image lock are adopted in ONE
+				// stabilization transaction: the pair was simultaneously
+				// stable or the run refuses to start. Two separate
+				// adoptions could certify pipeline A with lock B even
+				// though that combination never existed.
+				origRoot := lockRootFor(*file)
+				if origRoot == "" {
+					origRoot = wd
 				}
-				fileToLoad = adopted
+				origLock := filepath.Join(origRoot, ".kiwi", "lock.json")
+				lockPath := ""
+				if fileExists(origLock) {
+					lockPath = origLock
+				}
+				adopted, aerr2 := wm.AdoptInputs(abs, lockPath)
+				if aerr2 != nil {
+					return fmt.Errorf("freeze adopted inputs: %w", aerr2)
+				}
+				fileToLoad = adopted.PipelineDst
 				adoptedPipeline = true
+				adoptedLockRoot = adopted.LockRoot
 			}
 		}
 	}
@@ -131,20 +146,13 @@ func RunLocal(ctx context.Context, args []string) error {
 	lockRoot := lockRootFor(fileToLoad)
 	switch {
 	case adoptedPipeline && baseDir != "":
-		// Adopted pipeline: resolve the lock against the ORIGINAL project
-		// layout, but load bytes from a frozen copy. Never fall back to the
-		// live original path (that reopens the pipeline/lock split).
-		origRoot := lockRootFor(*file)
-		if origRoot == "" {
-			origRoot = wd
-		}
-		origLock := filepath.Join(origRoot, ".kiwi", "lock.json")
-		if fileExists(origLock) {
-			frozenRoot, aerr := wm.AdoptLock(origLock)
-			if aerr != nil {
-				return fmt.Errorf("freeze image lock: %w", aerr)
-			}
-			lockRoot = frozenRoot
+		// The pipeline and its image lock came from ONE joint adoption
+		// transaction above: the combination is simultaneous by
+		// construction. A lock that did not exist at that instant stays
+		// absent for this run; a late-appearing lock is not authority
+		// (same freeze rule as kiwi.toml).
+		if adoptedLockRoot != "" {
+			lockRoot = adoptedLockRoot
 		} else {
 			// No lock at the original location: point at a root with no
 			// lockfile so applyLocalImageLock takes the documented
