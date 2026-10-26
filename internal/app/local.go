@@ -100,19 +100,21 @@ func RunLocal(ctx context.Context, args []string) error {
 			if needAdopt {
 				// The pipeline AND its image lock are adopted in ONE
 				// stabilization transaction: the pair was simultaneously
-				// stable or the run refuses to start. Two separate
-				// adoptions could certify pipeline A with lock B even
-				// though that combination never existed.
+				// stable, or the lock's ABSENCE was, and the run refuses
+				// to start otherwise. Two separate adoptions could certify
+				// pipeline A with lock B even though that combination
+				// never existed; an outside-window fileExists check could
+				// observe "no lock" while one appeared mid-transaction.
 				origRoot := lockRootFor(*file)
 				if origRoot == "" {
 					origRoot = wd
 				}
 				origLock := filepath.Join(origRoot, ".kiwi", "lock.json")
-				lockPath := ""
-				if fileExists(origLock) {
-					lockPath = origLock
-				}
-				adopted, aerr2 := wm.AdoptInputs(abs, lockPath)
+				// Pass the lock path UNCONDITIONALLY: AdoptInputs treats a
+				// missing lock as a verified absence state inside the
+				// window, and a lock that appears there fails the attempt
+				// (the retry then coherently adopts the present pair).
+				adopted, aerr2 := wm.AdoptInputs(abs, origLock)
 				if aerr2 != nil {
 					return fmt.Errorf("freeze adopted inputs: %w", aerr2)
 				}

@@ -287,3 +287,96 @@ func TestAdoptInputsRejectsInodeSwapWithSameStat(t *testing.T) {
 		t.Fatal("bytes were adopted despite the inode swap")
 	}
 }
+
+// TestAdoptInputsTreatsLockAbsenceAsState pins the absence-state contract:
+// a missing optional lock is an OBSERVED state of the joint transaction,
+// not an error. A lock that APPEARS inside the window fails the attempt;
+// the retry then coherently adopts the now-present pair. (The old
+// fileExists-then-adopt design could observe "no lock" outside the window
+// and silently ignore a lock created mid-transaction.)
+func TestAdoptInputsTreatsLockAbsenceAsState(t *testing.T) {
+	src := t.TempDir()
+	m, err := NewManager(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if err := m.Freeze(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	extDir := t.TempDir()
+	pip := filepath.Join(extDir, "pipeline.yaml")
+	lock := filepath.Join(extDir, "lock.json")
+	if err := os.WriteFile(pip, []byte("version: 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// (a) Lock never exists: the pair (pipeline, absence) is certified.
+	res, err := m.AdoptInputs(pip, lock)
+	if err != nil {
+		t.Fatalf("absent lock must be an observed state, not an error: %v", err)
+	}
+	if res.LockRoot != "" {
+		t.Fatalf("LockRoot = %q, want \"\" for verified absence", res.LockRoot)
+	}
+	if res.PipelineDst == "" {
+		t.Fatal("pipeline was not adopted alongside the verified absence")
+	}
+	if b, rerr := os.ReadFile(res.PipelineDst); rerr != nil || string(b) != "version: 1\n" {
+		t.Fatalf("adopted pipeline = %q %v", b, rerr)
+	}
+	if _, serr := os.Stat(filepath.Join(m.BasePath(), ".kiwi-frozen", "lockroot", ".kiwi", "lock.json")); serr == nil {
+		t.Fatal("absent lock must not produce a lockroot file")
+	}
+
+	// (b) The lock APPEARS inside the window (S1 absent, S2 present): the
+	// attempt fails, the retry sees a present pair and adopts BOTH.
+	if err := os.WriteFile(lock, []byte(`{"version":1}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stP2, err := os.Stat(pip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stL, err := os.Stat(lock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Call order per attempt: S1(pip), S1(lock), S2(pip), S2(lock).
+	seq := []func() (os.FileInfo, error){
+		func() (os.FileInfo, error) { return scriptedStat{size: stP2.Size(), mtime: stP2.ModTime()}, nil },
+		func() (os.FileInfo, error) { return nil, os.ErrNotExist }, // lock absent at S1
+		func() (os.FileInfo, error) { return scriptedStat{size: stP2.Size(), mtime: stP2.ModTime()}, nil },
+		func() (os.FileInfo, error) { return stL, nil }, // lock appeared at S2
+		// Retry: lock present and stable both samples.
+		func() (os.FileInfo, error) { return scriptedStat{size: stP2.Size(), mtime: stP2.ModTime()}, nil },
+		func() (os.FileInfo, error) { return stL, nil },
+		func() (os.FileInfo, error) { return scriptedStat{size: stP2.Size(), mtime: stP2.ModTime()}, nil },
+		func() (os.FileInfo, error) { return stL, nil },
+	}
+	calls := 0
+	orig := adoptStat
+	adoptStat = func(string) (os.FileInfo, error) {
+		i := calls
+		calls++
+		if i >= len(seq) {
+			i = len(seq) - 1
+		}
+		return seq[i]()
+	}
+	t.Cleanup(func() { adoptStat = orig })
+
+	res2, err := m.AdoptInputs(pip, lock)
+	adoptStat = orig
+	if err != nil {
+		t.Fatalf("retry must adopt the coherent present pair: %v", err)
+	}
+	if res2.LockRoot == "" {
+		t.Fatal("retry adopted the pair without the lock root")
+	}
+	if b, rerr := os.ReadFile(filepath.Join(res2.LockRoot, ".kiwi", "lock.json")); rerr != nil || string(b) != `{"version":1}` {
+		t.Fatalf("retry-adapted lock = %q %v", b, rerr)
+	}
+	if calls < 8 {
+		t.Fatalf("stat samples = %d, want the full appearance-retry bracket (8)", calls)
+	}
+}

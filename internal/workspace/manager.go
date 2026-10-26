@@ -252,6 +252,12 @@ func (m *Manager) Freeze(ctx context.Context) error {
 }
 
 func (m *Manager) freezeLocked(ctx context.Context) error {
+	// Portable VERIFIED-STABLE TRANSACTION (not an instantaneous filesystem
+	// snapshot): observe the source, copy, re-observe, compare, and prove
+	// the copied bytes (including external symlink targets). A cooperative
+	// snapshot primitive could strengthen the "same nanosecond" claim on
+	// specific platforms later; the portable path proves stability across
+	// the transaction window instead.
 	if m.base != "" {
 		return nil
 	}
@@ -590,6 +596,9 @@ func freezeManifestIndex(root, skip string, idx trackedIndex, proofs map[string]
 				if !ok {
 					return fmt.Errorf("freeze: content identity for %q could not be established (refusing a metadata-only freeze proof)", rel)
 				}
+				// FULL digest: the bytes are already read; keeping every
+				// bit costs nothing and the before/after equality is an
+				// evidence question, not a cache key.
 				fmt.Fprintf(h, "\x00%s", d)
 			}
 		}
@@ -606,8 +615,8 @@ func freezeManifestIndex(root, skip string, idx trackedIndex, proofs map[string]
 // stream. ok is false when the bytes cannot be fully read or the file's
 // size moved while it was being read (the caller then refuses the freeze
 // rather than accepting metadata as a substitute). Every size gets the
-// full hash: sampled equality was acceptable for fast invalidation, never
-// for the canonical run-base proof.
+// full hash, and the FULL digest is retained (no truncated prefix): the
+// before/after manifest equality is an evidence question.
 func freezeContentDigest(path string, size int64) (string, bool) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -619,7 +628,7 @@ func freezeContentDigest(path string, size int64) (string, bool) {
 	if err != nil || n != size {
 		return "", false
 	}
-	return hex.EncodeToString(h.Sum(nil)[:8]), true
+	return hex.EncodeToString(h.Sum(nil)), true
 }
 
 // freezeBeforeManifestHook is a test-only seam invoked at the start of
@@ -657,6 +666,11 @@ func verifyRunBaseByteProof(srcRoot, baseRoot string, proofs map[string]freezeFi
 			return nil
 		}
 		relSlash := filepath.ToSlash(rel)
+		// The external-target store is content-addressed: each file's NAME
+		// is its full digest, and every entry is proven at materialization
+		// time (pre-stat, copied-digest, post-stat + source rehash). The
+		// byte proof therefore does not re-walk these files; a name that
+		// does not hash to itself could never have been published.
 		if rel == ".kiwi-frozen" || strings.HasPrefix(relSlash, ".kiwi-frozen/") ||
 			rel == ".kiwi-frozen-link-targets" || strings.HasPrefix(relSlash, ".kiwi-frozen-link-targets/") {
 			if info.IsDir() {
@@ -1558,9 +1572,12 @@ func RemoteRepoCoords(remote string) (repoURL, fullName string) {
 // contents despite one run-base (deterministic-local P1).
 //
 //   - target inside src (after resolve): rewrite to a relative link under dst
-//   - target is a regular file outside src: snapshot bytes into a hidden
-//     store under dst and rewrite as a relative symlink to that snapshot
-//     (filesystem semantics preserved: the entry stays a symlink)
+//   - target is a regular file outside src: copy it into a CONTENT-ADDRESSED
+//     hidden store under dst (the store file name is the full digest of its
+//     bytes) under the same pre-stat / stream-hash / post-stat + rehash
+//     proof as every other frozen byte, then rewrite as a relative symlink
+//     to that snapshot (filesystem semantics preserved: the entry stays a
+//     symlink)
 //   - target is a directory outside src: refuse (cannot snapshot cheaply)
 //   - dangling / lexically escaping: refuse (a later-created external path
 //     would re-enter the supposedly immutable run-base)
@@ -1597,22 +1614,123 @@ func materializeSymlink(path, link, src, dst, target string) error {
 	if st.IsDir() {
 		return fmt.Errorf("freeze: symlink %q points outside the source to directory %q; refusing a non-deterministic run-base", path, res)
 	}
-	sum := sha256.Sum256([]byte(absRes))
-	storeRel := filepath.Join(".kiwi-frozen-link-targets", hex.EncodeToString(sum[:8]))
-	storeAbs := filepath.Join(dst, storeRel)
-	if err := mkdirParents(filepath.Dir(storeAbs), 0o755); err != nil {
+	// External regular file: first-class freeze transaction member. The
+	// store filename IS the full content digest (256 bits), and the copy is
+	// proven like every other frozen byte: pre-stat, stream-hash the copy,
+	// post-stat + SameFile, then a full rehash of the source that must
+	// equal the copied digest. A hybrid copy or an identity move fails the
+	// whole freeze attempt (the transaction retries, then refuses).
+	digest, err := materializeExternalTarget(res, filepath.Join(dst, ".kiwi-frozen-link-targets"), st.Mode().Perm())
+	if err != nil {
 		return err
 	}
-	if _, serr := os.Stat(storeAbs); serr != nil {
-		if err := copyFile(res, storeAbs, st.Mode().Perm()); err != nil {
-			return err
-		}
-	}
+	storeAbs := filepath.Join(dst, ".kiwi-frozen-link-targets", digest)
 	relLink, err := filepath.Rel(filepath.Dir(target), storeAbs)
 	if err != nil {
 		return err
 	}
 	return os.Symlink(relLink, target)
+}
+
+// freezeAfterExternalReadHook is a test-only seam invoked after an external
+// symlink target's bytes have been copied (and hashed) but before the
+// post-copy source rehash, so tests can fabricate exactly the race the
+// proof exists for. Nil in production.
+var freezeAfterExternalReadHook func(srcPath string)
+
+// materializeExternalTarget copies an out-of-tree symlink target into the
+// frozen store under its FULL content digest and returns that digest (the
+// store file name). The store is content-addressed: two identical contents
+// share one entry regardless of source path, distinct contents can never
+// collide (256-bit names), and reuse of an existing entry is accepted only
+// after hashing it back to the same digest — a corrupt or short-named
+// leftover is replaced by the proven copy.
+func materializeExternalTarget(srcPath, storeRoot string, perm os.FileMode) (string, error) {
+	pre, err := os.Stat(srcPath)
+	if err != nil {
+		return "", fmt.Errorf("freeze: external target %s: %w", srcPath, err)
+	}
+	if pre.IsDir() {
+		return "", fmt.Errorf("freeze: external target %s is a directory", srcPath)
+	}
+	if err := os.MkdirAll(storeRoot, 0o755); err != nil {
+		return "", err
+	}
+	in, err := os.Open(srcPath)
+	if err != nil {
+		return "", fmt.Errorf("freeze: external target %s: %w", srcPath, err)
+	}
+	tmp, err := os.CreateTemp(storeRoot, ".part-")
+	if err != nil {
+		_ = in.Close()
+		return "", err
+	}
+	h := sha256.New()
+	_, copyErr := io.Copy(io.MultiWriter(tmp, h), in)
+	closeInErr := in.Close()
+	if cerr := tmp.Close(); cerr != nil && copyErr == nil {
+		copyErr = cerr
+	}
+	if copyErr != nil || closeInErr != nil {
+		_ = os.Remove(tmp.Name())
+		if copyErr == nil {
+			copyErr = closeInErr
+		}
+		return "", fmt.Errorf("freeze: external target %s: %w", srcPath, copyErr)
+	}
+	if err := os.Chmod(tmp.Name(), perm); err != nil {
+		_ = os.Remove(tmp.Name())
+		return "", err
+	}
+	digest := hex.EncodeToString(h.Sum(nil))
+	if freezeAfterExternalReadHook != nil {
+		freezeAfterExternalReadHook(srcPath)
+	}
+	// Post-copy identity plus full source rehash: the copied bytes must be
+	// exactly the source's current bytes, and the source must still be the
+	// same file the copy started from. This is the same three-way rule the
+	// run-base byte proof uses for ordinary files.
+	post, err := os.Stat(srcPath)
+	if err != nil {
+		_ = os.Remove(tmp.Name())
+		return "", fmt.Errorf("freeze: external target %s vanished during freeze: %w", srcPath, err)
+	}
+	if !os.SameFile(pre, post) || pre.Size() != post.Size() || pre.Mode() != post.Mode() || !pre.ModTime().Equal(post.ModTime()) {
+		_ = os.Remove(tmp.Name())
+		return "", fmt.Errorf("freeze: external target %s identity moved during freeze (inode/size/mode/mtime)", srcPath)
+	}
+	srcDigest, err := hashFileContent(srcPath)
+	if err != nil {
+		_ = os.Remove(tmp.Name())
+		return "", fmt.Errorf("freeze: external target %s content identity could not be established: %w", srcPath, err)
+	}
+	if srcDigest != digest {
+		_ = os.Remove(tmp.Name())
+		return "", fmt.Errorf("freeze: copied bytes do not match source for external target %s (content integrity)", srcPath)
+	}
+	final := filepath.Join(storeRoot, digest)
+	if existing, serr := os.Stat(final); serr == nil && existing.Mode().IsRegular() {
+		existingDigest, herr := hashFileContent(final)
+		if herr == nil && existingDigest == digest {
+			_ = os.Remove(tmp.Name())
+			return digest, nil
+		}
+		// Store corruption (or a truncated legacy name): replace with the
+		// proven copy instead of trusting the path.
+		if err := os.Remove(final); err != nil {
+			_ = os.Remove(tmp.Name())
+			return "", err
+		}
+	}
+	if err := os.Rename(tmp.Name(), final); err != nil {
+		// Windows cannot rename over an existing file: remove and retry once.
+		_ = os.Remove(final)
+		if err2 := os.Rename(tmp.Name(), final); err2 != nil {
+			_ = os.Remove(tmp.Name())
+			return "", err2
+		}
+	}
+	return digest, nil
 }
 
 // escapesFrozen reports whether a relative link target can climb out of the
@@ -1644,7 +1762,10 @@ type AdoptedInputs struct {
 // read, and stat-sampled again inside a single window, so the returned set
 // was simultaneously stable. Individually-stable reads could otherwise
 // certify pipeline A with lock B even though that combination never
-// existed. The whole transaction retries once, then fails closed.
+// existed. A MISSING lock is a first-class OBSERVED STATE of the same
+// transaction: absence is re-checked at the after-sample, so a lock created
+// mid-window fails the attempt (and the retry then coherently adopts the
+// now-present pair). The whole transaction retries once, then fails closed.
 func (m *Manager) AdoptInputs(pipelinePath, lockPath string) (AdoptedInputs, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1656,9 +1777,10 @@ func (m *Manager) AdoptInputs(pipelinePath, lockPath string) (AdoptedInputs, err
 		return out, fmt.Errorf("AdoptInputs: nothing to adopt")
 	}
 	type planned struct {
-		abs   string
-		dst   string
-		isPip bool
+		abs         string
+		dst         string
+		isPip       bool
+		allowAbsent bool
 	}
 	var plan []planned
 	if pipelinePath != "" {
@@ -1678,8 +1800,9 @@ func (m *Manager) AdoptInputs(pipelinePath, lockPath string) (AdoptedInputs, err
 			return out, err
 		}
 		plan = append(plan, planned{
-			abs: abs,
-			dst: filepath.Join(m.base, ".kiwi-frozen", "lockroot", ".kiwi", "lock.json"),
+			abs:         abs,
+			dst:         filepath.Join(m.base, ".kiwi-frozen", "lockroot", ".kiwi", "lock.json"),
+			allowAbsent: true,
 		})
 	}
 
@@ -1689,31 +1812,51 @@ func (m *Manager) AdoptInputs(pipelinePath, lockPath string) (AdoptedInputs, err
 	// One window across the whole set: stat-all, read-all, stat-all again.
 	// Any movement between a file's samples — size, mode, mtime, OR inode
 	// identity (an unlink/recreate that spoofs the metadata) — fails the
-	// WHOLE set: the combination was never simultaneously stable.
-	attempt := func() ([][]byte, string, error) {
+	// WHOLE set: the combination was never simultaneously stable. An
+	// allowAbsent slot that is missing at S1 must still be missing at S2.
+	attempt := func() ([][]byte, []bool, string, error) {
 		s1 := make([]sample, len(plan))
+		absent := make([]bool, len(plan))
 		for i, p := range plan {
 			st, err := adoptStat(p.abs)
 			if err != nil {
-				return nil, "", err
+				if os.IsNotExist(err) && p.allowAbsent {
+					absent[i] = true
+					continue
+				}
+				return nil, nil, "", err
 			}
 			if st.IsDir() {
-				return nil, "", fmt.Errorf("adopt: %s is a directory; adopt the specific file", p.abs)
+				return nil, nil, "", fmt.Errorf("adopt: %s is a directory; adopt the specific file", p.abs)
 			}
 			s1[i] = sample{info: st}
 		}
 		datas := make([][]byte, len(plan))
 		for i, p := range plan {
+			if absent[i] {
+				continue
+			}
 			b, err := os.ReadFile(p.abs)
 			if err != nil {
-				return nil, "", err
+				return nil, nil, "", err
 			}
 			datas[i] = b
 		}
 		for i, p := range plan {
 			st2, err := adoptStat(p.abs)
+			if absent[i] {
+				if err == nil {
+					// The optional input appeared inside the window: the
+					// observed pair (pipeline, absence) is no longer true.
+					return nil, nil, p.abs, nil
+				}
+				if !os.IsNotExist(err) {
+					return nil, nil, "", err
+				}
+				continue
+			}
 			if err != nil {
-				return nil, "", err
+				return nil, nil, "", err
 			}
 			// Inode identity: an unlink/recreate that clones size/mode/mtime
 			// is a different FILE. Stats without a Sys payload (test seam
@@ -1723,17 +1866,21 @@ func (m *Manager) AdoptInputs(pipelinePath, lockPath string) (AdoptedInputs, err
 				s1[i].info.Size() != st2.Size() ||
 				s1[i].info.Mode() != st2.Mode() ||
 				!s1[i].info.ModTime().Equal(st2.ModTime()) {
-				return nil, p.abs, nil
+				return nil, nil, p.abs, nil
 			}
 		}
-		return datas, "", nil
+		present := make([]bool, len(plan))
+		for i := range plan {
+			present[i] = !absent[i]
+		}
+		return datas, present, "", nil
 	}
-	datas, changed, err := attempt()
+	datas, present, changed, err := attempt()
 	if err != nil {
 		return out, err
 	}
 	if changed != "" {
-		datas, changed, err = attempt()
+		datas, present, changed, err = attempt()
 		if err != nil {
 			return out, err
 		}
@@ -1742,6 +1889,9 @@ func (m *Manager) AdoptInputs(pipelinePath, lockPath string) (AdoptedInputs, err
 		}
 	}
 	for i, p := range plan {
+		if !present[i] {
+			continue // absence is the published state for this slot
+		}
 		if err := os.MkdirAll(filepath.Dir(p.dst), 0o755); err != nil {
 			return out, err
 		}
@@ -1773,11 +1923,16 @@ func (m *Manager) AdoptFile(srcPath string) (string, error) {
 // (Join(root, ".kiwi/lock.json") must resolve to the adopted bytes). This
 // preserves the lockfilePath layout instead of flattening lock.json next to
 // the pipeline, and never leaves the live original path as authority.
-// It is the single-input form of AdoptInputs.
+// It is the single-input form of AdoptInputs and stays STRICT: a missing
+// lock is an error here (RunLocal passes absence through AdoptInputs
+// directly, where absence is a first-class transaction state).
 func (m *Manager) AdoptLock(srcLockFile string) (string, error) {
 	res, err := m.AdoptInputs("", srcLockFile)
 	if err != nil {
 		return "", err
+	}
+	if res.LockRoot == "" {
+		return "", fmt.Errorf("AdoptLock: %s does not exist", srcLockFile)
 	}
 	return res.LockRoot, nil
 }
