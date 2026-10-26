@@ -1,6 +1,7 @@
 package workspace
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
@@ -270,6 +271,74 @@ func TestFreezeExternalSymlinkTargetInodeSwapFailsClosed(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "identity moved during freeze") {
 		t.Fatalf("error = %v, want the external-target identity-move refusal", err)
+	}
+	if calls != 2 {
+		t.Fatalf("external-read hook fired %d time(s), want one per freeze attempt (2)", calls)
+	}
+	if m.BasePath() != "" {
+		t.Fatalf("failed freeze must not publish a run-base (base=%q)", m.BasePath())
+	}
+}
+
+// TestFreezeExternalLargeTargetMiddleMutationFailsClosed is the audit's
+// large-external-target checklist case: a 65 MiB out-of-tree target whose
+// MIDDLE is rewritten in place (same size, restored mtime, offset far from
+// any historic head/tail sampling band) after its bytes were copied. The
+// external-target proof rehashes every byte of the source and compares to
+// the copied digest, so no offset is special. Alternating offsets keep the
+// retry from converging onto a stable mutated state.
+func TestFreezeExternalLargeTargetMiddleMutationFailsClosed(t *testing.T) {
+	src := t.TempDir()
+	ext := filepath.Join(t.TempDir(), "huge.bin")
+	size := int64(65 << 20)
+	if err := os.WriteFile(ext, bytes.Repeat([]byte{'A'}, int(size)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(ext, filepath.Join(src, "huge.bin")); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(src, "seed.txt"), "s")
+	extInfo, err := os.Stat(ext)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	origHook := freezeAfterExternalReadHook
+	calls := 0
+	freezeAfterExternalReadHook = func(string) {
+		calls++
+		// In-place middle rewrite at a different offset every attempt;
+		// size unchanged, mtime restored: only the full rehash can see it.
+		off := int64(20 << 20)
+		if calls%2 == 0 {
+			off = 21 << 20
+		}
+		f, ferr := os.OpenFile(ext, os.O_WRONLY, 0)
+		if ferr != nil {
+			t.Errorf("hook open: %v", ferr)
+			return
+		}
+		if _, werr := f.WriteAt(bytes.Repeat([]byte{'B'}, 64<<10), off); werr != nil {
+			_ = f.Close()
+			t.Errorf("hook write: %v", werr)
+			return
+		}
+		_ = f.Close()
+		_ = os.Chtimes(ext, extInfo.ModTime(), extInfo.ModTime())
+	}
+	t.Cleanup(func() { freezeAfterExternalReadHook = origHook })
+
+	m, err := NewManager(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	err = m.Freeze(t.Context())
+	if err == nil {
+		t.Fatal("freeze accepted a large external target with a mid-copy middle rewrite")
+	}
+	if !strings.Contains(err.Error(), "external target") || !strings.Contains(err.Error(), "do not match source") {
+		t.Fatalf("error = %v, want external-target content-integrity failure", err)
 	}
 	if calls != 2 {
 		t.Fatalf("external-read hook fired %d time(s), want one per freeze attempt (2)", calls)
