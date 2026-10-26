@@ -215,3 +215,66 @@ func TestFreezeExternalTargetStoreContentAddressed(t *testing.T) {
 		t.Fatalf("corrupt store entry was reused verbatim: %q", got)
 	}
 }
+
+// TestFreezeExternalSymlinkTargetInodeSwapFailsClosed pins the IDENTITY
+// leg of the external-target proof, separately from the content leg: the
+// target is replaced mid-copy by a DIFFERENT inode that happens to carry
+// the same bytes (a rename-over). Size/mode/mtime may all match; SameFile
+// must still refuse, the freeze must retry, then fail with no run-base.
+func TestFreezeExternalSymlinkTargetInodeSwapFailsClosed(t *testing.T) {
+	src := t.TempDir()
+	ext := filepath.Join(t.TempDir(), "model.bin")
+	body := make([]byte, 1024)
+	for i := range body {
+		body[i] = 'A'
+	}
+	if err := os.WriteFile(ext, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	twin1 := filepath.Join(t.TempDir(), "twin1.bin")
+	twin2 := filepath.Join(t.TempDir(), "twin2.bin")
+	for _, twin := range []string{twin1, twin2} {
+		if err := os.WriteFile(twin, body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(ext, filepath.Join(src, "model.bin")); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(src, "seed.txt"), "s")
+
+	origHook := freezeAfterExternalReadHook
+	calls := 0
+	freezeAfterExternalReadHook = func(string) {
+		calls++
+		// Replace the target with an identical-content twin: the copied
+		// bytes and the rehash still match, but the inode moved.
+		twin := twin1
+		if calls%2 == 0 {
+			twin = twin2
+		}
+		if err := os.Rename(twin, ext); err != nil {
+			t.Errorf("hook rename: %v", err)
+		}
+	}
+	t.Cleanup(func() { freezeAfterExternalReadHook = origHook })
+
+	m, err := NewManager(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	err = m.Freeze(t.Context())
+	if err == nil {
+		t.Fatal("freeze accepted a target whose inode was replaced mid-copy")
+	}
+	if !strings.Contains(err.Error(), "identity moved during freeze") {
+		t.Fatalf("error = %v, want the external-target identity-move refusal", err)
+	}
+	if calls != 2 {
+		t.Fatalf("external-read hook fired %d time(s), want one per freeze attempt (2)", calls)
+	}
+	if m.BasePath() != "" {
+		t.Fatalf("failed freeze must not publish a run-base (base=%q)", m.BasePath())
+	}
+}
